@@ -134,6 +134,7 @@ fn recognizer_ext(eos: u32, extra: &[&str]) -> io::Result<RustRecognizer> {
         encoder,
         tokenizer,
         decoder: Arc::new(model).session(),
+        logits_scratch: Vec::new(),
         prompt_tokens,
         context: 512,
         batch_threads: 1,

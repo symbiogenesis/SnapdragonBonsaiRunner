@@ -75,6 +75,7 @@ pub struct RustRecognizer {
     encoder: Encoder,
     tokenizer: Tokenizer,
     decoder: Session,
+    logits_scratch: Vec<f32>,
     prompt_tokens: PromptTokens,
     context: usize,
     batch_threads: usize,
@@ -184,6 +185,7 @@ impl RustRecognizer {
             encoder,
             tokenizer,
             decoder: Arc::new(model).session(),
+            logits_scratch: Vec::new(),
             prompt_tokens,
             context,
             batch_threads,
@@ -257,6 +259,7 @@ impl RustRecognizer {
             self.prompt_tokens,
             self.context,
             &audio,
+            &mut self.logits_scratch,
             cancel,
             observe,
         )
@@ -302,11 +305,13 @@ impl RustRecognizer {
             self.prompt_tokens
                 .prompt_with_system(&system_tokens, audio.rows(), self.context)?;
         let budget = decode_budget(audio.rows(), prompt.ids().len(), self.context)?;
-        let logits = guard.0.prefill(&prompt, audio.values(), cancel)?;
+        guard
+            .0
+            .prefill_into(&prompt, audio.values(), &mut self.logits_scratch, cancel)?;
         decode_from_logits(
             guard.0,
             &self.tokenizer,
-            logits,
+            &mut self.logits_scratch,
             budget,
             options.trim_repetition_on_stop,
             cancel,
@@ -439,15 +444,15 @@ impl LiveCapture<'_> {
             .decoder
             .prefill_audio_chunk(encoded.values(), encoded.rows(), cancel)?;
         let suffix = self.recognizer.prompt_tokens.suffix_ids();
-        let logits = self
-            .recognizer
-            .decoder
-            .prefill_tokens(&suffix, true, cancel)?
-            .ok_or_else(invalid)?;
+        self.recognizer.decoder.prefill_tokens_into(
+            &suffix,
+            Some(&mut self.recognizer.logits_scratch),
+            cancel,
+        )?;
         decode_from_logits(
             &mut self.recognizer.decoder,
             &self.recognizer.tokenizer,
-            logits,
+            &mut self.recognizer.logits_scratch,
             budget,
             false,
             cancel,
@@ -469,12 +474,17 @@ impl Drop for ClearSession<'_> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shares prefill and decode loop with caller-owned reusable logits scratch."
+)]
 fn decode_audio(
     session: &mut Session,
     tokenizer: &Tokenizer,
     tokens: PromptTokens,
     context: usize,
     audio: &Encoded,
+    logits: &mut Vec<f32>,
     cancel: &mut impl FnMut() -> bool,
     observe: &mut impl FnMut(Observation<'_>) -> io::Result<()>,
 ) -> io::Result<String> {
@@ -482,14 +492,14 @@ fn decode_audio(
     let budget = decode_budget(audio.rows(), prompt.ids().len(), context)?;
     observe(Observation::Prompt(&prompt))?;
     check(cancel)?;
-    let logits = session.prefill(&prompt, audio.values(), cancel)?;
+    session.prefill_into(&prompt, audio.values(), logits, cancel)?;
     decode_from_logits(session, tokenizer, logits, budget, false, cancel, observe)
 }
 
 fn decode_from_logits(
     session: &mut Session,
     tokenizer: &Tokenizer,
-    mut logits: Vec<f32>,
+    logits: &mut Vec<f32>,
     budget: usize,
     trim_on_stop: bool,
     cancel: &mut impl FnMut() -> bool,
@@ -502,10 +512,10 @@ fn decode_from_logits(
         .map_err(io::Error::other)?;
     for index in 0..budget {
         check(cancel)?;
-        let token = argmax(&logits)?;
+        let token = argmax(logits)?;
         observe(Observation::Decoder {
             generation_index: index,
-            logits: &logits,
+            logits,
             token,
             state: session,
         })?;
@@ -532,7 +542,7 @@ fn decode_from_logits(
             return Err(invalid());
         }
         if index + 1 < budget {
-            logits = session.step(token, cancel)?;
+            session.step_into(token, logits, cancel)?;
         }
     }
     if trim_on_stop {

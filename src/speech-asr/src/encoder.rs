@@ -20,7 +20,10 @@ use crate::{
     row_workers, threads,
 };
 use fearless_simd::{dispatch, f32x4, prelude::*};
-use std::io::{self, Read, Seek};
+use std::{
+    cell::RefCell,
+    io::{self, Read, Seek},
+};
 
 #[path = "encoder/numerics.rs"]
 mod numerics;
@@ -531,9 +534,7 @@ impl Encoder {
         let num_rows = layout.audio_rows;
         let window_rows = (8 * layout.rows_per_chunk).max(1);
         let mut norm_buf = zeros(num_rows * c.hidden)?;
-        let mut q = zeros(num_rows * c.hidden)?;
-        let mut k = zeros(num_rows * c.hidden)?;
-        let mut v = zeros(num_rows * c.hidden)?;
+        let mut qkv = zeros(3 * num_rows * c.hidden)?;
         let mut attn_out = zeros(num_rows * c.hidden)?;
         let mut proj = zeros(num_rows * c.hidden)?;
         let mut ffn_buf = zeros(num_rows * c.intermediate)?;
@@ -542,9 +543,7 @@ impl Encoder {
                 block,
                 &mut rows,
                 &mut norm_buf,
-                &mut q,
-                &mut k,
-                &mut v,
+                &mut qkv,
                 &mut attn_out,
                 &mut proj,
                 &mut ffn_buf,
@@ -874,6 +873,36 @@ fn position_add(row: &mut [f32], position: usize) -> io::Result<()> {
     finite(row)
 }
 
+const MAX_SCORE_SCRATCH_CAP: usize = 65_536;
+
+thread_local! {
+    static SCORE_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+fn with_score_scratch<R>(
+    len: usize,
+    action: impl FnOnce(&mut [f32]) -> io::Result<R>,
+) -> io::Result<R> {
+    SCORE_SCRATCH.with(|cell| {
+        if let Ok(mut buf) = cell.try_borrow_mut() {
+            buf.clear();
+            if buf.capacity() < len {
+                buf.try_reserve(len).map_err(io::Error::other)?;
+            }
+            buf.resize(len, 0.0);
+            let res = action(&mut buf[..len]);
+            if buf.capacity() > MAX_SCORE_SCRATCH_CAP {
+                buf.clear();
+                buf.shrink_to(MAX_SCORE_SCRATCH_CAP);
+            }
+            res
+        } else {
+            let mut fallback = zeros(len)?;
+            action(&mut fallback)
+        }
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Reuses flat encoder transformer buffers across layers with zero per-layer allocations."
@@ -882,9 +911,7 @@ fn transform_block(
     block: &Block,
     rows: &mut [f32],
     norm_buf: &mut [f32],
-    q: &mut [f32],
-    k: &mut [f32],
-    v: &mut [f32],
+    qkv: &mut [f32],
     attn_out: &mut [f32],
     proj: &mut [f32],
     ffn_buf: &mut [f32],
@@ -900,6 +927,9 @@ fn transform_block(
     block
         .attention_norm
         .apply_batch(rows, norm_buf, c.hidden, workers)?;
+    let part = num_rows * c.hidden;
+    let (q, kv_mut) = qkv.split_at_mut(part);
+    let (k, v) = kv_mut.split_at_mut(part);
     prepared.prepare_meta(num_rows, c.hidden);
     Projection::multiply_batch_triple_into(
         &block.query.weights,
@@ -914,55 +944,57 @@ fn transform_block(
         v,
         cancel,
     )?;
-    for (dst, bias) in [
-        (&mut *q, &block.query.bias),
-        (&mut *k, &block.key.bias),
-        (&mut *v, &block.value.bias),
-    ] {
-        add_batch_bias(dst, bias, workers)?;
-    }
+    add_batch_bias_triple(
+        qkv,
+        &block.query.bias,
+        &block.key.bias,
+        &block.value.bias,
+        part,
+        workers,
+    )?;
 
     for _ in 0..(num_rows * c.heads) {
         check(cancel)?;
     }
-    let q_ref = &*q;
-    let k_ref = &*k;
-    let v_ref = &*v;
+    let (q_ref, kv_ref) = qkv.split_at(part);
+    let (k_ref, v_ref) = kv_ref.split_at(part);
     let head_dim = c.hidden / c.heads;
     let divisor = scalar(head_dim).sqrt();
     let window_rows = window_rows.max(1);
+    let score_needed = 4 * window_rows.min(num_rows).max(1);
     row_workers::try_run_aligned(attn_out, workers, c.hidden, &|elem_off, slice| {
         let start_row = elem_off / c.hidden;
         let rows_here = slice.len() / c.hidden;
-        let mut scores = zeros(4 * window_rows.min(num_rows).max(1))?;
-        let mut local_idx = 0_usize;
-        while local_idx < rows_here {
-            let row_idx = start_row + local_idx;
-            let win_start = (row_idx / window_rows) * window_rows;
-            let win_end = (win_start + window_rows).min(num_rows);
-            let win_len = win_end - win_start;
-            let tile_rows = (win_end - row_idx).min(rows_here - local_idx).min(4);
-            let q_tile = &q_ref[row_idx * c.hidden..(row_idx + tile_rows) * c.hidden];
-            let k_win = &k_ref[win_start * c.hidden..win_end * c.hidden];
-            let v_win = &v_ref[win_start * c.hidden..win_end * c.hidden];
-            let out_tile = &mut slice[local_idx * c.hidden..(local_idx + tile_rows) * c.hidden];
-            packed::attend_q_rows_bidirectional_f32(
-                q_tile,
-                k_win,
-                v_win,
-                win_len,
-                c.hidden,
-                c.heads,
-                head_dim,
-                divisor,
-                &mut scores[..tile_rows * win_len],
-                out_tile,
-                invalid,
-            )?;
-            finite(out_tile)?;
-            local_idx += tile_rows;
-        }
-        Ok(())
+        with_score_scratch(score_needed, |scores| {
+            let mut local_idx = 0_usize;
+            while local_idx < rows_here {
+                let row_idx = start_row + local_idx;
+                let win_start = (row_idx / window_rows) * window_rows;
+                let win_end = (win_start + window_rows).min(num_rows);
+                let win_len = win_end - win_start;
+                let tile_rows = (win_end - row_idx).min(rows_here - local_idx).min(4);
+                let q_tile = &q_ref[row_idx * c.hidden..(row_idx + tile_rows) * c.hidden];
+                let k_win = &k_ref[win_start * c.hidden..win_end * c.hidden];
+                let v_win = &v_ref[win_start * c.hidden..win_end * c.hidden];
+                let out_tile = &mut slice[local_idx * c.hidden..(local_idx + tile_rows) * c.hidden];
+                packed::attend_q_rows_bidirectional_f32(
+                    q_tile,
+                    k_win,
+                    v_win,
+                    win_len,
+                    c.hidden,
+                    c.heads,
+                    head_dim,
+                    divisor,
+                    &mut scores[..tile_rows * win_len],
+                    out_tile,
+                    invalid,
+                )?;
+                finite(out_tile)?;
+                local_idx += tile_rows;
+            }
+            Ok(())
+        })
     })?;
 
     prepared.prepare_meta(num_rows, c.hidden);
@@ -1090,6 +1122,45 @@ fn add_batch_bias(out: &mut [f32], bias: &[f32], workers: usize) -> io::Result<(
     row_workers::try_run_aligned(out, workers, out_width, &|_, slice| {
         let ok = dispatch!(level, simd => add_bias_rows_simd(simd, slice, bias));
         if ok { Ok(()) } else { Err(invalid()) }
+    })
+}
+
+fn add_batch_bias_triple(
+    qkv: &mut [f32],
+    q_bias: &[f32],
+    k_bias: &[f32],
+    v_bias: &[f32],
+    part: usize,
+    workers: usize,
+) -> io::Result<()> {
+    let width = q_bias.len();
+    if k_bias.len() != width || v_bias.len() != width {
+        return Err(invalid());
+    }
+    if width == 0 {
+        return finite(qkv);
+    }
+    if !part.is_multiple_of(width) || qkv.len() != part.checked_mul(3).ok_or_else(invalid)? {
+        return Err(invalid());
+    }
+    let level = packed::simd_level();
+    let biases = [q_bias, k_bias, v_bias];
+    row_workers::try_run_aligned(qkv, workers, width, &|elem_off, slice| {
+        let mut cursor = elem_off;
+        let mut local_off = 0_usize;
+        while local_off < slice.len() {
+            let section = cursor / part;
+            let section_end = (section + 1) * part;
+            let take = (section_end - cursor).min(slice.len() - local_off);
+            let subslice = &mut slice[local_off..local_off + take];
+            let ok = dispatch!(level, simd => add_bias_rows_simd(simd, subslice, biases[section]));
+            if !ok {
+                return Err(invalid());
+            }
+            cursor += take;
+            local_off += take;
+        }
+        Ok(())
     })
 }
 

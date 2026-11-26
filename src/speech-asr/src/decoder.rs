@@ -18,7 +18,9 @@ use crate::{
     replay::{CacheValues, LayerCache},
     row_workers, threads,
 };
+use fearless_simd::{dispatch, f32x4, prelude::*};
 use std::{
+    cell::RefCell,
     io::{self, Read, Seek},
     sync::Arc,
 };
@@ -984,11 +986,42 @@ struct DecoderWorkspace {
     batch_proj: Vec<f32>,
     batch_gate: Vec<f32>,
     batch_up: Vec<f32>,
+    rope_sin: Vec<f32>,
+    rope_cos: Vec<f32>,
     transposed_scratch: Vec<f32>,
     prepared: PreparedBatch,
 }
 
 const RETAIN_POSITIONS: usize = 128;
+const MAX_SCORE_SCRATCH_CAP: usize = 65_536;
+
+thread_local! {
+    static SCORE_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+fn with_score_scratch<R>(
+    len: usize,
+    action: impl FnOnce(&mut [f32]) -> io::Result<R>,
+) -> io::Result<R> {
+    SCORE_SCRATCH.with(|cell| {
+        if let Ok(mut buf) = cell.try_borrow_mut() {
+            buf.clear();
+            if buf.capacity() < len {
+                buf.try_reserve(len).map_err(io::Error::other)?;
+            }
+            buf.resize(len, 0.0);
+            let res = action(&mut buf[..len]);
+            if buf.capacity() > MAX_SCORE_SCRATCH_CAP {
+                buf.clear();
+                buf.shrink_to(MAX_SCORE_SCRATCH_CAP);
+            }
+            res
+        } else {
+            let mut fallback = zeros(len)?;
+            action(&mut fallback)
+        }
+    })
+}
 
 fn clear_bounded<T>(values: &mut Vec<T>, retain_cap: usize) {
     values.clear();
@@ -1039,6 +1072,9 @@ impl DecoderWorkspace {
             &mut self.batch_up,
             retain_pos.saturating_mul(c.intermediate),
         );
+        let retain_rope = retain_pos.saturating_mul((c.head_dim / 2).max(1));
+        clear_bounded(&mut self.rope_sin, retain_rope);
+        clear_bounded(&mut self.rope_cos, retain_rope);
         clear_bounded(
             &mut self.transposed_scratch,
             retain_pos.saturating_mul(max_proj_out),
@@ -1133,15 +1169,30 @@ impl Session {
     /// # Errors
     /// Rejects invalid token IDs or the conditions from [`Self::step_audio`].
     pub fn step(&mut self, id: u32, cancel: &mut impl FnMut() -> bool) -> io::Result<Vec<f32>> {
-        self.step_token(id, true, cancel)
+        let mut logits = Vec::new();
+        self.step_into(id, &mut logits, cancel)?;
+        Ok(logits)
     }
 
-    fn step_token(
+    /// Decode a vocabulary embedding into reusable `logits` storage and publish one position.
+    ///
+    /// # Errors
+    /// Rejects invalid token IDs, allocation faults, or the conditions from [`Self::step_audio`].
+    pub(crate) fn step_into(
         &mut self,
         id: u32,
-        project_logits: bool,
+        logits: &mut Vec<f32>,
         cancel: &mut impl FnMut() -> bool,
-    ) -> io::Result<Vec<f32>> {
+    ) -> io::Result<()> {
+        self.step_token_into(id, Some(logits), cancel)
+    }
+
+    fn step_token_into(
+        &mut self,
+        id: u32,
+        logits: Option<&mut Vec<f32>>,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
         check(cancel)?;
         let c = self.model.config;
         if self.position >= c.context {
@@ -1152,7 +1203,7 @@ impl Session {
         self.model
             .embedding
             .row_into(token_id, &mut self.workspace.single_hidden)?;
-        self.advance_prepared(project_logits, cancel)
+        self.advance_prepared_into(logits, cancel)
     }
 
     /// Decode one encoder row or token embedding, then return tied-head logits.
@@ -1169,15 +1220,17 @@ impl Session {
         row: &[f32],
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<Vec<f32>> {
-        self.advance(row, true, cancel)
+        let mut logits = Vec::new();
+        self.advance_into(row, Some(&mut logits), cancel)?;
+        Ok(logits)
     }
 
-    fn advance(
+    fn advance_into(
         &mut self,
         row: &[f32],
-        project_logits: bool,
+        logits: Option<&mut Vec<f32>>,
         cancel: &mut impl FnMut() -> bool,
-    ) -> io::Result<Vec<f32>> {
+    ) -> io::Result<()> {
         let c = self.model.config;
         if self.position >= c.context || row.len() != c.hidden {
             return Err(invalid());
@@ -1185,14 +1238,14 @@ impl Session {
         finite(row)?;
         ensure_len(&mut self.workspace.single_hidden, c.hidden)?;
         self.workspace.single_hidden.copy_from_slice(row);
-        self.advance_prepared(project_logits, cancel)
+        self.advance_prepared_into(logits, cancel)
     }
 
-    fn advance_prepared(
+    fn advance_prepared_into(
         &mut self,
-        project_logits: bool,
+        logits_out: Option<&mut Vec<f32>>,
         cancel: &mut impl FnMut() -> bool,
-    ) -> io::Result<Vec<f32>> {
+    ) -> io::Result<()> {
         let model = &self.model;
         let c = model.config;
         check(cancel)?;
@@ -1220,9 +1273,29 @@ impl Session {
             ensure_len(&mut ws.single_provisional_values, prov_total)?;
         }
 
+        let half_dim = c.head_dim / 2;
+        let mut rope_sin = [0.0_f32; 128];
+        let mut rope_cos = [0.0_f32; 128];
+        fill_rope_tables(
+            &model.inv_freq,
+            self.position,
+            1,
+            &mut rope_sin[..half_dim],
+            &mut rope_cos[..half_dim],
+        );
+
         for (layer_idx, (block, state)) in model.blocks.iter().zip(&self.layers).enumerate() {
             check(cancel)?;
-            forward_into(block, state, model, self.position, ws, cancel)?;
+            forward_into(
+                block,
+                state,
+                model,
+                self.position,
+                &rope_sin[..half_dim],
+                &rope_cos[..half_dim],
+                ws,
+                cancel,
+            )?;
             if matches!(c.cache_precision, CachePrecision::F16) {
                 ws.single_provisional_keys_f16[layer_idx * kv_width..(layer_idx + 1) * kv_width]
                     .copy_from_slice(&ws.single_k_f16);
@@ -1241,13 +1314,12 @@ impl Session {
             c.epsilon,
             &mut ws.single_norm,
         )?;
-        let logits = if project_logits {
+        if let Some(logits) = logits_out {
+            ensure_len(logits, model.embedding.output)?;
             model
                 .embedding
-                .multiply_with_threads(&ws.single_norm, model.decode_threads, cancel)?
-        } else {
-            Vec::new()
-        };
+                .multiply_into(&ws.single_norm, model.decode_threads, logits, cancel)?;
+        }
         check(cancel)?;
         for state in &mut self.layers {
             state.reserve_extra(kv_width)?;
@@ -1266,7 +1338,7 @@ impl Session {
             }
         }
         self.position += 1;
-        Ok(logits)
+        Ok(())
     }
 
     /// Start a fresh prompt, replacing only its contiguous audio placeholder rows.
@@ -1284,6 +1356,22 @@ impl Session {
         audio: &[f32],
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<Vec<f32>> {
+        let mut logits = Vec::new();
+        self.prefill_into(prompt, audio, &mut logits, cancel)?;
+        Ok(logits)
+    }
+
+    /// Start a fresh prompt and project the final row into reusable `logits` storage.
+    ///
+    /// # Errors
+    /// Rejects audio geometry, context, allocation faults, or any token/step failure.
+    pub(crate) fn prefill_into(
+        &mut self,
+        prompt: &Prompt,
+        audio: &[f32],
+        logits: &mut Vec<f32>,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
         self.reset();
         let mut guard = ResetGuard {
             session: self,
@@ -1300,22 +1388,22 @@ impl Session {
         }
         finite(audio)?;
         if total == 0 {
+            logits.clear();
             guard.success = true;
-            return Ok(Vec::new());
+            return Ok(());
         }
-        let logits = prefill_rows_inner(
+        prefill_rows_inner(
             &model,
             &mut guard.session.layers,
             &mut guard.session.workspace,
             0,
             PrefillSource::Prompt { prompt, audio },
-            true,
+            Some(logits),
             cancel,
-        )?
-        .ok_or_else(invalid)?;
+        )?;
         guard.session.position = total;
         guard.success = true;
-        Ok(logits)
+        Ok(())
     }
 
     /// Incrementally append prompt or control tokens at the current position,
@@ -1331,17 +1419,37 @@ impl Session {
         need_logits: bool,
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<Option<Vec<f32>>> {
+        if need_logits {
+            let mut logits = Vec::new();
+            self.prefill_tokens_into(ids, Some(&mut logits), cancel)?;
+            Ok(Some(logits))
+        } else {
+            self.prefill_tokens_into(ids, None, cancel)?;
+            Ok(None)
+        }
+    }
+
+    /// Incrementally append tokens into optional reusable `logits` storage.
+    ///
+    /// # Errors
+    /// Rejects empty slices when `logits` is `Some`, context overflow, or invalid IDs.
+    pub(crate) fn prefill_tokens_into(
+        &mut self,
+        ids: &[u32],
+        logits: Option<&mut Vec<f32>>,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
         check(cancel)?;
         let saved_pos = self.position;
         let model = Arc::clone(&self.model);
         let c = model.config;
         let kv_width = c.kv_heads * c.head_dim;
         let end_pos = saved_pos.checked_add(ids.len()).ok_or_else(invalid)?;
-        if end_pos > c.context || (ids.is_empty() && need_logits) {
+        if end_pos > c.context || (ids.is_empty() && logits.is_some()) {
             return Err(invalid());
         }
         if ids.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
         let mut guard = TruncateGuard {
             session: self,
@@ -1349,18 +1457,18 @@ impl Session {
             kv_width,
             success: false,
         };
-        let logits = prefill_rows_inner(
+        prefill_rows_inner(
             &model,
             &mut guard.session.layers,
             &mut guard.session.workspace,
             saved_pos,
             PrefillSource::Tokens(ids),
-            need_logits,
+            logits,
             cancel,
         )?;
         guard.session.position = end_pos;
         guard.success = true;
-        Ok(logits)
+        Ok(())
     }
 
     /// Incrementally append encoded audio feature rows during live microphone capture.
@@ -1398,13 +1506,13 @@ impl Session {
             kv_width,
             success: false,
         };
-        let _ = prefill_rows_inner(
+        prefill_rows_inner(
             &model,
             &mut guard.session.layers,
             &mut guard.session.workspace,
             saved_pos,
             PrefillSource::Audio { audio, rows },
-            false,
+            None,
             cancel,
         )?;
         guard.session.position = end_pos;
@@ -1441,14 +1549,15 @@ fn prefill_rows_inner(
     ws: &mut DecoderWorkspace,
     start_pos: usize,
     source: PrefillSource<'_>,
-    need_logits: bool,
+    logits_out: Option<&mut Vec<f32>>,
     cancel: &mut impl FnMut() -> bool,
-) -> io::Result<Option<Vec<f32>>> {
+) -> io::Result<()> {
     let c = model.config;
     let total = source.len();
     let hidden = c.hidden;
     let kv_width = c.kv_heads * c.head_dim;
     let q_width = c.heads * c.head_dim;
+    let half_dim = c.head_dim / 2;
     let workers = model.batch_threads;
 
     ensure_len(&mut ws.batch_a, total * hidden)?;
@@ -1460,6 +1569,8 @@ fn prefill_rows_inner(
     ensure_len(&mut ws.batch_proj, total * hidden)?;
     ensure_len(&mut ws.batch_gate, total * c.intermediate)?;
     ensure_len(&mut ws.batch_up, total * c.intermediate)?;
+    ensure_len(&mut ws.rope_sin, total * half_dim)?;
+    ensure_len(&mut ws.rope_cos, total * half_dim)?;
 
     match source {
         PrefillSource::Prompt { prompt, audio } => {
@@ -1505,6 +1616,14 @@ fn prefill_rows_inner(
     let gqa_group = c.heads / c.kv_heads;
     let last_layer = model.blocks.len() - 1;
     let last_offset = (total - 1) * hidden;
+    let need_logits = logits_out.is_some();
+    fill_rope_tables(
+        &model.inv_freq,
+        start_pos,
+        total,
+        &mut ws.rope_sin,
+        &mut ws.rope_cos,
+    );
     for (layer_idx, (block, state)) in model.blocks.iter().zip(layers.iter_mut()).enumerate() {
         check(cancel)?;
         rms_batch(
@@ -1534,18 +1653,18 @@ fn prefill_rows_inner(
             workers,
             q_width,
             &block.query_norm,
-            &model.inv_freq,
+            &ws.rope_sin,
+            &ws.rope_cos,
             c,
-            start_pos,
         )?;
         normalize_and_rope_batch(
             &mut ws.batch_k,
             workers,
             kv_width,
             &block.key_norm,
-            &model.inv_freq,
+            &ws.rope_sin,
+            &ws.rope_cos,
             c,
-            start_pos,
         )?;
 
         state.write_append(start_kv, &ws.batch_k, &ws.batch_v)?;
@@ -1563,36 +1682,38 @@ fn prefill_rows_inner(
                 let local_start = elem_off / q_width;
                 let rows = attn_slice.len() / q_width;
                 let max_history = start_pos + local_start + rows;
-                let mut scores = zeros(gqa_group * max_history)?;
-                for (local_pos, out_row) in attn_slice.chunks_exact_mut(q_width).enumerate() {
-                    let local_row = local_start + local_pos;
-                    let pos = start_pos + local_row;
-                    let q_row = &queries[local_row * q_width..(local_row + 1) * q_width];
-                    let history_rows = pos + 1;
-                    let row_scores = &mut scores[..gqa_group * history_rows];
-                    for kv_head in 0..c.kv_heads {
-                        let offset = kv_head * c.head_dim;
-                        let q_group = &q_row[kv_head * group_width..(kv_head + 1) * group_width];
-                        let out_group =
-                            &mut out_row[kv_head * group_width..(kv_head + 1) * group_width];
-                        attend_kv_group_causal(
-                            q_group,
-                            state,
-                            None,
-                            None,
-                            history_rows,
-                            kv_width,
-                            offset,
-                            c.head_dim,
-                            gqa_group,
-                            divisor,
-                            row_scores,
-                            out_group,
-                        )?;
+                with_score_scratch(gqa_group * max_history, |scores| {
+                    for (local_pos, out_row) in attn_slice.chunks_exact_mut(q_width).enumerate() {
+                        let local_row = local_start + local_pos;
+                        let pos = start_pos + local_row;
+                        let q_row = &queries[local_row * q_width..(local_row + 1) * q_width];
+                        let history_rows = pos + 1;
+                        let row_scores = &mut scores[..gqa_group * history_rows];
+                        for kv_head in 0..c.kv_heads {
+                            let offset = kv_head * c.head_dim;
+                            let q_group =
+                                &q_row[kv_head * group_width..(kv_head + 1) * group_width];
+                            let out_group =
+                                &mut out_row[kv_head * group_width..(kv_head + 1) * group_width];
+                            attend_kv_group_causal(
+                                q_group,
+                                state,
+                                None,
+                                None,
+                                history_rows,
+                                kv_width,
+                                offset,
+                                c.head_dim,
+                                gqa_group,
+                                divisor,
+                                row_scores,
+                                out_group,
+                            )?;
+                        }
+                        finite(out_row)?;
                     }
-                    finite(out_row)?;
-                }
-                Ok(())
+                    Ok(())
+                })
             },
         )?;
 
@@ -1608,7 +1729,7 @@ fn prefill_rows_inner(
         add_residual_batch(&mut ws.batch_a, &ws.batch_proj, workers, hidden)?;
 
         if layer_idx == last_layer && !need_logits {
-            return Ok(None);
+            return Ok(());
         }
 
         if layer_idx == last_layer {
@@ -1684,11 +1805,14 @@ fn prefill_rows_inner(
         c.epsilon,
         &mut ws.single_norm,
     )?;
-    let logits = model
-        .embedding
-        .multiply_with_threads(&ws.single_norm, workers, cancel)?;
+    if let Some(logits) = logits_out {
+        ensure_len(logits, model.embedding.output)?;
+        model
+            .embedding
+            .multiply_into(&ws.single_norm, workers, logits, cancel)?;
+    }
     check(cancel)?;
-    Ok(Some(logits))
+    Ok(())
 }
 
 struct TruncateGuard<'a> {
@@ -1733,19 +1857,120 @@ const fn scalar(value: usize) -> f32 {
     packed::scalar_f32(value)
 }
 
-fn rms_into(input: &[f32], weights: &[f32], epsilon: f32, output: &mut [f32]) -> io::Result<()> {
-    let mut squares = 0.0_f32;
-    for value in input {
-        squares += *value * *value;
-    }
-    if !squares.is_finite() || !(squares / scalar(input.len()) + epsilon).is_finite() {
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn rms_into_simd<S: Simd>(
+    simd: S,
+    input: &[f32],
+    weights: &[f32],
+    epsilon: f32,
+    output: &mut [f32],
+) -> io::Result<()> {
+    if input.is_empty() || output.len() != input.len() || weights.len() != input.len() {
         return Err(invalid());
     }
-    let scale = 1.0 / (squares / scalar(input.len()) + epsilon).sqrt();
-    for ((dst, value), weight) in output.iter_mut().zip(input).zip(weights) {
-        *dst = (*value * scale) * *weight;
+    let (chunks, tail) = input.as_chunks::<4>();
+    let mut sum_v = f32x4::splat(simd, 0.0_f32);
+    for chunk in chunks {
+        let x = f32x4::from_slice(simd, chunk);
+        sum_v += x * x;
     }
-    finite(output)
+    let lanes: [f32; 4] = sum_v.into();
+    let mut squares = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    for &value in tail {
+        squares += value * value;
+    }
+    let denom = scalar(input.len());
+    if !squares.is_finite() || !(squares / denom + epsilon).is_finite() {
+        return Err(invalid());
+    }
+    let scale = 1.0 / (squares / denom + epsilon).sqrt();
+    let scale_v = f32x4::splat(simd, scale);
+    let inf_v = f32x4::splat(simd, f32::INFINITY);
+    let mut all_finite = true;
+    let (dst_chunks, dst_tail) = output.as_chunks_mut::<4>();
+    let (w_chunks, w_tail) = weights.as_chunks::<4>();
+    for ((dst_chunk, in_chunk), w_chunk) in dst_chunks.iter_mut().zip(chunks).zip(w_chunks) {
+        let x = f32x4::from_slice(simd, in_chunk);
+        let w = f32x4::from_slice(simd, w_chunk);
+        let res = (x * scale_v) * w;
+        if !res.abs().simd_lt(inf_v).all_true() {
+            all_finite = false;
+        }
+        res.store_slice(dst_chunk);
+    }
+    for ((dst, &value), &w) in dst_tail.iter_mut().zip(tail).zip(w_tail) {
+        let res = (value * scale) * w;
+        if !res.is_finite() {
+            all_finite = false;
+        }
+        *dst = res;
+    }
+    if all_finite { Ok(()) } else { Err(invalid()) }
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn rms_in_place_simd<S: Simd>(
+    simd: S,
+    values: &mut [f32],
+    weights: &[f32],
+    epsilon: f32,
+) -> io::Result<()> {
+    if values.is_empty() || weights.len() != values.len() {
+        return Err(invalid());
+    }
+    let mut sum_v = f32x4::splat(simd, 0.0_f32);
+    {
+        let (chunks, tail) = values.as_chunks::<4>();
+        for chunk in chunks {
+            let x = f32x4::from_slice(simd, chunk);
+            sum_v += x * x;
+        }
+        let lanes: [f32; 4] = sum_v.into();
+        let mut squares = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+        for &value in tail {
+            squares += value * value;
+        }
+        let denom = scalar(values.len());
+        if !squares.is_finite() || !(squares / denom + epsilon).is_finite() {
+            return Err(invalid());
+        }
+        let scale = 1.0 / (squares / denom + epsilon).sqrt();
+        let scale_v = f32x4::splat(simd, scale);
+        let inf_v = f32x4::splat(simd, f32::INFINITY);
+        let mut all_finite = true;
+        let (val_chunks, val_tail) = values.as_chunks_mut::<4>();
+        let (w_chunks, w_tail) = weights.as_chunks::<4>();
+        for (val_chunk, w_chunk) in val_chunks.iter_mut().zip(w_chunks) {
+            let x = f32x4::from_slice(simd, val_chunk);
+            let w = f32x4::from_slice(simd, w_chunk);
+            let res = (x * scale_v) * w;
+            if !res.abs().simd_lt(inf_v).all_true() {
+                all_finite = false;
+            }
+            res.store_slice(val_chunk);
+        }
+        for (value, &w) in val_tail.iter_mut().zip(w_tail) {
+            let res = (*value * scale) * w;
+            if !res.is_finite() {
+                all_finite = false;
+            }
+            *value = res;
+        }
+        if all_finite { Ok(()) } else { Err(invalid()) }
+    }
+}
+
+fn rms_into(input: &[f32], weights: &[f32], epsilon: f32, output: &mut [f32]) -> io::Result<()> {
+    let level = packed::simd_level();
+    dispatch!(level, simd => rms_into_simd(simd, input, weights, epsilon, output))
 }
 
 fn rms_batch(
@@ -1756,14 +1981,17 @@ fn rms_batch(
     width: usize,
     workers: usize,
 ) -> io::Result<()> {
+    let level = packed::simd_level();
     row_workers::try_run_aligned(output, workers, width, &|elem_off, slice| {
-        for (src_row, dst_row) in input[elem_off..elem_off + slice.len()]
-            .chunks_exact(width)
-            .zip(slice.chunks_exact_mut(width))
-        {
-            rms_into(src_row, weights, epsilon, dst_row)?;
-        }
-        Ok(())
+        dispatch!(level, simd => {
+            for (src_row, dst_row) in input[elem_off..elem_off + slice.len()]
+                .chunks_exact(width)
+                .zip(slice.chunks_exact_mut(width))
+            {
+                rms_into_simd(simd, src_row, weights, epsilon, dst_row)?;
+            }
+            Ok(())
+        })
     })
 }
 
@@ -1776,36 +2004,97 @@ fn add_residual_batch(
     packed::add_residual_batch(dst, add, workers, width, invalid)
 }
 
-fn normalize_heads(values: &mut [f32], weights: &[f32], c: Config) -> io::Result<()> {
-    let mut normalized = [0.0_f32; 256];
-    let head_buf = &mut normalized[..c.head_dim];
-    for head in values.chunks_exact_mut(c.head_dim) {
-        rms_into(head, weights, c.epsilon, head_buf)?;
-        head.copy_from_slice(head_buf);
-    }
-    Ok(())
-}
-
-fn rope_with_inv_freq(
-    values: &mut [f32],
+fn fill_rope_tables(
     inv_freq: &[f32],
-    c: Config,
-    position: usize,
-) -> io::Result<()> {
-    let half = c.head_dim / 2;
-    let mut trig = [(0.0_f32, 0.0_f32); 128];
-    let pos = scalar(position);
-    for (slot, &freq) in trig[..half].iter_mut().zip(inv_freq) {
-        *slot = (pos * freq).sin_cos();
+    start_pos: usize,
+    rows: usize,
+    sin_out: &mut [f32],
+    cos_out: &mut [f32],
+) {
+    let half = inv_freq.len();
+    if half == 0 || rows == 0 {
+        return;
     }
-    for head in values.chunks_exact_mut(c.head_dim) {
-        for (index, &(sin, cos)) in trig[..half].iter().enumerate() {
-            let (a, b) = (head[index], head[index + half]);
-            head[index] = a * cos - b * sin;
-            head[index + half] = a * sin + b * cos;
+    for (local_pos, (sin_row, cos_row)) in sin_out
+        .chunks_exact_mut(half)
+        .zip(cos_out.chunks_exact_mut(half))
+        .enumerate()
+    {
+        let pos = scalar(start_pos + local_pos);
+        for ((s, c), &freq) in sin_row.iter_mut().zip(cos_row.iter_mut()).zip(inv_freq) {
+            (*s, *c) = (pos * freq).sin_cos();
         }
     }
-    finite(values)
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn rope_head_simd<S: Simd>(
+    simd: S,
+    lo: &mut [f32],
+    hi: &mut [f32],
+    sin: &[f32],
+    cos: &[f32],
+) -> bool {
+    let inf_v = f32x4::splat(simd, f32::INFINITY);
+    let mut all_finite = true;
+    let (lo_chunks, lo_tail) = lo.as_chunks_mut::<4>();
+    let (hi_chunks, hi_tail) = hi.as_chunks_mut::<4>();
+    let (sin_chunks, sin_tail) = sin.as_chunks::<4>();
+    let (cos_chunks, cos_tail) = cos.as_chunks::<4>();
+    for (((lc, hc), sc), cc) in lo_chunks
+        .iter_mut()
+        .zip(hi_chunks)
+        .zip(sin_chunks)
+        .zip(cos_chunks)
+    {
+        let a = f32x4::from_slice(simd, lc);
+        let b = f32x4::from_slice(simd, hc);
+        let s = f32x4::from_slice(simd, sc);
+        let c = f32x4::from_slice(simd, cc);
+        let r0 = a * c - b * s;
+        let r1 = a * s + b * c;
+        if !r0.abs().simd_lt(inf_v).all_true() || !r1.abs().simd_lt(inf_v).all_true() {
+            all_finite = false;
+        }
+        r0.store_slice(lc);
+        r1.store_slice(hc);
+    }
+    for (((a_ref, b_ref), &s), &c) in lo_tail.iter_mut().zip(hi_tail).zip(sin_tail).zip(cos_tail) {
+        let (a, b) = (*a_ref, *b_ref);
+        let r0 = a * c - b * s;
+        let r1 = a * s + b * c;
+        if !r0.is_finite() || !r1.is_finite() {
+            all_finite = false;
+        }
+        *a_ref = r0;
+        *b_ref = r1;
+    }
+    all_finite
+}
+
+fn normalize_and_rope_heads(
+    values: &mut [f32],
+    weights: &[f32],
+    sin: &[f32],
+    cos: &[f32],
+    c: Config,
+) -> io::Result<()> {
+    let half = c.head_dim / 2;
+    let level = packed::simd_level();
+    dispatch!(level, simd => {
+        for head in values.chunks_exact_mut(c.head_dim) {
+            rms_in_place_simd(simd, head, weights, c.epsilon)?;
+            let (lo, hi) = head.split_at_mut(half);
+            if !rope_head_simd(simd, lo, hi, sin, cos) {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    })
 }
 
 fn normalize_and_rope_batch(
@@ -1813,17 +2102,29 @@ fn normalize_and_rope_batch(
     workers: usize,
     width: usize,
     norm: &[f32],
-    inv_freq: &[f32],
+    rope_sin: &[f32],
+    rope_cos: &[f32],
     c: Config,
-    start_pos: usize,
 ) -> io::Result<()> {
+    let half = c.head_dim / 2;
+    let level = packed::simd_level();
     row_workers::try_run_aligned(values, workers, width, &|elem_off, slice| {
         let local_start = elem_off / width;
-        for (local_pos, row) in slice.chunks_exact_mut(width).enumerate() {
-            normalize_heads(row, norm, c)?;
-            rope_with_inv_freq(row, inv_freq, c, start_pos + local_start + local_pos)?;
-        }
-        Ok(())
+        dispatch!(level, simd => {
+            for (local_pos, row) in slice.chunks_exact_mut(width).enumerate() {
+                let pos_idx = local_start + local_pos;
+                let sin = &rope_sin[pos_idx * half..(pos_idx + 1) * half];
+                let cos = &rope_cos[pos_idx * half..(pos_idx + 1) * half];
+                for head in row.chunks_exact_mut(c.head_dim) {
+                    rms_in_place_simd(simd, head, norm, c.epsilon)?;
+                    let (lo, hi) = head.split_at_mut(half);
+                    if !rope_head_simd(simd, lo, hi, sin, cos) {
+                        return Err(invalid());
+                    }
+                }
+            }
+            Ok(())
+        })
     })
 }
 
@@ -1862,11 +2163,17 @@ fn ffn_single_row_into(
     finite(row)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Single-position decoder step shares workspace and precomputed RoPE tables across layers."
+)]
 fn forward_into(
     block: &Block,
     state: &LayerState,
     model: &Model,
     position: usize,
+    rope_sin: &[f32],
+    rope_cos: &[f32],
     ws: &mut DecoderWorkspace,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<()> {
@@ -1889,10 +2196,8 @@ fn forward_into(
         &mut ws.transposed_scratch,
         cancel,
     )?;
-    normalize_heads(&mut ws.single_q, &block.query_norm, c)?;
-    normalize_heads(&mut ws.single_k, &block.key_norm, c)?;
-    rope_with_inv_freq(&mut ws.single_q, &model.inv_freq, c, position)?;
-    rope_with_inv_freq(&mut ws.single_k, &model.inv_freq, c, position)?;
+    normalize_and_rope_heads(&mut ws.single_q, &block.query_norm, rope_sin, rope_cos, c)?;
+    normalize_and_rope_heads(&mut ws.single_k, &block.key_norm, rope_sin, rope_cos, c)?;
     if matches!(c.cache_precision, CachePrecision::F16) {
         if !packed::narrow_f32_to_f16_slice(&ws.single_k, &mut ws.single_k_f16)
             || !packed::narrow_f32_to_f16_slice(&ws.single_v, &mut ws.single_v_f16)
@@ -2072,29 +2377,30 @@ fn attend_into(
         row_workers::try_run_aligned(output, workers, group_width, &|elem_off, out_chunk| {
             let kv_start = elem_off / group_width;
             let kv_count = out_chunk.len() / group_width;
-            let mut local_scores = zeros(group_scores_len)?;
-            for local_kv in 0..kv_count {
-                let kv_head = kv_start + local_kv;
-                let offset = kv_head * c.head_dim;
-                let q_group = &query[kv_head * group_width..(kv_head + 1) * group_width];
-                let out_group =
-                    &mut out_chunk[local_kv * group_width..(local_kv + 1) * group_width];
-                attend_kv_group_causal(
-                    q_group,
-                    state,
-                    Some(&keys[offset..offset + c.head_dim]),
-                    Some(&values[offset..offset + c.head_dim]),
-                    position,
-                    width,
-                    offset,
-                    c.head_dim,
-                    gqa_group,
-                    divisor,
-                    &mut local_scores,
-                    out_group,
-                )?;
-            }
-            Ok(())
+            with_score_scratch(group_scores_len, |local_scores| {
+                for local_kv in 0..kv_count {
+                    let kv_head = kv_start + local_kv;
+                    let offset = kv_head * c.head_dim;
+                    let q_group = &query[kv_head * group_width..(kv_head + 1) * group_width];
+                    let out_group =
+                        &mut out_chunk[local_kv * group_width..(local_kv + 1) * group_width];
+                    attend_kv_group_causal(
+                        q_group,
+                        state,
+                        Some(&keys[offset..offset + c.head_dim]),
+                        Some(&values[offset..offset + c.head_dim]),
+                        position,
+                        width,
+                        offset,
+                        c.head_dim,
+                        gqa_group,
+                        divisor,
+                        local_scores,
+                        out_group,
+                    )?;
+                }
+                Ok(())
+            })
         })?;
         check(cancel)?;
     } else {
