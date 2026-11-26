@@ -86,12 +86,6 @@ impl State {
                         reply_preferences(ui, &mut self.output_budget, !self.model.busy());
                     ui.add_space(12.0);
                     ui.separator();
-                    self.recovery_dirty |= adapter_preferences(
-                        ui,
-                        &mut self.abliteration_scale,
-                        self.abliteration_enabled,
-                        !self.model.busy(),
-                    );
                     let daisyrose_changed = daisyrose_preferences(
                         ui,
                         self.daisyrose_available,
@@ -175,34 +169,6 @@ fn reply_preferences(ui: &mut egui::Ui, output_budget: &mut usize, editable: boo
     ui.add_space(8.0);
     ui.label(RichText::new("The output cap includes thinking. A smaller cap leaves more room for your conversation. Open Context for the capacity selected for this model.").small().weak());
     before != *output_budget
-}
-
-fn adapter_preferences(ui: &mut egui::Ui, scale: &mut f32, enabled: bool, editable: bool) -> bool {
-    ui.add_space(8.0);
-    ui.label(RichText::new("Adapter strength").strong());
-    ui.label(RichText::new("Abliteration changes the pinned adapter’s contribution to the response. It is an experimental model adjustment; higher values do not establish better quality.").small().weak());
-    ui.add_space(8.0);
-    let changed = ui
-        .add_enabled_ui(editable && enabled, |ui| {
-            ui.add(
-                egui::Slider::new(scale, 0.0..=2.0)
-                    .step_by(0.1)
-                    .fixed_decimals(1)
-                    .text("Abliteration scale"),
-            )
-            .changed()
-        })
-        .inner;
-    ui.label(
-        RichText::new(if enabled {
-            "0 disables the correction. Default: 1.3. Applies to your next response."
-        } else {
-            "Disabled by the selected launch options."
-        })
-        .small()
-        .weak(),
-    );
-    changed
 }
 
 fn loaded_daisyrose_summary(max_rank: Option<u16>, sha256_prefix: Option<&str>) -> Option<String> {

@@ -15,41 +15,10 @@ use serde::Deserialize;
 use crate::{Object, launcher::LaunchError};
 
 const LOCK: &str = include_str!("../../../config/prism-inference.lock.json");
-pub(super) const MODEL_SHA256: &str =
-    "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5";
-pub(super) const REPACKED_PTQ1_SHA256: &str =
-    "e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5";
-pub(super) const ADAPTER_SHA256: &str =
-    "f1669534803d340a496015f5c45125f3437b4d13ec764f40e34488ce83967f42";
-pub(super) const ADAPTER_PQ2_EXECUTION_SHA256: &str =
-    "73d7c72c706b7e310bafb314f70564fd1d006d56ff742bff7372f9f47223b9e6";
-pub(super) const ADAPTER_REPACKED_PTQ1_EXECUTION_SHA256: &str =
-    "f7f50497a217f23cbeafc49781fedce3a8437aa629ad98740aaf53b892b4b81a";
-pub(super) const ADAPTER_BONSAI25_PQ2_EXECUTION_SHA256: &str =
-    "d6b597fe8e1d1d559a41cbba127756be42401fbf5a44866cd4527471770f94ca";
-pub(super) const ADAPTER_BONSAI25_PTQ1_EXECUTION_SHA256: &str =
-    "e8dce51125fb57607b007789d4837cfc0856715e8cab6846010c1c6844ad127f";
 pub(super) const TEMPLATE_SHA256: &str =
     "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
 pub(super) const MMPROJ_SHA256: &str =
     "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903";
-
-pub(super) const fn adapter_execution_sha256(repacked: bool) -> &'static str {
-    if repacked {
-        ADAPTER_REPACKED_PTQ1_EXECUTION_SHA256
-    } else {
-        ADAPTER_PQ2_EXECUTION_SHA256
-    }
-}
-
-pub(super) const fn adapter_execution_sha256_for_bonsai25(
-    variant: bonsai_cpu_policy::Bonsai25Variant,
-) -> &'static str {
-    match variant {
-        bonsai_cpu_policy::Bonsai25Variant::Pq2 => ADAPTER_BONSAI25_PQ2_EXECUTION_SHA256,
-        bonsai_cpu_policy::Bonsai25Variant::Ptq1 => ADAPTER_BONSAI25_PTQ1_EXECUTION_SHA256,
-    }
-}
 
 fn parse_enum<T: Copy>(
     value: Option<&std::ffi::OsStr>,
@@ -1211,34 +1180,11 @@ mod tests {
     }
 
     #[test]
-    fn compiled_adapter_and_mmproj_digests_match_policy_locks() -> Result<(), String> {
+    fn compiled_mmproj_digest_matches_policy_locks() -> Result<(), String> {
         let data = std::env::temp_dir();
-        let adapter = bonsai_cpu_policy::abliterate_lora_artifact(&data)?;
         let mmproj = bonsai_cpu_policy::swift_mmproj_artifact(&data)?;
-        assert_eq!(ADAPTER_SHA256, adapter.sha256);
         assert_eq!(MMPROJ_SHA256, mmproj.sha256);
         Ok(())
-    }
-
-    #[test]
-    fn adapter_execution_digests_are_pinned_lowercase_hex_and_distinct() {
-        let pq2 = adapter_execution_sha256(false);
-        let ptq1 = adapter_execution_sha256(true);
-        assert_eq!(pq2, ADAPTER_PQ2_EXECUTION_SHA256);
-        assert_eq!(ptq1, ADAPTER_REPACKED_PTQ1_EXECUTION_SHA256);
-        assert!(hex(pq2, 64));
-        assert!(hex(ptq1, 64));
-        assert_ne!(pq2, ptq1);
-        for artifact in [
-            MODEL_SHA256,
-            REPACKED_PTQ1_SHA256,
-            ADAPTER_SHA256,
-            TEMPLATE_SHA256,
-            MMPROJ_SHA256,
-        ] {
-            assert_ne!(pq2, artifact);
-            assert_ne!(ptq1, artifact);
-        }
     }
 
     #[test]
@@ -1500,21 +1446,13 @@ mod tests {
     }
 
     #[test]
-    fn bonsai25_release_gate_and_execution_digests_are_pinned() -> Result<(), LaunchError> {
+    fn bonsai25_release_gate_is_pinned() -> Result<(), LaunchError> {
         assert_eq!(BONSAI_2_5_RELEASE, REVIEWED_0_1_35);
         assert!(bonsai_2_5_supported()?);
         let mut pin = release(LOCK)?;
         assert!(reviewed_release_matches(&pin, BONSAI_2_5_RELEASE));
         pin.version = "0.1.34".into();
         assert!(!reviewed_release_matches(&pin, BONSAI_2_5_RELEASE));
-        assert_eq!(
-            adapter_execution_sha256_for_bonsai25(bonsai_cpu_policy::Bonsai25Variant::Pq2),
-            ADAPTER_BONSAI25_PQ2_EXECUTION_SHA256
-        );
-        assert_eq!(
-            adapter_execution_sha256_for_bonsai25(bonsai_cpu_policy::Bonsai25Variant::Ptq1),
-            ADAPTER_BONSAI25_PTQ1_EXECUTION_SHA256
-        );
         Ok(())
     }
 

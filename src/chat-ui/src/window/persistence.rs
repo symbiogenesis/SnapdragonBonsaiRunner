@@ -126,7 +126,6 @@ struct ActiveView<'a> {
     enable_thinking: bool,
     streaming_read_aloud: bool,
     output_budget: usize,
-    abliteration_scale: f32,
     daisyrose_enabled: bool,
     daisyrose_scale: f32,
     cognitive: client::CognitiveOptions,
@@ -167,8 +166,7 @@ impl State {
     }
 
     pub(super) fn workspace_bytes(&self) -> io::Result<Vec<u8>> {
-        if !client::valid_abliteration_scale(self.abliteration_scale)
-            || !client::valid_daisyrose_scale(self.daisyrose_scale)
+        if !client::valid_daisyrose_scale(self.daisyrose_scale)
             || !self.memory.valid()
             || !valid_parts(
                 &self.transcript,
@@ -207,7 +205,6 @@ impl State {
                 enable_thinking: self.enable_thinking,
                 streaming_read_aloud: self.streaming_read_aloud,
                 output_budget: self.output_budget,
-                abliteration_scale: self.abliteration_scale,
                 daisyrose_enabled: self.daisyrose_enabled,
                 daisyrose_scale: self.daisyrose_scale,
                 cognitive: self.cognitive,
@@ -372,8 +369,7 @@ impl SavedWorkspace {
 }
 
 fn valid_snapshot(saved: &ConversationSnapshot) -> bool {
-    client::valid_abliteration_scale(saved.abliteration_scale)
-        && client::valid_daisyrose_scale(saved.daisyrose_scale)
+    client::valid_daisyrose_scale(saved.daisyrose_scale)
         && valid_parts(
             &saved.transcript,
             &saved.input,
@@ -1065,42 +1061,17 @@ mod tests {
     }
 
     #[test]
-    fn abliteration_recovery_preserves_selection_defaults_old_workspaces_and_rejects_invalid_scales()
-    -> io::Result<()> {
+    fn daisyrose_recovery_ignores_legacy_abliteration_and_validates_scales() -> io::Result<()> {
         let mut original = state();
-        original.abliteration_scale = 1.7;
         let bytes = original.workspace_bytes()?;
-        let mut restored = state();
-        restored.restore_workspace(&bytes)?;
-        assert!((restored.abliteration_scale - 1.7).abs() < f32::EPSILON);
-        let mut old: serde_json::Value =
+        let mut with_legacy: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        old["active"]
-            .as_object_mut()
-            .ok_or_else(|| io::Error::other("active object"))?
-            .remove("abliteration_scale");
-        restored.restore_workspace(&serde_json::to_vec(&old).map_err(io::Error::other)?)?;
-        assert!(
-            (restored.abliteration_scale - client::DEFAULT_ABLITERATION_SCALE).abs() < f32::EPSILON
-        );
-        for invalid in [
-            serde_json::json!(-0.1),
-            serde_json::json!(2.1),
-            serde_json::json!(null),
-            serde_json::json!("1.3"),
-        ] {
-            old["active"]["abliteration_scale"] = invalid;
-            assert!(
-                restored
-                    .restore_workspace(&serde_json::to_vec(&old).map_err(io::Error::other)?)
-                    .is_err()
-            );
-        }
-        for invalid in [f32::NAN, f32::INFINITY, -0.1, 2.1] {
-            original.abliteration_scale = invalid;
-            assert!(original.workspace_bytes().is_err());
-        }
-        original.abliteration_scale = 1.7;
+        with_legacy["active"]["abliteration_scale"] = serde_json::json!(1.7);
+        let mut restored = state();
+        restored.restore_workspace(&serde_json::to_vec(&with_legacy).map_err(io::Error::other)?)?;
+        let re_saved: serde_json::Value =
+            serde_json::from_slice(&restored.workspace_bytes()?).map_err(io::Error::other)?;
+        assert!(re_saved["active"].get("abliteration_scale").is_none());
         original.daisyrose_enabled = true;
         original.daisyrose_scale = 0.5;
         let daisy_bytes = original.workspace_bytes()?;

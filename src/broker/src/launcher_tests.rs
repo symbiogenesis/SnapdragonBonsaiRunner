@@ -27,7 +27,6 @@ fn synthetic_launched_service(
         process,
         credentials,
         _artifacts: VerifiedArtifacts::synthetic_for_test(),
-        _adapter: None,
         _daisyrose: None,
         _mmproj: None,
         _native_executable: None,
@@ -141,13 +140,11 @@ fn missing_native_runtime_is_distinct_from_missing_model_artifacts() -> io::Resu
         config.native_executable_guard().err(),
         Some(LaunchError::NativeRuntime)
     );
-    let plan = LaunchPlan::for_profile_with_options(
+    let plan = LaunchPlan::for_swift_bonsai25(
         data.path(),
         config.backend_port,
         &data.path().join("not-created.key"),
-        config.profile,
-        false,
-        false,
+        bonsai_cpu_policy::Bonsai25Variant::Pq2,
     )
     .map_err(|_| io::Error::other("Invalid fixture launch policy."))?;
     assert_eq!(
@@ -167,14 +164,12 @@ fn missing_native_runtime_is_distinct_from_missing_model_artifacts() -> io::Resu
 fn parallel_launch_artifact_verification_reports_deterministic_error_precedence() -> io::Result<()>
 {
     let data = TempDir::new("Bonsai-ParallelVerifyPrecedence")?;
-    let mut config = native_launch_config(data.path(), &["--use-abliterate-lora"])?;
-    let plan = LaunchPlan::for_profile_with_options(
+    let mut config = native_launch_config(data.path(), &[])?;
+    let plan = LaunchPlan::for_swift_bonsai25(
         data.path(),
         config.backend_port,
         &data.path().join("not-created.key"),
-        config.profile,
-        true,
-        false,
+        bonsai_cpu_policy::Bonsai25Variant::Pq2,
     )
     .map_err(|_| io::Error::other("Invalid fixture launch policy."))?;
     for _ in 0..4 {
@@ -715,101 +710,6 @@ fn launched_service_stops_with_sandbox_error_when_storage_budget_exceeded() -> i
 }
 
 #[test]
-fn adapter_guard_supports_chunk_manifest_and_whole_file_fallback() -> io::Result<()> {
-    let dir = TempDir::new("Bonsai-adapter-chunk-guard")?;
-    let adapter_path = dir.path().join("adapter.gguf");
-    let chunk_bytes = usize::try_from(bonsai_windows_credentials::MIN_MAPPED_HASH_BYTES)
-        .map_err(io::Error::other)?;
-    let total_len = chunk_bytes + 2_048;
-    let mut payload: Vec<u8> = (0..total_len)
-        .map(|i| u8::try_from((i.wrapping_mul(19) ^ 0x42) & 0xff).unwrap_or(0))
-        .collect();
-    payload[..4].copy_from_slice(b"GGUF");
-    fs::write(&adapter_path, &payload)?;
-
-    let encode_hex = |digest: [u8; 32]| {
-        let mut out = String::with_capacity(64);
-        for byte in digest {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-        }
-        out
-    };
-    let sha256 = encode_hex(bonsai_windows_credentials::Sha256::digest_bytes(&payload)?);
-    let bytes_u64 = u64::try_from(total_len).map_err(io::Error::other)?;
-    let locked = bonsai_artifacts::open_locked_file(&adapter_path)
-        .map_err(|error| io::Error::other(format!("{error:?}")))?;
-    let raw_chunks = bonsai_windows_credentials::compute_mapped_chunk_digests(
-        &locked,
-        bytes_u64,
-        chunk_bytes,
-        2,
-        &std::sync::atomic::AtomicBool::new(false),
-    )?
-    .ok_or_else(|| io::Error::other("Expected mapped chunk digests."))?;
-    drop(locked);
-    let chunk_sha256s: Vec<String> = raw_chunks.into_iter().map(encode_hex).collect();
-
-    let key = dir.path().join("not-created.key");
-    let mut plan = LaunchPlan::for_profile_with_options(
-        dir.path(),
-        8081,
-        &key,
-        LaunchProfile::SwiftPq2Assessment,
-        false,
-        false,
-    )
-    .map_err(|_| io::Error::other("Invalid fixture launch plan."))?;
-
-    plan.adapter = Some(bonsai_cpu_policy::AbliterateLoraArtifact {
-        path: adapter_path.clone(),
-        bytes: bytes_u64,
-        sha256: sha256.clone(),
-        chunk_bytes: Some(chunk_bytes),
-        chunk_sha256s: Some(chunk_sha256s),
-    });
-    let chunk_guard = LaunchConfig::adapter_guard(&plan)
-        .map_err(|error| io::Error::other(format!("chunk adapter_guard failed: {error:?}")))?;
-    assert!(chunk_guard.is_some());
-    drop(chunk_guard);
-
-    // Whole-file fallback when chunk fields are omitted.
-    let mut whole_plan = LaunchPlan::for_profile_with_options(
-        dir.path(),
-        8081,
-        &key,
-        LaunchProfile::SwiftPq2Assessment,
-        false,
-        false,
-    )
-    .map_err(|_| io::Error::other("Invalid fixture launch plan."))?;
-    whole_plan.adapter = Some(bonsai_cpu_policy::AbliterateLoraArtifact {
-        path: adapter_path.clone(),
-        bytes: bytes_u64,
-        sha256,
-        chunk_bytes: None,
-        chunk_sha256s: None,
-    });
-    let whole_guard = LaunchConfig::adapter_guard(&whole_plan)
-        .map_err(|error| io::Error::other(format!("whole adapter_guard failed: {error:?}")))?;
-    assert!(whole_guard.is_some());
-    drop(whole_guard);
-
-    // 1-byte tamper in second chunk fails closed with LaunchError::Adapter.
-    payload[chunk_bytes + 64] ^= 0x01;
-    fs::write(&adapter_path, &payload)?;
-    assert_eq!(
-        LaunchConfig::adapter_guard(&plan).err(),
-        Some(LaunchError::Adapter)
-    );
-    assert_eq!(
-        LaunchConfig::adapter_guard(&whole_plan).err(),
-        Some(LaunchError::Adapter)
-    );
-    Ok(())
-}
-
-#[test]
 fn launch_usage_and_vulkan_composite_wy_f32_gates_match_pinned_contract() -> Result<(), LaunchError>
 {
     for snippet in [
@@ -881,15 +781,9 @@ fn launch_usage_and_vulkan_composite_wy_f32_gates_match_pinned_contract() -> Res
         ],
     )?;
     let key = data.join("backend.key");
-    let plan = LaunchPlan::for_profile_with_options(
-        &data,
-        8081,
-        &key,
-        LaunchProfile::SwiftPq2Assessment,
-        true,
-        false,
-    )
-    .map_err(|_| LaunchError::Policy)?;
+    let plan =
+        LaunchPlan::for_swift_bonsai25(&data, 8081, &key, bonsai_cpu_policy::Bonsai25Variant::Pq2)
+            .map_err(|_| LaunchError::Policy)?;
     for (placement, expected) in [
         (crate::inference::Placement::Vulkan, "vulkan"),
         (crate::inference::Placement::Composite, "composite"),
@@ -914,27 +808,10 @@ fn daisyrose_stacks_with_nariq_no_orca_suffix_speculation_and_placements() -> Re
     let daisy_text = daisy_path.to_str().ok_or(LaunchError::Path)?;
     let key = data.join("backend.key");
 
-    // NariQ rejects Orca even when --daisyrose-lora is also passed.
-    assert_eq!(
-        parse_native_launch_config(
-            &data,
-            &[
-                "--nariq",
-                "2.5bpw",
-                "--use-abliterate-lora",
-                "--daisyrose-lora",
-                daisy_text,
-            ],
-        )
-        .err(),
-        Some(LaunchError::Arguments)
-    );
-
-    // NariQ LaunchPlan forbids Orca while budgeting DaisyRose reserve bytes cleanly.
+    // NariQ LaunchPlan budgets DaisyRose reserve bytes cleanly.
     let mut nariq_plan =
         LaunchPlan::for_swift_nariq(&data, 8081, &key, bonsai_cpu_policy::NariqVariant::Bpw2_5)
             .map_err(|_| LaunchError::Policy)?;
-    assert!(nariq_plan.adapter.is_none());
     let base_ws = nariq_plan.working_set_limit_bytes;
     let daisy_plan = crate::launch_policy::DaisyRoseLoraPlan {
         path: daisy_path.clone(),
@@ -980,8 +857,7 @@ fn daisyrose_stacks_with_nariq_no_orca_suffix_speculation_and_placements() -> Re
 }
 
 #[test]
-fn bonsai25_supports_orca_on_and_off_with_daisyrose_and_exact_cow_bytes() -> Result<(), LaunchError>
-{
+fn bonsai25_supports_daisyrose_with_exact_cow_bytes() -> Result<(), LaunchError> {
     let data = std::env::temp_dir().join("Bonsai-bonsai25-launch-plan");
     let daisy_path = data.join("adapters").join("custom-daisy.gguf");
     let key = data.join("backend.key");
@@ -1000,22 +876,19 @@ fn bonsai25_supports_orca_on_and_off_with_daisyrose_and_exact_cow_bytes() -> Res
         bonsai_cpu_policy::Bonsai25Variant::Pq2,
         bonsai_cpu_policy::Bonsai25Variant::Ptq1,
     ] {
-        for use_orca in [false, true] {
-            let mut plan = LaunchPlan::for_swift_bonsai25(&data, 8081, &key, variant, use_orca)
-                .map_err(|_| LaunchError::Policy)?;
-            assert_eq!(plan.adapter.is_some(), use_orca);
-            let base_ws = plan.working_set_limit_bytes;
-            let expected_fixed = usize::try_from(
-                bonsai_cpu_policy::context::SwiftWeightPacking::from_bonsai25(variant)
-                    .calibrated_fixed_runtime_bytes(),
-            )
-            .map_err(|_| LaunchError::Memory)?;
-            assert_eq!(base_ws, expected_fixed);
-            plan.working_set_limit_bytes = base_ws + reserve_usize;
-            plan.enable_daisyrose_lora(daisy_plan.clone())
-                .map_err(|_| LaunchError::Policy)?;
-            assert_eq!(plan.native_child_memory_limit_bytes(), base_ws);
-        }
+        let mut plan = LaunchPlan::for_swift_bonsai25(&data, 8081, &key, variant)
+            .map_err(|_| LaunchError::Policy)?;
+        let base_ws = plan.working_set_limit_bytes;
+        let expected_fixed = usize::try_from(
+            bonsai_cpu_policy::context::SwiftWeightPacking::from_bonsai25(variant)
+                .calibrated_fixed_runtime_bytes(),
+        )
+        .map_err(|_| LaunchError::Memory)?;
+        assert_eq!(base_ws, expected_fixed);
+        plan.working_set_limit_bytes = base_ws + reserve_usize;
+        plan.enable_daisyrose_lora(daisy_plan.clone())
+            .map_err(|_| LaunchError::Policy)?;
+        assert_eq!(plan.native_child_memory_limit_bytes(), base_ws);
     }
     Ok(())
 }

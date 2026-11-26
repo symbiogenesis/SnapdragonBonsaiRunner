@@ -335,12 +335,6 @@ impl LocalChatService {
         self.backend.require_process(process_id);
     }
 
-    /// Only the owned launcher can enable the already verified pinned adapter.
-    #[cfg(windows)]
-    pub(crate) const fn enable_pinned_abliteration(&mut self) {
-        self.policy.pinned_abliteration = true;
-    }
-
     /// Only the owned launcher can enable the already verified stackable DaisyRose adapter.
     ///
     /// # Errors

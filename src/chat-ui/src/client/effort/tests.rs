@@ -32,11 +32,10 @@ fn task() -> Vec<Message> {
 #[test]
 fn effort_working_material_keeps_json_bytes_and_rejects_oversized_temporaries() -> Result<()> {
     let pending = task();
-    let original = serialize_request_with_adapters(&pending, 1024, false, None, None)?;
+    let original = serialize_request_with_adapters(&pending, 1024, false, None)?;
     let options = ResponseOptions {
         max_completion_tokens: 1024,
         enable_thinking: false,
-        abliteration_scale: None,
         daisyrose_scale: None,
         ..ResponseOptions::default()
     };
@@ -77,7 +76,7 @@ fn effort_working_material_keeps_json_bytes_and_rejects_oversized_temporaries() 
             Some(request_byte_limit()),
         );
         assert_eq!(
-            serialize_request_with_adapters(&pending, 1024, false, None, None)?,
+            serialize_request_with_adapters(&pending, 1024, false, None)?,
             original
         );
     }
@@ -95,7 +94,6 @@ fn effort_applies_thinking_selection_to_every_stage() -> Result<()> {
             ResponseOptions {
                 max_completion_tokens: 1024,
                 enable_thinking,
-                abliteration_scale: None,
                 daisyrose_scale: None,
                 ..ResponseOptions::default()
             },
@@ -147,7 +145,6 @@ fn effort_stages_use_fresh_original_context() -> Result<()> {
         ResponseOptions {
             max_completion_tokens: 2048,
             enable_thinking: false,
-            abliteration_scale: Some(1.3),
             daisyrose_scale: Some(0.5),
             ..ResponseOptions::default()
         },
@@ -173,7 +170,7 @@ fn effort_stages_use_fresh_original_context() -> Result<()> {
     );
     for request in &requests {
         assert_eq!(request["max_completion_tokens"], 2048);
-        assert_eq!(request["abliteration_scale"], serde_json::json!(1.3));
+        assert!(request.get("abliteration_scale").is_none());
         assert_eq!(request["daisyrose_scale"], serde_json::json!(0.5));
         assert_eq!(request["messages"].as_array().map(Vec::len), Some(4));
         assert_eq!(request["messages"][0]["role"], "system");
@@ -228,7 +225,6 @@ fn effort_truncation_stops_later_stages_and_keeps_complete_draft() -> Result<()>
             ResponseOptions {
                 max_completion_tokens: 4096,
                 enable_thinking: false,
-                abliteration_scale: None,
                 daisyrose_scale: None,
                 ..ResponseOptions::default()
             },
@@ -287,7 +283,6 @@ fn effort_cancellation_and_request_bounds_prevent_later_calls() {
         ResponseOptions {
             max_completion_tokens: 1024,
             enable_thinking: false,
-            abliteration_scale: None,
             daisyrose_scale: None,
             ..ResponseOptions::default()
         },
@@ -309,7 +304,6 @@ fn effort_cancellation_and_request_bounds_prevent_later_calls() {
         ResponseOptions {
             max_completion_tokens: 1024,
             enable_thinking: false,
-            abliteration_scale: None,
             daisyrose_scale: None,
             ..ResponseOptions::default()
         },
@@ -334,7 +328,6 @@ fn effort_review_failure_leaves_complete_draft_visible() {
         ResponseOptions {
             max_completion_tokens: 4096,
             enable_thinking: false,
-            abliteration_scale: None,
             daisyrose_scale: None,
             ..ResponseOptions::default()
         },

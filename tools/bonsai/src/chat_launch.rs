@@ -190,18 +190,12 @@ struct Request {
     tts_quantization: String,
     #[serde(default)]
     tts_threads: u16,
-    #[serde(default)]
-    use_abliterate_lora: bool,
-    #[serde(default)]
-    no_abliterate_lora: bool,
     #[serde(default, rename = "DaisyRoseLora")]
     daisyrose_lora: Option<PathBuf>,
     #[serde(default, rename = "NoDaisyRoseLora")]
     no_daisyrose_lora: bool,
     #[serde(default)]
     no_mmproj: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    use_repacked_ptq1: Option<bool>,
     #[serde(default, rename = "NariqVariant")]
     nariq_variant: Option<bonsai_cpu_policy::NariqVariant>,
     #[serde(default, rename = "Bonsai25Variant")]
@@ -335,11 +329,11 @@ where
     D: serde::Deserializer<'de>,
 {
     let tokens = u8::deserialize(deserializer)?;
-    if matches!(tokens, 8 | 16 | 32) {
+    if matches!(tokens, 8 | 16 | 32 | 64) {
         Ok(Some(tokens))
     } else {
         Err(serde::de::Error::custom(
-            "CpuPrefillTokens must be 8, 16 or 32.",
+            "CpuPrefillTokens must be 8, 16, 32 or 64.",
         ))
     }
 }
@@ -420,23 +414,10 @@ impl Request {
     const fn effective_bonsai25_variant(&self) -> Option<bonsai_cpu_policy::Bonsai25Variant> {
         if let Some(variant) = self.bonsai25_variant {
             Some(variant)
-        } else if self.native_engine
-            && self.nariq_variant.is_none()
-            && self.use_repacked_ptq1.is_none()
-        {
+        } else if self.native_engine && self.nariq_variant.is_none() {
             Some(bonsai_cpu_policy::Bonsai25Variant::Pq2)
         } else {
             None
-        }
-    }
-
-    const fn effective_use_abliterate_lora(&self) -> bool {
-        if self.no_abliterate_lora || self.nariq_variant.is_some() {
-            false
-        } else if self.use_abliterate_lora {
-            true
-        } else {
-            self.effective_bonsai25_variant().is_none()
         }
     }
 
@@ -493,8 +474,8 @@ impl Request {
             if !self.native_engine {
                 return Err("CpuPrefillTokens requires NativeEngine.".into());
             }
-            if !matches!(tokens, 8 | 16 | 32) {
-                return Err("CpuPrefillTokens must be 8, 16 or 32.".into());
+            if !matches!(tokens, 8 | 16 | 32 | 64) {
+                return Err("CpuPrefillTokens must be 8, 16, 32 or 64.".into());
             }
         }
         if self.cpu_prefill_gdn.is_some()
@@ -531,16 +512,7 @@ impl Request {
             }
             external(path)?;
         }
-        if self.use_abliterate_lora && self.no_abliterate_lora {
-            return Err("UseAbliterateLora cannot be combined with NoAbliterateLora.".into());
-        }
         if self.nariq_variant.is_some() {
-            if self.use_abliterate_lora {
-                return Err("UseAbliterateLora cannot be combined with NariqVariant.".into());
-            }
-            if self.use_repacked_ptq1.is_some() {
-                return Err("NariqVariant cannot be combined with UseRepackedPtq1.".into());
-            }
             if !self.native_engine {
                 return Err("NariqVariant requires NativeEngine.".into());
             }
@@ -556,13 +528,8 @@ impl Request {
                 );
             }
         }
-        if self.bonsai25_variant.is_some() {
-            if self.use_repacked_ptq1.is_some() {
-                return Err("Bonsai25Variant cannot be combined with UseRepackedPtq1.".into());
-            }
-            if !self.native_engine {
-                return Err("Bonsai25Variant requires NativeEngine.".into());
-            }
+        if self.bonsai25_variant.is_some() && !self.native_engine {
+            return Err("Bonsai25Variant requires NativeEngine.".into());
         }
         if self.native_engine && self.spec_type != Some(SpeculationType::Suffix) {
             if self.prompt_reuse.is_none() {
@@ -1151,11 +1118,6 @@ fn effective_daisyrose_lora_path(
 }
 
 fn runtime_arguments(request: &Request, arguments: &mut Vec<OsString>) {
-    if request.use_abliterate_lora {
-        arguments.push("--use-abliterate-lora".into());
-    } else if request.no_abliterate_lora || request.nariq_variant.is_some() {
-        arguments.push("--no-abliterate-lora".into());
-    }
     if request.no_daisyrose_lora {
         arguments.push("--no-daisyrose-lora".into());
     }
@@ -1178,10 +1140,6 @@ fn runtime_arguments(request: &Request, arguments: &mut Vec<OsString>) {
         argument(arguments, "--nariq", variant.as_str());
     } else if let Some(variant) = request.effective_bonsai25_variant() {
         argument(arguments, "--bonsai-2-5", variant.as_str());
-    } else if request.use_repacked_ptq1 == Some(true) {
-        arguments.push("--use-repacked-ptq1".into());
-    } else {
-        arguments.push("--use-original-pq2".into());
     }
     arguments.push(if request.native_engine {
         "--native-engine".into()

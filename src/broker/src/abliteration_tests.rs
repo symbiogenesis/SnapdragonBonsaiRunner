@@ -1,4 +1,4 @@
-//! The only caller-controlled adapter value is a bounded scale for pinned slot 0.
+//! The only caller-controlled adapter value is a bounded scale for pinned DaisyRose slot 0.
 
 use super::{PendingChat, Rejection, RequestPolicy};
 use http::Request;
@@ -6,24 +6,18 @@ use serde_json::{Value, json};
 
 const CHAT: &[u8] = br#"{"messages":[{"role":"user","content":"Write a scene."}]}"#;
 
-fn prepare_with(
-    body: &[u8],
-    orca_enabled: bool,
-    daisyrose_enabled: bool,
-) -> Result<PendingChat, Rejection> {
-    prepare_with_default(body, orca_enabled, daisyrose_enabled, 0)
+fn prepare_with(body: &[u8], daisyrose_enabled: bool) -> Result<PendingChat, Rejection> {
+    prepare_with_default(body, daisyrose_enabled, 0)
 }
 
 fn prepare_with_default(
     body: &[u8],
-    orca_enabled: bool,
     daisyrose_enabled: bool,
     daisyrose_default_scale_tenths: u8,
 ) -> Result<PendingChat, Rejection> {
     let key = "a".repeat(64);
     let mut policy = RequestPolicy::new(8080, &key)?;
     // Production can set this only inside the owned launcher's verified service.
-    policy.pinned_abliteration = orca_enabled;
     policy.daisyrose_lora = daisyrose_enabled;
     policy.daisyrose_default_scale_tenths = daisyrose_default_scale_tenths;
     let request = Request::builder()
@@ -38,50 +32,41 @@ fn prepare_with_default(
     policy.check_head(&request.into_parts().0)?.prepare(body)
 }
 
-fn prepare(body: &[u8], enabled: bool) -> Result<PendingChat, Rejection> {
-    prepare_with(body, enabled, false)
-}
-
 fn body_with(scale: &str) -> String {
     format!(
-        r#"{{"messages":[{{"role":"user","content":"Write a scene."}}],"abliteration_scale":{scale}}}"#
+        r#"{{"messages":[{{"role":"user","content":"Write a scene."}}],"daisyrose_scale":{scale}}}"#
     )
 }
 
 fn canonical_with_default(
     body: &[u8],
-    orca_enabled: bool,
     daisyrose_enabled: bool,
     default_tenths: u8,
 ) -> Result<Value, Rejection> {
-    let admitted = prepare_with_default(body, orca_enabled, daisyrose_enabled, default_tenths)?
-        .admit(|_| Ok(1))?;
+    let admitted =
+        prepare_with_default(body, daisyrose_enabled, default_tenths)?.admit(|_| Ok(1))?;
     serde_json::from_slice(admitted.backend_body()).map_err(|_| Rejection::ChatSchema)
 }
 
-fn canonical(body: &[u8], enabled: bool) -> Result<Value, Rejection> {
-    canonical_with_default(body, enabled, false, 0)
-}
-
 #[test]
-fn pinned_abliteration_defaults_to_1_3_without_changing_other_policy() -> Result<(), Rejection> {
-    let baseline = canonical(CHAT, false)?;
+fn pinned_daisyrose_defaults_without_changing_other_policy() -> Result<(), Rejection> {
+    let baseline = canonical_with_default(CHAT, false, 0)?;
     assert!(baseline.get("lora").is_none());
-    let mut enabled = canonical(CHAT, true)?;
+    let mut enabled = canonical_with_default(CHAT, true, 10)?;
     let lora = enabled.as_object_mut().and_then(|body| body.remove("lora"));
-    assert_eq!(lora, Some(json!([{ "id": 0, "scale": 1.3 }])));
+    assert_eq!(lora, Some(json!([{ "id": 0, "scale": 1.0 }])));
     assert_eq!(enabled, baseline);
     Ok(())
 }
 
 #[test]
-fn pinned_abliteration_scale_is_identical_for_counting_and_generation() -> Result<(), Rejection> {
-    for (scale, expected) in [("0", json!(0.0)), ("1.3", json!(1.3)), ("2", json!(2.0))] {
-        let pending = prepare(body_with(scale).as_bytes(), true)?;
+fn pinned_daisyrose_scale_is_identical_for_counting_and_generation() -> Result<(), Rejection> {
+    for (scale, expected) in [("0", json!(0.0)), ("1.0", json!(1.0)), ("2", json!(2.0))] {
+        let pending = prepare_with(body_with(scale).as_bytes(), true)?;
         let counted = pending.body.clone();
         let decoded: Value = serde_json::from_slice(&counted).map_err(|_| Rejection::ChatSchema)?;
         assert_eq!(decoded["lora"], json!([{ "id": 0, "scale": expected }]));
-        assert!(decoded.get("abliteration_scale").is_none());
+        assert!(decoded.get("daisyrose_scale").is_none());
         let admitted = pending.admit(|body| {
             assert_eq!(body, counted);
             Ok(1)
@@ -92,12 +77,12 @@ fn pinned_abliteration_scale_is_identical_for_counting_and_generation() -> Resul
 }
 
 #[test]
-fn pinned_abliteration_rejects_invalid_scales_and_arbitrary_adapters() {
+fn pinned_daisyrose_rejects_invalid_scales_and_arbitrary_adapters() {
     for scale in [
         "null",
         "true",
         "false",
-        r#""1.3""#,
+        r#""1.0""#,
         "[]",
         "{}",
         "-0.1",
@@ -108,84 +93,49 @@ fn pinned_abliteration_rejects_invalid_scales_and_arbitrary_adapters() {
         "Infinity",
     ] {
         assert!(matches!(
-            prepare(body_with(scale).as_bytes(), true),
+            prepare_with(body_with(scale).as_bytes(), true),
             Err(Rejection::ChatSchema)
         ));
     }
     for extra in [
-        r#""abliteration_scale":1.3,"abliteration_scale":1.3"#,
-        r#""lora":[{"id":0,"scale":1.3}]"#,
-        r#""abliteration_scale":1.3,"lora":[]"#,
+        r#""daisyrose_scale":1.0,"daisyrose_scale":1.0"#,
+        r#""lora":[{"id":0,"scale":1.0}]"#,
+        r#""daisyrose_scale":1.0,"lora":[]"#,
+        r#""abliteration_scale":1.3"#,
     ] {
         let body = format!(r#"{{"messages":[{{"role":"user","content":"text"}}],{extra}}}"#);
         assert!(matches!(
-            prepare(body.as_bytes(), true),
+            prepare_with(body.as_bytes(), true),
             Err(Rejection::ChatSchema)
         ));
     }
 }
 
 #[test]
-fn pinned_abliteration_scale_is_unavailable_without_verified_launch() {
-    for scale in ["0", "1.3", "2"] {
-        assert!(matches!(
-            prepare(body_with(scale).as_bytes(), false),
-            Err(Rejection::ChatSchema)
-        ));
-    }
-}
-
-#[test]
-fn stacked_daisyrose_lora_defaults_to_zero_maps_slot_ids_and_rejects_when_unconfigured()
+fn daisyrose_lora_defaults_to_zero_maps_slot_zero_and_rejects_when_unconfigured()
 -> Result<(), Rejection> {
     // Unconfigured DaisyRose rejects explicit daisyrose_scale.
     let explicit_daisy =
         br#"{"messages":[{"role":"user","content":"Write a scene."}],"daisyrose_scale":0.5}"#;
     assert_eq!(
-        canonical_with_default(explicit_daisy, true, false, 0).err(),
-        Some(Rejection::ChatSchema)
-    );
-    assert_eq!(
-        canonical_with_default(explicit_daisy, false, false, 0).err(),
+        canonical_with_default(explicit_daisy, false, 0).err(),
         Some(Rejection::ChatSchema)
     );
 
-    // Both active: Orca id 0 (default 1.3), DaisyRose id 1 (default 0.0).
-    let stacked_default = canonical_with_default(CHAT, true, true, 0)?;
-    assert_eq!(
-        stacked_default["lora"],
-        json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.0}])
-    );
-
-    let stacked_explicit = canonical_with_default(
-        br#"{"messages":[{"role":"user","content":"Write a scene."}],"abliteration_scale":1.5,"daisyrose_scale":0.5}"#,
-        true,
-        true,
-        0,
-    )?;
-    assert_eq!(
-        stacked_explicit["lora"],
-        json!([{"id": 0, "scale": 1.5}, {"id": 1, "scale": 0.5}])
-    );
-
-    // DaisyRose only (no Orca): maps to slot id 0, defaulting to 0.0.
-    let daisy_only = canonical_with_default(explicit_daisy, false, true, 0)?;
+    // DaisyRose maps directly to slot id 0, defaulting to 0.0 when tenths == 0.
+    let daisy_only = canonical_with_default(explicit_daisy, true, 0)?;
     assert_eq!(daisy_only["lora"], json!([{"id": 0, "scale": 0.5}]));
-    let daisy_only_default = canonical_with_default(CHAT, false, true, 0)?;
+    let daisy_only_default = canonical_with_default(CHAT, true, 0)?;
     assert_eq!(daisy_only_default["lora"], json!([{"id": 0, "scale": 0.0}]));
     Ok(())
 }
 
 #[test]
-fn stacked_daisyrose_lora_uses_configured_default_scale_and_preserves_explicit_override()
+fn daisyrose_lora_uses_configured_default_scale_and_preserves_explicit_override()
 -> Result<(), Rejection> {
     // Omitted daisyrose_scale picks up the promoted lock default (1.0).
     assert_eq!(
-        canonical_with_default(CHAT, true, true, 10)?["lora"],
-        json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 1.0}])
-    );
-    assert_eq!(
-        canonical_with_default(CHAT, false, true, 10)?["lora"],
+        canonical_with_default(CHAT, true, 10)?["lora"],
         json!([{"id": 0, "scale": 1.0}])
     );
 
@@ -195,38 +145,28 @@ fn stacked_daisyrose_lora_uses_configured_default_scale_and_preserves_explicit_o
     let explicit_half =
         br#"{"messages":[{"role":"user","content":"Write a scene."}],"daisyrose_scale":0.5}"#;
     assert_eq!(
-        canonical_with_default(explicit_zero, true, true, 10)?["lora"],
-        json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.0}])
-    );
-    assert_eq!(
-        canonical_with_default(explicit_half, true, true, 10)?["lora"],
-        json!([{"id": 0, "scale": 1.3}, {"id": 1, "scale": 0.5}])
-    );
-    assert_eq!(
-        canonical_with_default(explicit_zero, false, true, 10)?["lora"],
+        canonical_with_default(explicit_zero, true, 10)?["lora"],
         json!([{"id": 0, "scale": 0.0}])
+    );
+    assert_eq!(
+        canonical_with_default(explicit_half, true, 10)?["lora"],
+        json!([{"id": 0, "scale": 0.5}])
     );
     Ok(())
 }
 
 #[test]
-fn nariq_daisyrose_without_orca_rejects_abliteration_and_maps_slot_zero() -> Result<(), Rejection> {
-    // NariQ / --no-abliterate-lora disables Orca while allowing explicit DaisyRose at slot 0.
-    let explicit_abliteration = br#"{"messages":[{"role":"user","content":"Write a scene."}],"abliteration_scale":1.3,"daisyrose_scale":0.5}"#;
+fn legacy_abliteration_scale_is_rejected_even_with_daisyrose_enabled() -> Result<(), Rejection> {
+    let legacy = br#"{"messages":[{"role":"user","content":"Write a scene."}],"abliteration_scale":1.3,"daisyrose_scale":0.5}"#;
     assert_eq!(
-        canonical_with_default(explicit_abliteration, false, true, 0).err(),
+        canonical_with_default(legacy, true, 10).err(),
         Some(Rejection::ChatSchema)
     );
-
-    let explicit_daisy =
-        br#"{"messages":[{"role":"user","content":"Write a scene."}],"daisyrose_scale":0.7}"#;
+    let legacy_only =
+        br#"{"messages":[{"role":"user","content":"Write a scene."}],"abliteration_scale":1.3}"#;
     assert_eq!(
-        canonical_with_default(explicit_daisy, false, true, 0)?["lora"],
-        json!([{"id": 0, "scale": 0.7}])
-    );
-    assert_eq!(
-        canonical_with_default(CHAT, false, true, 0)?["lora"],
-        json!([{"id": 0, "scale": 0.0}])
+        canonical_with_default(legacy_only, true, 10).err(),
+        Some(Rejection::ChatSchema)
     );
     Ok(())
 }
@@ -264,7 +204,7 @@ mod transport {
     async fn request(port: u16, scale: f64) -> TcpStream {
         let body = serde_json::to_vec(&json!({
             "messages":[{"role":"user","content":"Name a tree."}],
-            "stream":false, "max_completion_tokens":2, "abliteration_scale":scale,
+            "stream":false, "max_completion_tokens":2, "daisyrose_scale":scale,
         }))
         .unwrap();
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -326,7 +266,7 @@ mod transport {
                     LocalChatService::bind(0, FRONT, backend.local_addr().unwrap().port(), BACK, 0)
                         .await
                         .unwrap();
-                service.enable_pinned_abliteration();
+                service.enable_daisyrose_lora(0).unwrap();
                 let service = Arc::new(service);
                 let worker = Arc::clone(&service);
                 let rejected =

@@ -13,7 +13,6 @@ use std::{
 const LOCK_JSON: &str = include_str!("../../../config/runtime.lock.json");
 const PROFILE_JSON: &str = include_str!("../../../config/profiles/reference-cpu.json");
 const SWIFT_LOCK_JSON: &str = include_str!("../../../config/swift-assessment.lock.json");
-const PTQ1_EXPORT_JSON: &str = include_str!("../../../config/swift.ptq1-export.json");
 /// Fixed process memory ceiling: 18 GiB.
 pub const MEMORY_LIMIT_BYTES: usize = bonsai_cpu_policy::MEMORY_LIMIT_BYTES;
 /// Required available physical memory including a 4 GiB host reserve.
@@ -25,7 +24,7 @@ pub enum LaunchProfile {
     /// Default Qwen reference; its compiled JSON profile remains launch-disabled.
     #[default]
     ReferenceCpu,
-    /// Explicit Swift PQ2 assessment, optionally with the pinned abliteration `LoRA`.
+    /// Explicit Swift PQ2 assessment (publisher engine rollback).
     SwiftPq2Assessment,
 }
 impl LaunchProfile {
@@ -139,8 +138,6 @@ pub struct LaunchPlan {
     pub model_path: PathBuf,
     /// Optional verified vision projector identity for Swift multimodal launch.
     pub mmproj: Option<bonsai_cpu_policy::SwiftMmprojArtifact>,
-    /// Optional pinned adapter identity; never an arbitrary caller-supplied path.
-    pub adapter: Option<bonsai_cpu_policy::AbliterateLoraArtifact>,
     /// Optional verified stackable DaisyRose multi-rank adapter plan.
     pub daisyrose_lora: Option<DaisyRoseLoraPlan>,
     /// Pinned archive path verified before launch.
@@ -293,48 +290,8 @@ impl LaunchPlan {
         key_file: &Path,
         profile: LaunchProfile,
     ) -> Result<Self, PolicyError> {
-        Self::for_profile_with_lora(data, backend_port, key_file, profile, false)
-    }
-
-    /// Build a fixed server plan with the pinned scale-one `LoRA` when requested.
-    ///
-    /// # Errors
-    /// Rejects `LoRA` on the reference profile, invalid paths or compiled policy drift.
-    pub fn for_profile_with_lora(
-        data: &Path,
-        backend_port: u16,
-        key_file: &Path,
-        profile: LaunchProfile,
-        use_abliterate_lora: bool,
-    ) -> Result<Self, PolicyError> {
-        Self::for_profile_with_options(
-            data,
-            backend_port,
-            key_file,
-            profile,
-            use_abliterate_lora,
-            false,
-        )
-    }
-
-    /// Build a fixed server plan with explicit pinned adapter and weight packing selections.
-    /// The PTQ1 option selects only the verified current-weight export, never the older checkpoint.
-    ///
-    /// # Errors
-    /// Rejects Swift-only options on the reference profile, invalid paths or compiled policy drift.
-    pub fn for_profile_with_options(
-        data: &Path,
-        backend_port: u16,
-        key_file: &Path,
-        profile: LaunchProfile,
-        use_abliterate_lora: bool,
-        use_repacked_ptq1: bool,
-    ) -> Result<Self, PolicyError> {
-        if use_abliterate_lora && profile != LaunchProfile::SwiftPq2Assessment {
-            return Err(PolicyError::Configuration);
-        }
         validate_environment(std::env::vars_os().map(|(name, _)| name))?;
-        let pins = reviewed_pins_for_representation(profile, use_repacked_ptq1)?;
+        let pins = reviewed_pins(profile)?;
         validate_external_path(data)?;
         validate_external_path(key_file)?;
         if backend_port < 1024 {
@@ -351,7 +308,7 @@ impl LaunchPlan {
         for path in [&executable, &model_path, &archive_path] {
             validate_external_path(path)?;
         }
-        let mut arguments: Vec<OsString> = bonsai_cpu_policy::server::arguments(
+        let arguments: Vec<OsString> = bonsai_cpu_policy::server::arguments(
             model_path.to_str().ok_or(PolicyError::Path)?,
             key_file.to_str().ok_or(PolicyError::Path)?,
             backend_port,
@@ -361,26 +318,11 @@ impl LaunchPlan {
         .into_iter()
         .map(OsString::from)
         .collect();
-        let adapter = if use_abliterate_lora {
-            let adapter = bonsai_cpu_policy::abliterate_lora_artifact(data)
-                .map_err(|_| PolicyError::Configuration)?;
-            validate_external_path(&adapter.path)?;
-            // --lora applies scale 1 and accepts an absolute Windows path as one
-            // argument; --lora-scaled would split the drive-letter colon.
-            arguments.extend([
-                OsString::from("--lora"),
-                adapter.path.as_os_str().to_owned(),
-            ]);
-            Some(adapter)
-        } else {
-            None
-        };
         Ok(Self {
             executable,
             arguments,
             model_path,
             mmproj: None,
-            adapter,
             daisyrose_lora: None,
             archive_path,
             runtime_directory,
@@ -394,7 +336,7 @@ impl LaunchPlan {
         })
     }
 
-    /// Build a launch plan for an opt-in native `NariQ` `GGUF` variant (never selects Orca or Swift `mmproj`).
+    /// Build a launch plan for an opt-in native `NariQ` `GGUF` variant (never selects Swift `mmproj`).
     ///
     /// # Errors
     /// Rejects invalid external paths, privileged ports, or compiled policy drift.
@@ -438,7 +380,6 @@ impl LaunchPlan {
             arguments,
             model_path: nariq.path,
             mmproj: None,
-            adapter: None,
             daisyrose_lora: None,
             archive_path,
             runtime_directory,
@@ -453,9 +394,9 @@ impl LaunchPlan {
         })
     }
 
-    /// Build a launch plan for an opt-in native `Ternary Bonsai 2.5 27B` `GGUF` variant (`pq2` or `ptq1`).
+    /// Build a launch plan for a native `Ternary Bonsai 2.5 27B` `GGUF` variant (`pq2` or `ptq1`).
     ///
-    /// Unlike `NariQ`, Bonsai 2.5 supports stacking Orca `abliterate_lora`, `MultiRankAdapter`,
+    /// Unlike `NariQ`, Bonsai 2.5 supports stacking `MultiRankAdapter`,
     /// Hexagon NPU, Adreno Vulkan, Composite, and Vision (`mmproj` attached separately when admitted).
     ///
     /// # Errors
@@ -465,7 +406,6 @@ impl LaunchPlan {
         backend_port: u16,
         key_file: &Path,
         variant: bonsai_cpu_policy::Bonsai25Variant,
-        use_abliterate_lora: bool,
     ) -> Result<Self, PolicyError> {
         validate_environment(std::env::vars_os().map(|(name, _)| name))?;
         validate_external_path(data)?;
@@ -482,7 +422,7 @@ impl LaunchPlan {
         for path in [&executable, &bonsai25.path, &archive_path] {
             validate_external_path(path)?;
         }
-        let mut arguments: Vec<OsString> = bonsai_cpu_policy::server::arguments(
+        let arguments: Vec<OsString> = bonsai_cpu_policy::server::arguments(
             bonsai25.path.to_str().ok_or(PolicyError::Path)?,
             key_file.to_str().ok_or(PolicyError::Path)?,
             backend_port,
@@ -492,16 +432,6 @@ impl LaunchPlan {
         .into_iter()
         .map(OsString::from)
         .collect();
-        let adapter = if use_abliterate_lora {
-            let lora = bonsai_cpu_policy::abliterate_lora_artifact(data)
-                .map_err(|_| PolicyError::Configuration)?;
-            validate_external_path(&lora.path)?;
-            arguments.push(OsString::from("--lora"));
-            arguments.push(lora.path.as_os_str().to_owned());
-            Some(lora)
-        } else {
-            None
-        };
         let fixed_runtime = bonsai_cpu_policy::context::SwiftWeightPacking::from_bonsai25(variant)
             .calibrated_fixed_runtime_bytes();
         let memory_limit_bytes = usize::try_from(fixed_runtime)
@@ -511,7 +441,6 @@ impl LaunchPlan {
             arguments,
             model_path: bonsai25.path,
             mmproj: None,
-            adapter,
             daisyrose_lora: None,
             archive_path,
             runtime_directory,
@@ -755,51 +684,6 @@ pub(crate) fn reviewed_pins(profile: LaunchProfile) -> Result<ReviewedPins, Poli
     }
 }
 
-fn select_ptq1(profile: LaunchProfile) -> Result<SelectedModel, PolicyError> {
-    let lock = serde_json::from_str(SWIFT_LOCK_JSON).map_err(|_| PolicyError::Configuration)?;
-    let evidence =
-        serde_json::from_str(PTQ1_EXPORT_JSON).map_err(|_| PolicyError::Configuration)?;
-    let selected =
-        bonsai_cpu_policy::select_artifact(&lock, profile.cpu_profile(), true, Some(&evidence))
-            .map_err(|_| PolicyError::Configuration)?;
-    serde_json::from_value(selected).map_err(|_| PolicyError::Configuration)
-}
-
-pub(crate) fn reviewed_pins_for_representation(
-    profile: LaunchProfile,
-    use_repacked_ptq1: bool,
-) -> Result<ReviewedPins, PolicyError> {
-    static PTQ1_REFERENCE_CPU: LazyLock<Result<SelectedModel, PolicyError>> =
-        LazyLock::new(|| select_ptq1(LaunchProfile::ReferenceCpu));
-    static PTQ1_SWIFT_PQ2: LazyLock<Result<SelectedModel, PolicyError>> =
-        LazyLock::new(|| select_ptq1(LaunchProfile::SwiftPq2Assessment));
-    let mut pins = reviewed_pins(profile)?;
-    if use_repacked_ptq1 {
-        let selected = match profile {
-            LaunchProfile::ReferenceCpu => PTQ1_REFERENCE_CPU.clone()?,
-            LaunchProfile::SwiftPq2Assessment => PTQ1_SWIFT_PQ2.clone()?,
-        };
-        pins.model.filename = selected.filename;
-        pins.model.bytes = selected.bytes;
-        pins.model.sha256 = selected.sha256;
-        pins.model.chunk_manifest =
-            validate_chunk_manifest(selected.bytes, selected.chunk_bytes, selected.chunk_sha256s)?;
-    }
-    Ok(pins)
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "PascalCase", deny_unknown_fields)]
-struct SelectedModel {
-    filename: String,
-    bytes: u64,
-    sha256: String,
-    #[serde(default)]
-    chunk_bytes: Option<usize>,
-    #[serde(default)]
-    chunk_sha256s: Option<Vec<String>>,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SwiftPins {
@@ -1009,28 +893,6 @@ mod tests {
     }
 
     #[test]
-    fn repacked_identity_is_the_exact_current_weight_export_not_the_older_checkpoint()
-    -> Result<(), PolicyError> {
-        let profile = LaunchProfile::SwiftPq2Assessment;
-        let original = reviewed_pins_for_representation(profile, false)?;
-        let repacked = reviewed_pins_for_representation(profile, true)?;
-        assert_eq!(original.model.filename, "Swift-Bonsai-2-PQ2_0.gguf");
-        assert_eq!(
-            repacked.model.filename,
-            "Swift-Bonsai-2-current-repacked-PTQ1_0.gguf"
-        );
-        assert_eq!(repacked.model.bytes, 5_946_648_928);
-        assert_eq!(
-            repacked.model.sha256,
-            "e658f0f0736a03a4549535a439f9b07254ebf8ab88ae27cbe6e52d098ca5d1f5"
-        );
-        assert_eq!(repacked.model.revision, original.model.revision);
-        assert_eq!(repacked.runtime.commit, original.runtime.commit);
-        assert!(reviewed_pins_for_representation(LaunchProfile::ReferenceCpu, true).is_err());
-        Ok(())
-    }
-
-    #[test]
     fn profile_drift_and_coercions_fail_closed() {
         for changed in [
             PROFILE_JSON.replace("\"launchEnabled\": false", "\"launchEnabled\": true"),
@@ -1101,14 +963,8 @@ mod tests {
     {
         let data = std::env::temp_dir().join("Bonsai-launch-policy-mmproj");
         let key = data.join("backend.key");
-        let mut plan = LaunchPlan::for_profile_with_options(
-            &data,
-            8081,
-            &key,
-            LaunchProfile::SwiftPq2Assessment,
-            false,
-            false,
-        )?;
+        let mut plan =
+            LaunchPlan::for_profile(&data, 8081, &key, LaunchProfile::SwiftPq2Assessment)?;
         assert!(plan.mmproj.is_none());
         assert!(plan.arguments.iter().any(|arg| arg == "--no-mmproj"));
         let mmproj = bonsai_cpu_policy::swift_mmproj_artifact(&data)

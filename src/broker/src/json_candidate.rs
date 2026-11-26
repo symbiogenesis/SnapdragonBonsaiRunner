@@ -7,8 +7,13 @@ use crate::{
 use serde::Serialize;
 use std::{error::Error, hint::black_box, path::PathBuf, time::Instant};
 
-fn canonical(body: &[u8], candidate: bool, pinned: bool) -> Result<Vec<u8>, Rejection> {
-    let head = AuthorizedHead::test_head(body.len(), pinned);
+fn canonical(body: &[u8], candidate: bool, daisyrose: bool) -> Result<Vec<u8>, Rejection> {
+    let head = AuthorizedHead::test_head(body.len());
+    let head = if daisyrose {
+        head.with_daisyrose(10)
+    } else {
+        head
+    };
     if candidate {
         head.prepare_simd_json(body)
     } else {
@@ -17,25 +22,29 @@ fn canonical(body: &[u8], candidate: bool, pinned: bool) -> Result<Vec<u8>, Reje
     .map(|chat| chat.body)
 }
 
-fn parity(body: &[u8], pinned: bool) {
+fn parity(body: &[u8], daisyrose: bool) {
     let original = body.to_vec();
-    let expected = canonical(body, false, pinned);
-    assert_eq!(canonical(body, true, pinned), expected);
+    let expected = canonical(body, false, daisyrose);
+    assert_eq!(canonical(body, true, daisyrose), expected);
     let mut scratch = JsonCandidateScratch::default();
     for _ in 0..2 {
-        assert_eq!(reused_canonical(body, pinned, &mut scratch), expected);
+        assert_eq!(reused_canonical(body, daisyrose, &mut scratch), expected);
     }
     assert_eq!(body, original);
 }
 
 fn reused_canonical(
     body: &[u8],
-    pinned: bool,
+    daisyrose: bool,
     scratch: &mut JsonCandidateScratch,
 ) -> Result<Vec<u8>, Rejection> {
-    scratch
-        .prepare(AuthorizedHead::test_head(body.len(), pinned), body)
-        .map(|chat| chat.body)
+    let head = AuthorizedHead::test_head(body.len());
+    let head = if daisyrose {
+        head.with_daisyrose(10)
+    } else {
+        head
+    };
+    scratch.prepare(head, body).map(|chat| chat.body)
 }
 
 #[test]
@@ -99,8 +108,9 @@ fn fixed_candidate_preserves_schema_history_and_bounds() -> Result<(), Box<dyn E
         r#"{"messages":[{"role":"user","content":"a","reasoning_content":"x"}]}"#,
         r#"{"messages":[{"role":"user","content":"a"}],"max_completion_tokens":1.0}"#,
         r#"{"messages":[{"role":"user","content":"a"}],"max_completion_tokens":null}"#,
-        r#"{"messages":[{"role":"user","content":"a"}],"abliteration_scale":null}"#,
-        r#"{"messages":[{"role":"user","content":"a"}],"abliteration_scale":2.0000001}"#,
+        r#"{"messages":[{"role":"user","content":"a"}],"daisyrose_scale":null}"#,
+        r#"{"messages":[{"role":"user","content":"a"}],"daisyrose_scale":2.0000001}"#,
+        r#"{"messages":[{"role":"user","content":"a"}],"abliteration_scale":1.3}"#,
         r#"{"messages":[{"role":"user","content":"a"}],"enable_thinking":1}"#,
         r#"{"messages":[{"role":"user","content":"a"}]}{}"#,
     ] {
@@ -116,7 +126,7 @@ fn fixed_candidate_preserves_schema_history_and_bounds() -> Result<(), Box<dyn E
     }
     for scale in ["0", "-0.0", "0.1", "1.3", "2"] {
         let body = format!(
-            r#"{{"messages":[{{"role":"user","content":"a"}}],"abliteration_scale":{scale}}}"#
+            r#"{{"messages":[{{"role":"user","content":"a"}}],"daisyrose_scale":{scale}}}"#
         );
         parity(body.as_bytes(), false);
         parity(body.as_bytes(), true);
@@ -157,7 +167,7 @@ fn fixed_candidate_preserves_schema_history_and_bounds() -> Result<(), Box<dyn E
 
 #[test]
 fn fixed_candidate_preserves_serde_scale_lexemes() {
-    for key in ["abliteration_scale", r"abliteration_\u0073cale"] {
+    for key in ["daisyrose_scale", r"daisyrose_\u0073cale"] {
         for scale in [
             "1.2785641882898677",
             "1.6447349639294147",
@@ -181,14 +191,14 @@ fn fixed_candidate_preserves_serde_scale_lexemes() {
             parity(body.as_bytes(), false);
         }
     }
-    parity(br#"{"messages":[{"role":"user","content":"a"}],"abliteration_scale":1,"abliteration_\u0073cale":2}"#, true);
+    parity(br#"{"messages":[{"role":"user","content":"a"}],"daisyrose_scale":1,"daisyrose_\u0073cale":2}"#, true);
     let mut scratch = JsonCandidateScratch::default();
     for body in [
         br#"{"messages":[{"role":"user","content":"rain"}]}"#.as_slice(),
         br#"{"messages":[{"role":"user","content":"rain"}],"daisyrose_scale":0.0}"#,
         br#"{"messages":[{"role":"user","content":"rain"}],"daisyrose_scale":0.5}"#,
     ] {
-        let head = || AuthorizedHead::test_head(body.len(), true).with_daisyrose(10);
+        let head = || AuthorizedHead::test_head(body.len()).with_daisyrose(10);
         assert_eq!(
             head().prepare_simd_json(body).map(|chat| chat.body),
             head().prepare(body).map(|chat| chat.body)
@@ -340,9 +350,9 @@ fn compare_screen(reused: bool) -> Result<ScreenReport, serde_json::Error> {
         .fold(0.0, f64::max);
     let original_six_qualifies = geometric_mean_time_ratio <= 0.95 && worst_case_time_ratio <= 1.05;
     let supplemental_cases = [
-        ("adapter_scale_default", br#"{"messages":[{"role":"user","content":"Draft a scene with rain."}],"abliteration_scale":1.3}"#.as_slice()),
-        ("adapter_scale_decimal", br#"{"messages":[{"role":"user","content":"Draft a scene with rain."}],"abliteration_scale":1.2785641882898677}"#.as_slice()),
-        ("adapter_scale_escaped_key", br#"{"messages":[{"role":"user","content":"Draft a scene with rain."}],"abliteration_\u0073cale":1.6447349639294147}"#.as_slice()),
+        ("adapter_scale_default", br#"{"messages":[{"role":"user","content":"Draft a scene with rain."}],"daisyrose_scale":1.3}"#.as_slice()),
+        ("adapter_scale_decimal", br#"{"messages":[{"role":"user","content":"Draft a scene with rain."}],"daisyrose_scale":1.2785641882898677}"#.as_slice()),
+        ("adapter_scale_escaped_key", br#"{"messages":[{"role":"user","content":"Draft a scene with rain."}],"daisyrose_\u0073cale":1.6447349639294147}"#.as_slice()),
     ].into_iter().map(|(name, body)| compare_case(name, body, true, reused)).collect::<Vec<_>>();
     let supplemental_worst_case_time_ratio = supplemental_cases
         .iter()

@@ -7,8 +7,6 @@
 mod identity;
 mod startup;
 
-#[cfg(test)]
-use identity::validate_native_identity;
 use identity::{NativeIdentityError, WorkerReadiness};
 use startup::StartupTimer;
 
@@ -67,13 +65,12 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--hexagon-arena-cache <abs-dir>] (reviewed native runtime only; requires --allow-unisolated-backend and excludes --placement cpu)\n",
     "  [--reset-on-cancel] (reviewed native runtime only; reset live state in place on client cancel)\n",
     "  [--no-mmproj] (disable multimodal vision projector; Swift only)\n",
-    "  [--use-abliterate-lora] (pinned adapter; request scale 0..2, default 1.3; Swift CPU only)\n",
     "  [--daisyrose-lora <absolute-gguf>] (stackable multi-rank NpuFriendly LoRA; native Swift only; request scale 0..2, default 0.0 unless promoted lock)\n",
     "  [--no-daisyrose-lora] (disable any default-enabled DaisyRose adapter; native Swift only)\n",
-    "  [--use-repacked-ptq1|--use-original-pq2|--nariq 2.5bpw|3.0bpw|2.0bpw|--bonsai-2-5 pq2|ptq1] (mutually exclusive weight selections; Swift only)\n",
+    "  [--nariq 2.5bpw|3.0bpw|2.0bpw|--bonsai-2-5 pq2|ptq1] (mutually exclusive weight selections; native Swift only)\n",
     "  [--max-waiting <0..8>] [--check-only]\n",
     "Default: reference-cpu. Only compiled model/runtime pins and fixed CPU policies are accepted.\n",
-    "Swift defaults to Rust with eight workers on Snapdragon X1/X2 (four otherwise), Orca-free Bonsai 2.5 PQ2 weights (with local-verified DaisyRose attached when present), and --use-original-pq2/--use-repacked-ptq1/--bonsai-2-5 ptq1/--nariq as explicit selections; --publisher-engine rollback defaults to original PQ2. --require-broker-pipe omits --backend-port and requires a reviewed offline native release. Full daily-use qualification remains pending.\n",
+    "Swift defaults to Rust with eight workers on Snapdragon X1/X2 (four otherwise), Bonsai 2.5 PQ2 weights (with local-verified DaisyRose attached when present), and --bonsai-2-5 ptq1 or --nariq as explicit native selections; --publisher-engine rollback defaults to original PQ2. --require-broker-pipe omits --backend-port and requires a reviewed offline native release. Full daily-use qualification remains pending.\n",
     "Creates fresh protected credentials; prints paths, never key values.\n",
 );
 
@@ -124,7 +121,6 @@ pub enum LaunchError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WeightRepresentation {
     Source,
-    CurrentRepackedPtq1,
     NariQ(bonsai_cpu_policy::NariqVariant),
     Bonsai25(bonsai_cpu_policy::Bonsai25Variant),
 }
@@ -165,7 +161,6 @@ pub struct LaunchConfig {
     hexagon_arena_cache: Option<PathBuf>,
     reset_on_cancel: bool,
     no_mmproj: bool,
-    use_abliterate_lora: bool,
     daisyrose_lora: Option<PathBuf>,
     no_daisyrose_lora: bool,
     weight_representation: WeightRepresentation,
@@ -204,7 +199,6 @@ impl VerifiedDaisyRose {
 struct VerifiedLaunchGuards {
     native_executable: Option<(PathBuf, bonsai_artifacts::VerifiedFile)>,
     artifacts: VerifiedArtifacts,
-    adapter: Option<bonsai_artifacts::VerifiedFile>,
     daisyrose: Option<VerifiedDaisyRose>,
     mmproj: Option<(
         bonsai_cpu_policy::SwiftMmprojArtifact,
@@ -288,15 +282,9 @@ impl LaunchConfig {
             (None, None, None, None);
         let (mut spec_type, mut draft_max, mut cpu_family, mut hexagon_arena_cache) =
             (None, None, None, None);
-        let (mut reset_on_cancel, mut no_mmproj, mut use_abliterate_lora, mut no_daisyrose_lora) =
-            (false, false, false, false);
-        let (
-            mut daisyrose_lora,
-            mut use_repacked_ptq1,
-            mut nariq_variant,
-            mut bonsai25_variant,
-            mut profile,
-        ) = (None, None, None, None, None);
+        let (mut reset_on_cancel, mut no_mmproj, mut no_daisyrose_lora) = (false, false, false);
+        let (mut daisyrose_lora, mut nariq_variant, mut bonsai25_variant, mut profile) =
+            (None, None, None, None);
         let (mut data, mut evidence_parent) = (None, None);
         let (mut frontend_port, mut backend_port, mut max_waiting) = (None, None, None);
         let take_path = |v: Option<OsString>| v.map(PathBuf::from).ok_or(LaunchError::Arguments);
@@ -363,11 +351,8 @@ impl LaunchConfig {
                 }
                 Some("--reset-on-cancel") => set_flag(&mut reset_on_cancel)?,
                 Some("--no-mmproj") => set_flag(&mut no_mmproj)?,
-                Some("--use-abliterate-lora") => set_flag(&mut use_abliterate_lora)?,
                 Some("--daisyrose-lora") => take_once(&mut daisyrose_lora, &mut args, take_path)?,
                 Some("--no-daisyrose-lora") => set_flag(&mut no_daisyrose_lora)?,
-                Some("--use-repacked-ptq1") => set_once(&mut use_repacked_ptq1, true)?,
-                Some("--use-original-pq2") => set_once(&mut use_repacked_ptq1, false)?,
                 Some("--nariq") => take_once(&mut nariq_variant, &mut args, |v| {
                     v.and_then(|s| s.into_string().ok())
                         .and_then(|s| s.parse::<bonsai_cpu_policy::NariqVariant>().ok())
@@ -393,9 +378,8 @@ impl LaunchConfig {
                 _ => return Err(LaunchError::Arguments),
             }
         }
-        let explicit_variants = usize::from(nariq_variant.is_some())
-            + usize::from(bonsai25_variant.is_some())
-            + usize::from(use_repacked_ptq1.is_some());
+        let explicit_variants =
+            usize::from(nariq_variant.is_some()) + usize::from(bonsai25_variant.is_some());
         if explicit_variants > 1 {
             return Err(LaunchError::Arguments);
         }
@@ -472,27 +456,19 @@ impl LaunchConfig {
             hexagon_arena_cache,
             reset_on_cancel,
             no_mmproj,
-            use_abliterate_lora,
             daisyrose_lora,
             no_daisyrose_lora,
             weight_representation: if let Some(variant) = nariq_variant {
                 WeightRepresentation::NariQ(variant)
             } else if let Some(variant) = bonsai25_variant {
                 WeightRepresentation::Bonsai25(variant)
-            } else if use_repacked_ptq1 == Some(true) {
-                WeightRepresentation::CurrentRepackedPtq1
-            } else if use_repacked_ptq1 == Some(false)
-                || profile != LaunchProfile::SwiftPq2Assessment
-                || !native_engine
-            {
+            } else if profile != LaunchProfile::SwiftPq2Assessment || !native_engine {
                 WeightRepresentation::Source
             } else {
                 WeightRepresentation::Bonsai25(bonsai_cpu_policy::Bonsai25Variant::Pq2)
             },
         };
-        configuration.validate_selection(
-            use_repacked_ptq1.is_some() || nariq_variant.is_some() || bonsai25_variant.is_some(),
-        )?;
+        configuration.validate_selection(nariq_variant.is_some() || bonsai25_variant.is_some())?;
         if let Some(cache_dir) = &configuration.hexagon_arena_cache {
             validate_hexagon_arena_cache_dir(cache_dir)?;
         }
@@ -565,18 +541,14 @@ impl LaunchConfig {
     const fn nariq_variant(&self) -> Option<bonsai_cpu_policy::NariqVariant> {
         match self.weight_representation {
             WeightRepresentation::NariQ(variant) => Some(variant),
-            WeightRepresentation::Source
-            | WeightRepresentation::CurrentRepackedPtq1
-            | WeightRepresentation::Bonsai25(_) => None,
+            WeightRepresentation::Source | WeightRepresentation::Bonsai25(_) => None,
         }
     }
 
     const fn bonsai25_variant(&self) -> Option<bonsai_cpu_policy::Bonsai25Variant> {
         match self.weight_representation {
             WeightRepresentation::Bonsai25(variant) => Some(variant),
-            WeightRepresentation::Source
-            | WeightRepresentation::CurrentRepackedPtq1
-            | WeightRepresentation::NariQ(_) => None,
+            WeightRepresentation::Source | WeightRepresentation::NariQ(_) => None,
         }
     }
 
@@ -588,22 +560,9 @@ impl LaunchConfig {
         if let Some(variant) = self.nariq_variant() {
             LaunchPlan::for_swift_nariq(&self.data, backend_port, key_file, variant)
         } else if let Some(variant) = self.bonsai25_variant() {
-            LaunchPlan::for_swift_bonsai25(
-                &self.data,
-                backend_port,
-                key_file,
-                variant,
-                self.use_abliterate_lora,
-            )
+            LaunchPlan::for_swift_bonsai25(&self.data, backend_port, key_file, variant)
         } else {
-            LaunchPlan::for_profile_with_options(
-                &self.data,
-                backend_port,
-                key_file,
-                self.profile,
-                self.use_abliterate_lora,
-                self.uses_repacked_ptq1(),
-            )
+            LaunchPlan::for_profile(&self.data, backend_port, key_file, self.profile)
         }
     }
 
@@ -641,7 +600,6 @@ impl LaunchConfig {
                 && self.spec_type == Some(crate::inference::SpeculationType::Suffix))
             || (self.reset_on_cancel && !self.native_engine)
             || (self.no_mmproj && !swift)
-            || (self.use_abliterate_lora && (!swift || is_nariq))
             || (self.daisyrose_lora.is_some() && (!swift || !self.native_engine))
             || (self.no_daisyrose_lora && (!swift || self.daisyrose_lora.is_some()))
             || (self.hexagon_arena_cache.is_some()
@@ -711,15 +669,6 @@ impl LaunchConfig {
         Ok(supported)
     }
 
-    /// Whether the explicitly selected model is the verified current-weight PTQ1 export.
-    #[must_use]
-    pub const fn uses_repacked_ptq1(&self) -> bool {
-        matches!(
-            self.weight_representation,
-            WeightRepresentation::CurrentRepackedPtq1
-        )
-    }
-
     /// Whether the selected runtime has the reviewed memory-context protocol.
     /// Publisher Swift supports an explicit context; native releases require
     /// exact source and release-byte review before enabling the paired flags.
@@ -781,7 +730,6 @@ impl LaunchConfig {
         };
         let weight_packing = match self.weight_representation {
             WeightRepresentation::Source => SwiftWeightPacking::Pq2_0,
-            WeightRepresentation::CurrentRepackedPtq1 => SwiftWeightPacking::Ptq1_0,
             WeightRepresentation::NariQ(variant) => SwiftWeightPacking::from_nariq(variant),
             WeightRepresentation::Bonsai25(variant) => SwiftWeightPacking::from_bonsai25(variant),
         };
@@ -1044,37 +992,21 @@ impl LaunchConfig {
         }
     }
 
-    fn adapter_guard(
-        plan: &LaunchPlan,
-    ) -> Result<Option<bonsai_artifacts::VerifiedFile>, LaunchError> {
-        plan.adapter
-            .as_ref()
-            .map(|adapter| {
-                crate::artifacts::verify_file_with_optional_chunks(
-                    &adapter.path,
-                    adapter.bytes,
-                    &adapter.sha256,
-                    adapter.chunk_bytes,
-                    adapter.chunk_sha256s.as_deref(),
-                )
-                .map_err(|_| LaunchError::Adapter)
-            })
-            .transpose()
-    }
-
-    const fn active_base_sha256(&self) -> &'static str {
+    const fn active_base_sha256(&self) -> Option<&'static str> {
         match self.weight_representation {
-            WeightRepresentation::Source => crate::inference::MODEL_SHA256,
-            WeightRepresentation::CurrentRepackedPtq1 => crate::inference::REPACKED_PTQ1_SHA256,
-            WeightRepresentation::NariQ(variant) => variant.sha256(),
-            WeightRepresentation::Bonsai25(variant) => variant.sha256(),
+            WeightRepresentation::Source => None,
+            WeightRepresentation::NariQ(variant) => Some(variant.sha256()),
+            WeightRepresentation::Bonsai25(variant) => Some(variant.sha256()),
         }
     }
 
     fn resolve_daisyrose_selection(&self) -> Result<Option<DaisyRoseSelection>, LaunchError> {
+        let Some(base_sha256) = self.active_base_sha256() else {
+            return Ok(None);
+        };
         let pinned = bonsai_cpu_policy::DaisyRoseLoraArtifact::pinned_for_base_sha256(
             &self.data,
-            self.active_base_sha256(),
+            base_sha256,
         )
         .map_err(|_| LaunchError::Policy)?;
         let multi_rank_supported = crate::inference::multi_rank_lora_supported()?;
@@ -1093,7 +1025,9 @@ impl LaunchConfig {
             return Ok(None);
         }
         // Only auto-attach a compiled lock when its baseModelSha256 matches the active weights.
-        let expected_base_sha256 = self.active_base_sha256();
+        let Some(expected_base_sha256) = self.active_base_sha256() else {
+            return Ok(None);
+        };
         let pinned = pinned.filter(|artifact| artifact.base_model_sha256 == expected_base_sha256);
         if let Some(explicit) = &self.daisyrose_lora {
             if !multi_rank_supported {
@@ -1226,11 +1160,7 @@ impl LaunchConfig {
             } else if let Some(variant) = self.bonsai25_variant() {
                 VerifiedArtifacts::verify_bonsai25_model(&self.data, variant)
             } else {
-                VerifiedArtifacts::verify_model_for_profile(
-                    &self.data,
-                    self.profile,
-                    self.uses_repacked_ptq1(),
-                )
+                Err(crate::artifacts::ArtifactError::Configuration)
             }
             .map_err(|_| LaunchError::Artifacts)?;
             if artifacts.model() != plan.model_path {
@@ -1238,12 +1168,8 @@ impl LaunchConfig {
             }
             return Ok(artifacts);
         }
-        let artifacts = VerifiedArtifacts::verify_for_profile_with_representation(
-            &self.data,
-            self.profile,
-            self.uses_repacked_ptq1(),
-        )
-        .map_err(|_| LaunchError::Artifacts)?;
+        let artifacts = VerifiedArtifacts::verify_for_profile(&self.data, self.profile)
+            .map_err(|_| LaunchError::Artifacts)?;
         if artifacts.executable() != plan.executable
             || artifacts.model() != plan.model_path
             || artifacts.runtime_directory() != plan.runtime_directory
@@ -1271,10 +1197,6 @@ impl LaunchConfig {
             let native_handle = self
                 .native_engine
                 .then(|| scope.spawn(|| self.native_executable_guard()));
-            let adapter_handle = plan
-                .adapter
-                .is_some()
-                .then(|| scope.spawn(|| Self::adapter_guard(plan)));
             let daisyrose_handle = daisyrose_selection
                 .as_ref()
                 .map(|selection| scope.spawn(|| Self::verify_daisyrose_selection(selection)));
@@ -1286,7 +1208,6 @@ impl LaunchConfig {
             Ok(VerifiedLaunchGuards {
                 native_executable,
                 artifacts,
-                adapter: join_opt(adapter_handle, LaunchError::Adapter)?,
                 daisyrose: join_opt(daisyrose_handle, LaunchError::Adapter)?,
                 mmproj: join_opt(mmproj_handle, LaunchError::Artifacts)?,
             })
@@ -1348,7 +1269,6 @@ impl LaunchConfig {
             push_arg(&mut arguments, "--key-file", key_path.as_os_str());
         } else {
             let verified_sections = 1_usize
-                + usize::from(plan.adapter.is_some())
                 + usize::from(plan.daisyrose_lora.is_some())
                 + usize::from(plan.mmproj.is_some());
             arguments.push(OsString::from("--broker-pipe"));
@@ -1424,15 +1344,6 @@ impl LaunchConfig {
             push_arg(&mut arguments, "--nariq", variant.as_str());
         } else if let Some(variant) = self.bonsai25_variant() {
             push_arg(&mut arguments, "--bonsai-2-5", variant.as_str());
-        } else if self.uses_repacked_ptq1() {
-            arguments.push("--use-repacked-ptq1".into());
-        }
-        if let Some(adapter) = &plan.adapter {
-            push_arg(
-                &mut arguments,
-                "--abliterate-lora",
-                adapter.path.as_os_str(),
-            );
         }
         if let Some(daisyrose) = &plan.daisyrose_lora {
             push_arg(
@@ -1495,7 +1406,6 @@ impl LaunchConfig {
         &self,
         executable: &std::path::Path,
         artifacts: &VerifiedArtifacts,
-        adapter: Option<&bonsai_artifacts::VerifiedFile>,
         daisyrose: Option<&bonsai_artifacts::VerifiedMultiRankAdapter>,
         mmproj: Option<&bonsai_artifacts::VerifiedFile>,
         credentials: &PrivateCredentials,
@@ -1514,7 +1424,6 @@ impl LaunchConfig {
         if !broker_pipe && credentials.has_backend_file() {
             readonly_paths.push(credentials.backend_path().to_owned());
         }
-        readonly_paths.extend(adapter.map(|file| file.path().to_owned()));
         readonly_paths.extend(daisyrose.map(|file| file.path().to_owned()));
         readonly_paths.extend(mmproj.map(|file| file.path().to_owned()));
         readonly_paths.sort();
@@ -1526,7 +1435,6 @@ impl LaunchConfig {
         &self,
         specification: &ProcessSpec,
         artifacts: &VerifiedArtifacts,
-        adapter: Option<&bonsai_artifacts::VerifiedFile>,
         daisyrose: Option<&bonsai_artifacts::VerifiedMultiRankAdapter>,
         mmproj: Option<&bonsai_artifacts::VerifiedFile>,
         credentials: &PrivateCredentials,
@@ -1553,7 +1461,6 @@ impl LaunchConfig {
         let readonly_paths = self.sandbox_readonly_paths(
             &specification.executable,
             artifacts,
-            adapter,
             daisyrose,
             mmproj,
             credentials,
@@ -1572,23 +1479,17 @@ impl LaunchConfig {
             Self::classify_sandbox_start_error(error)
         };
         if broker_pipe {
-            let mut section_files: Vec<&std::fs::File> = Vec::with_capacity(4);
-            let mut section_digests: Vec<[u8; 32]> = Vec::with_capacity(4);
+            let mut section_files: Vec<&std::fs::File> = Vec::with_capacity(3);
+            let mut section_digests: Vec<[u8; 32]> = Vec::with_capacity(3);
             let model_hash = if let Some(variant) = self.nariq_variant() {
                 variant.sha256()
             } else if let Some(variant) = self.bonsai25_variant() {
                 variant.sha256()
-            } else if self.uses_repacked_ptq1() {
-                crate::inference::REPACKED_PTQ1_SHA256
             } else {
-                crate::inference::MODEL_SHA256
+                return Err(LaunchError::Policy);
             };
             section_files.push(artifacts.model_file().ok_or(LaunchError::Artifacts)?);
             section_digests.push(decode_sha256_hex(model_hash)?);
-            if let Some(adapter_file) = adapter {
-                section_files.push(adapter_file.file().ok_or(LaunchError::Artifacts)?);
-                section_digests.push(decode_sha256_hex(crate::inference::ADAPTER_SHA256)?);
-            }
             if let Some(daisyrose_file) = daisyrose {
                 section_files.push(daisyrose_file.file().ok_or(LaunchError::Adapter)?);
                 section_digests.push(decode_sha256_hex(daisyrose_file.sha256())?);
@@ -1691,7 +1592,6 @@ impl LaunchConfig {
         let VerifiedLaunchGuards {
             native_executable,
             artifacts,
-            adapter,
             daisyrose,
             mmproj,
         } = self.verify_launch_artifacts(&preliminary)?;
@@ -1865,7 +1765,6 @@ impl LaunchConfig {
             let (process, pipe_handles) = self.start_process(
                 &specification,
                 &artifacts,
-                adapter.as_ref(),
                 active_daisyrose.map(|d| &d.guard),
                 active_mmproj_guard,
                 &credentials,
@@ -1960,7 +1859,6 @@ impl LaunchConfig {
                     &process,
                     &credentials,
                     pipe_backend,
-                    adapter.is_some(),
                     daisyrose_default_scale_tenths,
                     context_tokens,
                     vision_enabled,
@@ -1973,7 +1871,6 @@ impl LaunchConfig {
                 process,
                 credentials,
                 _artifacts: artifacts,
-                _adapter: adapter,
                 _daisyrose: if daisyrose_admitted {
                     daisyrose.map(|d| d.guard)
                 } else {
@@ -1995,7 +1892,6 @@ impl LaunchConfig {
         process: &OwnedProcess,
         credentials: &PrivateCredentials,
         pipe_backend: Option<crate::pipe_transport::PipeBackend>,
-        adapter: bool,
         daisyrose_default_scale_tenths: Option<u8>,
         context_tokens: usize,
         vision_enabled: bool,
@@ -2028,9 +1924,6 @@ impl LaunchConfig {
                 return Err(LaunchError::Service);
             }
             service.require_backend_process(process.id());
-            if adapter {
-                service.enable_pinned_abliteration();
-            }
             if let Some(default_scale_tenths) = daisyrose_default_scale_tenths
                 && service.enable_daisyrose_lora(default_scale_tenths).is_err()
             {
@@ -2072,7 +1965,6 @@ impl LaunchConfig {
                 identity::validate_native_identity_for_representation(
                     models,
                     self.weight_representation,
-                    self.use_abliterate_lora,
                     WorkerReadiness {
                         prompt_reuse: self.prompt_reuse,
                         prompt_reuse_checkpoints: self.prompt_reuse_checkpoints.unwrap_or(1),
@@ -2353,7 +2245,6 @@ pub struct LaunchedService {
     process: OwnedProcess,
     credentials: PrivateCredentials,
     _artifacts: VerifiedArtifacts,
-    _adapter: Option<bonsai_artifacts::VerifiedFile>,
     _daisyrose: Option<bonsai_artifacts::VerifiedMultiRankAdapter>,
     _mmproj: Option<bonsai_artifacts::VerifiedFile>,
     _native_executable: Option<bonsai_artifacts::VerifiedFile>,
@@ -3155,13 +3046,11 @@ mod tests {
         data: &std::path::Path,
         key: &std::path::Path,
     ) -> Result<super::LaunchPlan, LaunchError> {
-        super::LaunchPlan::for_profile_with_options(
+        super::LaunchPlan::for_swift_bonsai25(
             data,
             8081,
             key,
-            LaunchProfile::SwiftPq2Assessment,
-            true,
-            false,
+            bonsai_cpu_policy::Bonsai25Variant::Pq2,
         )
         .map_err(|_| LaunchError::Policy)
     }
@@ -3211,99 +3100,6 @@ mod tests {
     }
 
     #[test]
-    fn repacked_ptq1_is_explicit_swift_prism_only_and_keeps_lora_available() {
-        let default = LaunchConfig::parse(arguments()).ok();
-        assert!(default.is_some_and(|config| !config.uses_repacked_ptq1()));
-        let enabled = args_with(&["--profile", "swift-pq2-assessment", "--use-repacked-ptq1"]);
-        let config = LaunchConfig::parse(enabled.clone()).ok();
-        assert!(config.is_some_and(|config| config.uses_repacked_ptq1()));
-        let mut with_lora = enabled.clone();
-        with_lora.push("--use-abliterate-lora".into());
-        assert!(LaunchConfig::parse(with_lora).is_ok());
-        let mut rust = enabled.clone();
-        rust.extend(["--native-engine", "--use-abliterate-lora"].map(OsString::from));
-        assert!(LaunchConfig::parse(rust).is_ok());
-        let mut rejected = enabled;
-        rejected.push("--use-repacked-ptq1".into());
-        assert_eq!(
-            LaunchConfig::parse(rejected).err(),
-            Some(LaunchError::Arguments)
-        );
-        assert_eq!(
-            LaunchConfig::parse(args_with(&["--use-repacked-ptq1"])).err(),
-            Some(LaunchError::Arguments)
-        );
-    }
-
-    #[test]
-    fn original_pq2_is_explicit_swift_only_and_rejects_every_duplicate_or_conflict() {
-        let mut swift = arguments();
-        swift.extend(
-            ["--profile", "swift-pq2-assessment", "--use-abliterate-lora"].map(OsString::from),
-        );
-        for native in [false, true] {
-            let mut selected = swift.clone();
-            selected.push(
-                if native {
-                    "--native-engine"
-                } else {
-                    "--publisher-engine"
-                }
-                .into(),
-            );
-            selected.push("--use-original-pq2".into());
-            assert!(
-                LaunchConfig::parse(selected).is_ok_and(|config| !config.uses_repacked_ptq1()
-                    && config.use_abliterate_lora
-                    && config.native_engine == native)
-            );
-        }
-        for first in ["--use-original-pq2", "--use-repacked-ptq1"] {
-            for second in ["--use-original-pq2", "--use-repacked-ptq1"] {
-                let mut rejected = swift.clone();
-                rejected.extend([first, second].map(OsString::from));
-                assert_eq!(
-                    LaunchConfig::parse(rejected).err(),
-                    Some(LaunchError::Arguments)
-                );
-            }
-        }
-        let mut reference = arguments();
-        reference.push("--use-original-pq2".into());
-        assert_eq!(
-            LaunchConfig::parse(reference).err(),
-            Some(LaunchError::Arguments)
-        );
-    }
-
-    #[test]
-    fn lora_launch_is_explicit_swift_prism_only() {
-        let default = LaunchConfig::parse(arguments()).ok();
-        assert!(default.is_some_and(|config| !config.use_abliterate_lora));
-        let mut enabled = arguments();
-        enabled.extend(
-            ["--profile", "swift-pq2-assessment", "--use-abliterate-lora"].map(OsString::from),
-        );
-        let config = LaunchConfig::parse(enabled.clone()).ok();
-        assert!(config.is_some_and(|config| config.use_abliterate_lora));
-        let mut rust = enabled.clone();
-        rust.push("--native-engine".into());
-        assert!(LaunchConfig::parse(rust).is_ok());
-        let mut rejected = enabled.clone();
-        rejected.push("--use-abliterate-lora".into());
-        assert_eq!(
-            LaunchConfig::parse(rejected).err(),
-            Some(LaunchError::Arguments)
-        );
-        let mut reference = arguments();
-        reference.push("--use-abliterate-lora".into());
-        assert_eq!(
-            LaunchConfig::parse(reference).err(),
-            Some(LaunchError::Arguments)
-        );
-    }
-
-    #[test]
     fn reset_on_cancel_is_explicit_native_swift_only() -> Result<(), LaunchError> {
         let default = LaunchConfig::parse(arguments())?;
         assert!(!default.reset_on_cancel);
@@ -3344,55 +3140,6 @@ mod tests {
             LaunchConfig::parse(publisher).err(),
             Some(LaunchError::Arguments)
         );
-        Ok(())
-    }
-
-    #[test]
-    fn lora_guard_rejects_missing_and_altered_adapter_and_opt_out_needs_no_file()
-    -> std::io::Result<()> {
-        use std::{fs, io};
-        let temp = crate::test_util::TempDir::new("Bonsai-lora-guard")?;
-        let directory = temp.path();
-        let key = directory.join("not-created.key");
-        let base = super::LaunchPlan::for_profile(
-            directory,
-            49152,
-            &key,
-            LaunchProfile::SwiftPq2Assessment,
-        )
-        .map_err(io::Error::other)?;
-        assert!(
-            LaunchConfig::adapter_guard(&base)
-                .map_err(|_| io::Error::other("Unexpected base guard"))?
-                .is_none()
-        );
-        let plan = super::LaunchPlan::for_profile_with_lora(
-            directory,
-            49152,
-            &key,
-            LaunchProfile::SwiftPq2Assessment,
-            true,
-        )
-        .map_err(io::Error::other)?;
-        assert_eq!(
-            LaunchConfig::adapter_guard(&plan).err(),
-            Some(LaunchError::Adapter)
-        );
-        let path = &plan
-            .adapter
-            .as_ref()
-            .ok_or_else(|| io::Error::other("Missing adapter plan"))?
-            .path;
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::other("Missing parent"))?;
-        fs::create_dir_all(parent)?;
-        fs::write(path, b"altered adapter")?;
-        assert_eq!(
-            LaunchConfig::adapter_guard(&plan).err(),
-            Some(LaunchError::Adapter)
-        );
-        assert_eq!(directory.parent(), Some(std::env::temp_dir().as_path()));
         Ok(())
     }
 
@@ -3471,49 +3218,31 @@ mod tests {
         let data = std::env::temp_dir().join("Bonsai-row-routing");
         let key = data.join("backend.key");
         for workers in ["1", "4", "8", "12"] {
-            for repacked in [false, true] {
-                let mut args = native.clone();
-                args.extend(
-                    ["--native-row-workers", workers, "--use-abliterate-lora"].map(OsString::from),
-                );
-                if repacked {
-                    args.push("--use-repacked-ptq1".into());
-                }
-                let config = LaunchConfig::parse(args)?;
-                let plan = super::LaunchPlan::for_profile_with_options(
-                    &data,
-                    8081,
-                    &key,
-                    LaunchProfile::SwiftPq2Assessment,
-                    true,
-                    repacked,
-                )
-                .map_err(|_| LaunchError::Policy)?;
-                let child = config.native_arguments(&plan, Some(&key));
-                let expected_flag = workers != "1";
-                assert_eq!(
-                    child.iter().filter(|arg| *arg == "--row-workers").count(),
-                    usize::from(expected_flag)
-                );
-                if expected_flag {
-                    assert!(
-                        child
-                            .array_windows()
-                            .any(|[flag, value]| flag == "--row-workers" && value == workers)
-                    );
-                }
-                let adapter = plan.adapter.as_ref().ok_or(LaunchError::Adapter)?;
+            let mut args = native.clone();
+            args.extend(["--native-row-workers", workers].map(OsString::from));
+            let config = LaunchConfig::parse(args)?;
+            let plan = super::LaunchPlan::for_swift_bonsai25(
+                &data,
+                8081,
+                &key,
+                bonsai_cpu_policy::Bonsai25Variant::Pq2,
+            )
+            .map_err(|_| LaunchError::Policy)?;
+            let child = config.native_arguments(&plan, Some(&key));
+            let expected_flag = workers != "1";
+            assert_eq!(
+                child.iter().filter(|arg| *arg == "--row-workers").count(),
+                usize::from(expected_flag)
+            );
+            if expected_flag {
                 assert!(
                     child
                         .array_windows()
-                        .any(|[flag, value]| flag == "--abliterate-lora"
-                            && value == adapter.path.as_os_str())
-                );
-                assert_eq!(
-                    child.iter().any(|arg| arg == "--use-repacked-ptq1"),
-                    repacked
+                        .any(|[flag, value]| flag == "--row-workers" && value == workers)
                 );
             }
+            assert!(!child.iter().any(|arg| arg == "--abliterate-lora"));
+            assert!(!child.iter().any(|arg| arg == "--use-repacked-ptq1"));
         }
         Ok(())
     }
@@ -3556,7 +3285,6 @@ mod tests {
             "--profile",
             "swift-pq2-assessment",
             "--native-engine",
-            "--use-abliterate-lora",
         ]))?;
         config.daisyrose_lora = Some(daisy_path.clone());
         let mut plan = swift_plan_for(&data, &key)?;
@@ -3578,7 +3306,7 @@ mod tests {
         assert!(has_flag_pair(
             &pipe_args,
             "--verified-sections",
-            std::ffi::OsStr::new("3")
+            std::ffi::OsStr::new("2")
         ));
         assert!(has_flag_pair(
             &pipe_args,
@@ -3741,7 +3469,7 @@ mod tests {
         let mut unpromoted = promoted.clone();
         unpromoted.default_enabled = false;
         let mut wrong_base = promoted.clone();
-        wrong_base.base_model_sha256 = crate::inference::MODEL_SHA256.into();
+        wrong_base.base_model_sha256 = "0".repeat(64);
 
         let mut base_args = arguments();
         base_args.extend(["--profile", "swift-pq2-assessment"].map(OsString::from));
@@ -4011,13 +3739,11 @@ mod tests {
         );
         let data = std::env::temp_dir().join("Bonsai-prefix-routing");
         let key = data.join("backend.key");
-        let plan = super::LaunchPlan::for_profile_with_options(
+        let plan = super::LaunchPlan::for_swift_bonsai25(
             &data,
             8081,
             &key,
-            LaunchProfile::SwiftPq2Assessment,
-            true,
-            false,
+            bonsai_cpu_policy::Bonsai25Variant::Pq2,
         )
         .map_err(|_| LaunchError::Policy)?;
         for (name, mode) in [
@@ -4105,13 +3831,11 @@ mod tests {
         );
         let data = std::env::temp_dir().join("Bonsai-kv-routing");
         let key = data.join("backend.key");
-        let plan = super::LaunchPlan::for_profile_with_options(
+        let plan = super::LaunchPlan::for_swift_bonsai25(
             &data,
             8081,
             &key,
-            LaunchProfile::SwiftPq2Assessment,
-            true,
-            false,
+            bonsai_cpu_policy::Bonsai25Variant::Pq2,
         )
         .map_err(|_| LaunchError::Policy)?;
         let mut config = LaunchConfig::parse(native)?;
@@ -4184,13 +3908,11 @@ mod tests {
         }
         let data = std::env::temp_dir().join("Bonsai-placement-routing");
         let key = data.join("backend.key");
-        let plan = super::LaunchPlan::for_profile_with_options(
+        let plan = super::LaunchPlan::for_swift_bonsai25(
             &data,
             8081,
             &key,
-            LaunchProfile::SwiftPq2Assessment,
-            true,
-            false,
+            bonsai_cpu_policy::Bonsai25Variant::Pq2,
         )
         .map_err(|_| LaunchError::Policy)?;
         let admitted = config.swift_context_plan(20 * 1024 * 1024 * 1024)?;
@@ -4285,8 +4007,6 @@ mod tests {
         assert!(LaunchConfig::parse(swift.clone()).is_ok_and(|config| {
             config.uses_native_engine()
                 && config.native_row_workers == 4
-                && !config.uses_repacked_ptq1()
-                && !config.use_abliterate_lora
                 && config.weight_representation
                     == super::WeightRepresentation::Bonsai25(
                         bonsai_cpu_policy::Bonsai25Variant::Pq2,
@@ -4335,14 +4055,56 @@ mod tests {
     #[test]
     fn native_readiness_requires_exact_model_template_runtime_context_and_seed()
     -> std::io::Result<()> {
+        use bonsai_cpu_policy::Bonsai25Variant;
         use serde_json::json;
-        let workers = super::WorkerReadiness::for_version("0.1.10", 1);
-        let model = json!({"id":"Swift-Bonsai-2-PQ2_0","object":"model",
-            "model_sha256":crate::inference::MODEL_SHA256,
-            "template_sha256":crate::inference::TEMPLATE_SHA256,
-            "runtime":"prism-inference","context_tokens":8192,"seed":42});
+        let workers = super::WorkerReadiness::for_version("0.1.35", 4);
+        let variant = Bonsai25Variant::Pq2;
+        let model = json!({
+            "id": variant.model_id(),
+            "object": "model",
+            "model_sha256": variant.sha256(),
+            "template_sha256": crate::inference::TEMPLATE_SHA256,
+            "runtime": "prism-inference",
+            "weight_representation": variant.representation_name(),
+            "context_tokens": 8192,
+            "seed": 42,
+            "row_workers": 4,
+            "kv_cache": "rsq4",
+            "startup_graph_identity": format!(
+                "{}:qwen35-text-v1:nonflash-f16:kv-rsq4-d256-rht3-v1:gdn-f32:prism-arm64-fused-v1",
+                variant.sha256()
+            ),
+            "startup_projection": {
+                "schema_version": 1,
+                "requested": "auto",
+                "effective": "cpu",
+                "identity": null,
+                "resident_tensors": 0,
+                "resident_weight_bytes": 0,
+                "host_metadata_bytes": 0
+            }
+        });
+        let repr = super::WeightRepresentation::Bonsai25(variant);
         let body = serde_json::to_string(&json!({"data":[model]}))?;
-        assert!(super::validate_native_identity(&response(&body), false, false, workers).is_ok());
+        assert!(
+            super::identity::validate_native_identity_for_representation(
+                &response(&body),
+                repr,
+                super::WorkerReadiness {
+                    kv_cache: Some(crate::inference::KvCache::Rsq4),
+                    ..workers
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            super::identity::validate_native_identity_for_representation(
+                &response(&body),
+                super::WeightRepresentation::Source,
+                workers
+            )
+            .is_err()
+        );
         for (field, changed) in [
             ("id", json!("foreign")),
             ("object", json!("list")),
@@ -4351,12 +4113,21 @@ mod tests {
             ("runtime", json!("Prism")),
             ("context_tokens", json!(8193)),
             ("seed", json!(43)),
+            ("weight_representation", json!(null)),
         ] {
             let mut changed_model = model.clone();
             changed_model[field] = changed;
             let body = serde_json::to_string(&json!({"data":[changed_model]}))?;
             assert!(
-                super::validate_native_identity(&response(&body), false, false, workers).is_err(),
+                super::identity::validate_native_identity_for_representation(
+                    &response(&body),
+                    repr,
+                    super::WorkerReadiness {
+                        kv_cache: Some(crate::inference::KvCache::Rsq4),
+                        ..workers
+                    }
+                )
+                .is_err(),
                 "{field}"
             );
         }
@@ -4367,90 +4138,82 @@ mod tests {
         ] {
             let body = serde_json::to_string(&json!({"data":data}))?;
             assert!(
-                super::validate_native_identity(&response(&body), false, false, workers).is_err()
-            );
-        }
-        for field in [
-            "weight_representation",
-            "adapter_sha256",
-            "supports_abliteration_scale",
-            "abliteration_scale_range",
-        ] {
-            let mut changed_model = model.clone();
-            changed_model[field] = json!(null);
-            let body = serde_json::to_string(&json!({"data":[changed_model]}))?;
-            assert!(
-                super::validate_native_identity(&response(&body), false, false, workers).is_err(),
-                "{field}"
+                super::identity::validate_native_identity_for_representation(
+                    &response(&body),
+                    repr,
+                    super::WorkerReadiness {
+                        kv_cache: Some(crate::inference::KvCache::Rsq4),
+                        ..workers
+                    }
+                )
+                .is_err()
             );
         }
         let duplicate = body.replace("\"seed\":42", "\"seed\":42,\"seed\":42");
         assert!(
-            super::validate_native_identity(&response(&duplicate), false, false, workers).is_err()
+            super::identity::validate_native_identity_for_representation(
+                &response(&duplicate),
+                repr,
+                super::WorkerReadiness {
+                    kv_cache: Some(crate::inference::KvCache::Rsq4),
+                    ..workers
+                }
+            )
+            .is_err()
         );
         Ok(())
     }
 
     #[test]
-    fn native_readiness_binds_explicit_packing_and_adapter_scale_capability() -> std::io::Result<()>
-    {
-        use super::validate_native_identity;
+    fn native_readiness_rejects_legacy_abliteration_adapter_fields() -> std::io::Result<()> {
+        use bonsai_cpu_policy::Bonsai25Variant;
         use serde_json::json;
-        use std::io;
-        let workers = super::WorkerReadiness::for_version("0.1.10", 1);
-        for (repacked, adapter) in [(true, false), (false, true), (true, true)] {
-            let mut model = json!({
-                "id": if repacked { "Swift-Bonsai-2-current-repacked-PTQ1_0" } else { "Swift-Bonsai-2-PQ2_0" },
-                "object":"model",
-                "model_sha256": if repacked { crate::inference::REPACKED_PTQ1_SHA256 } else { crate::inference::MODEL_SHA256 },
-                "template_sha256":crate::inference::TEMPLATE_SHA256,
-                "runtime":"prism-inference", "context_tokens":8192, "seed":42,
-                "weight_representation": if repacked { "current-repacked-PTQ1_0" } else { "PQ2_0" },
-                "adapter_sha256": adapter.then_some(crate::inference::ADAPTER_SHA256),
-                "supports_abliteration_scale":adapter,
+        let variant = Bonsai25Variant::Pq2;
+        let workers = super::WorkerReadiness {
+            kv_cache: Some(crate::inference::KvCache::Rsq4),
+            ..super::WorkerReadiness::for_version("0.1.35", 4)
+        };
+        for field in [
+            "adapter_sha256",
+            "supports_abliteration_scale",
+            "abliteration_scale_range",
+        ] {
+            let model = json!({
+                "id": variant.model_id(),
+                "object": "model",
+                "model_sha256": variant.sha256(),
+                "template_sha256": crate::inference::TEMPLATE_SHA256,
+                "runtime": "prism-inference",
+                "weight_representation": variant.representation_name(),
+                "context_tokens": 8192,
+                "seed": 42,
+                "row_workers": 4,
+                "kv_cache": "rsq4",
+                "startup_graph_identity": format!(
+                    "{}:qwen35-text-v1:nonflash-f16:kv-rsq4-d256-rht3-v1:gdn-f32:prism-arm64-fused-v1",
+                    variant.sha256()
+                ),
+                "startup_projection": {
+                    "schema_version": 1,
+                    "requested": "auto",
+                    "effective": "cpu",
+                    "identity": null,
+                    "resident_tensors": 0,
+                    "resident_weight_bytes": 0,
+                    "host_metadata_bytes": 0
+                },
+                field: null
             });
-            if adapter {
-                model["abliteration_scale_range"] = json!([0, 2]);
-            }
             let body = serde_json::to_string(&json!({"data":[model]}))?;
-            assert!(validate_native_identity(&response(&body), repacked, adapter, workers).is_ok());
             assert!(
-                validate_native_identity(&response(&body), !repacked, adapter, workers).is_err()
+                super::identity::validate_native_identity_for_representation(
+                    &response(&body),
+                    super::WeightRepresentation::Bonsai25(variant),
+                    workers
+                )
+                .is_err(),
+                "{field}"
             );
-            assert!(
-                validate_native_identity(&response(&body), repacked, !adapter, workers).is_err()
-            );
-            for (field, value) in [
-                ("weight_representation", json!("other")),
-                ("adapter_sha256", json!("0".repeat(64))),
-                ("supports_abliteration_scale", json!(!adapter)),
-                ("abliteration_scale_range", json!([0, 3])),
-                ("abliteration_scale_range", json!(null)),
-            ] {
-                let mut changed = model.clone();
-                changed[field] = value;
-                let body = serde_json::to_string(&json!({"data":[changed]}))?;
-                assert!(
-                    validate_native_identity(&response(&body), repacked, adapter, workers).is_err(),
-                    "{field}"
-                );
-            }
-            for field in [
-                "weight_representation",
-                "adapter_sha256",
-                "supports_abliteration_scale",
-            ] {
-                let mut changed = model.clone();
-                changed
-                    .as_object_mut()
-                    .ok_or_else(|| io::Error::other("fixture"))?
-                    .remove(field);
-                let body = serde_json::to_string(&json!({"data":[changed]}))?;
-                assert!(
-                    validate_native_identity(&response(&body), repacked, adapter, workers).is_err(),
-                    "{field}"
-                );
-            }
         }
         Ok(())
     }
@@ -4740,13 +4503,11 @@ mod tests {
                         .map_err(|_| LaunchError::Memory)?;
                 assert_eq!(vision_context.context_tokens, base_context.context_tokens);
 
-                let mut plan = super::LaunchPlan::for_profile_with_options(
+                let mut plan = super::LaunchPlan::for_swift_bonsai25(
                     &data,
                     8081,
                     &key,
-                    LaunchProfile::SwiftPq2Assessment,
-                    true,
-                    false,
+                    bonsai_cpu_policy::Bonsai25Variant::Pq2,
                 )
                 .map_err(|_| LaunchError::Policy)?;
                 plan.select_swift_context(vision_context)
@@ -5029,13 +4790,11 @@ mod tests {
             );
             let data = std::env::temp_dir().join("Bonsai-prefill-args");
             let key = data.join("backend.key");
-            let mut launch_plan = super::LaunchPlan::for_profile_with_options(
+            let mut launch_plan = super::LaunchPlan::for_swift_bonsai25(
                 &data,
                 8081,
                 &key,
-                LaunchProfile::SwiftPq2Assessment,
-                true,
-                false,
+                bonsai_cpu_policy::Bonsai25Variant::Pq2,
             )
             .map_err(|_| LaunchError::Policy)?;
             launch_plan
@@ -5122,22 +4881,14 @@ mod tests {
         let mmproj =
             bonsai_cpu_policy::swift_mmproj_artifact(&data).map_err(|_| LaunchError::Policy)?;
 
-        for (with_adapter, with_mmproj, expected_count) in [
-            (false, false, "1"),
-            (true, false, "2"),
-            (false, true, "2"),
-            (true, true, "3"),
-        ] {
-            let mut plan = super::LaunchPlan::for_profile_with_options(
+        for (with_mmproj, expected_count) in [(false, "1"), (true, "2")] {
+            let mut plan = super::LaunchPlan::for_swift_bonsai25(
                 &data,
                 8081,
                 &key,
-                LaunchProfile::SwiftPq2Assessment,
-                with_adapter,
-                false,
+                bonsai_cpu_policy::Bonsai25Variant::Pq2,
             )
             .map_err(|_| LaunchError::Policy)?;
-            assert_eq!(plan.adapter.is_some(), with_adapter);
             if with_mmproj {
                 plan.enable_swift_mmproj(mmproj.clone())
                     .map_err(|_| LaunchError::Policy)?;
@@ -5198,13 +4949,11 @@ mod tests {
         let key = data.join("backend.key");
         let mmproj =
             bonsai_cpu_policy::swift_mmproj_artifact(&data).map_err(|_| LaunchError::Policy)?;
-        let mut plan = super::LaunchPlan::for_profile_with_options(
+        let mut plan = super::LaunchPlan::for_swift_bonsai25(
             &data,
             8081,
             &key,
-            LaunchProfile::SwiftPq2Assessment,
-            true,
-            false,
+            bonsai_cpu_policy::Bonsai25Variant::Pq2,
         )
         .map_err(|_| LaunchError::Policy)?;
         plan.select_calibrated_swift_context(&calibrated)
@@ -5268,13 +5017,11 @@ mod tests {
 
         let gib = 1024 * 1024 * 1024_u64;
         let calibrated_branch = branch.calibrated_context_plan(48 * gib, true)?;
-        let mut branch_plan = super::LaunchPlan::for_profile_with_options(
+        let mut branch_plan = super::LaunchPlan::for_swift_bonsai25(
             &branch.data,
             8081,
             &branch.evidence_parent.join("backend.key"),
-            LaunchProfile::SwiftPq2Assessment,
-            true,
-            false,
+            bonsai_cpu_policy::Bonsai25Variant::Pq2,
         )
         .map_err(|_| LaunchError::Policy)?;
         branch_plan
@@ -5324,13 +5071,11 @@ mod tests {
             "suffix speculation must automatically suppress optional mmproj"
         );
         let calibrated_spec = spec.calibrated_context_plan(24 * gib, false)?;
-        let mut spec_plan = super::LaunchPlan::for_profile_with_options(
+        let mut spec_plan = super::LaunchPlan::for_swift_bonsai25(
             &spec.data,
             8081,
             &spec.evidence_parent.join("backend.key"),
-            LaunchProfile::SwiftPq2Assessment,
-            true,
-            false,
+            bonsai_cpu_policy::Bonsai25Variant::Pq2,
         )
         .map_err(|_| LaunchError::Policy)?;
         spec_plan
@@ -5674,30 +5419,21 @@ mod tests {
             );
         }
 
-        // Promoted v0.1.35 release pin admits `--bonsai-2-5` while allowing Orca, placements, and DaisyRose parsing.
-        for (extra, expected_variant, expected_abliterate, expected_placement) in [
+        // Promoted v0.1.35 release pin admits `--bonsai-2-5` with placements and DaisyRose parsing.
+        for (extra, expected_variant, expected_placement) in [
             (
                 vec!["--bonsai-2-5", "pq2"],
                 bonsai_cpu_policy::Bonsai25Variant::Pq2,
-                false,
                 crate::inference::Placement::Auto,
             ),
             (
-                vec!["--bonsai-2-5", "ptq1", "--use-abliterate-lora"],
+                vec!["--bonsai-2-5", "ptq1"],
                 bonsai_cpu_policy::Bonsai25Variant::Ptq1,
-                true,
                 crate::inference::Placement::Auto,
             ),
             (
-                vec![
-                    "--bonsai-2-5",
-                    "ptq1",
-                    "--placement",
-                    "composite",
-                    "--use-abliterate-lora",
-                ],
+                vec!["--bonsai-2-5", "ptq1", "--placement", "composite"],
                 bonsai_cpu_policy::Bonsai25Variant::Ptq1,
-                true,
                 crate::inference::Placement::Composite,
             ),
         ] {
@@ -5709,7 +5445,6 @@ mod tests {
                 parsed.weight_representation,
                 super::WeightRepresentation::Bonsai25(expected_variant)
             );
-            assert_eq!(parsed.use_abliterate_lora, expected_abliterate);
             assert_eq!(parsed.placement, expected_placement);
         }
 
@@ -5734,7 +5469,7 @@ mod tests {
                 path: temp.path().join("pq2-promoted.gguf"),
                 bytes: 1024,
                 sha256: "a".repeat(64),
-                base_model_sha256: crate::inference::MODEL_SHA256.into(),
+                base_model_sha256: "5912bb739217cf25b4283a098c7b893d9baff36bdf2e72d3dbf4cb999d5633d5".into(),
                 envelope: "npu-friendly".into(),
                 dtype: "f16".into(),
                 max_rank: 16,
@@ -5774,7 +5509,6 @@ mod tests {
                 "--bonsai-2-5",
                 std::ffi::OsStr::new(variant.as_str())
             ));
-            assert!(!args.iter().any(|arg| arg == "--use-repacked-ptq1"));
         }
         Ok(())
     }
@@ -5788,7 +5522,6 @@ mod tests {
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
         cfg.data = temp.path().to_path_buf();
         cfg.evidence_parent = temp.path().to_path_buf();
-        cfg.use_abliterate_lora = false;
         cfg.kv_cache = Some(crate::inference::KvCache::Rsq4);
         cfg.weight_representation =
             super::WeightRepresentation::NariQ(bonsai_cpu_policy::NariqVariant::Bpw2_5);
@@ -5954,7 +5687,6 @@ mod tests {
         let mut plan = cfg
             .build_launch_plan(cfg.backend_port, creds.backend_path())
             .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
-        assert!(plan.adapter.is_none());
         assert!(plan.mmproj.is_none());
         plan.select_calibrated_swift_context(&stacked)
             .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
@@ -6107,7 +5839,6 @@ mod tests {
             let readonly = cfg.sandbox_readonly_paths(
                 &exe,
                 &artifacts,
-                None,
                 Some(&verified.guard),
                 None,
                 &creds,

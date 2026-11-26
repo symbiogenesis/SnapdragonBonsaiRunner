@@ -156,19 +156,10 @@ never include `<script>` elements, event-handler attributes, or external URLs or
 If the user explicitly asks to inspect raw SVG markup or source code, use a ```xml block instead. \
 For all ordinary requests, respond normally without emitting an ```svg block.";
 
-pub(crate) const DEFAULT_ABLITERATION_SCALE: f32 = 1.3;
 pub(crate) const DEFAULT_DAISYROSE_SCALE: f32 = 0.0;
-
-pub(crate) const fn default_abliteration_scale() -> f32 {
-    DEFAULT_ABLITERATION_SCALE
-}
 
 pub(crate) fn valid_adapter_scale(scale: f32) -> bool {
     scale.is_finite() && (0.0..=2.0).contains(&scale)
-}
-
-pub(crate) fn valid_abliteration_scale(scale: f32) -> bool {
-    valid_adapter_scale(scale)
 }
 
 pub(crate) const fn default_daisyrose_scale() -> f32 {
@@ -414,11 +405,9 @@ pub(crate) struct Config {
     pub(crate) frontend_port: u16,
     pub(crate) backend_port: u16,
     pub(crate) require_broker_pipe: bool,
-    pub(crate) use_abliterate_lora: bool,
     pub(crate) daisyrose_lora: Option<PathBuf>,
     pub(crate) no_daisyrose_lora: bool,
     pub(crate) no_mmproj: bool,
-    pub(crate) use_repacked_ptq1: bool,
     pub(crate) bonsai25_variant: Option<Bonsai25Variant>,
     pub(crate) native_engine: bool,
     pub(crate) native_row_workers: u8,
@@ -572,7 +561,6 @@ pub(crate) enum Command {
         max_completion_tokens: u32,
         extra_effort: bool,
         enable_thinking: bool,
-        abliteration_scale: f32,
         daisyrose_scale: f32,
         cognitive: CognitiveOptions,
         system_appendix: Option<Arc<str>>,
@@ -831,8 +819,6 @@ struct ChatRequest<'a> {
     stream: bool,
     enable_thinking: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    abliteration_scale: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     daisyrose_scale: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
@@ -870,7 +856,6 @@ struct ChatRequest<'a> {
 struct ResponseOptions {
     max_completion_tokens: u32,
     enable_thinking: bool,
-    abliteration_scale: Option<f32>,
     daisyrose_scale: Option<f32>,
     cognitive: CognitiveOptions,
     cognitive_controls: bool,
@@ -1054,9 +1039,6 @@ fn wait_for_retry(
 
 fn runtime_arguments(config: &Config) -> Vec<String> {
     let mut arguments = Vec::with_capacity(16);
-    if config.use_abliterate_lora {
-        arguments.push("--use-abliterate-lora".into());
-    }
     if config.no_daisyrose_lora {
         arguments.push("--no-daisyrose-lora".into());
     }
@@ -1068,15 +1050,6 @@ fn runtime_arguments(config: &Config) -> Vec<String> {
     }
     if let Some(variant) = config.bonsai25_variant {
         arguments.extend(["--bonsai-2-5".into(), variant.name().into()]);
-    } else {
-        arguments.push(
-            if config.use_repacked_ptq1 {
-                "--use-repacked-ptq1"
-            } else {
-                "--use-original-pq2"
-            }
-            .into(),
-        );
     }
     arguments.push(
         if config.native_engine {
@@ -1121,6 +1094,7 @@ fn runtime_arguments(config: &Config) -> Vec<String> {
                 8 => "8",
                 16 => "16",
                 32 => "32",
+                64 => "64",
                 _ => "8",
             }
             .into(),
@@ -1256,7 +1230,6 @@ fn serve_broker(
                 max_completion_tokens,
                 extra_effort,
                 enable_thinking,
-                abliteration_scale,
                 daisyrose_scale,
                 cognitive,
                 system_appendix,
@@ -1277,12 +1250,10 @@ fn serve_broker(
                     reasoning_content: None,
                     images,
                 });
-                let scale = config.use_abliterate_lora.then_some(abliteration_scale);
                 let daisyrose_scale = daisyrose_available.then_some(daisyrose_scale);
                 let options = ResponseOptions {
                     max_completion_tokens,
                     enable_thinking,
-                    abliteration_scale: scale,
                     daisyrose_scale,
                     cognitive,
                     cognitive_controls,
@@ -1800,14 +1771,13 @@ fn serialize_request(
     history: &[Message],
     max_completion_tokens: u32,
     enable_thinking: bool,
-    abliteration_scale: Option<f32>,
+    daisyrose_scale: Option<f32>,
 ) -> Result<Vec<u8>> {
     serialize_request_with_adapters(
         history,
         max_completion_tokens,
         enable_thinking,
-        abliteration_scale,
-        None,
+        daisyrose_scale,
     )
 }
 
@@ -1816,13 +1786,11 @@ fn serialize_request_with_adapters(
     history: &[Message],
     max_completion_tokens: u32,
     enable_thinking: bool,
-    abliteration_scale: Option<f32>,
     daisyrose_scale: Option<f32>,
 ) -> Result<Vec<u8>> {
     let options = ResponseOptions {
         max_completion_tokens,
         enable_thinking,
-        abliteration_scale,
         daisyrose_scale,
         ..ResponseOptions::default()
     };
@@ -1911,14 +1879,6 @@ fn serialize_request_with_options(
     options: &ResponseOptions,
 ) -> Result<Vec<u8>> {
     if options
-        .abliteration_scale
-        .is_some_and(|scale| !valid_adapter_scale(scale))
-    {
-        return Err(Failure::Rejected(
-            "Choose an abliteration scale between 0 and 2.",
-        ));
-    }
-    if options
         .daisyrose_scale
         .is_some_and(|scale| !valid_adapter_scale(scale))
     {
@@ -1961,7 +1921,6 @@ fn serialize_request_with_options(
             max_completion_tokens: options.max_completion_tokens,
             stream: true,
             enable_thinking: options.enable_thinking,
-            abliteration_scale: options.abliteration_scale,
             daisyrose_scale: options.daisyrose_scale,
             reasoning_effort: cognitive.reasoning_effort,
             reasoning_budget: cognitive.reasoning_budget,
@@ -2426,11 +2385,9 @@ mod tests {
             frontend_port: 5173,
             backend_port: 8081,
             require_broker_pipe: false,
-            use_abliterate_lora: true,
             daisyrose_lora: None,
             no_daisyrose_lora: false,
             no_mmproj: false,
-            use_repacked_ptq1: false,
             bonsai25_variant: None,
             native_engine: false,
             native_row_workers: 1,
@@ -2454,21 +2411,13 @@ mod tests {
         let mut config = publisher_runtime_config();
         assert_eq!(
             runtime_arguments(&config),
-            [
-                "--use-abliterate-lora",
-                "--use-original-pq2",
-                "--publisher-engine",
-                "--native-row-workers",
-                "1"
-            ]
+            ["--publisher-engine", "--native-row-workers", "1"]
         );
         config.native_engine = true;
         config.native_row_workers = 4;
         assert_eq!(
             runtime_arguments(&config),
             [
-                "--use-abliterate-lora",
-                "--use-original-pq2",
                 "--native-engine",
                 "--reset-on-cancel",
                 "--native-row-workers",
@@ -2480,8 +2429,6 @@ mod tests {
             assert_eq!(
                 runtime_arguments(&config),
                 [
-                    "--use-abliterate-lora",
-                    "--use-original-pq2",
                     "--native-engine",
                     "--reset-on-cancel",
                     "--native-row-workers",
@@ -2489,35 +2436,23 @@ mod tests {
                 ]
             );
         }
-        config.native_row_workers = 4;
-        config.use_abliterate_lora = false;
-        config.use_repacked_ptq1 = true;
+        config.bonsai25_variant = Some(super::Bonsai25Variant::Ptq1);
         assert_eq!(
             runtime_arguments(&config),
             [
-                "--use-repacked-ptq1",
+                "--bonsai-2-5",
+                "ptq1",
                 "--native-engine",
                 "--reset-on-cancel",
                 "--native-row-workers",
-                "4"
+                "12"
             ]
         );
         config.native_row_workers = 1;
+        config.bonsai25_variant = None;
         assert_eq!(
             runtime_arguments(&config),
             [
-                "--use-repacked-ptq1",
-                "--native-engine",
-                "--reset-on-cancel",
-                "--native-row-workers",
-                "1"
-            ]
-        );
-        config.use_repacked_ptq1 = false;
-        assert_eq!(
-            runtime_arguments(&config),
-            [
-                "--use-original-pq2",
                 "--native-engine",
                 "--reset-on-cancel",
                 "--native-row-workers",
@@ -2618,11 +2553,9 @@ mod tests {
             frontend_port: 5174,
             backend_port: 8082,
             require_broker_pipe: true,
-            use_abliterate_lora: true,
             daisyrose_lora: None,
             no_daisyrose_lora: false,
             no_mmproj: false,
-            use_repacked_ptq1: false,
             bonsai25_variant: None,
             native_engine: true,
             native_row_workers: 4,
@@ -2787,52 +2720,34 @@ mod tests {
     }
 
     #[test]
-    fn abliteration_requests_preserve_scale_bounds_and_omit_disabled_adapter() -> Result<(), Failure>
-    {
+    fn daisyrose_requests_preserve_scale_bounds_and_omit_disabled_adapter() -> Result<(), Failure> {
         let history = [Message {
             role: "user",
             content: "Write a garden scene.".into(),
             reasoning_content: None,
             images: super::Arc::default(),
         }];
-        for scale in [0.0, super::DEFAULT_ABLITERATION_SCALE, 2.0] {
-            let body = serialize_request(&history, 4096, false, Some(scale))?;
+        for scale in [0.0, 0.5, 2.0] {
+            let body = super::serialize_request_with_adapters(&history, 4096, false, Some(scale))?;
             let request: serde_json::Value = serde_json::from_slice(&body)
                 .map_err(|_| Failure::Message("invalid scale request JSON"))?;
-            assert!(request["abliteration_scale"].as_f64().is_some_and(|value| {
+            assert!(request["daisyrose_scale"].as_f64().is_some_and(|value| {
                 (value - f64::from(scale)).abs() < f64::from(f32::EPSILON)
             }));
+            assert!(request.get("abliteration_scale").is_none());
             assert!(request.get("lora").is_none());
         }
-        let body = serialize_request(&history, 4096, false, None)?;
+        let body = super::serialize_request_with_adapters(&history, 4096, false, None)?;
         let request: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|_| Failure::Message("invalid disabled request JSON"))?;
+        assert!(request.get("daisyrose_scale").is_none());
         assert!(request.get("abliteration_scale").is_none());
         for scale in [-0.1, 2.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(matches!(
-                serialize_request(&history, 4096, false, Some(scale)),
-                Err(Failure::Rejected(_))
-            ));
-            assert!(matches!(
-                super::serialize_request_with_adapters(
-                    &history,
-                    4096,
-                    false,
-                    Some(1.3),
-                    Some(scale)
-                ),
+                super::serialize_request_with_adapters(&history, 4096, false, Some(scale)),
                 Err(Failure::Rejected(_))
             ));
         }
-        let stacked =
-            super::serialize_request_with_adapters(&history, 4096, false, Some(1.3), Some(0.5))?;
-        let stacked_json: serde_json::Value = serde_json::from_slice(&stacked)
-            .map_err(|_| Failure::Message("invalid stacked request JSON"))?;
-        assert!(
-            stacked_json["daisyrose_scale"]
-                .as_f64()
-                .is_some_and(|v| (v - 0.5).abs() < 1e-6)
-        );
         let mut with_daisy = publisher_runtime_config();
         with_daisy.daisyrose_lora = Some(r"C:\adapters\daisyrose.gguf".into());
         assert!(
@@ -3714,7 +3629,6 @@ mod tests {
                     max_completion_tokens: 4096,
                     extra_effort: false,
                     enable_thinking: false,
-                    abliteration_scale: super::DEFAULT_ABLITERATION_SCALE,
                     daisyrose_scale: super::DEFAULT_DAISYROSE_SCALE,
                     cognitive: super::CognitiveOptions::default(),
                     system_appendix: None,

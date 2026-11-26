@@ -253,7 +253,6 @@ pub struct RequestPolicy {
     authority: String,
     origin: String,
     authorization: [u8; 71], // "Bearer " + 64 lowercase hex characters
-    pinned_abliteration: bool,
     daisyrose_lora: bool,
     daisyrose_default_scale_tenths: u8,
     context_tokens: usize,
@@ -309,7 +308,6 @@ impl RequestPolicy {
             origin: format!("http://{authority}"),
             authority,
             authorization,
-            pinned_abliteration: false,
             daisyrose_lora: false,
             daisyrose_default_scale_tenths: 0,
             context_tokens: CONTEXT_TOKENS,
@@ -477,7 +475,6 @@ impl RequestPolicy {
         }
         Ok(AuthorizedHead {
             length,
-            pinned_abliteration: self.pinned_abliteration,
             daisyrose_lora: self.daisyrose_lora,
             daisyrose_default_scale_tenths: self.daisyrose_default_scale_tenths,
             context_tokens: self.context_tokens,
@@ -571,7 +568,6 @@ fn singleton<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a [u8]>,
 /// Constructed only by successful head validation; does not retain the key.
 pub struct AuthorizedHead {
     length: usize,
-    pinned_abliteration: bool,
     daisyrose_lora: bool,
     daisyrose_default_scale_tenths: u8,
     context_tokens: usize,
@@ -604,7 +600,7 @@ impl AuthorizedHead {
     /// compatibility entry point starts with fresh scratch; the qualification
     /// harness also measures repeated requests with reusable parser scratch.
     /// Schema, history, settings and canonical serialization use the production
-    /// policy. Requests with a decoded `abliteration_scale` field, and candidate
+    /// policy. Requests with a decoded `daisyrose_scale` field, and candidate
     /// parsing failures, use the production parser to retain its exact numeric
     /// and rejection semantics. No service route selects this parser.
     ///
@@ -644,25 +640,14 @@ impl AuthorizedHead {
         if !(1..=MAX_COMPLETION_TOKENS).contains(&chat.max_completion_tokens) {
             return Err(Rejection::CompletionLimit);
         }
-        if chat.abliteration_scale.is_some() && !self.pinned_abliteration {
-            return Err(Rejection::ChatSchema);
-        }
         if chat.daisyrose_scale.is_some() && !self.daisyrose_lora {
             return Err(Rejection::ChatSchema);
         }
         let default_daisyrose = f64::from(self.daisyrose_default_scale_tenths) / 10.0;
-        let mut loras = Vec::with_capacity(
-            usize::from(self.pinned_abliteration) + usize::from(self.daisyrose_lora),
-        );
-        if self.pinned_abliteration {
-            loras.push(PinnedLora {
-                id: 0,
-                scale: chat.abliteration_scale.unwrap_or(1.3),
-            });
-        }
+        let mut loras = Vec::with_capacity(usize::from(self.daisyrose_lora));
         if self.daisyrose_lora {
             loras.push(PinnedLora {
-                id: u8::from(self.pinned_abliteration),
+                id: 0,
                 scale: chat.daisyrose_scale.unwrap_or(default_daisyrose),
             });
         }
@@ -838,9 +823,7 @@ struct ClientChat<'a> {
     stream: bool,
     #[serde(default)]
     enable_thinking: bool,
-    #[serde(default, deserialize_with = "deserialize_abliteration_scale")]
-    abliteration_scale: Option<f64>,
-    #[serde(default, deserialize_with = "deserialize_abliteration_scale")]
+    #[serde(default, deserialize_with = "deserialize_lora_scale")]
     daisyrose_scale: Option<f64>,
     #[serde(default, borrow, deserialize_with = "deserialize_present_text")]
     reasoning_effort: Option<Cow<'a, str>>,
@@ -874,14 +857,14 @@ struct ClientChat<'a> {
     top_logprobs: Option<u8>,
 }
 
-fn deserialize_abliteration_scale<'de, D: Deserializer<'de>>(
+fn deserialize_lora_scale<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<f64>, D::Error> {
     // Deserialize the number directly so an explicit null cannot mean omission.
     // Validate before any narrower representation can round an excess to 2.0.
     let scale = f64::deserialize(deserializer)?;
     if !scale.is_finite() || !(0.0..=2.0).contains(&scale) {
-        return Err(de::Error::custom("unsupported abliteration scale"));
+        return Err(de::Error::custom("unsupported daisyrose scale"));
     }
     Ok(Some(scale))
 }
@@ -1471,10 +1454,9 @@ pub(crate) mod test_util {
 
 #[cfg(all(test, feature = "json-candidate"))]
 impl AuthorizedHead {
-    pub(crate) const fn test_head(length: usize, pinned_abliteration: bool) -> Self {
+    pub(crate) const fn test_head(length: usize) -> Self {
         Self {
             length,
-            pinned_abliteration,
             daisyrose_lora: false,
             daisyrose_default_scale_tenths: 0,
             context_tokens: CONTEXT_TOKENS,

@@ -135,11 +135,8 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             "--tts-key-file" => ("TtsKeyFile", false, false),
             "--native-engine" | "--publisher-engine" => ("NativeEngine", true, false),
             "--require-broker-pipe" => ("RequireBrokerPipe", true, false),
-            "--use-repacked-ptq1" | "--use-original-pq2" => ("UseRepackedPtq1", true, false),
             "--nariq" => ("NariqVariant", false, false),
             "--bonsai-2-5" => ("Bonsai25Variant", false, false),
-            "--use-abliterate-lora" => ("UseAbliterateLora", true, false),
-            "--no-abliterate-lora" => ("NoAbliterateLora", true, false),
             "--daisyrose-lora" => ("DaisyRoseLora", false, false),
             "--no-daisyrose-lora" => ("NoDaisyRoseLora", true, false),
             "--no-mmproj" => ("NoMmproj", true, false),
@@ -150,10 +147,7 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             _ => return Err(format!("Unknown chat option: {option}")),
         };
         let value = if boolean {
-            Value::Bool(!matches!(
-                option,
-                "--use-original-pq2" | "--publisher-engine"
-            ))
+            Value::Bool(option != "--publisher-engine")
         } else {
             let text = values
                 .next()
@@ -172,19 +166,9 @@ fn chat_options(arguments: &[OsString]) -> crate::Result<Map<String, Value>> {
             return Err(format!("Repeated or conflicting chat option: {option}"));
         }
     }
-    let weight_options = usize::from(request.contains_key("NariqVariant"))
-        + usize::from(request.contains_key("Bonsai25Variant"))
-        + usize::from(request.contains_key("UseRepackedPtq1"));
-    if weight_options > 1 {
+    if request.contains_key("NariqVariant") && request.contains_key("Bonsai25Variant") {
         return Err(
-            "Weight selection flags (`--nariq`, `--bonsai-2-5`, `--use-repacked-ptq1`, `--use-original-pq2`) are mutually exclusive."
-                .into(),
-        );
-    }
-    if request.contains_key("UseAbliterateLora") && request.contains_key("NoAbliterateLora") {
-        return Err(
-            "Orca flags (`--use-abliterate-lora`, `--no-abliterate-lora`) are mutually exclusive."
-                .into(),
+            "Weight selection flags (`--nariq`, `--bonsai-2-5`) are mutually exclusive.".into(),
         );
     }
     Ok(request)
@@ -245,11 +229,8 @@ pub fn installed_chat(arguments: &[OsString]) -> crate::Result<Value> {
             "DataDirectory"
                 | "NoSpeechModels"
                 | "NoTts"
-                | "UseAbliterateLora"
-                | "NoAbliterateLora"
                 | "NoDaisyRoseLora"
                 | "NoMmproj"
-                | "UseRepackedPtq1"
                 | "NariqVariant"
                 | "Bonsai25Variant"
                 | "NativeEngine"
@@ -436,20 +417,14 @@ mod tests {
     }
 
     #[test]
-    fn weight_options_preserve_explicit_false_and_reject_conflicting_selections()
-    -> crate::Result<()> {
-        assert_eq!(
-            chat_options(&["--use-original-pq2".into()])?["UseRepackedPtq1"],
-            false
-        );
-        assert_eq!(
-            chat_options(&["--use-repacked-ptq1".into()])?["UseRepackedPtq1"],
-            true
-        );
-        for first in ["--use-original-pq2", "--use-repacked-ptq1"] {
-            for second in ["--use-original-pq2", "--use-repacked-ptq1"] {
-                assert!(chat_options(&[first.into(), second.into()]).is_err());
-            }
+    fn legacy_swift_and_orca_cli_flags_are_rejected() -> crate::Result<()> {
+        for flag in [
+            "--use-original-pq2",
+            "--use-repacked-ptq1",
+            "--use-abliterate-lora",
+            "--no-abliterate-lora",
+        ] {
+            assert!(chat_options(&[flag.into()]).is_err());
         }
         Ok(())
     }
@@ -552,12 +527,7 @@ mod tests {
             );
         }
         for conflict in [
-            vec!["--nariq", "2.5bpw", "--use-repacked-ptq1"],
-            vec!["--nariq", "2.5bpw", "--use-original-pq2"],
-            vec!["--use-repacked-ptq1", "--nariq", "2.5bpw"],
             vec!["--nariq", "2.5bpw", "--nariq", "3.0bpw"],
-            vec!["--bonsai-2-5", "pq2", "--use-repacked-ptq1"],
-            vec!["--bonsai-2-5", "ptq1", "--use-original-pq2"],
             vec!["--bonsai-2-5", "pq2", "--nariq", "2.5bpw"],
             vec!["--bonsai-2-5", "pq2", "--bonsai-2-5", "ptq1"],
         ] {
@@ -571,24 +541,6 @@ mod tests {
                 variant
             );
         }
-        assert_eq!(
-            chat_options(&["--use-abliterate-lora".into()])?["UseAbliterateLora"],
-            true
-        );
-        assert!(
-            chat_options(&[
-                "--use-abliterate-lora".into(),
-                "--use-abliterate-lora".into()
-            ])
-            .is_err()
-        );
-        assert!(
-            chat_options(&[
-                "--use-abliterate-lora".into(),
-                "--no-abliterate-lora".into()
-            ])
-            .is_err()
-        );
         Ok(())
     }
 

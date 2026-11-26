@@ -111,7 +111,6 @@ fn thinking_popup_changes_are_saved_only_for_the_selected_conversation() {
     let mut chat = harness([620.0, 640.0], false);
     let original = chat.state().app.active_conversation;
     let output_budget = chat.state().app.output_budget;
-    let adapter = chat.state().app.abliteration_scale;
     chat.state_mut().app.recovery_dirty = false;
     open_thinking(&mut chat);
     assert!(!chat.state().app.recovery_dirty);
@@ -124,7 +123,6 @@ fn thinking_popup_changes_are_saved_only_for_the_selected_conversation() {
     assert!(chat.state().app.enable_thinking && chat.state().app.extra_effort);
     assert!(chat.state().app.recovery_dirty);
     assert_eq!(chat.state().app.output_budget, output_budget);
-    assert!((chat.state().app.abliteration_scale - adapter).abs() < f32::EPSILON);
     chat.key_press(egui::Key::Escape);
     chat.run();
     chat.state_mut().app.new_chat();
@@ -464,11 +462,11 @@ fn settings_response_controls_stay_locked_while_a_response_is_generating() {
             .accesskit_node()
             .is_disabled()
     );
-    chat.get_by_role_and_label(egui::Role::Slider, "Abliteration scale")
+    chat.get_by_role_and_label(egui::Role::Slider, "DaisyRose scale")
         .scroll_to_me();
     chat.run();
     assert!(
-        chat.get_by_role_and_label(egui::Role::Slider, "Abliteration scale")
+        chat.get_by_role_and_label(egui::Role::Slider, "DaisyRose scale")
             .accesskit_node()
             .is_disabled()
     );

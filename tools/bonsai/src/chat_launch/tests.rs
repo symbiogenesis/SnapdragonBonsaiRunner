@@ -536,8 +536,8 @@ fn development_default_and_explicit_rollback_survive_deferred_preparation() -> c
             assert_eq!(serialized["NativeEngine"], selected_native);
             assert_eq!(serialized["NativeRowWorkers"], selected_workers);
             assert!(serialized.get("UseRepackedPtq1").is_none());
-            assert_eq!(serialized["UseAbliterateLora"], false);
-            assert_eq!(serialized["NoAbliterateLora"], false);
+            assert!(serialized.get("UseAbliterateLora").is_none());
+            assert!(serialized.get("NoAbliterateLora").is_none());
             let prepared = prepare_backend(plan(serialized)?, &mut recorder, &fixture.working)?;
             let arguments = prepared["Arguments"]
                 .as_array()
@@ -586,7 +586,7 @@ fn development_default_and_explicit_rollback_survive_deferred_preparation() -> c
                 assert!(!arguments.iter().any(|arg| arg == "--use-original-pq2"));
                 assert!(!arguments.iter().any(|arg| arg == "--use-abliterate-lora"));
             } else {
-                assert!(arguments.iter().any(|arg| arg == "--use-original-pq2"));
+                assert!(!arguments.iter().any(|arg| arg == "--use-original-pq2"));
                 assert!(!arguments.iter().any(|arg| arg == "--bonsai-2-5"));
                 assert!(!arguments.iter().any(|arg| arg == "--cpu-prefill-tokens"));
                 assert!(!arguments.iter().any(|arg| arg == "--cpu-prefill-gdn"));
@@ -775,45 +775,35 @@ fn source_built_broker_provenance_is_reserved_for_owned_preparation() -> crate::
 
 #[test]
 fn weight_selection_survives_deferred_json_and_emits_one_explicit_app_flag() -> crate::Result<()> {
-    for native in [false, true] {
-        for repacked in [false, true] {
-            let mut fixture = fixture("explicit-weights")?;
-            fixture.request["NativeEngine"] = json!(native);
-            fixture.request["UseRepackedPtq1"] = json!(repacked);
-            fixture.request["NoSpeechModels"] = json!(true);
-            let mut recorder = Recorder::new(fixture.root.clone());
-            launch_pending(
-                plan(fixture.request)?.request,
-                &mut recorder,
-                &fixture.working,
-                &fixture.root.join("maintenance.exe"),
-            )?;
-            let (_, arguments, _) = recorder.launch()?;
-            let request_path = PathBuf::from(value_after(arguments, "--startup-request")?);
-            let serialized: Value =
-                serde_json::from_slice(&fs::read(request_path).map_err(|error| error.to_string())?)
-                    .map_err(|error| error.to_string())?;
-            // A present false value is the original-PQ2 selection, rather than
-            // an omitted option that a later launcher default could reinterpret.
-            assert_eq!(serialized.get("UseRepackedPtq1"), Some(&json!(repacked)));
-            let prepared = prepare_backend(plan(serialized)?, &mut recorder, &fixture.working)?;
-            let args = prepared["Arguments"]
-                .as_array()
-                .ok_or("Missing arguments.")?;
-            assert_eq!(
-                args.iter()
-                    .filter(|arg| arg.as_str() == Some("--use-repacked-ptq1"))
-                    .count(),
-                usize::from(repacked)
-            );
-            assert_eq!(
-                args.iter()
-                    .filter(|arg| arg.as_str() == Some("--use-original-pq2"))
-                    .count(),
-                usize::from(!repacked)
-            );
-            assert!(!args.iter().any(|arg| arg == "--no-abliterate-lora"));
-        }
+    for variant in ["pq2", "ptq1"] {
+        let mut fixture = fixture("explicit-weights")?;
+        fixture.request["NativeEngine"] = json!(true);
+        fixture.request["Bonsai25Variant"] = json!(variant);
+        fixture.request["NoSpeechModels"] = json!(true);
+        let mut recorder = Recorder::new(fixture.root.clone());
+        launch_pending(
+            plan(fixture.request)?.request,
+            &mut recorder,
+            &fixture.working,
+            &fixture.root.join("maintenance.exe"),
+        )?;
+        let (_, arguments, _) = recorder.launch()?;
+        let request_path = PathBuf::from(value_after(arguments, "--startup-request")?);
+        let serialized: Value =
+            serde_json::from_slice(&fs::read(request_path).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        assert_eq!(serialized.get("Bonsai25Variant"), Some(&json!(variant)));
+        let prepared = prepare_backend(plan(serialized)?, &mut recorder, &fixture.working)?;
+        let args = prepared["Arguments"]
+            .as_array()
+            .ok_or("Missing arguments.")?;
+        assert!(
+            args.array_windows::<2>()
+                .any(|pair| pair[0] == "--bonsai-2-5" && pair[1] == variant)
+        );
+        assert!(!args.iter().any(|arg| arg == "--use-repacked-ptq1"));
+        assert!(!args.iter().any(|arg| arg == "--use-original-pq2"));
+        assert!(!args.iter().any(|arg| arg == "--no-abliterate-lora"));
     }
     Ok(())
 }
@@ -1151,8 +1141,7 @@ fn prebuilt_paths_skip_builds_and_all_profile_choices_are_forwarded() -> crate::
     fixture.request["TtsPath"] = json!(fixture.root.join("tts.exe"));
     fixture.request["TtsQuantization"] = json!("q4_k_m");
     fixture.request["TtsThreads"] = json!(10);
-    fixture.request["UseRepackedPtq1"] = json!(true);
-    fixture.request["NoAbliterateLora"] = json!(true);
+    fixture.request["NoDaisyRoseLora"] = json!(true);
     fixture.request["FrontendPort"] = json!(9001);
     fixture.request["BackendPort"] = json!(9002);
     fixture.request["CanaryPort"] = json!(9003);
@@ -1176,12 +1165,7 @@ fn prebuilt_paths_skip_builds_and_all_profile_choices_are_forwarded() -> crate::
     ] {
         assert_eq!(value_after(arguments, option)?, expected);
     }
-    assert!(arguments.iter().any(|value| value == "--use-repacked-ptq1"));
-    assert!(
-        arguments
-            .iter()
-            .any(|value| value == "--no-abliterate-lora")
-    );
+    assert!(arguments.iter().any(|value| value == "--no-daisyrose-lora"));
     Ok(())
 }
 
@@ -1216,7 +1200,6 @@ fn explicit_rust_runtime_survives_early_window_and_backend_preparation() -> crat
     for workers in [4, 8, 12] {
         case.request["NativeEngine"] = json!(true);
         case.request["NativeRowWorkers"] = json!(workers);
-        case.request["NoAbliterateLora"] = json!(true);
         case.request["NoSpeechModels"] = json!(true);
         let worker_text = workers.to_string();
         let mut recorder = Recorder::new(case.root.clone());
@@ -1232,7 +1215,7 @@ fn explicit_rust_runtime_survives_early_window_and_backend_preparation() -> crat
             serde_json::from_slice(&fs::read(request_path).map_err(|error| error.to_string())?)
                 .map_err(|error| error.to_string())?;
         let deferred = prepare(request, true)?;
-        assert!(deferred.request.native_engine && deferred.request.no_abliterate_lora);
+        assert!(deferred.request.native_engine);
         assert_eq!(deferred.request.native_row_workers, Some(workers));
         let prepared = prepare_backend(deferred, &mut recorder, &case.working)?;
         let arguments = prepared["Arguments"]
@@ -1243,11 +1226,6 @@ fn explicit_rust_runtime_survives_early_window_and_backend_preparation() -> crat
             arguments
                 .array_windows::<2>()
                 .any(|args| args[0] == "--native-row-workers" && args[1] == worker_text)
-        );
-        assert!(
-            arguments
-                .iter()
-                .any(|value| value == "--no-abliterate-lora")
         );
         assert!(!arguments.iter().any(|value| value == "--use-repacked-ptq1"));
     }
@@ -1270,27 +1248,20 @@ fn explicit_rust_runtime_survives_early_window_and_backend_preparation() -> crat
 
 #[test]
 fn native_alternate_profiles_keep_verified_launch_options() -> crate::Result<()> {
-    for (repacked, adapter) in [(true, false), (false, true), (true, true)] {
-        let mut fixture = fixture("native-alternate")?;
-        fixture.request["NativeEngine"] = json!(true);
-        fixture.request["NoAbliterateLora"] = json!(!adapter);
-        fixture.request["UseRepackedPtq1"] = json!(repacked);
-        fixture.request["NoSpeechModels"] = json!(true);
-        let mut recorder = Recorder::new(fixture.root);
-        let result = prepare_backend(plan(fixture.request)?, &mut recorder, &fixture.working)?;
-        let args = result["Arguments"]
-            .as_array()
-            .ok_or("Missing launch arguments.")?;
-        assert!(args.iter().any(|value| value == "--native-engine"));
-        assert_eq!(
-            args.iter().any(|value| value == "--use-repacked-ptq1"),
-            repacked
-        );
-        assert_eq!(
-            args.iter().any(|value| value == "--no-abliterate-lora"),
-            !adapter
-        );
-    }
+    let mut case = fixture("native-alternate")?;
+    case.request["NativeEngine"] = json!(true);
+    case.request["Bonsai25Variant"] = json!("ptq1");
+    case.request["NoSpeechModels"] = json!(true);
+    let mut recorder = Recorder::new(case.root);
+    let result = prepare_backend(plan(case.request)?, &mut recorder, &case.working)?;
+    let args = result["Arguments"]
+        .as_array()
+        .ok_or("Missing launch arguments.")?;
+    assert!(args.iter().any(|value| value == "--native-engine"));
+    assert!(
+        args.array_windows::<2>()
+            .any(|pair| pair[0] == "--bonsai-2-5" && pair[1] == "ptq1")
+    );
     let mut daisy_fixture = fixture("daisyrose-forwarding")?;
     let daisy_path = daisy_fixture.root.join("daisyrose-vet.gguf");
     daisy_fixture.request["NativeEngine"] = json!(true);
@@ -1386,52 +1357,38 @@ fn automatic_setup_accepts_fresh_data_and_preserves_every_explicit_model_choice(
     fixture.request["PreparationStage"] = json!("model");
     assert!(!data.exists());
     for native in [false, true] {
-        for ptq1 in [false, true] {
-            for adapter in [false, true] {
-                fixture.request["NativeEngine"] = json!(native);
-                fixture.request["UseRepackedPtq1"] = json!(ptq1);
-                fixture.request["NoAbliterateLora"] = json!(!adapter);
-                let mut recorder = Recorder::new(fixture.root.clone());
-                execute(
-                    plan(fixture.request.clone())?,
-                    &mut recorder,
-                    &fixture.working,
-                )?;
-                assert!(data.is_dir());
-                assert_eq!(recorder.artifact_requests.len(), 1);
-                let setup = &recorder.artifact_requests[0];
-                assert_eq!(setup["DataDirectory"], json!(data));
-                assert_eq!(setup["NativeEngine"], native);
-                assert_eq!(setup["UseRepackedPtq1"], ptq1);
-                assert_eq!(setup["NoAbliterateLora"], !adapter);
-                assert!(setup.get("LockPath").is_none());
-                let (_, arguments, _) = recorder.launch()?;
-                assert_eq!(
-                    arguments
-                        .iter()
-                        .any(|argument| argument == "--native-engine"),
-                    native
-                );
-                assert_eq!(
-                    arguments
-                        .iter()
-                        .any(|argument| argument == "--publisher-engine"),
-                    !native
-                );
-                assert_eq!(
-                    arguments
-                        .iter()
-                        .any(|argument| argument == "--use-repacked-ptq1"),
-                    ptq1
-                );
-                assert_eq!(
-                    arguments
-                        .iter()
-                        .any(|argument| argument == "--no-abliterate-lora"),
-                    !adapter
-                );
-            }
-        }
+        fixture.request["NativeEngine"] = json!(native);
+        let mut recorder = Recorder::new(fixture.root.clone());
+        execute(
+            plan(fixture.request.clone())?,
+            &mut recorder,
+            &fixture.working,
+        )?;
+        assert!(data.is_dir());
+        assert_eq!(recorder.artifact_requests.len(), 1);
+        let setup = &recorder.artifact_requests[0];
+        assert_eq!(setup["DataDirectory"], json!(data));
+        assert_eq!(setup["NativeEngine"], native);
+        assert!(setup.get("LockPath").is_none());
+        let (_, arguments, _) = recorder.launch()?;
+        assert_eq!(
+            arguments
+                .iter()
+                .any(|argument| argument == "--native-engine"),
+            native
+        );
+        assert_eq!(
+            arguments
+                .iter()
+                .any(|argument| argument == "--publisher-engine"),
+            !native
+        );
+        assert_eq!(
+            arguments
+                .array_windows::<2>()
+                .any(|args| args[0] == "--bonsai-2-5" && args[1] == "pq2"),
+            native
+        );
     }
     fs::remove_dir_all(fixture.root).map_err(|error| error.to_string())
 }
@@ -1628,7 +1585,7 @@ fn renderer_guidance_uses_only_the_selected_adapter_record() -> crate::Result<()
 
 #[test]
 fn cpu_prefill_tokens_validate_and_forward_in_chat_launch() -> crate::Result<()> {
-    for tokens in [8_u8, 16, 32] {
+    for tokens in [8_u8, 16, 32, 64] {
         let mut f = fixture(&format!("prefill-{tokens}"))?;
         f.request["NativeEngine"] = json!(true);
         f.request["NoSpeechModels"] = json!(true);
@@ -1648,7 +1605,7 @@ fn cpu_prefill_tokens_validate_and_forward_in_chat_launch() -> crate::Result<()>
     for patch in [
         json!({"NativeEngine": false, "CpuPrefillTokens": 8}),
         json!({"NativeEngine": true, "CpuPrefillTokens": 4}),
-        json!({"NativeEngine": true, "CpuPrefillTokens": 64}),
+        json!({"NativeEngine": true, "CpuPrefillTokens": 128}),
         json!({"NativeEngine": true, "CpuPrefillTokens": "8"}),
         json!({"NativeEngine": true, "CpuPrefillTokens": null}),
     ] {
@@ -1988,17 +1945,6 @@ fn effective_daisyrose_path_respects_promotion_opt_out_and_explicit_override() -
         Some(promoted.path.clone())
     );
 
-    req.use_repacked_ptq1 = Some(false);
-    assert_eq!(
-        effective_daisyrose_lora_path(&req, Some(&swift_promoted)),
-        Some(swift_promoted.path.clone())
-    );
-    req.use_repacked_ptq1 = None;
-
-    req.no_daisyrose_lora = true;
-    assert_eq!(effective_daisyrose_lora_path(&req, Some(&promoted)), None);
-
-    req.no_daisyrose_lora = false;
     req.native_engine = false;
     assert_eq!(effective_daisyrose_lora_path(&req, Some(&promoted)), None);
 
@@ -2028,17 +1974,6 @@ fn nariq_chat_request_validates_conflicts_and_wires_arguments_with_daisyrose() -
     let mut req: Request = serde_json::from_value(fixture.request).map_err(|e| e.to_string())?;
     req.native_engine = true;
     req.nariq_variant = Some(bonsai_cpu_policy::NariqVariant::Bpw2_5);
-    req.use_repacked_ptq1 = Some(true);
-    assert!(req.validate_native_runtime(None).is_err());
-
-    req.use_repacked_ptq1 = Some(false);
-    assert!(req.validate_native_runtime(None).is_err());
-
-    req.use_repacked_ptq1 = None;
-    req.use_abliterate_lora = true;
-    assert!(req.validate_native_runtime(None).is_err());
-
-    req.use_abliterate_lora = false;
     req.native_engine = false;
     assert!(req.validate_native_runtime(None).is_err());
 
@@ -2054,7 +1989,6 @@ fn nariq_chat_request_validates_conflicts_and_wires_arguments_with_daisyrose() -
         .map(|s| s.to_string_lossy().into_owned())
         .collect();
     assert!(rendered.windows(2).any(|w| w == ["--nariq", "2.5bpw"]));
-    assert!(rendered.contains(&"--no-abliterate-lora".to_owned()));
     assert!(rendered.contains(&"--no-mmproj".to_owned()));
     assert!(rendered.iter().any(|a| a == "--daisyrose-lora"));
     assert!(
@@ -2067,16 +2001,8 @@ fn nariq_chat_request_validates_conflicts_and_wires_arguments_with_daisyrose() -
 }
 
 #[test]
-fn bonsai25_chat_request_allows_orca_mmproj_composite_and_explicit_daisyrose() -> crate::Result<()>
-{
+fn bonsai25_chat_request_allows_mmproj_composite_and_explicit_daisyrose() -> crate::Result<()> {
     let fixture = fixture("bonsai25-chat-args")?;
-    let mut conflict_ptq1: Request =
-        serde_json::from_value(fixture.request.clone()).map_err(|e| e.to_string())?;
-    conflict_ptq1.native_engine = true;
-    conflict_ptq1.use_repacked_ptq1 = Some(true);
-    conflict_ptq1.bonsai25_variant = Some(bonsai_cpu_policy::Bonsai25Variant::Pq2);
-    assert!(conflict_ptq1.validate_native_runtime(None).is_err());
-
     let mut conflict_nariq: Request =
         serde_json::from_value(fixture.request.clone()).map_err(|e| e.to_string())?;
     conflict_nariq.native_engine = true;
@@ -2087,7 +2013,6 @@ fn bonsai25_chat_request_allows_orca_mmproj_composite_and_explicit_daisyrose() -
     let mut req: Request = serde_json::from_value(fixture.request).map_err(|e| e.to_string())?;
     req.native_engine = true;
     req.bonsai25_variant = Some(bonsai_cpu_policy::Bonsai25Variant::Ptq1);
-    req.use_repacked_ptq1 = None;
     req.placement = Some(Placement::Auto);
     let daisy = fixture.root.join("daisyrose.gguf");
     req.daisyrose_lora = Some(daisy);
@@ -2109,11 +2034,6 @@ fn bonsai25_chat_request_allows_orca_mmproj_composite_and_explicit_daisyrose() -
             .iter()
             .any(|a| a == "--use-original-pq2" || a == "--use-repacked-ptq1")
     );
-
-    req.use_abliterate_lora = true;
-    let mut orca_args = Vec::new();
-    runtime_arguments(&req, &mut orca_args);
-    assert!(orca_args.iter().any(|a| a == "--use-abliterate-lora"));
 
     fs::remove_dir_all(fixture.root).map_err(|error| error.to_string())
 }

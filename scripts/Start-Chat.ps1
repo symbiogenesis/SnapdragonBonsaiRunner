@@ -7,20 +7,10 @@ Launches native chat with the Rust inference engine development default.
 Automatically builds or refreshes bonsai-tools from this checkout when -ToolPath
 and BONSAI_TOOLS_PATH are omitted, then launches native chat. Rust owns startup
 and application policy.
-.PARAMETER AbliterateLora
-Controls the pinned Orca abliteration LoRA adapter: 'auto' (default, follows the
-selected model/engine profile: off on Bonsai 2.5 and NariQ, on for Swift-Bonsai-2
-rollback such as -UseOriginalPq2, -UseRepackedPtq1, or -PublisherEngine), 'on'
-(explicit opt-in via --use-abliterate-lora), or 'off' (explicit opt-out via
---no-abliterate-lora).
 .EXAMPLE
 ./scripts/Start-Chat.ps1
 .EXAMPLE
 ./scripts/Start-Chat.ps1 -PublisherEngine
-.EXAMPLE
-./scripts/Start-Chat.ps1 -AbliterateLora on
-.EXAMPLE
-./scripts/Start-Chat.ps1 -PublisherEngine -AbliterateLora off
 .EXAMPLE
 ./scripts/Start-Chat.ps1 -GraphicsBackend dx12
 #>
@@ -40,7 +30,7 @@ param(
     [long]$PromptReuseCheckpointBytes,
     [ValidateSet('f16', 'rsq4', 'rsq4kvf', 'rsq4k3v')]
     [string]$KvCache,
-    [ValidateSet(8, 16, 32)]
+    [ValidateSet(8, 16, 32, 64)]
     [int]$CpuPrefillTokens,
     [ValidateSet('sequential', 'wy-f32')]
     [string]$CpuPrefillGdn,
@@ -52,12 +42,8 @@ param(
     [string]$CpuFamily,
     [ValidateSet('auto', 'cpu', 'vulkan', 'composite')]
     [string]$Placement,
-    [switch]$UseRepackedPtq1,
-    [switch]$UseOriginalPq2,
     [ValidateSet('pq2', 'ptq1')]
     [string]$Bonsai25,
-    [ValidateSet('auto', 'on', 'off')]
-    [string]$AbliterateLora = 'auto',
     [string]$DaisyRoseLora,
     [switch]$NoDaisyRoseLora,
     [ValidateSet('dx12', 'vulkan', 'gl')]
@@ -196,14 +182,7 @@ try {
     if ($PSBoundParameters.ContainsKey('NativeRowWorkers')) {
         $launchArguments += @('--native-row-workers', [string]$NativeRowWorkers)
     }
-    if ($UseRepackedPtq1) { $launchArguments += '--use-repacked-ptq1' }
-    if ($UseOriginalPq2) { $launchArguments += '--use-original-pq2' }
     if ($Bonsai25) { $launchArguments += @('--bonsai-2-5', $Bonsai25.ToLowerInvariant()) }
-    switch ($AbliterateLora.ToLowerInvariant()) {
-        'auto' { }
-        'on' { $launchArguments += '--use-abliterate-lora' }
-        'off' { $launchArguments += '--no-abliterate-lora' }
-    }
     if ($DaisyRoseLora) { $launchArguments += @('--daisyrose-lora', $DaisyRoseLora) }
     if ($NoDaisyRoseLora) { $launchArguments += '--no-daisyrose-lora' }
     if ($GraphicsBackend) { $launchArguments += @('--graphics-backend', $GraphicsBackend.ToLowerInvariant()) }

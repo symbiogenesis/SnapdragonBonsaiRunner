@@ -267,7 +267,6 @@ fn context_capacity_toolbar_keeps_plain_actions_visible_at_minimum_and_wide_size
             chat.state_mut().app.appearance.text_size = 24;
             chat.state_mut().app.enable_thinking = true;
             chat.state_mut().app.extra_effort = true;
-            chat.state_mut().app.abliteration_scale = 2.0;
             chat.state().app.appearance.apply(&chat.ctx);
             chat.run();
             let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size.into());

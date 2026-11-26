@@ -208,11 +208,9 @@ fn configuration_for_family(
     let mut tts_voice_model = None;
     let (mut tts_quantization, mut tts_threads) = (None, None);
     let mut require_broker_pipe = false;
-    let mut use_abliterate_lora = None;
     let mut daisyrose_lora = None;
     let mut no_daisyrose_lora = false;
     let mut no_mmproj = false;
-    let mut use_repacked_ptq1 = None;
     let mut bonsai25_variant = None;
     let mut native_engine = None;
     let mut native_row_workers = None;
@@ -229,12 +227,6 @@ fn configuration_for_family(
     while let Some(option) = args.next() {
         match option.to_str() {
             Some("--require-broker-pipe") if !require_broker_pipe => require_broker_pipe = true,
-            Some("--use-abliterate-lora") if use_abliterate_lora.is_none() => {
-                use_abliterate_lora = Some(true);
-            }
-            Some("--no-abliterate-lora") if use_abliterate_lora.is_none() => {
-                use_abliterate_lora = Some(false);
-            }
             Some("--daisyrose-lora") if daisyrose_lora.is_none() => {
                 daisyrose_lora = Some(next_path(
                     &mut args,
@@ -243,12 +235,6 @@ fn configuration_for_family(
             }
             Some("--no-daisyrose-lora") if !no_daisyrose_lora => no_daisyrose_lora = true,
             Some("--no-mmproj") if !no_mmproj => no_mmproj = true,
-            Some("--use-repacked-ptq1") if use_repacked_ptq1.is_none() => {
-                use_repacked_ptq1 = Some(true);
-            }
-            Some("--use-original-pq2") if use_repacked_ptq1.is_none() => {
-                use_repacked_ptq1 = Some(false);
-            }
             Some("--bonsai-2-5") if bonsai25_variant.is_none() => {
                 bonsai25_variant = Some(next_str(
                     &mut args,
@@ -309,9 +295,10 @@ fn configuration_for_family(
                         "8" => Some(8_u8),
                         "16" => Some(16_u8),
                         "32" => Some(32_u8),
+                        "64" => Some(64_u8),
                         _ => None,
                     },
-                    "CPU prefill tokens must be 8, 16 or 32.",
+                    "CPU prefill tokens must be 8, 16, 32 or 64.",
                 )?);
             }
             Some("--cpu-prefill-gdn") if cpu_prefill_gdn.is_none() => {
@@ -436,7 +423,7 @@ fn configuration_for_family(
             }
             _ => {
                 return Err(
-                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--use-abliterate-lora|--no-abliterate-lora] [--daisyrose-lora ABSOLUTE_GGUF] [--no-daisyrose-lora] [--no-mmproj] [--use-repacked-ptq1|--use-original-pq2|--bonsai-2-5 pq2|ptq1] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4kvf|rsq4k3v] [--cpu-prefill-tokens 8|16|32] [--placement auto|cpu|vulkan|composite] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
+                    "Usage: bonsai-chat --broker-path ABSOLUTE_EXE --data-directory ABSOLUTE_DIRECTORY --evidence-directory ABSOLUTE_DIRECTORY [--frontend-port 5173] [--backend-port 8081] [--daisyrose-lora ABSOLUTE_GGUF] [--no-daisyrose-lora] [--no-mmproj] [--bonsai-2-5 pq2|ptq1] [--native-engine|--publisher-engine] [--native-row-workers 1|4|8|12] [--prompt-reuse disabled|latest] [--kv-cache f16|rsq4|rsq4kvf|rsq4k3v] [--cpu-prefill-tokens 8|16|32|64] [--placement auto|cpu|vulkan|composite] [--canary-key-file ABSOLUTE_FILE --canary-port 8766 [--canary-executable ABSOLUTE_EXE --canary-model ABSOLUTE_GGUF]] [--tts-key-file ABSOLUTE_FILE --tts-port 8767 [--tts-executable ABSOLUTE_EXE --tts-model ABSOLUTE_GGUF --tts-codec ABSOLUTE_GGUF --tts-voice-model ABSOLUTE_GGUF [--tts-quantization Q8_0|Q4_K_M] [--tts-threads 10]]]",
                 );
             }
         }
@@ -500,9 +487,6 @@ fn configuration_for_family(
     if daisyrose_lora.is_some() && !native_engine {
         return Err("DaisyRose multi-rank LoRA requires --native-engine.");
     }
-    if bonsai25_variant.is_some() && use_repacked_ptq1.is_some() {
-        return Err("Do not combine --bonsai-2-5 with --use-repacked-ptq1 or --use-original-pq2.");
-    }
     if bonsai25_variant.is_some() && !native_engine {
         return Err("--bonsai-2-5 requires --native-engine.");
     }
@@ -550,12 +534,11 @@ fn configuration_for_family(
     }
     let bonsai25_variant = if bonsai25_variant.is_some() {
         bonsai25_variant
-    } else if native_engine && use_repacked_ptq1.is_none() {
+    } else if native_engine {
         Some(client::Bonsai25Variant::Pq2)
     } else {
         None
     };
-    let use_abliterate_lora = use_abliterate_lora.unwrap_or(bonsai25_variant.is_none());
     let config = client::Config {
         broker: broker.ok_or("A broker executable is required.")?,
         data: data.ok_or("A provisioned data directory is required.")?,
@@ -563,11 +546,9 @@ fn configuration_for_family(
         frontend_port: frontend_port.unwrap_or(5173),
         backend_port: backend_port.unwrap_or(8081),
         require_broker_pipe,
-        use_abliterate_lora,
         daisyrose_lora,
         no_daisyrose_lora,
         no_mmproj,
-        use_repacked_ptq1: use_repacked_ptq1.unwrap_or(false),
         bonsai25_variant,
         native_engine,
         native_row_workers,
@@ -912,28 +893,15 @@ mod tests {
             OsString::from("--evidence-directory"),
             directory.clone().into_os_string(),
         ];
-        for native in [false, true] {
-            let mut args = base.clone();
-            args.push(
-                if native {
-                    "--native-engine"
-                } else {
-                    "--publisher-engine"
-                }
-                .into(),
-            );
-            args.push("--use-original-pq2".into());
-            let config = configuration(args).map_err(io::Error::other)?;
-            assert!(!config.use_repacked_ptq1);
-            assert!(config.use_abliterate_lora);
-            assert_eq!(config.native_engine, native);
-        }
-        for first in ["--use-original-pq2", "--use-repacked-ptq1"] {
-            for second in ["--use-original-pq2", "--use-repacked-ptq1"] {
-                let mut rejected = base.clone();
-                rejected.extend([first, second].map(OsString::from));
-                assert!(configuration(rejected).is_err());
-            }
+        for legacy in [
+            "--use-original-pq2",
+            "--use-repacked-ptq1",
+            "--use-abliterate-lora",
+            "--no-abliterate-lora",
+        ] {
+            let mut rejected = base.clone();
+            rejected.push(legacy.into());
+            assert!(configuration(rejected).is_err());
         }
         for (flag, expected) in [
             ("pq2", crate::client::Bonsai25Variant::Pq2),
@@ -952,8 +920,6 @@ mod tests {
             vec!["--bonsai-2-5"],
             vec!["--bonsai-2-5", "invalid"],
             vec!["--bonsai-2-5", "pq2", "--bonsai-2-5", "ptq1"],
-            vec!["--bonsai-2-5", "pq2", "--use-repacked-ptq1"],
-            vec!["--bonsai-2-5", "pq2", "--use-original-pq2"],
             vec!["--publisher-engine", "--bonsai-2-5", "pq2"],
         ] {
             let mut rejected = base.clone();
@@ -967,8 +933,6 @@ mod tests {
 
     fn assert_runtime_defaults_and_rollback(args: &[OsString]) -> io::Result<()> {
         let default = configuration(args.to_vec()).map_err(io::Error::other)?;
-        assert!(!default.use_abliterate_lora);
-        assert!(!default.use_repacked_ptq1);
         assert_eq!(
             default.bonsai25_variant,
             Some(crate::client::Bonsai25Variant::Pq2)
@@ -1209,8 +1173,7 @@ mod tests {
         let rollback = configuration(publisher).map_err(io::Error::other)?;
         assert!(!rollback.native_engine);
         assert_eq!(rollback.native_row_workers, 1);
-        assert!(!rollback.use_repacked_ptq1);
-        assert!(rollback.use_abliterate_lora);
+        assert!(rollback.bonsai25_variant.is_none());
         publisher = args.to_vec();
         publisher.extend(["--publisher-engine", "--prompt-reuse", "latest"].map(OsString::from));
         assert!(configuration(publisher).is_err());
@@ -1244,18 +1207,10 @@ mod tests {
             directory.clone().into_os_string(),
         ];
         assert_runtime_defaults_and_rollback(&args)?;
-        let mut repacked = args.clone();
-        repacked.push("--use-repacked-ptq1".into());
-        let alternate = configuration(repacked.clone()).map_err(io::Error::other)?;
-        assert!(alternate.use_repacked_ptq1);
-        assert!(alternate.use_abliterate_lora);
-        repacked.push("--use-repacked-ptq1".into());
-        assert!(configuration(repacked).is_err());
         let mut native = args.clone();
         native.push("--native-engine".into());
         assert!(configuration(native.clone()).is_ok_and(|config| {
-            !config.use_abliterate_lora
-                && config.bonsai25_variant == Some(crate::client::Bonsai25Variant::Pq2)
+            config.bonsai25_variant == Some(crate::client::Bonsai25Variant::Pq2)
         }));
         for value in ["0", "2", "3", "5", "16", "01", "+4", "4.0", " 4"] {
             let mut rejected = native.clone();
@@ -1267,11 +1222,7 @@ mod tests {
             configured.extend(["--native-row-workers", value].map(OsString::from));
             let selected = configuration(configured.clone()).map_err(io::Error::other)?;
             assert_eq!(selected.native_row_workers.to_string(), value);
-            assert!(
-                !selected.use_abliterate_lora
-                    && !selected.use_repacked_ptq1
-                    && selected.bonsai25_variant == Some(crate::client::Bonsai25Variant::Pq2)
-            );
+            assert!(selected.bonsai25_variant == Some(crate::client::Bonsai25Variant::Pq2));
             configured.extend(["--native-row-workers", value].map(OsString::from));
             assert!(configuration(configured).is_err());
         }
@@ -1297,7 +1248,7 @@ mod tests {
         )
         .map_err(io::Error::other)?;
         assert_eq!(x2_default.native_row_workers, 8);
-        for (value, expected) in [("8", 8_u8), ("16", 16), ("32", 32)] {
+        for (value, expected) in [("8", 8_u8), ("16", 16), ("32", 32), ("64", 64)] {
             let mut tiled = native.clone();
             tiled.extend(["--cpu-prefill-tokens", value].map(OsString::from));
             assert_eq!(
@@ -1309,7 +1260,7 @@ mod tests {
             tiled.extend(["--cpu-prefill-tokens", value].map(OsString::from));
             assert!(configuration(tiled).is_err());
         }
-        for invalid in ["0", "4", "64", "eight"] {
+        for invalid in ["0", "4", "128", "eight"] {
             let mut rejected = native.clone();
             rejected.extend(["--cpu-prefill-tokens", invalid].map(OsString::from));
             assert!(configuration(rejected).is_err());
@@ -1321,10 +1272,8 @@ mod tests {
         let mut missing_rows = native.clone();
         missing_rows.push("--native-row-workers".into());
         assert!(configuration(missing_rows).is_err());
-        native.push("--no-abliterate-lora".into());
         let rust = configuration(native.clone()).map_err(io::Error::other)?;
         assert!(rust.native_engine);
-        assert!(!rust.use_abliterate_lora);
         let mut duplicate_native = native.clone();
         duplicate_native.push("--native-engine".into());
         assert!(configuration(duplicate_native).is_err());
@@ -1352,7 +1301,7 @@ mod tests {
         ]);
         assert!(configuration(with_daisy).is_err());
 
-        let mut no_daisy = native.clone();
+        let mut no_daisy = native;
         no_daisy.push("--no-daisyrose-lora".into());
         let parsed_no_daisy = configuration(no_daisy.clone()).map_err(io::Error::other)?;
         assert!(parsed_no_daisy.daisyrose_lora.is_none());
@@ -1361,37 +1310,13 @@ mod tests {
         no_daisy.push("--no-daisyrose-lora".into());
         assert!(configuration(no_daisy).is_err());
 
-        let mut publisher_daisy = args.clone();
+        let mut publisher_daisy = args;
         publisher_daisy.extend([
             OsString::from("--publisher-engine"),
             OsString::from("--daisyrose-lora"),
             daisy_gguf.as_os_str().to_owned(),
         ]);
         assert!(configuration(publisher_daisy).is_err());
-
-        native.push("--use-repacked-ptq1".into());
-        assert!(
-            configuration(native).is_ok_and(|config| config.use_repacked_ptq1
-                && config.bonsai25_variant.is_none()
-                && !config.use_abliterate_lora)
-        );
-        let mut enabled_orca = args.clone();
-        enabled_orca.push("--use-abliterate-lora".into());
-        let opted_in = configuration(enabled_orca.clone()).map_err(io::Error::other)?;
-        assert!(opted_in.use_abliterate_lora);
-        assert_eq!(
-            opted_in.bonsai25_variant,
-            Some(crate::client::Bonsai25Variant::Pq2)
-        );
-        enabled_orca.push("--no-abliterate-lora".into());
-        assert!(configuration(enabled_orca).is_err());
-        let mut disabled = args;
-        disabled.push("--no-abliterate-lora".into());
-        let opted_out = configuration(disabled.clone()).map_err(io::Error::other)?;
-        assert!(!opted_out.use_abliterate_lora);
-        assert!(!opted_out.no_mmproj);
-        disabled.push("--no-abliterate-lora".into());
-        assert!(configuration(disabled).is_err());
         // Neither mode requires adapter bytes at UI parsing time; the broker
         // verifies the selected artifacts before creating an inference process.
         assert!(!directory.join("adapters").exists());

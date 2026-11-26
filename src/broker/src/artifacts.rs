@@ -1,6 +1,6 @@
 //! Offline verification of compiled model/runtime identities with retained guards.
 
-use crate::launch_policy::{LaunchProfile, ModelArtifact, reviewed_pins_for_representation};
+use crate::launch_policy::{LaunchProfile, ModelArtifact, reviewed_pins};
 use bonsai_artifacts::{ChunkedFileSpec, RuntimeSpec, VerifiedFile, VerifiedRuntime};
 use std::{
     path::{Path, PathBuf},
@@ -86,17 +86,11 @@ fn model_failure_reason(path: &Path, error: ArtifactError) -> &'static str {
 fn write_model_failure(
     output: &mut impl std::io::Write,
     path: &Path,
-    use_repacked_ptq1: bool,
     error: ArtifactError,
 ) -> std::io::Result<()> {
-    let representation = if use_repacked_ptq1 {
-        "ptq1"
-    } else {
-        "original"
-    };
     writeln!(
         output,
-        "Selected model verification failed: reason={}, representation={representation}.",
+        "Selected model verification failed: reason={}.",
         model_failure_reason(path, error)
     )?;
     writeln!(output, "Selected model verifier error: {error:?}.")
@@ -140,24 +134,10 @@ impl VerifiedArtifacts {
     /// # Errors
     /// Rejects policy/path drift, changed artifacts and unsafe installations.
     pub fn verify_for_profile(data: &Path, profile: LaunchProfile) -> Result<Self, ArtifactError> {
-        Self::verify_for_profile_with_representation(data, profile, false)
-    }
-
-    /// Verify one compiled model/runtime profile and its explicitly selected weight representation.
-    /// PTQ1 uses the pinned current-weight export receipt and retains the same runtime verification.
-    ///
-    /// # Errors
-    /// Rejects incompatible selection, policy/path drift, changed artifacts and unsafe installations.
-    pub fn verify_for_profile_with_representation(
-        data: &Path,
-        profile: LaunchProfile,
-        use_repacked_ptq1: bool,
-    ) -> Result<Self, ArtifactError> {
         if !cfg!(windows) {
             return Err(ArtifactError::Configuration);
         }
-        let pins = reviewed_pins_for_representation(profile, use_repacked_ptq1)
-            .map_err(|_| ArtifactError::Configuration)?;
+        let pins = reviewed_pins(profile).map_err(|_| ArtifactError::Configuration)?;
         let spec = RuntimeSpec {
             archive_path: data.join("downloads").join(&pins.runtime.asset.filename),
             runtime_directory: data.join("runtime").join(&pins.runtime.commit),
@@ -166,7 +146,7 @@ impl VerifiedArtifacts {
         };
         let (runtime_result, model_result) = std::thread::scope(|scope| {
             let runtime_handle = scope.spawn(|| VerifiedRuntime::verify(&spec));
-            let model_result = Self::verify_selected_model(data, profile, use_repacked_ptq1);
+            let model_result = Self::verify_selected_model(data, profile);
             let runtime_result = runtime_handle
                 .join()
                 .unwrap_or(Err(ArtifactError::Configuration));
@@ -185,13 +165,12 @@ impl VerifiedArtifacts {
         })
     }
 
-    #[cfg(windows)]
+    #[cfg(all(test, windows))]
     pub(crate) fn verify_model_for_profile(
         data: &Path,
         profile: LaunchProfile,
-        use_repacked_ptq1: bool,
     ) -> Result<Self, ArtifactError> {
-        let (model, model_guard) = Self::verify_selected_model(data, profile, use_repacked_ptq1)?;
+        let (model, model_guard) = Self::verify_selected_model(data, profile)?;
         Ok(Self {
             executable: PathBuf::new(),
             model,
@@ -273,7 +252,6 @@ impl VerifiedArtifacts {
     fn verify_model_artifact(
         model: &Path,
         artifact: &ModelArtifact,
-        use_repacked_ptq1: bool,
     ) -> Result<VerifiedFile, ArtifactError> {
         let (chunk_bytes, chunk_sha256s) = artifact
             .chunk_manifest
@@ -291,27 +269,20 @@ impl VerifiedArtifacts {
         .inspect_err(|error| {
             // Only fixed classifications enter stderr; paths, file contents
             // and inherited process output never enter the UI error text.
-            let _written = write_model_failure(
-                &mut std::io::stderr().lock(),
-                model,
-                use_repacked_ptq1,
-                *error,
-            );
+            let _written = write_model_failure(&mut std::io::stderr().lock(), model, *error);
         })
     }
 
     fn verify_selected_model(
         data: &Path,
         profile: LaunchProfile,
-        use_repacked_ptq1: bool,
     ) -> Result<(PathBuf, VerifiedFile), ArtifactError> {
-        let pins = reviewed_pins_for_representation(profile, use_repacked_ptq1)
-            .map_err(|_| ArtifactError::Configuration)?;
+        let pins = reviewed_pins(profile).map_err(|_| ArtifactError::Configuration)?;
         let model = data
             .join("models")
             .join(&pins.model.revision)
             .join(&pins.model.filename);
-        let guard = Self::verify_model_artifact(&model, &pins.model, use_repacked_ptq1)?;
+        let guard = Self::verify_model_artifact(&model, &pins.model)?;
         Ok((model, guard))
     }
 
@@ -354,7 +325,7 @@ impl VerifiedArtifacts {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use crate::{launch_policy::reviewed_pins, test_util::TempDir};
+    use crate::test_util::TempDir;
     use std::fs;
 
     #[test]
@@ -369,17 +340,15 @@ mod tests {
             (ArtifactError::Configuration, "configuration"),
             (ArtifactError::Cancelled, "cancelled"),
         ] {
-            for (ptq1, representation) in [(false, "original"), (true, "ptq1")] {
-                let mut output = Vec::new();
-                write_model_failure(&mut output, &path, ptq1, error)?;
-                assert_eq!(
-                    output,
-                    format!(
-                        "Selected model verification failed: reason={reason}, representation={representation}.\nSelected model verifier error: {error:?}.\n"
-                    )
-                    .into_bytes()
-                );
-            }
+            let mut output = Vec::new();
+            write_model_failure(&mut output, &path, error)?;
+            assert_eq!(
+                output,
+                format!(
+                    "Selected model verification failed: reason={reason}.\nSelected model verifier error: {error:?}.\n"
+                )
+                .into_bytes()
+            );
         }
         fs::write(&path, b"model bytes must never appear in diagnostics")?;
         assert_eq!(model_failure_reason(&path, ArtifactError::Path), "storage");
@@ -389,40 +358,6 @@ mod tests {
             "storage"
         );
         assert_eq!(directory.parent(), Some(std::env::temp_dir().as_path()));
-        Ok(())
-    }
-
-    #[test]
-    fn ptq1_verification_rejects_missing_or_altered_selected_file_without_pq2_fallback()
-    -> std::io::Result<()> {
-        let temp = TempDir::new("Bonsai-ptq1-identity")?;
-        let data = temp.path();
-        let profile = LaunchProfile::SwiftPq2Assessment;
-        let pins = reviewed_pins(profile).map_err(std::io::Error::other)?;
-        let directory = data.join("models").join(&pins.model.revision);
-        fs::create_dir_all(&directory)?;
-        let pq2 = directory.join(pins.model.filename);
-        let ptq1 = directory.join("Swift-Bonsai-2-current-repacked-PTQ1_0.gguf");
-        fs::write(&ptq1, b"altered PTQ1")?;
-        assert_eq!(
-            VerifiedArtifacts::verify_selected_model(data, profile, true).err(),
-            Some(ArtifactError::Identity)
-        );
-        assert_eq!(
-            VerifiedArtifacts::verify_selected_model(data, profile, false).err(),
-            Some(ArtifactError::Path)
-        );
-        fs::write(&pq2, b"altered PQ2")?;
-        fs::remove_file(&ptq1)?;
-        assert_eq!(
-            VerifiedArtifacts::verify_selected_model(data, profile, true).err(),
-            Some(ArtifactError::Path)
-        );
-        assert_eq!(
-            VerifiedArtifacts::verify_selected_model(data, profile, false).err(),
-            Some(ArtifactError::Identity)
-        );
-        assert_eq!(data.parent(), Some(std::env::temp_dir().as_path()));
         Ok(())
     }
 
@@ -439,7 +374,7 @@ mod tests {
         // Identity, rather than Path, proves admission reached the model without
         // first opening a C++ archive or requiring its installed runtime tree.
         assert_eq!(
-            VerifiedArtifacts::verify_model_for_profile(data, profile, false).err(),
+            VerifiedArtifacts::verify_model_for_profile(data, profile).err(),
             Some(ArtifactError::Identity)
         );
         assert!(!data.join("downloads").exists());
@@ -558,7 +493,7 @@ mod tests {
         };
 
         // Valid chunked verification acquires read lock and prevents write opens.
-        let guard = VerifiedArtifacts::verify_model_artifact(&model_path, &artifact, false)
+        let guard = VerifiedArtifacts::verify_model_artifact(&model_path, &artifact)
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
         assert!(
             fs::OpenOptions::new()
@@ -573,9 +508,8 @@ mod tests {
             chunk_manifest: None,
             ..artifact.clone()
         };
-        let whole_guard =
-            VerifiedArtifacts::verify_model_artifact(&model_path, &whole_artifact, false)
-                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        let whole_guard = VerifiedArtifacts::verify_model_artifact(&model_path, &whole_artifact)
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
         drop(whole_guard);
 
         // 1-byte corruption in chunk 0, chunk 1, and final tail chunk must fail with Identity.
@@ -597,9 +531,9 @@ mod tests {
         for tamper_offset in [17_usize, chunk_bytes + 17, total_len - 1] {
             toggle_byte(tamper_offset)?;
             let chunked_err =
-                VerifiedArtifacts::verify_model_artifact(&model_path, &artifact, false).err();
+                VerifiedArtifacts::verify_model_artifact(&model_path, &artifact).err();
             let whole_err =
-                VerifiedArtifacts::verify_model_artifact(&model_path, &whole_artifact, false).err();
+                VerifiedArtifacts::verify_model_artifact(&model_path, &whole_artifact).err();
             toggle_byte(tamper_offset)?;
             assert_eq!(
                 chunked_err,
@@ -613,14 +547,14 @@ mod tests {
         let mut wrong_count = artifact.clone();
         wrong_count.chunk_manifest = Some((chunk_bytes, chunk_sha256s[..2].to_vec()));
         assert_eq!(
-            VerifiedArtifacts::verify_model_artifact(&model_path, &wrong_count, false).err(),
+            VerifiedArtifacts::verify_model_artifact(&model_path, &wrong_count).err(),
             Some(ArtifactError::Identity)
         );
 
         let mut wrong_chunk_bytes = artifact.clone();
         wrong_chunk_bytes.chunk_manifest = Some((chunk_bytes + 4096, chunk_sha256s.clone()));
         assert_eq!(
-            VerifiedArtifacts::verify_model_artifact(&model_path, &wrong_chunk_bytes, false).err(),
+            VerifiedArtifacts::verify_model_artifact(&model_path, &wrong_chunk_bytes).err(),
             Some(ArtifactError::Identity)
         );
 
@@ -634,7 +568,7 @@ mod tests {
             ],
         ));
         assert_eq!(
-            VerifiedArtifacts::verify_model_artifact(&model_path, &bad_hex, false).err(),
+            VerifiedArtifacts::verify_model_artifact(&model_path, &bad_hex).err(),
             Some(ArtifactError::Identity)
         );
 

@@ -2764,9 +2764,7 @@ fn native_ptq1_row4_lifecycle_is_explicit_and_preserves_the_required_workload() 
         ]
         .map(OsString::from),
     );
-    let config = LaunchConfig::parse(actual).unwrap();
-    assert!(config.uses_native_engine() && config.uses_repacked_ptq1());
-    assert!(config.requires_native_sandbox());
+    assert!(LaunchConfig::parse(actual).is_err());
     let report = json!({"streams":[adapter_initial_fixture(parallel)]});
     assert_eq!(
         generated_adapter_history(parallel, &report),

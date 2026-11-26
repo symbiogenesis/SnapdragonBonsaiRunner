@@ -10,12 +10,8 @@ use std::{
 };
 
 const SWIFT: &str = include_str!("../../../../config/swift-assessment.lock.json");
-const ADAPTER: &str = include_str!("../../../../config/swift-lora.lock.json");
-const PTQ1: &str = include_str!("../../../../config/swift.ptq1-export.json");
 
 static SWIFT_LOCK: OnceLock<crate::Result<Value>> = OnceLock::new();
-static ADAPTER_LOCK: OnceLock<crate::Result<Value>> = OnceLock::new();
-static PTQ1_EXPORT: OnceLock<crate::Result<Value>> = OnceLock::new();
 
 fn cached_json(
     cache: &'static OnceLock<crate::Result<Value>>,
@@ -60,14 +56,12 @@ pub(super) fn model(request: &Request) -> crate::Result<Model> {
             url: Some(selected.url),
         });
     }
-    let repacked = request.use_repacked_ptq1.unwrap_or(false);
     let lock = cached_json(&SWIFT_LOCK, SWIFT)?;
-    let derived = cached_json(&PTQ1_EXPORT, PTQ1)?;
     let pin = bonsai_cpu_policy::select_artifact(
         lock,
         bonsai_cpu_policy::Profile::SwiftPq2Assessment,
-        repacked,
-        repacked.then_some(derived),
+        false,
+        None,
     )?;
     let source = &lock["model"];
     let filename = text(&pin, "Filename")?;
@@ -81,13 +75,11 @@ pub(super) fn model(request: &Request) -> crate::Result<Model> {
             .as_u64()
             .ok_or("Missing compiled Swift model length.")?,
         sha256: text(&pin, "Sha256")?.into(),
-        url: (!repacked).then(|| {
-            format!(
-                "https://huggingface.co/{}/resolve/{}/{filename}",
-                source["repository"].as_str().unwrap_or_default(),
-                source["revision"].as_str().unwrap_or_default(),
-            )
-        }),
+        url: Some(format!(
+            "https://huggingface.co/{}/resolve/{}/{filename}",
+            source["repository"].as_str().unwrap_or_default(),
+            source["revision"].as_str().unwrap_or_default(),
+        )),
     })
 }
 
@@ -342,11 +334,7 @@ fn prepare_weights_with(
     mut verify: impl FnMut(&Path, u64, &str) -> crate::Result<()>,
 ) -> crate::Result<()> {
     preflight(&request.data_directory, selected, model_exists)?;
-    let (activity, message) = if selected.url.is_none() {
-        ("verifying", "Verifying the selected PTQ1 model…")
-    } else {
-        ("checking", "Checking Swift model files…")
-    };
+    let (activity, message) = ("checking", "Checking Swift model files…");
     status(
         working,
         "model",
@@ -359,22 +347,12 @@ fn prepare_weights_with(
         receive(url, &selected.path, selected.bytes, &selected.sha256, working)
             .map_err(|error| format!("Swift model setup failed at {}: {error}. Check the internet connection, free storage and folder permissions, then select Retry setup. Partial downloads are kept for resume.", selected.path.display()))?;
     } else {
-        verify(&selected.path, selected.bytes, &selected.sha256)
-            .map_err(|error| format!("The explicitly selected PTQ1 export at {} could not be verified: {error}. Automatic setup cannot create this export. Supply the matching current-weight export, or close and relaunch with original PQ2 selected.", selected.path.display()))?;
-    }
-    if request.effective_use_abliterate_lora() {
-        let selected = bonsai_cpu_policy::abliterate_lora_artifact(&request.data_directory)?;
-        let lock = cached_json(&ADAPTER_LOCK, ADAPTER)?;
-        status(
-            working,
-            "adapter",
-            "Checking model adapter files…",
-            kind,
-            "checking",
-            Some((&selected.path, selected.bytes)),
-        )?;
-        receive(text(&lock["adapter"], "url")?, &selected.path, selected.bytes, &selected.sha256, working)
-            .map_err(|error| format!("Model adapter setup failed at {}: {error}. Check the internet connection, free storage and folder permissions, then select Retry setup.", selected.path.display()))?;
+        verify(&selected.path, selected.bytes, &selected.sha256).map_err(|error| {
+            format!(
+                "The selected model export at {} could not be verified: {error}.",
+                selected.path.display()
+            )
+        })?;
     }
     if let Some(mmproj) = mmproj {
         status(
@@ -514,7 +492,7 @@ mod tests {
                 .ends_with("Ternary-Bonsai-2.5-27B-PQ2_0.gguf")
         );
 
-        request.use_repacked_ptq1 = Some(false);
+        request.native_engine = false;
         let pq2 = model(&request)?;
         assert_eq!(pq2.bytes, 7_206_168_928);
         assert_eq!(
@@ -530,67 +508,7 @@ mod tests {
                 "https://huggingface.co/ukisai/Swift-Bonsai-2-GGUF/resolve/a3bdac086bbb6b04d87d0108d18943b5f63868f7/Swift-Bonsai-2-PQ2_0.gguf"
             )
         );
-        request.use_repacked_ptq1 = Some(true);
-        let ptq1 = model(&request)?;
-        assert!(ptq1.url.is_none());
-        assert_eq!(ptq1.bytes, 5_946_648_928);
-        assert_ne!(ptq1.path, pq2.path);
-        assert_ne!(ptq1.path, default_b25.path);
         Ok(())
-    }
-
-    #[test]
-    fn setup_progress_replaces_complete_reports_and_missing_ptq1_never_fetches_pq2()
-    -> crate::Result<()> {
-        let working = std::env::temp_dir().join(format!(
-            "Bonsai-SetupProgress-{}",
-            crate::startup_process::unique()
-        ));
-        fs::create_dir(&working).map_err(|error| error.to_string())?;
-        let data = working.join("data");
-        fs::create_dir(&data).map_err(|error| error.to_string())?;
-        let request: Request = serde_json::from_value(json!({
-            "DataDirectory":data,"RepositoryRoot":working.join("source"),
-            "NativeEngine":true,"UseRepackedPtq1":true,"NoAbliterateLora":true,
-        }))
-        .map_err(|error| error.to_string())?;
-        status(
-            &working,
-            "runtime",
-            "Checking runtime",
-            "first-run",
-            "preparing",
-            None,
-        )?;
-        let error = prepare(&request, &working)
-            .err()
-            .ok_or("Missing PTQ1 unexpectedly succeeded.")?;
-        assert!(error.contains("explicitly selected PTQ1 export"));
-        assert!(error.contains("Automatic setup cannot create this export"));
-        assert!(!data.join("models").exists());
-        assert!(!data.join("downloads").exists());
-        let report: Value = serde_json::from_slice(
-            &fs::read(working.join("chat-setup-progress.json"))
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        assert_eq!(report["SchemaVersion"], 2);
-        assert_eq!(report["Kind"], "first-run");
-        assert_eq!(report["Activity"], "verifying");
-        assert_eq!(report["Stage"], "model");
-        assert_eq!(report["ExpectedBytes"], 5_946_648_928_u64);
-        assert!(
-            report["ArtifactPath"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("Swift-Bonsai-2-current-repacked-PTQ1_0.gguf"))
-        );
-        assert_eq!(
-            fs::read_dir(&working)
-                .map_err(|error| error.to_string())?
-                .count(),
-            2
-        );
-        fs::remove_dir_all(working).map_err(|error| error.to_string())
     }
 
     #[test]
@@ -614,9 +532,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         fs::write(&selected.path, b"intentionally invalid model-free fixture")
             .map_err(|error| error.to_string())?;
-        for (adapter, no_mmproj) in [(false, false), (true, false), (true, true)] {
-            request.use_abliterate_lora = adapter;
-            request.no_abliterate_lora = !adapter;
+        for no_mmproj in [false, true] {
             request.no_mmproj = no_mmproj;
             let mut received = Vec::new();
             prepare_weights(
@@ -626,31 +542,21 @@ mod tests {
                     received.push((url.to_owned(), path.to_owned(), bytes, hash.to_owned()));
                     Ok(())
                 },
-                |_, _, _| Err("PQ2 must use verified download preparation.".into()),
+                |_, _, _| Err("Native setup must use verified download preparation.".into()),
             )?;
-            let expected_count = 1 + usize::from(adapter) + usize::from(!no_mmproj);
+            let expected_count = 1 + usize::from(!no_mmproj);
             assert_eq!(received.len(), expected_count);
             assert_eq!(received[0].1, selected.path);
             assert_eq!(received[0].2, selected.bytes);
             assert_eq!(received[0].3, selected.sha256);
-            let mut next_index = 1;
-            if adapter {
-                let expected = bonsai_cpu_policy::abliterate_lora_artifact(&data)?;
-                assert_eq!(received[next_index].1, expected.path);
-                assert_eq!(received[next_index].2, expected.bytes);
-                assert_eq!(received[next_index].3, expected.sha256);
-                next_index += 1;
-            }
             if !no_mmproj {
                 let expected = bonsai_cpu_policy::swift_mmproj_artifact(&data)?;
-                assert_eq!(received[next_index].1, expected.path);
-                assert_eq!(received[next_index].2, expected.bytes);
-                assert_eq!(received[next_index].3, expected.sha256);
-                assert_eq!(received[next_index].0, expected.url);
+                assert_eq!(received[1].1, expected.path);
+                assert_eq!(received[1].2, expected.bytes);
+                assert_eq!(received[1].3, expected.sha256);
+                assert_eq!(received[1].0, expected.url);
             }
         }
-        request.use_abliterate_lora = false;
-        request.no_abliterate_lora = false;
         request.no_mmproj = false;
         let mut count = 0;
         let error = prepare_weights(
@@ -666,27 +572,6 @@ mod tests {
         .ok_or("Download failure was ignored.")?;
         assert!(error.contains("Synthetic interrupted download"));
         assert_eq!(count, 1);
-
-        request.use_repacked_ptq1 = Some(true);
-        request.no_abliterate_lora = true;
-        request.no_mmproj = true;
-        let mut verified = Vec::new();
-        prepare_weights(
-            &request,
-            &working,
-            |_, _, _, _, _| Err("PTQ1 must never fetch substitute weights.".into()),
-            |path, bytes, hash| {
-                verified.push((path.to_owned(), bytes, hash.to_owned()));
-                Ok(())
-            },
-        )?;
-        assert_eq!(verified.len(), 1);
-        assert_eq!(verified[0].1, 5_946_648_928);
-        assert!(
-            verified[0]
-                .0
-                .ends_with("Swift-Bonsai-2-current-repacked-PTQ1_0.gguf")
-        );
         fs::remove_dir_all(working).map_err(|error| error.to_string())
     }
 
@@ -703,7 +588,6 @@ mod tests {
             "DataDirectory": data,
             "RepositoryRoot": working.join("source"),
             "NativeEngine": true,
-            "NoAbliterateLora": true,
             "NoMmproj": true,
         }))
         .map_err(|error| error.to_string())?;
@@ -959,8 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn bonsai25_setup_downloads_model_keeps_orca_and_mmproj_and_skips_pq2_daisyrose()
-    -> crate::Result<()> {
+    fn bonsai25_setup_downloads_model_and_mmproj_and_skips_pq2_daisyrose() -> crate::Result<()> {
         let working = std::env::temp_dir().join(format!(
             "Bonsai-SetupBonsai25-{}",
             crate::startup_process::unique()
@@ -968,7 +851,7 @@ mod tests {
         fs::create_dir(&working).map_err(|error| error.to_string())?;
         let data = working.join("data");
         fs::create_dir(&data).map_err(|error| error.to_string())?;
-        let mut request: Request = serde_json::from_value(json!({
+        let request: Request = serde_json::from_value(json!({
             "DataDirectory": data,
             "RepositoryRoot": working.join("source"),
             "NativeEngine": true,
@@ -1008,7 +891,6 @@ mod tests {
         });
         let promoted =
             bonsai_cpu_policy::daisyrose_lora_artifact_from_lock(&data, &daisy_lock.to_string())?;
-        let orca = bonsai_cpu_policy::abliterate_lora_artifact(&data)?;
         let mmproj = bonsai_cpu_policy::swift_mmproj_artifact(&data)?;
         let mut received = Vec::new();
         prepare_weights_with(
@@ -1025,32 +907,10 @@ mod tests {
             },
             |_, _, _| Ok(()),
         )?;
-        // Default Bonsai 2.5 downloads model + mmproj (2 downloads; Orca-free and foreign DaisyRose skipped).
+        // Bonsai 2.5 downloads model + mmproj (foreign DaisyRose skipped).
         assert_eq!(received.len(), 2);
         assert_eq!(received[0].1, pinned_b25.path);
         assert_eq!(received[1].1, mmproj.path);
-
-        // Explicit Orca opt-in downloads Bonsai 2.5 model + Orca + mmproj (3 downloads; foreign DaisyRose skipped).
-        request.use_abliterate_lora = true;
-        received.clear();
-        prepare_weights_with(
-            &request,
-            &working,
-            &selected,
-            false,
-            "first-run",
-            Some(&mmproj),
-            Some(&promoted),
-            |url, path, bytes, hash, _| {
-                received.push((url.to_owned(), path.to_owned(), bytes, hash.to_owned()));
-                Ok(())
-            },
-            |_, _, _| Ok(()),
-        )?;
-        assert_eq!(received.len(), 3);
-        assert_eq!(received[0].1, pinned_b25.path);
-        assert_eq!(received[1].1, orca.path);
-        assert_eq!(received[2].1, mmproj.path);
 
         fs::remove_dir_all(working).map_err(|error| error.to_string())
     }

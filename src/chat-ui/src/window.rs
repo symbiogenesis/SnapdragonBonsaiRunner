@@ -113,8 +113,6 @@ fn runtime_description(config: &Config) -> String {
             client::Bonsai25Variant::Pq2 => "Bonsai 2.5 PQ2",
             client::Bonsai25Variant::Ptq1 => "Bonsai 2.5 PTQ1",
         }
-    } else if config.use_repacked_ptq1 {
-        "PTQ1"
     } else {
         "PQ2"
     };
@@ -198,8 +196,6 @@ struct State {
     extra_effort: bool,
     enable_thinking: bool,
     output_budget: usize,
-    abliteration_scale: f32,
-    abliteration_enabled: bool,
     daisyrose_scale: f32,
     daisyrose_enabled: bool,
     daisyrose_available: bool,
@@ -376,8 +372,6 @@ impl State {
             extra_effort: false,
             enable_thinking: false,
             output_budget: 3,
-            abliteration_scale: client::DEFAULT_ABLITERATION_SCALE,
-            abliteration_enabled: true,
             daisyrose_scale: client::DEFAULT_DAISYROSE_SCALE,
             daisyrose_enabled: false,
             daisyrose_available: false,
@@ -464,7 +458,6 @@ impl State {
         }
         "Preparing runtime selection…".clone_into(&mut state.runtime_description);
         state.model = ModelLifecycle::Preparing;
-        state.abliteration_enabled = false;
         state.daisyrose_available = false;
         state.daisyrose_max_rank = None;
         state.daisyrose_sha256_prefix = None;
@@ -647,15 +640,11 @@ impl State {
     fn apply_model_config(&mut self, config: &Config) {
         self.markdown_image = Some(config.broker.clone());
         self.runtime_description = runtime_description(config);
-        self.weight_packing = match (config.bonsai25_variant, config.use_repacked_ptq1) {
-            (Some(client::Bonsai25Variant::Pq2), _) => context_capacity::WeightPacking::Bonsai25Pq2,
-            (Some(client::Bonsai25Variant::Ptq1), _) => {
-                context_capacity::WeightPacking::Bonsai25Ptq1
-            }
-            (None, true) => context_capacity::WeightPacking::Ptq1_0,
-            (None, false) => context_capacity::WeightPacking::Pq2_0,
+        self.weight_packing = match config.bonsai25_variant {
+            Some(client::Bonsai25Variant::Pq2) => context_capacity::WeightPacking::Bonsai25Pq2,
+            Some(client::Bonsai25Variant::Ptq1) => context_capacity::WeightPacking::Bonsai25Ptq1,
+            None => context_capacity::WeightPacking::Pq2_0,
         };
-        self.abliteration_enabled = config.use_abliterate_lora;
         self.daisyrose_available = config.daisyrose_lora.is_some();
         self.daisyrose_max_rank = None;
         self.daisyrose_sha256_prefix = None;
@@ -842,7 +831,6 @@ impl State {
                 max_completion_tokens,
                 extra_effort: self.extra_effort,
                 enable_thinking: self.enable_thinking,
-                abliteration_scale: self.abliteration_scale,
                 daisyrose_scale: self.effective_daisyrose_scale(),
                 cognitive: self.cognitive,
                 system_appendix,
@@ -3239,11 +3227,9 @@ mod startup_tests {
             frontend_port: 5173,
             backend_port: 8081,
             require_broker_pipe: false,
-            use_abliterate_lora: false,
             daisyrose_lora: None,
             no_daisyrose_lora: false,
             no_mmproj: false,
-            use_repacked_ptq1: false,
             bonsai25_variant: None,
             native_engine: false,
             native_row_workers: 1,
@@ -3266,7 +3252,6 @@ mod startup_tests {
         assert_eq!(state.input, "A message drafted while applications prepare");
         assert!(state.enable_thinking && state.output_budget == 1);
         assert_eq!(state.voice_profile, "My chosen voice");
-        assert!(!state.abliteration_enabled);
         assert!(!state.preview && !state.model.ready());
         drop(state);
         fs::remove_dir_all(&directory)?;
@@ -3369,11 +3354,9 @@ mod startup_tests {
                 frontend_port: 5173,
                 backend_port: 8081,
                 require_broker_pipe: false,
-                use_abliterate_lora: false,
                 daisyrose_lora: None,
                 no_daisyrose_lora: false,
                 no_mmproj: false,
-                use_repacked_ptq1: false,
                 bonsai25_variant: None,
                 native_engine: true,
                 native_row_workers: 4,

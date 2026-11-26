@@ -55,8 +55,7 @@ impl JsonCandidateScratch {
             let mut deserializer = simd_json::Deserializer::from_tape(tape);
             let result = match Object::<ClientChat<'_>>::deserialize(&mut deserializer) {
                 Ok(Object(chat))
-                    if chat.abliteration_scale.is_none()
-                        && chat.daisyrose_scale.is_none()
+                    if chat.daisyrose_scale.is_none()
                         && chat.temperature.is_none()
                         && chat.top_p.is_none()
                         && chat.min_p.is_none()
@@ -97,10 +96,17 @@ mod tests {
         scratch: &mut JsonCandidateScratch,
         body: &[u8],
         declared_length: usize,
-        pinned: bool,
+        daisyrose: bool,
     ) {
         let original = body.to_vec();
-        let head = || AuthorizedHead::test_head(declared_length, pinned);
+        let head = || {
+            let head = AuthorizedHead::test_head(declared_length);
+            if daisyrose {
+                head.with_daisyrose(10)
+            } else {
+                head
+            }
+        };
         let summarize =
             |chat: crate::PendingChat| (chat.body, chat.max_completion_tokens, chat.stream);
         assert_eq!(
@@ -144,10 +150,7 @@ mod tests {
         compare(&mut scratch, &oversized, oversized.len(), false);
         assert_eq!(
             scratch
-                .prepare(
-                    AuthorizedHead::test_head(oversized.len(), false),
-                    &oversized
-                )
+                .prepare(AuthorizedHead::test_head(oversized.len()), &oversized)
                 .err(),
             Some(Rejection::BodySize)
         );
@@ -167,16 +170,17 @@ mod tests {
         for _ in 0..3 {
             for body in [
                 br#"{"messages":[{"role":"user","content":"rain"}]}"#.as_slice(),
-                br#"{"messages":[{"role":"user","content":"rain"}],"abliteration_scale":1.2785641882898677}"#,
-                br#"{"messages":[{"role":"user","content":"rain"}],"abliteration_\u0073cale":1.6447349639294147}"#,
-                br#"{"messages":[{"role":"user","content":"rain"}],"abliteration_scale":2.0000000000000001}"#,
-                br#"{"messages":[{"role":"user","content":"rain"}],"abliteration_scale":null}"#,
-                br#"{"messages":[{"role":"user","content":"rain"}],"abliteration_scale":1e9999}"#,
+                br#"{"messages":[{"role":"user","content":"rain"}],"daisyrose_scale":1.2785641882898677}"#,
+                br#"{"messages":[{"role":"user","content":"rain"}],"daisyrose_\u0073cale":1.6447349639294147}"#,
+                br#"{"messages":[{"role":"user","content":"rain"}],"daisyrose_scale":2.0000000000000001}"#,
+                br#"{"messages":[{"role":"user","content":"rain"}],"daisyrose_scale":null}"#,
+                br#"{"messages":[{"role":"user","content":"rain"}],"daisyrose_scale":1e9999}"#,
+                br#"{"messages":[{"role":"user","content":"rain"}],"abliteration_scale":1.3}"#,
                 br#"{"messages":[{"role":"user","content":"\ud800"}]}"#,
                 br#"{"messages":[{"role":"user","content":"rain","extra":0}]}"#,
             ] {
-                for pinned in [false, true] {
-                    compare(&mut scratch, body, body.len(), pinned);
+                for daisyrose in [false, true] {
+                    compare(&mut scratch, body, body.len(), daisyrose);
                     assert_eq!(scratch.input.as_ptr(), input_pointer);
                     assert_eq!(scratch.input.capacity(), input_capacity);
                     assert_eq!(scratch.tape.0.as_ptr(), tape_pointer);
@@ -184,8 +188,7 @@ mod tests {
                 }
             }
         }
-        let enabled_head =
-            |len| AuthorizedHead::test_head(len, false).with_cognitive_controls(true);
+        let enabled_head = |len| AuthorizedHead::test_head(len).with_cognitive_controls(true);
         for body in [
             br#"{"messages":[{"role":"user","content":"rain"}],"reasoning_effort":"low","reasoning_budget":128,"top_k":40,"dry_allowed_length":2,"dry_penalty_last_n":512,"logprobs":true,"top_logprobs":5}"#.as_slice(),
             br#"{"messages":[{"role":"user","content":"rain"}],"temperature":0.85,"top_p":0.95,"min_p":0.05,"dry_multiplier":0.8,"dry_base":1.75}"#,

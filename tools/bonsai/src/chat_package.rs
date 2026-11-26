@@ -358,10 +358,7 @@ fn launch_options(package: &Value, options: Value) -> crate::Result<Value> {
             "DataDirectory"
                 | "NoSpeechModels"
                 | "NoTts"
-                | "UseAbliterateLora"
-                | "NoAbliterateLora"
                 | "NoDaisyRoseLora"
-                | "UseRepackedPtq1"
                 | "Bonsai25Variant"
                 | "NativeEngine"
                 | "RequireBrokerPipe"
@@ -600,7 +597,7 @@ mod tests {
             .as_str()
             .ok_or("Missing manifest digest.")?;
         let options = json!({"DataDirectory": root.join("data"), "NoTts": true,
-            "UseRepackedPtq1": true, "TtsThreads": 0});
+            "Bonsai25Variant": "ptq1", "TtsThreads": 0});
         let result = checked_launch(&root, &directory, id, digest, options.clone(), |request| {
             assert_eq!(request["RepositoryRoot"], json!(directory));
             assert_eq!(
@@ -616,7 +613,7 @@ mod tests {
                 json!(directory.join("bin/bonsai-asr.exe"))
             );
             assert!(request.get("TtsPath").is_none());
-            assert_eq!(request["UseRepackedPtq1"], true);
+            assert_eq!(request["Bonsai25Variant"], "ptq1");
             Ok(json!({"Status": "handed-off"}))
         })?;
         assert_eq!(result["Status"], "handed-off");
@@ -629,7 +626,6 @@ mod tests {
                 "NativeEngine": true,
                 "RequireBrokerPipe": true,
                 "NativeRowWorkers": 4,
-                "NoAbliterateLora": true,
                 "NoDaisyRoseLora": true,
                 "PromptReuse": "prompt-end-and-latest",
                 "PromptReuseCheckpoints": 4,
@@ -643,7 +639,6 @@ mod tests {
         assert_eq!(native["NativeEngine"], true);
         assert_eq!(native["RequireBrokerPipe"], true);
         assert_eq!(native["NativeRowWorkers"], 4);
-        assert_eq!(native["NoAbliterateLora"], true);
         assert_eq!(native["NoDaisyRoseLora"], true);
         assert_eq!(native["PromptReuse"], "prompt-end-and-latest");
         assert_eq!(native["PromptReuseCheckpoints"], 4);
@@ -652,13 +647,9 @@ mod tests {
         assert_eq!(native["DraftMax"], 6);
         assert_eq!(native["CpuFamily"], "x2");
         assert_eq!(native["Placement"], "cpu");
-        let original = launch_options(
-            &package,
-            json!({"UseRepackedPtq1": false, "NativeEngine": true, "UseAbliterateLora": true}),
-        )?;
-        assert_eq!(original.get("UseRepackedPtq1"), Some(&json!(false)));
-        assert_eq!(original["NativeEngine"], true);
-        assert_eq!(original["UseAbliterateLora"], true);
+        for legacy in ["UseRepackedPtq1", "UseAbliterateLora", "NoAbliterateLora"] {
+            assert!(launch_options(&package, json!({ legacy: true })).is_err());
+        }
         assert!(launch_options(&package, json!({"ChatPath": "outside.exe"})).is_err());
         assert!(launch_options(&package, json!({"ForceBuild": true})).is_err());
         for (expected_directory, expected_id, expected_digest) in [

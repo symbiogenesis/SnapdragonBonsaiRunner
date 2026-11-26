@@ -29,8 +29,8 @@ pub(super) struct ConversationSnapshot {
     #[serde(default)]
     pub(super) streaming_read_aloud: bool,
     pub(super) output_budget: usize,
-    #[serde(default = "client::default_abliteration_scale")]
-    pub(super) abliteration_scale: f32,
+    #[serde(default, skip_serializing, rename = "abliteration_scale")]
+    pub(super) _legacy_abliteration_scale: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     pub(super) daisyrose_enabled: bool,
     #[serde(default = "client::default_daisyrose_scale")]
@@ -136,7 +136,7 @@ impl State {
             enable_thinking: self.enable_thinking,
             streaming_read_aloud: self.streaming_read_aloud,
             output_budget: self.output_budget,
-            abliteration_scale: self.abliteration_scale,
+            _legacy_abliteration_scale: None,
             daisyrose_enabled: self.daisyrose_enabled,
             daisyrose_scale: self.daisyrose_scale,
             cognitive: self.cognitive,
@@ -183,7 +183,6 @@ impl State {
         self.enable_thinking = false;
         self.streaming_read_aloud = false;
         self.output_budget = 3;
-        self.abliteration_scale = client::DEFAULT_ABLITERATION_SCALE;
         self.daisyrose_enabled = self.daisyrose_default_enabled();
         self.daisyrose_scale = self.daisyrose_default_scale();
         self.daisyrose_customized = false;
@@ -206,7 +205,6 @@ impl State {
         self.enable_thinking = snapshot.enable_thinking;
         self.streaming_read_aloud = snapshot.streaming_read_aloud;
         self.output_budget = snapshot.output_budget;
-        self.abliteration_scale = snapshot.abliteration_scale;
         self.daisyrose_enabled = snapshot.daisyrose_enabled;
         self.daisyrose_scale = snapshot.daisyrose_scale;
         self.daisyrose_customized = true;
@@ -340,7 +338,6 @@ impl State {
             &mut saved.streaming_read_aloud,
         );
         std::mem::swap(&mut self.output_budget, &mut saved.output_budget);
-        std::mem::swap(&mut self.abliteration_scale, &mut saved.abliteration_scale);
         std::mem::swap(&mut self.daisyrose_enabled, &mut saved.daisyrose_enabled);
         std::mem::swap(&mut self.daisyrose_scale, &mut saved.daisyrose_scale);
         std::mem::swap(&mut self.cognitive, &mut saved.cognitive);

@@ -426,6 +426,13 @@ const SEQUENTIAL_KV_BOOKKEEPING_BYTES_PER_TOKEN: u64 = 24 * 4 + 128;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WeightPacking {
     Pq2_0,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Historical PTQ1_0 footprint variant covered by capacity tests."
+        )
+    )]
     Ptq1_0,
     Bonsai25Pq2,
     Bonsai25Ptq1,

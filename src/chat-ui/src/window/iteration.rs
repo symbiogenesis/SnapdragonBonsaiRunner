@@ -284,7 +284,6 @@ impl State {
                 max_completion_tokens,
                 extra_effort: self.extra_effort,
                 enable_thinking: self.enable_thinking,
-                abliteration_scale: self.abliteration_scale,
                 daisyrose_scale: self.effective_daisyrose_scale(),
                 cognitive: self.cognitive,
                 system_appendix,
@@ -385,7 +384,6 @@ impl State {
             self.enable_thinking,
             self.streaming_read_aloud,
             self.output_budget,
-            self.abliteration_scale,
             self.daisyrose_enabled,
             self.daisyrose_scale,
         );
@@ -406,7 +404,6 @@ impl State {
             self.enable_thinking,
             self.streaming_read_aloud,
             self.output_budget,
-            self.abliteration_scale,
             self.daisyrose_enabled,
             self.daisyrose_scale,
         ) = settings;
@@ -1071,7 +1068,6 @@ mod tests {
         state.enable_thinking = true;
         state.extra_effort = true;
         state.output_budget = 1;
-        state.abliteration_scale = 1.4;
         (state, incoming)
     }
 
@@ -1179,7 +1175,7 @@ mod tests {
             matches!(commands.try_recv(), Ok(Command::RestoreChat(history)) if history.len() == 2)
         );
         assert!(
-            matches!(commands.try_recv(), Ok(Command::Send { text, enable_thinking: true, extra_effort: true, max_completion_tokens: 1024, abliteration_scale, .. }) if text == "Same question" && (abliteration_scale - 1.4).abs() < f32::EPSILON)
+            matches!(commands.try_recv(), Ok(Command::Send { text, enable_thinking: true, extra_effort: true, max_completion_tokens: 1024, .. }) if text == "Same question")
         );
         assert_eq!(state.conversations[0].id, state.active_conversation);
         let original = state.conversations[1].saved.as_ref();

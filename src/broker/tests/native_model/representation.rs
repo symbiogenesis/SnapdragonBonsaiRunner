@@ -933,9 +933,7 @@ fn native_representation_row4_profile_is_explicit_and_preserves_pair() {
             ]
             .map(OsString::from),
         );
-        let config = LaunchConfig::parse(actual).unwrap();
-        assert!(config.uses_native_engine() && config.requires_native_sandbox());
-        assert_eq!(config.uses_repacked_ptq1(), parallel.repacked);
+        assert!(LaunchConfig::parse(actual).is_err());
     }
     assert!(!profiles(4)[0].repacked && profiles(4)[1].repacked);
     assert_eq!(NEXT_OWNER_RESERVE, Duration::from_mins(1));
