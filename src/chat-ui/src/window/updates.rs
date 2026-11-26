@@ -404,6 +404,7 @@ pub(super) struct Updates {
     next_check: Instant,
     status: String,
     error: Option<String>,
+    error_offline: bool,
 }
 
 impl Updates {
@@ -432,6 +433,7 @@ impl Updates {
             next_check: Instant::now(),
             status: "Checking for updates shortly…".into(),
             error: None,
+            error_offline: false,
         })
     }
 
@@ -488,6 +490,7 @@ impl Updates {
         }
         self.confirming = false;
         self.error = None;
+        self.error_offline = false;
         if operation != Operation::Install {
             self.confirmed = false;
         }
@@ -514,6 +517,7 @@ impl Updates {
                 self.confirmed = false;
                 self.status = "Could not start the update check. Try again.".into();
                 self.error = Some(error.to_string());
+                self.error_offline = false;
             }
         }
     }
@@ -547,6 +551,7 @@ impl Updates {
 
     fn operation_finished(&mut self, operation: Operation, result: Response) -> Option<String> {
         self.error = None;
+        self.error_offline = false;
         match result.status.as_str() {
             "available" => {
                 if self.select_candidate(result) {
@@ -576,6 +581,7 @@ impl Updates {
                     self.confirmed = false;
                     self.status = "The update was not approved for this verified download. Check for updates and confirm again.".into();
                     self.error = Some(self.status.clone());
+                    self.error_offline = false;
                     return Some("Application update: rejected a queued result without current confirmation and a verified download.".into());
                 }
                 self.queued = true;
@@ -594,10 +600,12 @@ impl Updates {
     }
 
     fn operation_failed(&mut self, operation: Operation, error: &io::Error) -> String {
-        self.error = Some(error.to_string());
-        self.cleanup_unconfirmed = error
-            .to_string()
-            .contains("Application update process cleanup could not be confirmed.");
+        let message = error.to_string();
+        self.cleanup_unconfirmed =
+            message.contains("Application update process cleanup could not be confirmed.");
+        let offline = !self.cleanup_unconfirmed && is_offline_error(&message);
+        self.error = Some(message);
+        self.error_offline = offline;
         if operation == Operation::Install {
             // Failed queue preparation never carries an old approval or
             // a potentially changed publication into another attempt.
@@ -606,11 +614,23 @@ impl Updates {
             self.downloaded = false;
             self.release_identity = None;
             if !self.cleanup_unconfirmed {
-                self.next_check = Instant::now();
+                self.next_check = if offline {
+                    Instant::now() + CHECK_INTERVAL
+                } else {
+                    Instant::now()
+                };
             }
         }
         self.status = if self.cleanup_unconfirmed {
             "Update cleanup could not be confirmed. Close Swift before trying another update."
+        } else if offline {
+            match operation {
+                Operation::Check => "No internet connection. Couldn't check for updates.",
+                Operation::Download => "No internet connection. Couldn't download the update.",
+                Operation::Install => {
+                    "No internet connection. Couldn't verify the update before installing."
+                }
+            }
         } else if operation == Operation::Check {
             "Could not check for updates. Try again or open diagnostics for details."
         } else {
@@ -770,10 +790,14 @@ impl Updates {
             self.status =
                 "The model could not stop safely. Close Swift before updating manually.".into();
             self.error = Some(self.status.clone());
+            self.error_offline = false;
         }
     }
 
     pub(super) fn error_notice(&self) -> Option<(&str, &str)> {
+        if self.error_offline {
+            return None;
+        }
         self.error
             .as_deref()
             .map(|error| (self.status.as_str(), error))
@@ -781,6 +805,7 @@ impl Updates {
 
     pub(super) fn dismiss_error(&mut self) {
         self.error = None;
+        self.error_offline = false;
     }
 
     #[cfg(test)]
@@ -788,18 +813,23 @@ impl Updates {
         let mut updates = tests::update_fixture()?;
         updates.status = error.to_owned();
         updates.error = Some(error.to_owned());
+        updates.error_offline = false;
         Ok(updates)
     }
 
     pub(super) fn controls(&mut self, ui: &mut egui::Ui, can_install: bool) {
         update_header(ui);
         let idle = self.task.is_none() && !self.installing() && !self.cleanup_unconfirmed;
-        ui.horizontal_top(|ui| {
-            if self.task.is_some() || self.installing() {
-                ui.spinner();
-            }
-            super::error_ui::summary(ui, &self.status);
-        });
+        if self.error_offline && self.task.is_none() && !self.installing() {
+            offline_alert(ui, &self.status);
+        } else {
+            ui.horizontal_top(|ui| {
+                if self.task.is_some() || self.installing() {
+                    ui.spinner();
+                }
+                super::error_ui::summary(ui, &self.status);
+            });
+        }
         if !idle {
             return;
         }
@@ -834,6 +864,65 @@ impl Updates {
             }
         }
     }
+}
+
+fn is_offline_error(message: &str) -> bool {
+    if message.contains("Application update process cleanup could not be confirmed.") {
+        return false;
+    }
+    if message.contains("No internet connection:")
+        || message.contains("Native HTTPS operation exceeded its aggregate allowance.")
+        || message.contains("The update operation timed out.")
+    {
+        return true;
+    }
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("github update check failed (http ") {
+        return false;
+    }
+    [
+        "host not found",
+        "connection failed",
+        "timeout:",
+        "connect proxy failed",
+        "network unreachable",
+        "host unreachable",
+        "network down",
+        "no such host",
+        "os error 11001",
+        "os error 11002",
+        "os error 11003",
+        "os error 11004",
+        "os error 10050",
+        "os error 10051",
+        "os error 10052",
+        "os error 10060",
+        "os error 10064",
+        "os error 10065",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn offline_alert(ui: &mut egui::Ui, message: &str) {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(
+                    egui::RichText::new("Offline")
+                        .small()
+                        .strong()
+                        .color(ui.visuals().warn_fg_color),
+                );
+                ui.label(egui::RichText::new(message).small());
+            });
+        });
 }
 
 fn update_header(ui: &mut egui::Ui) {
@@ -905,6 +994,7 @@ mod tests {
             next_check: Instant::now() + CHECK_INTERVAL,
             status: "Verified fixture update".into(),
             error: None,
+            error_offline: false,
         })
     }
 
@@ -1768,6 +1858,138 @@ mod tests {
             Installation::for_launch(&tool, handoff, &root.join("bin/bonsai-chat.exe"), true)
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn offline_update_failures_stay_out_of_chat_area_and_show_compact_alert_in_settings()
+    -> io::Result<()> {
+        use egui_kittest::{Harness, kittest::Queryable as _};
+
+        for (operation, raw_error, expected_status) in [
+            (
+                Operation::Check,
+                "No internet connection: Native HTTPS request failed: host not found",
+                "No internet connection. Couldn't check for updates.",
+            ),
+            (
+                Operation::Check,
+                "No internet connection: GitHub update requests are paused until Unix time 9999999999 after a network failure. Your installed app is unchanged.",
+                "No internet connection. Couldn't check for updates.",
+            ),
+            (
+                Operation::Check,
+                "Native HTTPS request failed: io: No such host is known. (os error 11001)",
+                "No internet connection. Couldn't check for updates.",
+            ),
+            (
+                Operation::Download,
+                "The update operation timed out.",
+                "No internet connection. Couldn't download the update.",
+            ),
+            (
+                Operation::Install,
+                "No internet connection: Native HTTPS request failed: connection failed",
+                "No internet connection. Couldn't verify the update before installing.",
+            ),
+        ] {
+            let mut updates = update_fixture()?;
+            updates.version = None;
+            updates.downloaded = false;
+            updates.release_identity = None;
+            let diagnostic = updates.operation_failed(operation, &io::Error::other(raw_error));
+            assert!(diagnostic.contains(raw_error));
+            assert!(updates.error_offline);
+            assert!(updates.error_notice().is_none());
+            assert_eq!(updates.status, expected_status);
+        }
+
+        // Non-offline failures must continue surfacing in the shared chat alert panel.
+        for non_offline in [
+            "GitHub update check failed (HTTP 403). Your installed app is unchanged.",
+            "Update signature invalid",
+            "Application update process cleanup could not be confirmed. Synthetic failure.",
+        ] {
+            let mut updates = update_fixture()?;
+            updates.operation_failed(Operation::Check, &io::Error::other(non_offline));
+            assert!(!updates.error_offline);
+            assert!(updates.error_notice().is_some());
+        }
+
+        // Offline failure never renders an alert in the chat area, and shows only the
+        // compact inline notice inside Settings -> Application.
+        for (size, theme) in [
+            ([480.0, 480.0], egui::ThemePreference::Light),
+            ([1180.0, 860.0], egui::ThemePreference::Dark),
+        ] {
+            let (mut state, _commands) = update_state()?;
+            let mut updates = state
+                .updates
+                .take()
+                .ok_or_else(|| io::Error::other("Missing updates"))?;
+            updates.version = None;
+            updates.downloaded = false;
+            updates.release_identity = None;
+            updates.operation_failed(
+                Operation::Check,
+                &io::Error::other(
+                    "No internet connection: Native HTTPS request failed: host not found",
+                ),
+            );
+            state.updates = Some(updates);
+
+            let mut harness = Harness::builder()
+                .with_size(size)
+                .with_context_setup(super::super::configure_test_context)
+                .build_ui_state(
+                    |ui, state: &mut super::super::State| {
+                        state.handle_input_shortcuts(ui.ctx());
+                        state.draw(ui);
+                    },
+                    state,
+                );
+            harness.ctx.set_theme(theme);
+            harness.run();
+            assert!(harness.state().active_alerts().is_empty());
+            assert!(harness.query_by_label("Update needs attention").is_none());
+            assert!(harness.query_by_label("1 alert").is_none());
+            assert!(harness.query_by_label("Offline").is_none());
+
+            harness
+                .state_mut()
+                .open_settings(super::super::settings::Page::Application);
+            harness.run();
+            let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size.into());
+            let offline_badge = harness.get_by_label("Offline").rect();
+            let offline_text = harness
+                .get_by_label("No internet connection. Couldn't check for updates.")
+                .rect();
+            let check_button = harness
+                .get_by_role_and_label(egui::Role::Button, "Check for updates")
+                .rect();
+            assert!(bounds.contains_rect(offline_badge));
+            assert!(bounds.contains_rect(offline_text));
+            assert!(bounds.contains_rect(check_button));
+            assert!(harness.query_by_label("Update needs attention").is_none());
+
+            // A subsequent current response clears the offline state and its Settings alert.
+            harness
+                .state_mut()
+                .updates
+                .as_mut()
+                .ok_or_else(|| io::Error::other("Missing updates"))?
+                .operation_finished(
+                    Operation::Check,
+                    Response {
+                        status: "current".into(),
+                        version: None,
+                        release_identity: None,
+                    },
+                );
+            harness.run();
+            assert!(harness.query_by_label("Offline").is_none());
+            assert!(harness.query_by_label("Swift is up to date.").is_some());
+        }
         Ok(())
     }
 }

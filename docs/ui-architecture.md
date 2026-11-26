@@ -166,7 +166,9 @@ No authentication, conversation or model data accompanies
 these requests.
 Network and HTTP failures persist an exponential cooldown across helper processes,
 honoring `Retry-After` and exhausted GitHub rate-limit reset instructions. Failed
-requests never fall back to cached success or immediately retry.
+requests never fall back to cached success or immediately retry. Offline or
+no-internet update failures do not surface in the shared chat-area alert panel
+and appear only as a small inline notice in the Settings update area.
 
 After the download is verified, a nonmodal nudge offers **Restart to update** or
 **Later** without interrupting typing or generation. A pending-update badge stays
@@ -218,7 +220,7 @@ Installed upgrade/rollback acceptance is independent of portable updates.
 | Response controls | Per-conversation settings lock during generation. The composer popup exposes Thinking/Extra effort; advanced reply/adapter controls live in Settings. [Application controls](development-guide.md#conversations-and-response-settings) own defaults and actions. |
 | Stop/retry | No generation elapsed-time cutoff. Response Stop freezes queued updates, wakes network/backpressure waits, and restores readiness without raising a model alert (resetting the warm native session in place via authenticated `/reset`, or automatically restarting a fresh warm instance after confirmed Job teardown on publisher rollback). Explicit model teardown (`StopModel`, such as before installing an update) parks cleanly until `Reload model` or shutdown. Retry/reload requires acknowledged teardown, fresh credentials/diagnostics and repeated artifact/identity/memory admission. Preserve completed turns/newer drafts; never replay or reduce the profile automatically. Completion winning the Stop race must leave transcript and history consistent. |
 | Rejections | Only the exact [broker recovery errors](broker-policy.md#native-client-completion-and-recovery) retain readiness and restore input. Other disconnects require explicit Retry and identify no token/memory cause. |
-| Alerts | One shared native panel selects among setup/model/saving/speech/audio/update failures. Each has a two-line summary, an `×` dismiss control and source-specific actions. Details provides a bounded scrollable modal; Copy error copies the complete message. Successful progress stays separate. |
+| Alerts | One shared native panel selects among setup/model/saving/speech/audio/update failures. Each has a two-line summary, an `×` dismiss control and source-specific actions. Details provides a bounded scrollable modal; Copy error copies the complete message. Successful progress stays separate. Offline or no-internet update failures are excluded from this shared panel and appear only as a small inline notice inside the Settings update area. |
 
 Markdown parsing and offline SVG rasterization use the same persistent [offline native sandbox worker](sandboxing.md#markdown-parser-worker),
 with bounded background pipe I/O and trusted-parent validation (`BMD2` segmented
