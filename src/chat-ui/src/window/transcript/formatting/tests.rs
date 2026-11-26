@@ -344,3 +344,31 @@ fn markdown_streaming_prefix_retains_formatted_prefix_and_renders_plain_tail() {
         assert!(pair[0].display.end <= pair[1].display.start);
     }
 }
+
+#[test]
+fn presentation_append_coalesces_single_newlines_and_splits_only_paragraph_gaps() {
+    let visuals = egui::Visuals::dark();
+    let format = presentation::body_format(16.0, &visuals);
+    let mut job = egui::text::LayoutJob::default();
+    presentation::append(
+        &mut job,
+        "line 1\nline 2\nline 3\n\npara 2\nline 4",
+        format,
+        16.0,
+    );
+    assert_eq!(job.text, "line 1\nline 2\nline 3\n\npara 2\nline 4");
+    assert_eq!(job.sections.len(), 3);
+    assert_eq!(
+        &job.text[job.sections[0].byte_range.start.0..job.sections[0].byte_range.end.0],
+        "line 1\nline 2\nline 3\n"
+    );
+    assert_eq!(
+        &job.text[job.sections[1].byte_range.start.0..job.sections[1].byte_range.end.0],
+        "\n"
+    );
+    assert_eq!(job.sections[1].format.line_height, Some(16.0 * 0.65));
+    assert_eq!(
+        &job.text[job.sections[2].byte_range.start.0..job.sections[2].byte_range.end.0],
+        "para 2\nline 4"
+    );
+}

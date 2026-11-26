@@ -20,12 +20,20 @@ enum RequestKind {
     },
 }
 
-fn write_frame(output: &mut impl Write, ticket: u64, bytes: &[u8]) -> io::Result<()> {
+fn write_frame(
+    output: &mut impl Write,
+    ticket: u64,
+    bytes: &[u8],
+    scratch: &mut Vec<u8>,
+) -> io::Result<()> {
     let length = u32::try_from(bytes.len()).map_err(io::Error::other)?;
-    output.write_all(RESPONSE_MAGIC)?;
-    output.write_all(&ticket.to_le_bytes())?;
-    output.write_all(&length.to_le_bytes())?;
-    output.write_all(bytes)?;
+    scratch.clear();
+    scratch.reserve(HEADER_BYTES + bytes.len());
+    scratch.extend_from_slice(RESPONSE_MAGIC);
+    scratch.extend_from_slice(&ticket.to_le_bytes());
+    scratch.extend_from_slice(&length.to_le_bytes());
+    scratch.extend_from_slice(bytes);
+    output.write_all(scratch)?;
     output.flush()
 }
 
@@ -100,7 +108,8 @@ fn read_frame(input: &mut impl Read) -> io::Result<(u64, RequestKind)> {
 /// Rejects invalid identity, zero request tickets, oversized or truncated frames,
 /// invalid UTF-8, oversized results and failed pipe reads, writes or flushes.
 pub fn serve(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
-    write_frame(output, 0, &[])?;
+    let mut scratch = Vec::with_capacity(HEADER_BYTES);
+    write_frame(output, 0, &[], &mut scratch)?;
     loop {
         let (ticket, request) = read_frame(input)?;
         match request {
@@ -109,7 +118,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
                 if rendered.len() > MAX_OUTPUT_BYTES {
                     return Err(io::Error::other("Oversized Markdown result"));
                 }
-                write_frame(output, ticket, &rendered)?;
+                write_frame(output, ticket, &rendered, &mut scratch)?;
             }
             RequestKind::Rasterize {
                 max_width,
@@ -120,7 +129,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
                 if raster.len() > MAX_RASTER_OUTPUT_BYTES {
                     return Err(io::Error::other("Oversized SVG raster result"));
                 }
-                write_frame(output, ticket, &raster)?;
+                write_frame(output, ticket, &raster, &mut scratch)?;
             }
         }
     }

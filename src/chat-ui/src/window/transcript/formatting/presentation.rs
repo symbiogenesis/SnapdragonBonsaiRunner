@@ -66,17 +66,36 @@ pub(super) fn append(
     format: egui::TextFormat,
     size: f32,
 ) {
-    for line in text.split_inclusive('\n') {
-        let effective = if line == "\n" && job.text.ends_with('\n') && !block_code(&format) {
-            egui::TextFormat {
+    if text.is_empty() {
+        return;
+    }
+    if block_code(&format) || !text.contains('\n') {
+        job.append(text, 0.0, format);
+        return;
+    }
+    let bytes = text.as_bytes();
+    let mut cursor = 0_usize;
+    for pos in memchr::memchr_iter(b'\n', bytes) {
+        let prev_is_newline = if pos > cursor {
+            bytes[pos - 1] == b'\n'
+        } else {
+            job.text.ends_with('\n')
+        };
+        if prev_is_newline {
+            if cursor < pos {
+                job.append(&text[cursor..pos], 0.0, format.clone());
+            }
+            let gap = egui::TextFormat {
                 font_id: egui::FontId::proportional(1.0),
                 line_height: Some(size * 0.65),
                 ..format.clone()
-            }
-        } else {
-            format.clone()
-        };
-        job.append(line, 0.0, effective);
+            };
+            job.append("\n", 0.0, gap);
+            cursor = pos + 1;
+        }
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, format);
     }
 }
 

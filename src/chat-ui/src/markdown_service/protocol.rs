@@ -20,12 +20,16 @@ fn write_frame(
     magic: &[u8; 8],
     ticket: Ticket,
     bytes: &[u8],
+    scratch: &mut Vec<u8>,
 ) -> io::Result<()> {
     let length = u32::try_from(bytes.len()).map_err(io::Error::other)?;
-    output.write_all(magic)?;
-    output.write_all(&ticket.0.to_le_bytes())?;
-    output.write_all(&length.to_le_bytes())?;
-    output.write_all(bytes)?;
+    scratch.clear();
+    scratch.reserve(HEADER_BYTES + bytes.len());
+    scratch.extend_from_slice(magic);
+    scratch.extend_from_slice(&ticket.0.to_le_bytes());
+    scratch.extend_from_slice(&length.to_le_bytes());
+    scratch.extend_from_slice(bytes);
+    output.write_all(scratch)?;
     output.flush()
 }
 
@@ -35,18 +39,22 @@ fn write_raster_frame(
     max_width: u32,
     max_height: u32,
     svg: &[u8],
+    scratch: &mut Vec<u8>,
 ) -> io::Result<()> {
     let payload_len = svg
         .len()
         .checked_add(8)
         .ok_or_else(|| io::Error::other("Oversized SVG raster frame"))?;
     let length = u32::try_from(payload_len).map_err(io::Error::other)?;
-    output.write_all(RASTER_REQUEST_MAGIC)?;
-    output.write_all(&ticket.0.to_le_bytes())?;
-    output.write_all(&length.to_le_bytes())?;
-    output.write_all(&max_width.to_le_bytes())?;
-    output.write_all(&max_height.to_le_bytes())?;
-    output.write_all(svg)?;
+    scratch.clear();
+    scratch.reserve(HEADER_BYTES + payload_len);
+    scratch.extend_from_slice(RASTER_REQUEST_MAGIC);
+    scratch.extend_from_slice(&ticket.0.to_le_bytes());
+    scratch.extend_from_slice(&length.to_le_bytes());
+    scratch.extend_from_slice(&max_width.to_le_bytes());
+    scratch.extend_from_slice(&max_height.to_le_bytes());
+    scratch.extend_from_slice(svg);
+    output.write_all(scratch)?;
     output.flush()
 }
 
@@ -90,6 +98,7 @@ pub(super) fn exchange(
     if !ready.is_empty() || events.send(Event::Ready).is_err() {
         return;
     }
+    let mut write_scratch = Vec::with_capacity(HEADER_BYTES);
     while let Ok(request) = commands.recv() {
         let (wrote, max_output) = match &request.kind {
             RequestKind::Markdown(source) => (
@@ -98,6 +107,7 @@ pub(super) fn exchange(
                     MARKDOWN_REQUEST_MAGIC,
                     request.ticket,
                     source.as_bytes(),
+                    &mut write_scratch,
                 ),
                 MAX_OUTPUT_BYTES,
             ),
@@ -112,6 +122,7 @@ pub(super) fn exchange(
                     *max_width,
                     *max_height,
                     svg.as_bytes(),
+                    &mut write_scratch,
                 ),
                 MAX_RASTER_OUTPUT_BYTES,
             ),

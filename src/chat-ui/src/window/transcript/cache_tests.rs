@@ -977,3 +977,61 @@ fn transcript_accounting_restore_rebuilds_total_without_changing_saved_schema()
     assert!(serde_json::from_value::<Transcript>(saved).is_err());
     Ok(())
 }
+
+#[test]
+fn incremental_streaming_layout_reuses_completed_chunks_and_preserves_find_offsets()
+-> Result<(), &'static str> {
+    let mut transcript = Transcript::default();
+    transcript.start_turn("Prompt".to_owned(), 0);
+    transcript.append(
+        "First paragraph **bold**.\n\n```rust\nlet x = 1;\n\nlet y = 2;\n```\n\nActive needle",
+        false,
+    );
+    let mut chat = harness(transcript);
+    chat.run();
+
+    let message = &chat.state().messages[1];
+    let cache = message.cache.as_ref().ok_or("Expected streaming cache")?;
+    assert_eq!(cache.segments.len(), 3);
+    let CachedSegment::Text(first) = &cache.segments[0] else {
+        return Err("Expected first paragraph segment");
+    };
+    let CachedSegment::Text(fence) = &cache.segments[1] else {
+        return Err("Expected closed fence segment");
+    };
+    let first_galley = Arc::clone(&first.body);
+    let fence_galley = Arc::clone(&fence.body);
+    let shaped_before = message.shaped_galleys;
+    assert_eq!(shaped_before, 3);
+
+    // Streaming tokens into the active tail block only reshapes that tail block.
+    for token in [" one", " two", " three"] {
+        chat.state_mut().append(token, false);
+        chat.run();
+    }
+    let message = &chat.state().messages[1];
+    let cache = message.cache.as_ref().ok_or("Expected updated cache")?;
+    assert_eq!(cache.segments.len(), 3);
+    let CachedSegment::Text(first_after) = &cache.segments[0] else {
+        return Err("Expected first paragraph segment");
+    };
+    let CachedSegment::Text(fence_after) = &cache.segments[1] else {
+        return Err("Expected closed fence segment");
+    };
+    assert!(Arc::ptr_eq(&first_galley, &first_after.body));
+    assert!(Arc::ptr_eq(&fence_galley, &fence_after.body));
+    assert_eq!(message.shaped_galleys, shaped_before + 3);
+
+    // Find maps into the active tail chunk cleanly.
+    chat.state_mut().find_query("needle");
+    chat.run();
+    let message = &chat.state().messages[1];
+    let cache = message.cache.as_ref().ok_or("Expected Find cache")?;
+    let found_offset = message.body.find("needle").ok_or("Missing needle")?;
+    assert!(cache.text_offset_y(found_offset).is_some());
+    let CachedSegment::Text(tail_after) = &cache.segments[2] else {
+        return Err("Expected tail segment");
+    };
+    assert!(!tail_after.underline.is_empty());
+    Ok(())
+}

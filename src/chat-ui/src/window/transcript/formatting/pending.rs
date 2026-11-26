@@ -144,9 +144,7 @@ impl Pending {
             && let Some(ticket) = self.ticket
         {
             match service.poll(ticket) {
-                Status::Pending => ui
-                    .ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(16)),
+                Status::Pending => {}
                 Status::Ready(bytes) => {
                     let ticket_source = self.ticket_source.take();
                     let decoded = ticket_source
@@ -195,10 +193,6 @@ impl Pending {
             if ticket.admitted() {
                 self.ticket = Some(ticket);
                 self.ticket_source = self.request_source.take();
-                // Admission follows polling. An idle transcript needs another
-                // frame to collect even the first completed parse.
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(16));
             } else if service.unavailable() {
                 self.failed = true;
                 self.request_source = None;
@@ -325,7 +319,7 @@ mod tests {
             assert!(chat.state().markdown_preparing(&context));
             assert!(
                 chat.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay
-                    <= std::time::Duration::from_millis(16)
+                    > std::time::Duration::from_millis(16)
             );
             if failed {
                 Service::get(&context)
@@ -336,6 +330,7 @@ mod tests {
                 // Receiving a packet is insufficient: apply it and draw a frame.
                 assert!(chat.state().markdown_preparing(&context));
             }
+            assert!(context.has_requested_repaint());
             chat.step();
             let message = &chat.state().transcript.messages[0];
             assert_eq!(

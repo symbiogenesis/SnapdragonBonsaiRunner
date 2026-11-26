@@ -90,10 +90,29 @@ struct Shared {
     cancelled: AtomicBool,
     warmup: AtomicBool,
     cleanup_failed: AtomicBool,
+    repaint: Mutex<Option<egui::Context>>,
     state: Mutex<State>,
 }
 
 impl Shared {
+    fn set_repaint(&self, context: egui::Context) {
+        *self
+            .repaint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(context);
+    }
+
+    fn request_repaint(&self) {
+        let context = self
+            .repaint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(context) = context {
+            context.request_repaint();
+        }
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
@@ -112,6 +131,8 @@ impl Shared {
                 *status = Status::Failed;
             }
         }
+        drop(state);
+        self.request_repaint();
     }
 
     fn pending(&self, ticket: Ticket) -> bool {
@@ -126,8 +147,14 @@ impl Shared {
         if state.failed || self.cancelled.load(Ordering::Acquire) {
             return;
         }
+        let mut updated = false;
         if let Some(status) = state.results.get_mut(&ticket) {
             *status = Status::Ready(bytes.into());
+            updated = true;
+        }
+        drop(state);
+        if updated {
+            self.request_repaint();
         }
     }
 }
@@ -143,8 +170,10 @@ impl Service {
     #[cfg(test)]
     fn inert(context: &egui::Context) -> (Arc<Self>, Receiver<Request>) {
         let (requests, pending) = mpsc::sync_channel(MAX_REQUESTS);
+        let shared = Arc::new(Shared::default());
+        shared.set_repaint(context.clone());
         let service = Arc::new(Self {
-            shared: Arc::new(Shared::default()),
+            shared,
             requests,
             worker: Mutex::new(None),
         });
@@ -255,7 +284,7 @@ impl Service {
             // Legacy launchers can prepare the broker after the first UI frame.
             // Restored messages wait without poisoning the parser session.
             let image = data.get_temp::<PathBuf>(egui::Id::unique("offline-markdown-image"))?;
-            let service = Self::new(image);
+            let service = Self::new(image, context.clone());
             data.insert_temp(identity, Arc::clone(&service));
             Some(service)
         })
@@ -275,8 +304,9 @@ impl Service {
         slot.as_deref()
     }
 
-    fn new(image: PathBuf) -> Arc<Self> {
+    fn new(image: PathBuf, context: egui::Context) -> Arc<Self> {
         let shared = Arc::new(Shared::default());
+        shared.set_repaint(context);
         let (requests, pending) = mpsc::sync_channel(MAX_REQUESTS);
         let state = Arc::clone(&shared);
         let worker = thread::Builder::new()

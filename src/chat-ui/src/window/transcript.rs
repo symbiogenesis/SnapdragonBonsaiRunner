@@ -154,6 +154,15 @@ impl LayoutCache {
     }
 }
 
+fn sections_match(a: &[egui::text::LayoutSection], b: &[egui::text::LayoutSection]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.byte_range == y.byte_range
+                && x.leading_space.to_bits() == y.leading_space.to_bits()
+                && x.format == y.format
+        })
+}
+
 fn handles_source_offset(segments: &[CachedSegment], index: usize, source_offset: usize) -> bool {
     !segments[index + 1..].iter().any(|later| match later {
         CachedSegment::Text(text) => text
@@ -211,6 +220,9 @@ pub(super) struct Message {
     #[cfg(test)]
     #[serde(skip)]
     body_layouts: usize,
+    #[cfg(test)]
+    #[serde(skip)]
+    shaped_galleys: usize,
     #[cfg(test)]
     #[serde(skip)]
     cache_updates: usize,
@@ -373,6 +385,8 @@ impl Transcript {
             measured_height: None,
             #[cfg(test)]
             body_layouts: 0,
+            #[cfg(test)]
+            shaped_galleys: 0,
             #[cfg(test)]
             cache_updates: 0,
             #[cfg(test)]
@@ -838,15 +852,12 @@ impl Message {
         let reasoning_visible = self.show_reasoning && !self.reasoning.is_empty();
         // Polonius lets a complete cache hit lend self.cache directly while a
         // partial miss ends the borrow and reclaims reusable galley owners below.
-        let (body_unchanged, reasoning_unchanged, underline_unchanged) =
+        let (body_unchanged, reasoning_unchanged, underline_unchanged, can_reuse_galleys) =
             if let Some(cache) = self.cache.as_ref() {
                 let same_geometry = cache.width.to_bits() == width.to_bits()
                     && cache.pixels_per_point.to_bits() == pixels_per_point.to_bits()
                     && cache.text_size.to_bits() == text_size.to_bits();
-                let body_unchanged = same_geometry
-                    && !markdown_changed
-                    && cache.body_revision == self.body_revision
-                    && cache.pending == self.pending
+                let can_reuse_galleys = same_geometry
                     && cache.color == color
                     && cache.code_background == code_background
                     && cache.strong_color == strong_color
@@ -854,6 +865,10 @@ impl Message {
                     && (matches.is_empty()
                         || (cache.highlight_fill == highlight_fill
                             && cache.highlight_color == highlight_color));
+                let body_unchanged = can_reuse_galleys
+                    && !markdown_changed
+                    && cache.body_revision == self.body_revision
+                    && cache.pending == self.pending;
                 // Hidden reasoning has no galley. Its streamed bytes and weak
                 // color cannot invalidate the visible body or Find geometry;
                 // opening it still checks the complete current text below.
@@ -869,9 +884,14 @@ impl Message {
                 {
                     return cache;
                 }
-                (body_unchanged, reasoning_unchanged, underline_unchanged)
+                (
+                    body_unchanged,
+                    reasoning_unchanged,
+                    underline_unchanged,
+                    can_reuse_galleys,
+                )
             } else {
-                (false, false, false)
+                (false, false, false, false)
             };
         #[cfg(test)]
         {
@@ -890,7 +910,14 @@ impl Message {
             {
                 self.body_layouts += 1;
             }
-            self.layout_body(ui, width, text_size, matches, streaming_visible_prefix)
+            self.layout_body(
+                ui,
+                width,
+                text_size,
+                matches,
+                streaming_visible_prefix,
+                previous_segments.as_deref().filter(|_| can_reuse_galleys),
+            )
         };
         if !underline_unchanged || !body_unchanged {
             if let Some(selected) = selected {
@@ -902,11 +929,12 @@ impl Message {
                 for index in 0..segment_count {
                     let active_here = handles_source_offset(&segments, index, selected.start);
                     if let CachedSegment::Text(text) = &mut segments[index] {
-                        text.underline = if active_here {
+                        let mapped = text.source_map.range(selected.clone());
+                        text.underline = if active_here || !mapped.is_empty() {
                             active_underline(
                                 &text.body.job.text,
                                 &text.body,
-                                &text.source_map.range(selected.clone()),
+                                &mapped,
                                 pixels_per_point,
                             )
                         } else {
@@ -989,18 +1017,20 @@ impl Message {
     }
 
     fn layout_body(
-        &self,
+        &mut self,
         ui: &egui::Ui,
         width: f32,
         text_size: f32,
         matches: &[search::Match],
         streaming_visible_prefix: Option<usize>,
+        previous_segments: Option<&[CachedSegment]>,
     ) -> Vec<CachedSegment> {
         #[cfg(test)]
         self.highlight_range_visits
             .set(self.highlight_range_visits.get() + matches.len());
         let parse_slice =
             streaming_visible_prefix.map_or(self.body.as_str(), |end| &self.body[..end]);
+        let streaming_chunks = self.pending && self.body_revision > 0;
         let (body_segments, show_generating) = formatting::layout_document(
             &self.body,
             self.role == Role::Assistant,
@@ -1010,14 +1040,42 @@ impl Message {
             matches,
             self.markdown.parsed_for(parse_slice),
             streaming_visible_prefix,
+            streaming_chunks,
         );
         let mut image_index = 0_usize;
+        let mut prev_cursor = 0_usize;
         let mut cached = Vec::with_capacity(body_segments.len() + usize::from(show_generating));
         for segment in body_segments {
             match segment {
                 formatting::BodySegment::Text(layout) => {
-                    let body = ui.fonts_mut(|fonts| fonts.layout_job(layout.job));
-                    let code_panels = formatting::code_panels(&body);
+                    let reused = previous_segments.and_then(|prevs| {
+                        prevs[prev_cursor..]
+                            .iter()
+                            .enumerate()
+                            .find_map(|(offset, seg)| {
+                                let CachedSegment::Text(prev) = seg else {
+                                    return None;
+                                };
+                                (prev.body.job.text == layout.job.text
+                                    && sections_match(
+                                        &prev.body.job.sections,
+                                        &layout.job.sections,
+                                    ))
+                                .then_some((prev_cursor + offset + 1, prev))
+                            })
+                    });
+                    let (body, code_panels) = if let Some((next_cursor, prev)) = reused {
+                        prev_cursor = next_cursor;
+                        (Arc::clone(&prev.body), prev.code_panels.clone())
+                    } else {
+                        #[cfg(test)]
+                        {
+                            self.shaped_galleys += 1;
+                        }
+                        let body = ui.fonts_mut(|fonts| fonts.layout_job(layout.job));
+                        let code_panels = formatting::code_panels(&body);
+                        (body, code_panels)
+                    };
                     cached.push(CachedSegment::Text(TextSegmentCache {
                         body,
                         code_panels,
