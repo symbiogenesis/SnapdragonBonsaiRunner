@@ -974,7 +974,13 @@ impl NativeProcess {
             if assigned > MAX_MEMBERS || listed > capacity || listed > assigned {
                 return Err(invalid("Job process list exceeded its bound"));
             }
-            if assigned > listed {
+            // When QueryInformationJobObject succeeds with spare capacity
+            // (`assigned <= capacity`), Windows already traversed the complete
+            // Job process list; any gap (`listed < assigned`) reflects
+            // terminating/unlisted members that cannot be enumerated by PID,
+            // while `stop_within` still enforces `TerminateJobObject`,
+            // `active_processes() == 0`, and `root_wait_for_exit`.
+            if assigned > capacity {
                 capacity = assigned;
                 continue;
             }
