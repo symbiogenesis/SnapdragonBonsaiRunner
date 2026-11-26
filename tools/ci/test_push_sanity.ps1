@@ -136,7 +136,7 @@ function Invoke-PushRecoveryFixture([string]$CheckerState, [string]$RecoveryStat
         }
         Write-CiFixture $repository 'unrelated-source.txt' 'Uncommitted poison must not reach recovery.'
         if ($PreparationState -cne 'none') { Write-CiFixture $repository 'tools/ci/prepare_push_helpers.ps1' "throw 'Uncommitted preparation helper must never execute.'" }
-        $gitPath = (Get-Command git -CommandType Application).Source
+        $gitPath = (Get-Command git -CommandType Application | Select-Object -First 1).Source
         try {
             Invoke-RedirectedStdin "refs/heads/main $head refs/heads/main $head`n" {
                 $PSNativeCommandUseErrorActionPreference = $true
@@ -237,7 +237,7 @@ $cases = [ordered]@{
             Write-CiFixture $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe' 'Inert checker; archive interception must stop before execution.'
             @{SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-CiFileSha256 $binary) } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $target 'push-checker.json') -Encoding utf8NoBOM
             foreach ($name in $policy) { Write-CiFixture $repository "tools/ci/$name" 'Uncommitted poison must not become checking policy.' }
-            $gitPath = (Get-Command git -CommandType Application).Source
+            $gitPath = (Get-Command git -CommandType Application | Select-Object -First 1).Source
             Invoke-RedirectedStdin "refs/heads/main $head refs/heads/main $head`n" {
                 $PSNativeCommandUseErrorActionPreference = $true
                 function git {
