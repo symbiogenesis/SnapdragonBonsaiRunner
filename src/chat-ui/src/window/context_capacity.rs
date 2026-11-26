@@ -1,6 +1,20 @@
 //! Quiet composer guidance; estimates never participate in request admission.
 use super::{ModelLifecycle, OUTPUT_TOKENS, RichText, State, controls, egui};
 use crate::context::{self, Estimate, Pressure};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+#[derive(Default)]
+struct MemoryCache {
+    valid: bool,
+    committed_len: usize,
+    committed_tail_hash: u64,
+    memory_revision: u64,
+    memory_hash: u64,
+    input_len: usize,
+    input_hash: u64,
+    estimated_tokens: usize,
+}
 
 #[derive(Default)]
 pub(super) struct DraftCache {
@@ -10,10 +24,68 @@ pub(super) struct DraftCache {
     attachments_revision: u64,
     estimate: Option<Estimate>,
     extra_effort: bool,
+    memory: MemoryCache,
+}
+
+fn hash_value<T: Hash>(value: &T) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn committed_tail_hash(committed: &[crate::client::Message]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let start = committed
+        .len()
+        .saturating_sub(crate::context_cards::SCAN_HISTORY_MESSAGES);
+    for message in &committed[start..] {
+        message.content.as_ptr().hash(&mut hasher);
+        message.content.len().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 impl State {
+    fn cached_memory_tokens(&mut self) -> usize {
+        if self.memory.is_default_empty() {
+            return 0;
+        }
+        let committed_len = self.committed.len();
+        let tail_hash = committed_tail_hash(&self.committed);
+        let memory_revision = self.memory_revision;
+        let memory_hash = hash_value(&self.memory);
+        let input_len = self.input.len();
+        let input_hash = hash_value(&self.input);
+        let cache = &self.context_draft.memory;
+        if cache.valid
+            && cache.committed_len == committed_len
+            && cache.committed_tail_hash == tail_hash
+            && cache.memory_revision == memory_revision
+            && cache.memory_hash == memory_hash
+            && cache.input_len == input_len
+            && cache.input_hash == input_hash
+        {
+            return cache.estimated_tokens;
+        }
+        let estimated_tokens = self
+            .memory
+            .resolve(&self.committed, &self.input)
+            .estimated_tokens;
+        self.context_draft.memory = MemoryCache {
+            valid: true,
+            committed_len,
+            committed_tail_hash: tail_hash,
+            memory_revision,
+            memory_hash,
+            input_len,
+            input_hash,
+            estimated_tokens,
+        };
+        estimated_tokens
+    }
+
     pub(super) fn context_estimate(&mut self) -> Estimate {
+        let memory = self.cached_memory_tokens();
         let history = *self
             .context_history
             .get_or_insert_with(|| context::history_tokens(&self.committed));
@@ -23,10 +95,6 @@ impl State {
         } else {
             self.context_draft.has_attachments && self.context_draft.attachment_input == self.input
         };
-        let memory = self
-            .memory
-            .resolve(&self.committed, &self.input)
-            .estimated_tokens;
         if let Some(estimate) = self.context_draft.estimate
             && estimate.history == history
             && estimate.memory == memory

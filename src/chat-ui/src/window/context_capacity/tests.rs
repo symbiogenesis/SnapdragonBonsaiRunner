@@ -776,3 +776,37 @@ fn footprint_diagnostics_cover_bonsai25_pq2_and_ptq1_variants() -> Result<(), &'
     );
     Ok(())
 }
+
+#[test]
+fn memory_resolve_cache_invalidates_on_draft_history_and_memory_changes() -> Result<(), &'static str>
+{
+    let (mut app, _commands) = state();
+    app.memory
+        .add_card("Rust", "rust", "Prefer zero-copy iterators.", false)?;
+    app.memory_revision = app.memory_revision.wrapping_add(1);
+    app.commit_history(history("hello world"));
+    app.input = "plain draft".into();
+    let baseline = app.context_estimate();
+    assert_eq!(baseline.memory, 0);
+
+    // Matching input/history/memory hits the cached memory estimate.
+    assert_eq!(app.context_estimate().memory, 0);
+
+    // Keyword in input triggers the card and updates the cached estimate.
+    app.input = "rust draft".into();
+    let triggered = app.context_estimate();
+    assert!(triggered.memory > 0);
+    assert_eq!(app.context_estimate().memory, triggered.memory);
+
+    // Equal-length committed replacement invalidates the memory cache.
+    app.input = "plain draft".into();
+    assert_eq!(app.context_estimate().memory, 0);
+    app.commit_history(history("rust  world"));
+    assert_eq!(app.context_estimate().memory, triggered.memory);
+
+    // Memory store edits invalidate the cache.
+    app.memory.cards[0].enabled = false;
+    app.memory_revision = app.memory_revision.wrapping_add(1);
+    assert_eq!(app.context_estimate().memory, 0);
+    Ok(())
+}

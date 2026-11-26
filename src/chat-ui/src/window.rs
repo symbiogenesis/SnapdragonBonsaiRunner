@@ -198,6 +198,7 @@ struct State {
     placement: Option<placement::Placement>,
     save_conversations: bool,
     recovery_dirty: bool,
+    recovery_flush_now: bool,
     recovery_erase_pending: bool,
     recovery_notice: String,
     last_recovery_save: Instant,
@@ -232,6 +233,7 @@ struct State {
     cognitive: client::CognitiveOptions,
     cognitive_controls_available: bool,
     memory: crate::context_cards::MemoryStore,
+    memory_revision: u64,
     memory_draft: settings::MemoryEditorDraft,
     focus_composer: bool,
     composing: bool,
@@ -374,6 +376,7 @@ impl State {
             placement: None,
             save_conversations: false,
             recovery_dirty: false,
+            recovery_flush_now: false,
             recovery_erase_pending: false,
             recovery_notice: String::new(),
             last_recovery_save: Instant::now(),
@@ -408,6 +411,7 @@ impl State {
             cognitive: client::CognitiveOptions::default(),
             cognitive_controls_available: false,
             memory: crate::context_cards::MemoryStore::default(),
+            memory_revision: 0,
             memory_draft: settings::MemoryEditorDraft::default(),
             focus_composer: false,
             composing: false,
@@ -1342,6 +1346,7 @@ impl State {
                 self.awaiting_first_token = false;
                 self.fail(&message);
                 self.model = ModelLifecycle::Retryable;
+                self.recovery_flush_now = true;
             }
             Event::Stopping(text) => {
                 self.awaiting_first_token = false;
@@ -1351,10 +1356,12 @@ impl State {
             Event::Stopped => {
                 self.awaiting_first_token = false;
                 self.stopped_response();
+                self.recovery_flush_now = true;
             }
             Event::ModelStopped => {
                 self.awaiting_first_token = false;
                 self.stopped_model();
+                self.recovery_flush_now = true;
             }
             Event::ContextCapacity(tokens) => self.context_tokens = Some(tokens),
             Event::VisionAvailable(available) => self.vision_available = available,
@@ -1405,6 +1412,7 @@ impl State {
             } => {
                 self.awaiting_first_token = false;
                 self.reject(&message, &text, retry_required);
+                self.recovery_flush_now = true;
             }
             Event::Stage(label) => {
                 self.replace_streaming_stage();
@@ -1449,6 +1457,7 @@ impl State {
                 self.transcript.remove_empty_response();
                 self.model = ModelLifecycle::Ready;
                 self.answer_complete = true;
+                self.recovery_flush_now = true;
                 match completion {
                     Completion::Finished => {
                         self.finish_streaming_speech();
@@ -1482,6 +1491,7 @@ impl State {
             Event::Failed(message) => {
                 self.awaiting_first_token = false;
                 self.fail(&message);
+                self.recovery_flush_now = true;
             }
         }
     }
@@ -2914,7 +2924,7 @@ impl State {
                     || self.audio_import.is_some()
                     || !self.speech_checked));
         if active_generation && !self.awaiting_first_token {
-            Duration::from_millis(16)
+            Duration::from_millis(150)
         } else if waiting {
             Duration::from_millis(50)
         } else if active_generation {

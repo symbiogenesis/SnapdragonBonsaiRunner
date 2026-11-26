@@ -1741,20 +1741,20 @@ fn prefill_repaint_cadence_throttles_until_first_token_arrives() {
     assert!(state.awaiting_first_token);
     assert_eq!(state.next_repaint_delay(), Duration::from_millis(125));
 
-    // Empty deltas keep prefill throttling; first non-empty reasoning or text token restores 16 ms pacing.
+    // Empty deltas keep prefill throttling; first non-empty reasoning or text token switches to 150 ms fallback.
     state.model_event(Event::Text(String::new()));
     assert_eq!(state.next_repaint_delay(), Duration::from_millis(125));
 
     state.model_event(Event::Reasoning("Thinking".into()));
     assert!(!state.awaiting_first_token);
-    assert_eq!(state.next_repaint_delay(), Duration::from_millis(16));
+    assert_eq!(state.next_repaint_delay(), Duration::from_millis(150));
 
     // Extra effort stage transitions return to 125 ms until that stage emits its first token.
     state.model_event(Event::Stage("Extra effort: Drafting (2/3)"));
     assert_eq!(state.next_repaint_delay(), Duration::from_millis(125));
 
     state.model_event(Event::Text("First answer token".into()));
-    assert_eq!(state.next_repaint_delay(), Duration::from_millis(16));
+    assert_eq!(state.next_repaint_delay(), Duration::from_millis(150));
 
     state.model_event(Event::Complete(Completion::Finished));
     assert_eq!(state.next_repaint_delay(), Duration::from_secs(1));

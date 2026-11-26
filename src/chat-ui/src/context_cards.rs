@@ -11,7 +11,7 @@ pub(crate) const MAX_CARD_TRIGGER_CHARS: usize = 64;
 pub(crate) const MIN_TOKEN_BUDGET: usize = 128;
 pub(crate) const DEFAULT_TOKEN_BUDGET: usize = 1_024;
 pub(crate) const MAX_TOKEN_BUDGET: usize = 4_096;
-const SCAN_HISTORY_MESSAGES: usize = 4;
+pub(crate) const SCAN_HISTORY_MESSAGES: usize = 4;
 
 const PIPE_SPELLINGS: &[&str] = &[
     "<|endoftext|>",
@@ -75,7 +75,7 @@ const fn default_true() -> bool {
 }
 
 /// User-authored persistent memory card injected deterministically when pinned or triggered.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ContextCard {
     pub(crate) id: u64,
@@ -106,7 +106,7 @@ impl ContextCard {
 }
 
 /// Persisted instructions and bounded card deck shared across conversations on this device.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MemoryStore {
     #[serde(default)]

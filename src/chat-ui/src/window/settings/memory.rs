@@ -41,6 +41,7 @@ impl State {
             );
             if instr_response.changed() {
                 self.recovery_dirty = true;
+                self.memory_revision = self.memory_revision.wrapping_add(1);
             }
             if resolved.instructions_rejected_control {
                 ui.add_space(4.0);
@@ -75,6 +76,7 @@ impl State {
                 .changed();
             if budget_changed {
                 self.recovery_dirty = true;
+                self.memory_revision = self.memory_revision.wrapping_add(1);
             }
         });
 
@@ -83,15 +85,15 @@ impl State {
             ui.label(RichText::new("Context cards").strong());
             ui.add_space(6.0);
             let mut remove_id = None;
+            let mut cards_changed = false;
             if self.memory.cards.is_empty() {
                 ui.label(RichText::new("No context cards added yet.").small().weak());
             } else {
                 for card in &mut self.memory.cards {
                     ui.group(|ui| {
                         ui.horizontal_wrapped(|ui| {
-                            self.recovery_dirty |=
-                                ui.checkbox(&mut card.enabled, &card.title).changed();
-                            self.recovery_dirty |= ui.checkbox(&mut card.pinned, "Pin").changed();
+                            cards_changed |= ui.checkbox(&mut card.enabled, &card.title).changed();
+                            cards_changed |= ui.checkbox(&mut card.pinned, "Pin").changed();
                             if ui.small_button("Remove").clicked() {
                                 remove_id = Some(card.id);
                             }
@@ -115,9 +117,14 @@ impl State {
                     ui.add_space(4.0);
                 }
             }
+            if cards_changed {
+                self.recovery_dirty = true;
+                self.memory_revision = self.memory_revision.wrapping_add(1);
+            }
             if let Some(id) = remove_id {
                 self.memory.remove_card(id);
                 self.recovery_dirty = true;
+                self.memory_revision = self.memory_revision.wrapping_add(1);
             }
 
             ui.add_space(8.0);
@@ -161,6 +168,7 @@ impl State {
                         Ok(()) => {
                             self.memory_draft = MemoryEditorDraft::default();
                             self.recovery_dirty = true;
+                            self.memory_revision = self.memory_revision.wrapping_add(1);
                         }
                         Err(message) => self.memory_draft.notice = Some(message),
                     }

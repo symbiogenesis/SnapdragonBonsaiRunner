@@ -264,6 +264,7 @@ impl State {
         self.next_conversation = saved.next_conversation;
         self.voice_profile = saved.voice_profile;
         self.memory = saved.memory;
+        self.memory_revision = self.memory_revision.wrapping_add(1);
         self.load_conversation(saved.active);
         self.restore_history = true;
         self.recovery_dirty |= adopted;
@@ -331,7 +332,13 @@ impl State {
                 }
             }
         }
-        if self.last_recovery_save.elapsed() < Duration::from_secs(2) {
+        let flush_now = std::mem::take(&mut self.recovery_flush_now);
+        let interval = if !self.preview && self.model.busy() {
+            Duration::from_secs(15)
+        } else {
+            Duration::from_secs(2)
+        };
+        if !flush_now && self.last_recovery_save.elapsed() < interval {
             return;
         }
         self.last_recovery_save = Instant::now();
@@ -1405,6 +1412,44 @@ mod tests {
             .restore_workspace(&serde_json::to_vec(&legacy_no_cog).map_err(io::Error::other)?)?;
         assert!(legacy_loaded.memory.is_default_empty());
         assert_eq!(legacy_loaded.cognitive, client::CognitiveOptions::default());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_throttles_active_generation_and_flushes_immediately_on_completion() -> io::Result<()>
+    {
+        let mut state = state();
+        let (store, controlled) = crate::recovery::Recovery::controlled();
+        state.recovery = Some(store);
+        state.preview = false;
+        state.save_conversations = true;
+        state.model = ModelLifecycle::Generating;
+        state.recovery_dirty = true;
+        state.last_recovery_save = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .unwrap_or_else(Instant::now);
+        // Active generation throttles saves to 15s, so 3s elapsed skips serialization.
+        state.poll_recovery();
+        assert!(state.recovery_dirty);
+
+        // 16s elapsed during generation still saves periodically.
+        state.last_recovery_save = Instant::now()
+            .checked_sub(Duration::from_secs(16))
+            .unwrap_or_else(Instant::now);
+        state.poll_recovery();
+        assert!(!state.recovery_dirty);
+        let saved = controlled.next_completion()?;
+        controlled.complete(saved)?;
+
+        // Completion triggers an immediate flush even within the idle 2s window.
+        state.recovery_dirty = true;
+        state.last_recovery_save = Instant::now();
+        state.model_event(client::Event::Complete(client::Completion::Finished));
+        state.poll_recovery();
+        assert!(!state.recovery_dirty);
+        let completed_save = controlled.next_completion()?;
+        controlled.complete(completed_save)?;
+        drop(controlled);
         Ok(())
     }
 }
