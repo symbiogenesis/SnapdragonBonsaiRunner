@@ -605,9 +605,9 @@ dependencies = [
 
 [[package]]
 name = "bonsai-neon-dot"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "210d3eb31190ca7b24af45ccad37e25eca65882a66c2fd83a333beea6ea46897"
+checksum = "bb974957884f720c7da8b2634c20748b8632a856d5b6d1c4d745c35736f4d618"
 dependencies = [
  "bonsai-ternary",
 ]
@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-windows-process"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "ash",
  "bonsai-neon-dot",
