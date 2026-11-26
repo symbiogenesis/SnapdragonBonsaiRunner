@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "checked-in-native-retirement-boundary",
   "repository": "runner",
-  "sourceRevision": "89db2f656d3823f9beb4c05c7b29a7f52f4e2337",
+  "sourceRevision": "c748e0ef284e156dae55f43877ebb27c292efdcf",
   "exclusions": [
     {
       "path": ".git",
@@ -100,13 +100,13 @@
     {
       "path": "Cargo.lock",
       "bytes": 140023,
-      "sha256": "f62db3ac7a6ae66fea99a9d8b838368daa1fee7137bafa5078d4ee32f24af059",
+      "sha256": "efafab72c161485ab8ed94084e41a3460ede835090224d37cbec2a83060aedf7",
       "family": "native-asr"
     },
     {
       "path": "Cargo.toml",
       "bytes": 5108,
-      "sha256": "ed0f02d50e015bdf15b3cd29ef42cb51c81cf7bdb1138df516ae319e3f110b4c",
+      "sha256": "7f748d78f0bfc8549ef7e6d49bfc69acd563029d3526608ce8431a1605819b22",
       "family": "msvc-unwind"
     },
     {
@@ -129,8 +129,8 @@
     },
     {
       "path": "src/cpu-policy/src/lib.rs",
-      "bytes": 42210,
-      "sha256": "a0ab29a35c09664719161ba0ca7a3247977931f314386eacca02045fc2b073b0",
+      "bytes": 42383,
+      "sha256": "e7849bacd2c4f7b272d8b48ce10a10bc753ca6db07dbaae630250f7a6534b9de",
       "family": "msvc-unwind"
     },
     {
