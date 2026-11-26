@@ -57,7 +57,7 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--prompt-reuse disabled|latest|prompt-end-and-latest] (reviewed native runtime only)\n",
     "  [--prompt-reuse-checkpoints 1..=8] [--prompt-reuse-checkpoint-bytes <bytes>] (reviewed native runtime only; requires --prompt-reuse)\n",
     "  [--kv-cache f16|rsq4|rsq4kvf|rsq4k3v] (reviewed native runtime only; rsq4 default when supported, f16 explicit recovery)\n",
-    "  [--cpu-prefill-tokens 8|16|32] (reviewed native runtime only; enables layer-major CPU FFN tile prefill)\n",
+    "  [--cpu-prefill-tokens 8|16|32|64] (reviewed native runtime only; enables layer-major CPU FFN tile prefill)\n",
     "  [--cpu-prefill-gdn sequential|wy-f32] (reviewed native runtime only; requires --cpu-prefill-tokens; wy-f32 excludes suffix speculation)\n",
     "  [--spec-type none|suffix] [--draft-max 1..=8] (reviewed native runtime only; suffix requires --cpu-prefill-tokens and suppresses mmproj)\n",
     "  [--cpu-family x1|x2] (reviewed native runtime only; overrides detected Snapdragon X1/X2 family)\n",
@@ -4057,7 +4057,7 @@ mod tests {
     -> std::io::Result<()> {
         use bonsai_cpu_policy::Bonsai25Variant;
         use serde_json::json;
-        let workers = super::WorkerReadiness::for_version("0.1.35", 4);
+        let workers = super::WorkerReadiness::for_version("0.1.38", 4);
         let variant = Bonsai25Variant::Pq2;
         let model = json!({
             "id": variant.model_id(),
@@ -4171,7 +4171,7 @@ mod tests {
         let variant = Bonsai25Variant::Pq2;
         let workers = super::WorkerReadiness {
             kv_cache: Some(crate::inference::KvCache::Rsq4),
-            ..super::WorkerReadiness::for_version("0.1.35", 4)
+            ..super::WorkerReadiness::for_version("0.1.38", 4)
         };
         for field in [
             "adapter_sha256",
@@ -4832,8 +4832,8 @@ mod tests {
                 Some(LaunchError::Arguments)
             );
         }
-        let mut gated_64 = arguments();
-        gated_64.extend(
+        let mut admitted_64 = arguments();
+        admitted_64.extend(
             [
                 "--profile",
                 "swift-pq2-assessment",
@@ -4842,10 +4842,7 @@ mod tests {
             ]
             .map(OsString::from),
         );
-        assert_eq!(
-            LaunchConfig::parse(gated_64).err(),
-            Some(LaunchError::NativeRuntime)
-        );
+        assert_eq!(LaunchConfig::parse(admitted_64)?.cpu_prefill_tokens, Some(64));
         let mut publisher = arguments();
         publisher.extend(
             [

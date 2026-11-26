@@ -1528,6 +1528,7 @@ mod context_tests {
             ("0.1.32", false, true),
             ("0.1.34", false, true),
             ("0.1.35", false, true),
+            ("0.1.38", false, true),
             ("1.0.0", false, false),
             ("0.1.031", false, false),
             ("0.1.31-dev", false, false),

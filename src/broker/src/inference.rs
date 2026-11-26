@@ -183,21 +183,21 @@ impl Placement {
     }
 }
 
-const REVIEWED_0_1_35: Option<(&str, &str)> =
-    Some(("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839"));
+const REVIEWED_0_1_38: Option<(&str, &str)> =
+    Some(("0.1.38", "50977990398a20a8add2056bfe34ce59e1677510"));
 
 // CPU placement must skip accelerator initialization and report both its
 // requested placement and effective CPU backend in a genuine reviewed release.
 // Source omission alone does not justify a smaller fixed memory allowance.
-const CPU_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const CPU_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
 // Explicit Vulkan/Composite placements require a separately reviewed native
 // release before they can be admitted on a pinned bundle.
-const VULKAN_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const VULKAN_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
 // Opt-in Hexagon arena cache persistence requires a separately reviewed native
 // release implementing `--hexagon-arena-cache <dir>` and verified cache I/O.
-const HEXAGON_ARENA_CACHE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const HEXAGON_ARENA_CACHE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
 fn hexagon_arena_cache_supported_for(
     release: &ReleasePin,
@@ -458,7 +458,7 @@ fn pinned_matches(identity: Option<(&str, &str)>) -> Result<bool, LaunchError> {
 // not activate smaller process allowances. A version number alone attests neither.
 // This combined review also retains four row workers, K4/V4 and latest reuse;
 // a later repin cannot silently lose those existing serving capabilities.
-const MEMORY_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const MEMORY_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
 // K4/V3 changes precision and needs its own reviewed capacity/quality release.
 // Both gates must identify the same genuine released source before this profile
@@ -466,15 +466,15 @@ const MEMORY_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
 const K4V3_CONTEXT_RELEASE: Option<(&str, &str)> = None;
 
 // Version-3 scale-code co-optimized K4/V4 (`rsq4kvf`) and cognitive request
-// controls promoted with the reviewed Prism v0.1.35 release pin.
-const RSQ4KVF_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+// controls promoted with the reviewed Prism v0.1.38 release pin.
+const RSQ4KVF_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
 // Full-model K4/V4 context needs the separately reviewed larger live-state and
 // checkpoint guards, not just the existing paired memory protocol. This exact
 // source supplies the geometry-derived Swift allowance; generic graphs retain
 // 4 GiB. Precision and process charges remain unchanged; this gate cannot
 // authorize an unrelated memory release.
-const K4V4_FULL_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const K4V4_FULL_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
 fn full_context_release_matches(release: &ReleasePin, reviewed: Option<(&str, &str)>) -> bool {
     reviewed.is_some()
@@ -513,7 +513,7 @@ pub(super) fn memory_context_supported() -> Result<bool, LaunchError> {
 // observes abandoned generation sockets, settles active computation within a
 // bounded timeout, and resets live model state on authenticated `POST /reset`
 // without expecting a `Content-Type` header.
-const RESET_ON_CANCEL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const RESET_ON_CANCEL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
 pub(super) fn reset_on_cancel_supported() -> Result<bool, LaunchError> {
     pinned_matches(RESET_ON_CANCEL_RELEASE)
@@ -522,21 +522,21 @@ pub(super) fn reset_on_cancel_supported() -> Result<bool, LaunchError> {
 // Offline anonymous broker-pipe transport requires a separately reviewed native
 // release implementing `--broker-pipe`, `AppContainer` verification, `SB2PIPE1`
 // / `SB2OKAY1` handshake, `KIND_SERVER_READY`, `KIND_RESET`, and `KIND_VERIFIED_SECTION`.
-const BROKER_PIPE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const BROKER_PIPE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
 pub(super) fn broker_pipe_supported() -> Result<bool, LaunchError> {
     pinned_matches(BROKER_PIPE_RELEASE)
 }
 
 // Calibrated CoW admission, sparse branch prompt reuse, chunkwise GDN prefill,
-// and suffix CPU speculation require the reviewed post-0.1.31 Prism release.
-const CALIBRATED_COW_ADMISSION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
-const BRANCH_PROMPT_REUSE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
-const CPU_PREFILL_GDN_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+// and suffix CPU speculation require the reviewed Prism release.
+const CALIBRATED_COW_ADMISSION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
+const BRANCH_PROMPT_REUSE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
+const CPU_PREFILL_GDN_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 // `wy-f32` chunkwise GDN prefill with rotated KV caches (`rsq4` / `rsq4k3v`)
 // requires a reviewed Prism release implementing rotated-KV WY prefill.
-const WY_F32_ROTATED_KV_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
-const CPU_SPECULATION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const WY_F32_ROTATED_KV_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
+const CPU_SPECULATION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
 pub(super) fn calibrated_cow_admission_supported() -> Result<bool, LaunchError> {
     pinned_matches(CALIBRATED_COW_ADMISSION_RELEASE)
@@ -597,30 +597,30 @@ pub(super) fn cpu_speculation_supported() -> Result<bool, LaunchError> {
 // Multimodal image/mmproj support requires a separately reviewed native release
 // that implements vision projector loading, image embedding injection and the
 // matching readiness identity fields.
-const VISION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const VISION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 // Multi-rank DaisyRose LoRA support requires a reviewed Prism release supporting
 // `--multi-rank-adapter` and `multi-rank-lora-v1` readiness identity.
-const MULTI_RANK_LORA_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const MULTI_RANK_LORA_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 // Opt-in NariQ trellis support requires a separately reviewed native Prism
 // release supporting `--nariq <2.5bpw|3.0bpw|2.0bpw>` and `:trellis-v1` identity.
-pub(crate) const NARIQ_TRELLIS_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+pub(crate) const NARIQ_TRELLIS_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 // Opt-in Ternary Bonsai 2.5 27B support requires a separately reviewed native
 // Prism release (`v0.1.35+`) supporting `--bonsai-2-5 <pq2|ptq1>`.
-pub(crate) const BONSAI_2_5_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+pub(crate) const BONSAI_2_5_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
 // CPU tiled prefill requires a separately reviewed native release supporting
 // `--cpu-prefill-tokens`, `--cpu-prefill-scratch-bytes`, and the matching
 // readiness fields (`cpu_prefill_tokens`, `cpu_prefill_scratch_bytes`, `:cpu-tiled-ffn-v1:{n}`).
-const CPU_PREFILL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_35;
+const CPU_PREFILL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
-// 64-token CPU tiled prefill (`--cpu-prefill-tokens 64`) requires a separately
-// reviewed native release (`0.1.36+`) supporting 64-row prefill tiles.
-const PREFILL_TILE_64_RELEASE: Option<(&str, &str)> = None;
+// 64-token CPU tiled prefill (`--cpu-prefill-tokens 64`) requires a reviewed
+// native release (`0.1.38+`) supporting 64-row prefill tiles.
+const PREFILL_TILE_64_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
 // Split decode/prefill CPU row-worker pools (`--prefill-row-workers`;
-// X1: 8 decode / 12 prefill, X2: 8 decode / 16 prefill) require a separately
-// reviewed native release (`0.1.36+`).
-const PREFILL_ROW_WORKERS_RELEASE: Option<(&str, &str)> = None;
+// X1: 8 decode / 12 prefill, X2: 8 decode / 16 prefill) require a reviewed
+// native release (`0.1.38+`).
+const PREFILL_ROW_WORKERS_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_38;
 
 pub(super) fn prefill_tile_64_supported() -> Result<bool, LaunchError> {
     let release = pinned_release()?;
@@ -816,9 +816,11 @@ mod tests {
             ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
             ("0.1.33", "3bc76f135bf23c538b3bb789aef382143ff36839"),
             ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.36", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.35", "0000000000000000000000000000000000000000"),
-            ("0.1.35", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.36", "50977990398a20a8add2056bfe34ce59e1677510"),
+            ("0.1.38", "0000000000000000000000000000000000000000"),
+            ("0.1.38", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.39", "50977990398a20a8add2056bfe34ce59e1677510"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -852,8 +854,9 @@ mod tests {
             ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
             ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
             ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.35", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.35", "0000000000000000000000000000000000000000"),
+            ("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.38", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.38", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -906,9 +909,11 @@ mod tests {
             ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
             ("0.1.33", "3bc76f135bf23c538b3bb789aef382143ff36839"),
             ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.36", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.35", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.35", "0000000000000000000000000000000000000000"),
+            ("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.36", "50977990398a20a8add2056bfe34ce59e1677510"),
+            ("0.1.38", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.38", "0000000000000000000000000000000000000000"),
+            ("0.1.39", "50977990398a20a8add2056bfe34ce59e1677510"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -934,12 +939,13 @@ mod tests {
         assert!(!full_context_release_matches(&pin, None));
         assert!(full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
         for version in [
-            "0.1.27", "0.1.28", "0.1.30", "0.1.31", "0.1.32", "0.1.33", "0.1.34", "0.1.36",
+            "0.1.27", "0.1.28", "0.1.30", "0.1.31", "0.1.32", "0.1.33", "0.1.34", "0.1.35",
+            "0.1.36", "0.1.39",
         ] {
             pin.version = version.into();
             assert!(!full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
         }
-        pin.version = "0.1.35".into();
+        pin.version = "0.1.38".into();
         pin.commit = "0".repeat(40);
         assert!(!full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
         let other_source = (pin.version.as_str(), pin.commit.as_str());
@@ -971,8 +977,8 @@ mod tests {
             ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
             ("0.1.33", "3bc76f135bf23c538b3bb789aef382143ff36839"),
             ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.36", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.35", "0000000000000000000000000000000000000000"),
+            ("0.1.36", "50977990398a20a8add2056bfe34ce59e1677510"),
+            ("0.1.38", "0000000000000000000000000000000000000000"),
         ] {
             pin.version = version.into();
             pin.commit = commit.into();
@@ -1003,11 +1009,13 @@ mod tests {
             "0.1.32",
             "0.1.33",
             "0.1.34",
+            "0.1.35",
             "0.1.36",
-            "0.1.35-dev",
-            "v0.1.35",
-            "0.1.35.0",
-            "0.1.035",
+            "0.1.38-dev",
+            "v0.1.38",
+            "0.1.38.0",
+            "0.1.038",
+            "0.1.39",
             "",
             "latest",
         ] {
@@ -1102,11 +1110,13 @@ mod tests {
             "0.1.32",
             "0.1.33",
             "0.1.34",
+            "0.1.35",
             "0.1.36",
-            "0.1.35-dev",
-            "v0.1.35",
-            "0.1.35.0",
-            "0.1.035",
+            "0.1.38-dev",
+            "v0.1.38",
+            "0.1.38.0",
+            "0.1.038",
+            "0.1.39",
             "",
             "latest",
         ] {
@@ -1188,11 +1198,11 @@ mod tests {
     }
 
     #[test]
-    fn broker_pipe_and_0_1_35_capabilities_require_reviewed_release() -> Result<(), LaunchError> {
+    fn broker_pipe_and_0_1_38_capabilities_require_reviewed_release() -> Result<(), LaunchError> {
         let mut pin = release(LOCK)?;
         assert_eq!(
             BROKER_PIPE_RELEASE,
-            Some(("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839"))
+            Some(("0.1.38", "50977990398a20a8add2056bfe34ce59e1677510"))
         );
         assert!(broker_pipe_supported()?);
         assert!(reviewed_release_matches(&pin, BROKER_PIPE_RELEASE));
@@ -1209,8 +1219,9 @@ mod tests {
             ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
             ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
             ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.35", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.35", "0000000000000000000000000000000000000000"),
+            ("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839"),
+            ("0.1.38", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
+            ("0.1.38", "0000000000000000000000000000000000000000"),
             ("0.1.36", "3bc76f135bf23c538b3bb789aef382143ff36839"),
         ] {
             pin.version = version.into();
@@ -1349,10 +1360,10 @@ mod tests {
     }
 
     #[test]
-    fn wy_f32_rotated_kv_gate_admits_reviewed_0_1_35_and_rejects_unreviewed_release()
+    fn wy_f32_rotated_kv_gate_admits_reviewed_0_1_38_and_rejects_unreviewed_release()
     -> Result<(), LaunchError> {
         let pinned = release(LOCK)?;
-        assert_eq!(WY_F32_ROTATED_KV_RELEASE, REVIEWED_0_1_35);
+        assert_eq!(WY_F32_ROTATED_KV_RELEASE, REVIEWED_0_1_38);
         for kv in [
             KvCache::F16,
             KvCache::Rsq4,
@@ -1405,7 +1416,7 @@ mod tests {
     #[test]
     fn hexagon_arena_cache_requires_reviewed_release() -> Result<(), LaunchError> {
         let mut pin = release(LOCK)?;
-        assert_eq!(HEXAGON_ARENA_CACHE_RELEASE, REVIEWED_0_1_35);
+        assert_eq!(HEXAGON_ARENA_CACHE_RELEASE, REVIEWED_0_1_38);
         assert!(hexagon_arena_cache_supported()?);
         assert!(hexagon_arena_cache_supported_for(
             &pin,
@@ -1416,7 +1427,7 @@ mod tests {
         assert!(!hexagon_arena_cache_supported_for(&pin, Some(unreviewed)));
         assert!(!hexagon_arena_cache_supported_for(
             &pin,
-            Some(("0.1.35", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+            Some(("0.1.38", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
         ));
         assert!(!hexagon_arena_cache_supported_for(&pin, None));
 
@@ -1432,7 +1443,7 @@ mod tests {
 
     #[test]
     fn nariq_trellis_requires_exact_reviewed_release() -> Result<(), LaunchError> {
-        assert_eq!(NARIQ_TRELLIS_RELEASE, REVIEWED_0_1_35);
+        assert_eq!(NARIQ_TRELLIS_RELEASE, REVIEWED_0_1_38);
         assert!(nariq_trellis_supported()?);
         let mut pin = release(LOCK)?;
         assert!(reviewed_release_matches(&pin, NARIQ_TRELLIS_RELEASE));
@@ -1447,7 +1458,7 @@ mod tests {
 
     #[test]
     fn bonsai25_release_gate_is_pinned() -> Result<(), LaunchError> {
-        assert_eq!(BONSAI_2_5_RELEASE, REVIEWED_0_1_35);
+        assert_eq!(BONSAI_2_5_RELEASE, REVIEWED_0_1_38);
         assert!(bonsai_2_5_supported()?);
         let mut pin = release(LOCK)?;
         assert!(reviewed_release_matches(&pin, BONSAI_2_5_RELEASE));
@@ -1457,19 +1468,16 @@ mod tests {
     }
 
     #[test]
-    fn future_0_1_36_tile_64_and_prefill_row_workers_remain_gated_on_0_1_35_and_unlock_on_pin()
+    fn tile_64_and_prefill_row_workers_admit_reviewed_0_1_38_and_reject_unreviewed()
     -> Result<(), LaunchError> {
         use bonsai_cpu_policy::hardware::SnapdragonFamily;
         use std::ffi::OsStr;
 
-        assert_eq!(PREFILL_TILE_64_RELEASE, None);
-        assert_eq!(PREFILL_ROW_WORKERS_RELEASE, None);
-        assert!(!prefill_tile_64_supported()?);
+        assert_eq!(PREFILL_TILE_64_RELEASE, REVIEWED_0_1_38);
+        assert_eq!(PREFILL_ROW_WORKERS_RELEASE, REVIEWED_0_1_38);
+        assert!(prefill_tile_64_supported()?);
         assert_eq!(parse_cpu_prefill_tokens(Some(OsStr::new("64"))), Ok(64));
-        assert_eq!(
-            pinned_cpu_prefill_tokens(true, Some(64)),
-            Err(LaunchError::NativeRuntime)
-        );
+        assert_eq!(pinned_cpu_prefill_tokens(true, Some(64)), Ok(Some(64)));
         assert_eq!(
             pinned_cpu_prefill_tokens(false, Some(64)),
             Err(LaunchError::Arguments)
@@ -1479,79 +1487,70 @@ mod tests {
         assert_eq!(parse_prefill_row_workers(Some(OsStr::new("16"))), Ok(16));
         assert_eq!(
             pinned_prefill_row_workers(true, None, Some(SnapdragonFamily::XElite), None),
-            Ok(None)
+            Ok(Some(12))
+        );
+        assert_eq!(
+            pinned_prefill_row_workers(true, None, Some(SnapdragonFamily::X2EliteExtreme), None),
+            Ok(Some(16))
+        );
+        assert_eq!(
+            pinned_prefill_row_workers(
+                true,
+                None,
+                Some(SnapdragonFamily::XElite),
+                Some(CpuFamily::X2)
+            ),
+            Ok(Some(16))
+        );
+        assert_eq!(
+            pinned_prefill_row_workers(true, None, None, None),
+            Ok(Some(4))
         );
         assert_eq!(
             pinned_prefill_row_workers(true, Some(12), Some(SnapdragonFamily::XElite), None),
-            Err(LaunchError::NativeRuntime)
+            Ok(Some(12))
         );
         assert_eq!(
             pinned_prefill_row_workers(false, Some(12), None, None),
             Err(LaunchError::Arguments)
         );
 
-        let mut future_pin = release(LOCK)?;
-        let reviewed_0_1_36 = ("0.1.36", "4444444444444444444444444444444444444444");
-        future_pin.version = reviewed_0_1_36.0.into();
-        future_pin.commit = reviewed_0_1_36.1.into();
+        let mut unreviewed_pin = release(LOCK)?;
+        let prior_0_1_35 = ("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839");
+        unreviewed_pin.version = prior_0_1_35.0.into();
+        unreviewed_pin.commit = prior_0_1_35.1.into();
         assert_eq!(
             select_cpu_prefill_tokens(
-                &future_pin,
+                &unreviewed_pin,
                 true,
                 Some(64),
-                Some(reviewed_0_1_36),
-                Some(reviewed_0_1_36),
-                Some(reviewed_0_1_36),
+                PREFILL_TILE_64_RELEASE,
+                PREFILL_TILE_64_RELEASE,
+                PREFILL_TILE_64_RELEASE,
             ),
-            Ok(Some(64))
+            Err(LaunchError::NativeRuntime)
         );
         assert_eq!(
             select_prefill_row_workers(
-                &future_pin,
+                &unreviewed_pin,
                 true,
                 None,
                 Some(SnapdragonFamily::XElite),
                 None,
-                Some(reviewed_0_1_36),
+                PREFILL_ROW_WORKERS_RELEASE,
             ),
-            Ok(Some(12))
+            Ok(None)
         );
         assert_eq!(
             select_prefill_row_workers(
-                &future_pin,
-                true,
-                None,
-                Some(SnapdragonFamily::X2EliteExtreme),
-                None,
-                Some(reviewed_0_1_36),
-            ),
-            Ok(Some(16))
-        );
-        assert_eq!(
-            select_prefill_row_workers(
-                &future_pin,
-                true,
-                None,
-                Some(SnapdragonFamily::XElite),
-                Some(CpuFamily::X2),
-                Some(reviewed_0_1_36),
-            ),
-            Ok(Some(16))
-        );
-        assert_eq!(
-            select_prefill_row_workers(&future_pin, true, None, None, None, Some(reviewed_0_1_36),),
-            Ok(Some(4))
-        );
-        assert_eq!(
-            select_prefill_row_workers(
-                &future_pin,
+                &unreviewed_pin,
                 true,
                 Some(12),
+                Some(SnapdragonFamily::XElite),
                 None,
-                None,
-                Some(reviewed_0_1_36),
+                PREFILL_ROW_WORKERS_RELEASE,
             ),
-            Ok(Some(12))
+            Err(LaunchError::NativeRuntime)
         );
         Ok(())
     }
