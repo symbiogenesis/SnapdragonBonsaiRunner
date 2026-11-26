@@ -50,6 +50,62 @@ pub fn gemm_q8_0_8x2(
     crate::native::quant_q8::gemm_q8_0_8x2(caps, rows, acts)
 }
 
+/// Computes an 8-row by 8-token repacked `Q4_K` strip GEMM tile using `I8MM` (`SMMLA`) or exact fallback.
+#[must_use]
+pub fn gemm_q4_k_repacked8_8x8(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    acts: [&[Q8_KActBlock]; 8],
+) -> [[f32; 8]; 8] {
+    crate::native::quant_q8::gemm_q4_k_repacked8_8x8(caps, strip, acts)
+}
+
+/// Computes an 8-row by 4-token repacked `Q4_K` strip GEMM tile using `I8MM` (`SMMLA`) or exact fallback.
+#[must_use]
+pub fn gemm_q4_k_repacked8_8x4(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    acts: [&[Q8_KActBlock]; 4],
+) -> [[f32; 4]; 8] {
+    crate::native::quant_q8::gemm_q4_k_repacked8_8x4(caps, strip, acts)
+}
+
+/// Computes eight `Q6_K` row dot products while sharing activations per superblock (`0-ULP` vs `dot_q6_k_row`).
+#[must_use]
+pub fn dot_q6_k_8rows(caps: Arm64QuantCaps, rows: [&[u8]; 8], act: &[Q8_KActBlock]) -> [f32; 8] {
+    crate::native::quant_q8::dot_q6_k_8rows(caps, rows, act)
+}
+
+/// Computes an 8-row by 8-token `Q6_K` tile using `I8MM` (`SMMLA`) or exact `SDOT`/portable fallback.
+#[must_use]
+pub fn gemm_q6_k_8x8(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    acts: [&[Q8_KActBlock]; 8],
+) -> [[f32; 8]; 8] {
+    crate::native::quant_q8::gemm_q6_k_8x8(caps, rows, acts)
+}
+
+/// Computes an 8-row by 4-token `Q6_K` tile using `I8MM` (`SMMLA`) or exact `SDOT`/portable fallback.
+#[must_use]
+pub fn gemm_q6_k_8x4(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    acts: [&[Q8_KActBlock]; 4],
+) -> [[f32; 4]; 8] {
+    crate::native::quant_q8::gemm_q6_k_8x4(caps, rows, acts)
+}
+
+/// Computes an 8-row by 2-token `Q6_K` tile using `I8MM` (`SMMLA`) or exact `SDOT`/portable fallback.
+#[must_use]
+pub fn gemm_q6_k_8x2(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    acts: [&[Q8_KActBlock]; 2],
+) -> [[f32; 2]; 8] {
+    crate::native::quant_q8::gemm_q6_k_8x2(caps, rows, acts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +640,176 @@ mod tests {
             gemm_q8_0_8x4(caps, good_rows, [&act, short_act, &act, &act])
                 .map(|r| r.map(f32::to_bits)),
             [[0_u32; 4]; 8]
+        );
+    }
+
+    fn make_edge_q8_k_act(blocks: usize, token: usize) -> Vec<Q8_KActBlock> {
+        const EXTREME_I8: [i8; 8] = [i8::MIN + 1, -99, -1, 0, 1, 63, 126, i8::MAX];
+        (0..blocks)
+            .map(|b| {
+                let d = match (token + b) % 6 {
+                    0 => -0.0_f32,
+                    1 => 0.0_f32,
+                    2 => -0.333_333_34_f32,
+                    3 => 1.0_f32 / 7.0_f32,
+                    4 => -1.625_f32,
+                    _ => 0.618_033_9_f32,
+                };
+                let mut qs = [0_i8; 256];
+                let mut bsums = [0_i16; 16];
+                for (g, bsum) in bsums.iter_mut().enumerate() {
+                    let mut sum = 0_i16;
+                    for k in 0..16 {
+                        let idx = g * 16 + k;
+                        let q = if (token + b + idx) % 5 == 0 {
+                            EXTREME_I8[(token * 3 + b * 7 + idx) % EXTREME_I8.len()]
+                        } else {
+                            i8::try_from(
+                                isize::try_from((token * 37 + b * 19 + idx * 23) % 255)
+                                    .unwrap_or(0)
+                                    - 127,
+                            )
+                            .unwrap_or(0)
+                        };
+                        qs[idx] = q;
+                        sum += i16::from(q);
+                    }
+                    *bsum = sum;
+                }
+                Q8_KActBlock { d, qs, bsums }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn q4_k_repacked8_8x8_and_8x4_match_row_and_portable_bit_exact() {
+        let caps = Arm64QuantCaps::detect();
+        let port = Arm64QuantCaps::portable();
+
+        for blocks in [0_usize, 1, 2, 3, 5] {
+            let in_dim = blocks * QK_K;
+            let q4_rows: Vec<Vec<u8>> = (0..8).map(|r| make_q4_k_row(blocks, r + 1)).collect();
+            let flat_q4: Vec<u8> = q4_rows.iter().flat_map(|r| r.iter().copied()).collect();
+            let repacked = if blocks == 0 {
+                Vec::new()
+            } else {
+                repack_q4_k_8rows(&flat_q4, in_dim, 8).unwrap_or_default()
+            };
+            assert_eq!(repacked.len(), blocks * Q4_K_REPACK8_BLOCK_BYTES);
+
+            let acts_vec: [Vec<Q8_KActBlock>; 8] =
+                std::array::from_fn(|t| make_edge_q8_k_act(blocks, t));
+            let act8_refs: [&[Q8_KActBlock]; 8] = std::array::from_fn(|t| acts_vec[t].as_slice());
+            let act4_refs: [&[Q8_KActBlock]; 4] = std::array::from_fn(|t| acts_vec[t].as_slice());
+
+            let expected: [[u32; 8]; 8] = std::array::from_fn(|r| {
+                std::array::from_fn(|t| dot_q4_k_row(port, &q4_rows[r], act8_refs[t]).to_bits())
+            });
+
+            let g8_nat = gemm_q4_k_repacked8_8x8(caps, &repacked, act8_refs);
+            let g8_prt = gemm_q4_k_repacked8_8x8(port, &repacked, act8_refs);
+            let g4_nat = gemm_q4_k_repacked8_8x4(caps, &repacked, act4_refs);
+            let g4_prt = gemm_q4_k_repacked8_8x4(port, &repacked, act4_refs);
+
+            for r in 0..8 {
+                assert_eq!(g8_nat[r].map(f32::to_bits), g8_prt[r].map(f32::to_bits));
+                assert_eq!(g8_nat[r].map(f32::to_bits), expected[r]);
+                assert_eq!(g4_nat[r].map(f32::to_bits), g4_prt[r].map(f32::to_bits));
+                assert_eq!(g4_nat[r].map(f32::to_bits), expected[r][..4]);
+            }
+        }
+
+        let valid_strip = vec![0_u8; 2 * Q4_K_REPACK8_BLOCK_BYTES];
+        let act = make_edge_q8_k_act(2, 0);
+        let short_act = &act[..1];
+        assert_eq!(
+            gemm_q4_k_repacked8_8x4(caps, &valid_strip[..valid_strip.len() - 1], [&act; 4])
+                .map(|r| r.map(f32::to_bits)),
+            [[0_u32; 4]; 8]
+        );
+        assert_eq!(
+            gemm_q4_k_repacked8_8x8(
+                caps,
+                &valid_strip,
+                [&act, short_act, &act, &act, &act, &act, &act, &act]
+            )
+            .map(|r| r.map(f32::to_bits)),
+            [[0_u32; 8]; 8]
+        );
+    }
+
+    #[test]
+    fn q6_k_8row_and_8x_gemm_match_row_and_portable_bit_exact() {
+        let caps = Arm64QuantCaps::detect();
+        let port = Arm64QuantCaps::portable();
+
+        for blocks in [0_usize, 1, 2, 3, 5] {
+            let q6_rows: Vec<Vec<u8>> = (0..8).map(|r| make_q6_k_row(blocks, r + 3)).collect();
+            let row_refs: [&[u8]; 8] = std::array::from_fn(|r| q6_rows[r].as_slice());
+
+            let acts_vec: [Vec<Q8_KActBlock>; 8] =
+                std::array::from_fn(|t| make_edge_q8_k_act(blocks, t));
+            let act8_refs: [&[Q8_KActBlock]; 8] = std::array::from_fn(|t| acts_vec[t].as_slice());
+            let act4_refs: [&[Q8_KActBlock]; 4] = std::array::from_fn(|t| acts_vec[t].as_slice());
+            let act2_refs: [&[Q8_KActBlock]; 2] = std::array::from_fn(|t| acts_vec[t].as_slice());
+
+            let expected: [[u32; 8]; 8] = std::array::from_fn(|r| {
+                std::array::from_fn(|t| dot_q6_k_row(port, row_refs[r], act8_refs[t]).to_bits())
+            });
+            let expected_caps: [[u32; 8]; 8] = std::array::from_fn(|r| {
+                std::array::from_fn(|t| dot_q6_k_row(caps, row_refs[r], act8_refs[t]).to_bits())
+            });
+            assert_eq!(expected, expected_caps);
+
+            for t in 0..8 {
+                let d_nat = dot_q6_k_8rows(caps, row_refs, act8_refs[t]);
+                let d_prt = dot_q6_k_8rows(port, row_refs, act8_refs[t]);
+                assert_eq!(d_nat.map(f32::to_bits), d_prt.map(f32::to_bits));
+                for r in 0..8 {
+                    assert_eq!(d_nat[r].to_bits(), expected[r][t]);
+                }
+            }
+
+            let g8_nat = gemm_q6_k_8x8(caps, row_refs, act8_refs);
+            let g8_prt = gemm_q6_k_8x8(port, row_refs, act8_refs);
+            let g4_nat = gemm_q6_k_8x4(caps, row_refs, act4_refs);
+            let g4_prt = gemm_q6_k_8x4(port, row_refs, act4_refs);
+            let g2_nat = gemm_q6_k_8x2(caps, row_refs, act2_refs);
+            let g2_prt = gemm_q6_k_8x2(port, row_refs, act2_refs);
+
+            for r in 0..8 {
+                assert_eq!(g8_nat[r].map(f32::to_bits), g8_prt[r].map(f32::to_bits));
+                assert_eq!(g8_nat[r].map(f32::to_bits), expected[r]);
+                assert_eq!(g4_nat[r].map(f32::to_bits), g4_prt[r].map(f32::to_bits));
+                assert_eq!(g4_nat[r].map(f32::to_bits), expected[r][..4]);
+                assert_eq!(g2_nat[r].map(f32::to_bits), g2_prt[r].map(f32::to_bits));
+                assert_eq!(g2_nat[r].map(f32::to_bits), expected[r][..2]);
+            }
+        }
+
+        let valid_row = make_q6_k_row(2, 5);
+        let short_row = &valid_row[..valid_row.len() - 1];
+        let act = make_edge_q8_k_act(2, 0);
+        let short_act = &act[..1];
+        let mut bad_rows = [valid_row.as_slice(); 8];
+        bad_rows[6] = short_row;
+        assert_eq!(
+            dot_q6_k_8rows(caps, bad_rows, &act).map(f32::to_bits),
+            [0_u32; 8]
+        );
+        assert_eq!(
+            gemm_q6_k_8x4(caps, bad_rows, [&act; 4]).map(|r| r.map(f32::to_bits)),
+            [[0_u32; 4]; 8]
+        );
+        let good_rows = [valid_row.as_slice(); 8];
+        assert_eq!(
+            gemm_q6_k_8x8(
+                caps,
+                good_rows,
+                [&act, &act, short_act, &act, &act, &act, &act, &act]
+            )
+            .map(|r| r.map(f32::to_bits)),
+            [[0_u32; 8]; 8]
         );
     }
 }

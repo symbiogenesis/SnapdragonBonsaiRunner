@@ -1364,10 +1364,11 @@ mod quant_dispatch {
     use bonsai_windows_process::quant_kernels::{
         Arm64QuantCaps, Q4_K_BLOCK_BYTES, Q4_K_REPACK8_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
         Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, Q8_0ActBlock, Q8_KActBlock, QK_K, dot_q4_k_4rows,
-        dot_q4_k_repacked8, dot_q4_k_row, dot_q6_k_4rows, dot_q6_k_row, dot_q8_0_4rows,
-        dot_q8_0_8rows, dot_q8_0_row, gemm_q4_k_4x2, gemm_q4_k_repacked8_8x2, gemm_q6_k_4x2,
-        gemm_q8_0_4x2, gemm_q8_0_8x2, gemm_q8_0_8x4, gemm_q8_0_8x8, quantize_row_q8_0,
-        quantize_row_q8_k,
+        dot_q4_k_repacked8, dot_q4_k_row, dot_q6_k_4rows, dot_q6_k_8rows, dot_q6_k_row,
+        dot_q8_0_4rows, dot_q8_0_8rows, dot_q8_0_row, gemm_q4_k_4x2, gemm_q4_k_repacked8_8x2,
+        gemm_q4_k_repacked8_8x4, gemm_q4_k_repacked8_8x8, gemm_q6_k_4x2, gemm_q6_k_8x2,
+        gemm_q6_k_8x4, gemm_q6_k_8x8, gemm_q8_0_4x2, gemm_q8_0_8x2, gemm_q8_0_8x4, gemm_q8_0_8x8,
+        quantize_row_q8_0, quantize_row_q8_k,
     };
 
     use super::{LinearProjection, WeightQuantization, run_row_chunks_aligned};
@@ -1496,14 +1497,18 @@ mod quant_dispatch {
         };
         let row_bytes = (in_dim / block) * elem_bytes;
         let mut processed = 0_usize;
-        if ggml_type == 8 {
+        if ggml_type == 8 || ggml_type == 14 {
             for oct in dst.chunks_exact_mut(8) {
                 let r0 = (start_row + processed) * row_bytes;
                 let row_refs: [&[u8]; 8] = std::array::from_fn(|r| {
                     let start = r0 + r * row_bytes;
                     &bytes[start..start + row_bytes]
                 });
-                let sums = dot_q8_0_8rows(caps, row_refs, q8_act);
+                let sums = if ggml_type == 8 {
+                    dot_q8_0_8rows(caps, row_refs, q8_act)
+                } else {
+                    dot_q6_k_8rows(caps, row_refs, qk_act)
+                };
                 for (slot, add) in oct.iter_mut().zip(sums) {
                     *slot += add;
                 }
@@ -1561,8 +1566,9 @@ mod quant_dispatch {
                 });
             });
         } else {
+            let align = if ggml_type == 14 { 8 } else { 4 };
             with_q8_k_act(input, |act| {
-                run_row_chunks_aligned(out, worker_count, 4, |start_row, dst| {
+                run_row_chunks_aligned(out, worker_count, align, |start_row, dst| {
                     add_packed_rows(ggml_type, bytes, in_dim, caps, &[], act, start_row, dst);
                 });
             });
@@ -1714,7 +1720,33 @@ mod quant_dispatch {
             let take = (8 - lane).min(rows_here - idx);
             let strip = &bytes[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
             let mut t = 0_usize;
-            while t + 1 < seq_len {
+            while t + 8 <= seq_len {
+                let acts: [&[Q8_KActBlock]; 8] = std::array::from_fn(|k| {
+                    &acts[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
+                });
+                let tile = gemm_q4_k_repacked8_8x8(caps, strip, acts);
+                for k in 0..take {
+                    let base = (idx + k) * seq_len + t;
+                    for (col_idx, &val) in tile[lane + k].iter().enumerate() {
+                        dst[base + col_idx] += val;
+                    }
+                }
+                t += 8;
+            }
+            if t + 4 <= seq_len {
+                let acts: [&[Q8_KActBlock]; 4] = std::array::from_fn(|k| {
+                    &acts[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
+                });
+                let tile = gemm_q4_k_repacked8_8x4(caps, strip, acts);
+                for k in 0..take {
+                    let base = (idx + k) * seq_len + t;
+                    for (col_idx, &val) in tile[lane + k].iter().enumerate() {
+                        dst[base + col_idx] += val;
+                    }
+                }
+                t += 4;
+            }
+            if t + 2 <= seq_len {
                 let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
                 let a1 = &acts[(t + 1) * blocks_per_tok..(t + 2) * blocks_per_tok];
                 let tile = gemm_q4_k_repacked8_8x2(caps, strip, a0, a1);
@@ -1786,20 +1818,28 @@ mod quant_dispatch {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "8-row Q8_0 I8MM GEMM kernel processes 8x8/8x4/8x2/8x1 tiles over arbitrary row slices."
+        reason = "Generic 8-row I8MM GEMM kernel processes 8x8/8x4/8x2/8x1 tiles and delegates tail rows to 4-row GEMM."
     )]
-    fn add_batch_q8_0_gemm(
+    fn add_batch_8row_gemm<Act>(
         dst: &mut [f32],
         bytes: &[u8],
         in_dim: usize,
         seq_len: usize,
         local_row_start: usize,
         rows_here: usize,
-        caps: Arm64QuantCaps,
-        q8_act: &[Q8_0ActBlock],
+        block_elems: usize,
+        elem_bytes: usize,
+        acts_buf: &[Act],
+        gemm_8x8: impl Fn([&[u8]; 8], [&[Act]; 8]) -> [[f32; 8]; 8],
+        gemm_8x4: impl Fn([&[u8]; 8], [&[Act]; 4]) -> [[f32; 4]; 8],
+        gemm_8x2: impl Fn([&[u8]; 8], [&[Act]; 2]) -> [[f32; 2]; 8],
+        dot_8rows: impl Fn([&[u8]; 8], &[Act]) -> [f32; 8],
+        gemm_4x2: impl Fn([&[u8]; 4], &[Act], &[Act]) -> [[f32; 2]; 4],
+        dot_4rows: impl Fn([&[u8]; 4], &[Act]) -> [f32; 4],
+        dot_row: impl Fn(&[u8], &[Act]) -> f32,
     ) {
-        let blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
-        let row_bytes = blocks_per_tok * Q8_0_BLOCK_BYTES;
+        let blocks_per_tok = in_dim / block_elems;
+        let row_bytes = blocks_per_tok * elem_bytes;
         let mut processed = 0_usize;
         while processed + 8 <= rows_here {
             let r0 = (local_row_start + processed) * row_bytes;
@@ -1809,10 +1849,10 @@ mod quant_dispatch {
             });
             let mut t = 0_usize;
             while t + 8 <= seq_len {
-                let acts: [&[Q8_0ActBlock]; 8] = std::array::from_fn(|k| {
-                    &q8_act[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
+                let acts: [&[Act]; 8] = std::array::from_fn(|k| {
+                    &acts_buf[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
                 });
-                let tile = gemm_q8_0_8x8(caps, row_refs, acts);
+                let tile = gemm_8x8(row_refs, acts);
                 for (r, row_vals) in tile.iter().enumerate() {
                     let base = (processed + r) * seq_len + t;
                     for (k, &val) in row_vals.iter().enumerate() {
@@ -1822,10 +1862,10 @@ mod quant_dispatch {
                 t += 8;
             }
             if t + 4 <= seq_len {
-                let acts: [&[Q8_0ActBlock]; 4] = std::array::from_fn(|k| {
-                    &q8_act[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
+                let acts: [&[Act]; 4] = std::array::from_fn(|k| {
+                    &acts_buf[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
                 });
-                let tile = gemm_q8_0_8x4(caps, row_refs, acts);
+                let tile = gemm_8x4(row_refs, acts);
                 for (r, row_vals) in tile.iter().enumerate() {
                     let base = (processed + r) * seq_len + t;
                     for (k, &val) in row_vals.iter().enumerate() {
@@ -1835,10 +1875,10 @@ mod quant_dispatch {
                 t += 4;
             }
             if t + 2 <= seq_len {
-                let acts: [&[Q8_0ActBlock]; 2] = std::array::from_fn(|k| {
-                    &q8_act[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
+                let acts: [&[Act]; 2] = std::array::from_fn(|k| {
+                    &acts_buf[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
                 });
-                let tile = gemm_q8_0_8x2(caps, row_refs, acts);
+                let tile = gemm_8x2(row_refs, acts);
                 for (r, row_vals) in tile.iter().enumerate() {
                     let base = (processed + r) * seq_len + t;
                     dst[base] += row_vals[0];
@@ -1847,8 +1887,8 @@ mod quant_dispatch {
                 t += 2;
             }
             if t < seq_len {
-                let a0 = &q8_act[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                let col = dot_q8_0_8rows(caps, row_refs, a0);
+                let a0 = &acts_buf[t * blocks_per_tok..(t + 1) * blocks_per_tok];
+                let col = dot_8rows(row_refs, a0);
                 for (r, &val) in col.iter().enumerate() {
                     dst[(processed + r) * seq_len + t] += val;
                 }
@@ -1863,12 +1903,12 @@ mod quant_dispatch {
                 seq_len,
                 local_row_start + processed,
                 rows_here - processed,
-                Q8_0_BLOCK_ELEMENTS,
-                Q8_0_BLOCK_BYTES,
-                q8_act,
-                |r, a0, a1| gemm_q8_0_4x2(caps, r, a0, a1),
-                |r, a0| dot_q8_0_4rows(caps, r, a0),
-                |r, a0| dot_q8_0_row(caps, r, a0),
+                block_elems,
+                elem_bytes,
+                acts_buf,
+                gemm_4x2,
+                dot_4rows,
+                dot_row,
             );
         }
     }
@@ -1892,8 +1932,23 @@ mod quant_dispatch {
             GroupKind::Packed {
                 ggml_type: 8,
                 bytes,
-            } => add_batch_q8_0_gemm(
-                dst, bytes, in_dim, seq_len, local_row, rows_here, caps, q8_act,
+            } => add_batch_8row_gemm(
+                dst,
+                bytes,
+                in_dim,
+                seq_len,
+                local_row,
+                rows_here,
+                Q8_0_BLOCK_ELEMENTS,
+                Q8_0_BLOCK_BYTES,
+                q8_act,
+                |r, a| gemm_q8_0_8x8(caps, r, a),
+                |r, a| gemm_q8_0_8x4(caps, r, a),
+                |r, a| gemm_q8_0_8x2(caps, r, a),
+                |r, a| dot_q8_0_8rows(caps, r, a),
+                |r, a0, a1| gemm_q8_0_4x2(caps, r, a0, a1),
+                |r, a0| dot_q8_0_4rows(caps, r, a0),
+                |r, a0| dot_q8_0_row(caps, r, a0),
             ),
             GroupKind::Packed {
                 ggml_type: 12,
@@ -1912,7 +1967,7 @@ mod quant_dispatch {
                 |r, a0| dot_q4_k_4rows(caps, r, a0),
                 |r, a0| dot_q4_k_row(caps, r, a0),
             ),
-            GroupKind::Packed { bytes, .. } => add_batch_4row_gemm(
+            GroupKind::Packed { bytes, .. } => add_batch_8row_gemm(
                 dst,
                 bytes,
                 in_dim,
@@ -1922,6 +1977,10 @@ mod quant_dispatch {
                 QK_K,
                 Q6_K_BLOCK_BYTES,
                 qk_act,
+                |r, a| gemm_q6_k_8x8(caps, r, a),
+                |r, a| gemm_q6_k_8x4(caps, r, a),
+                |r, a| gemm_q6_k_8x2(caps, r, a),
+                |r, a| dot_q6_k_8rows(caps, r, a),
                 |r, a0, a1| gemm_q6_k_4x2(caps, r, a0, a1),
                 |r, a0| dot_q6_k_4rows(caps, r, a0),
                 |r, a0| dot_q6_k_row(caps, r, a0),
@@ -2076,7 +2135,10 @@ mod quant_dispatch {
         }
         let worker_count = worker_count.clamp(1, 18).min(out_dim.max(1));
         let row_align = match kind {
-            GroupKind::Repacked(_) | GroupKind::Packed { ggml_type: 8, .. } => 8,
+            GroupKind::Repacked(_)
+            | GroupKind::Packed {
+                ggml_type: 8 | 14, ..
+            } => 8,
             GroupKind::Packed { .. } => 4,
         };
         match kind {
