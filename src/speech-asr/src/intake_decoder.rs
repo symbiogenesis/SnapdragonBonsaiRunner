@@ -467,12 +467,15 @@ pub(super) fn load_mapped(
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<Model> {
     let mut cursor = io::Cursor::new(mapping.as_slice());
-    let mut loader = Loader::new_mapped(index, &mut cursor, mapping);
+    let loader = Loader::new_mapped(index, &mut cursor, mapping);
     let (config, count) = validate_decoder_geometry(&loader, precision)?;
-    let embedding = loader.projection("dec.token_embd.weight", cancel)?;
-    let output_norm = loader.vector("dec.output_norm.weight", cancel)?;
+    if cancel() {
+        return Err(io::Error::from(io::ErrorKind::Interrupted));
+    }
     let slice_loader = MappedSliceLoader::new(index, mapping);
     let mut remaining = loader.remaining;
+    slice_loader.reserve_tensor(&mut remaining, "dec.token_embd.weight")?;
+    slice_loader.reserve_tensor(&mut remaining, "dec.output_norm.weight")?;
     for layer in 0..count {
         let prefix = format!("dec.blocks.{layer}.");
         for suffix in [
@@ -491,10 +494,26 @@ pub(super) fn load_mapped(
             slice_loader.reserve_tensor(&mut remaining, &(prefix.clone() + suffix))?;
         }
     }
-    let blocks = load_mapped_blocks(count, cancel, |layer| {
-        let mut s = &slice_loader;
-        load_decoder_block(&mut s, layer)
-    })?;
+    let (embedding_res, (output_norm_res, blocks_res)) = rayon::join(
+        || slice_loader.projection("dec.token_embd.weight"),
+        || {
+            rayon::join(
+                || slice_loader.vector("dec.output_norm.weight"),
+                || {
+                    load_mapped_blocks(count, &mut || false, |layer| {
+                        let mut s = &slice_loader;
+                        load_decoder_block(&mut s, layer)
+                    })
+                },
+            )
+        },
+    );
+    if cancel() {
+        return Err(io::Error::from(io::ErrorKind::Interrupted));
+    }
+    let embedding = embedding_res?;
+    let output_norm = output_norm_res?;
+    let blocks = blocks_res?;
     Model::new(config, embedding, blocks, output_norm)
 }
 

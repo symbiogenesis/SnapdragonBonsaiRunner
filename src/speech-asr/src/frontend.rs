@@ -279,12 +279,7 @@ impl Frontend {
             );
         });
         let mut values = zeroes(MEL_BINS * frames)?;
-        for frame in 0..frames {
-            let src = &frame_major[frame * MEL_BINS..(frame + 1) * MEL_BINS];
-            for mel in 0..MEL_BINS {
-                values[mel * frames + frame] = src[mel];
-            }
-        }
+        packed::transpose_f32_matrix(frame_major, frames, MEL_BINS, threads, &mut values);
         normalize(&mut values, &mut is_cancelled)?;
         Ok(MelSpectrogram { frames, values })
     }

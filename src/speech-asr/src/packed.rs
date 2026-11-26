@@ -2590,6 +2590,18 @@ fn scatter_rows_to_batch(
     scatter_transposed_to_batch(transposed, batch, output, batch, workers, out);
 }
 
+/// Transpose row-major `[rows, cols]` `f32` matrix into `[cols, rows]` using
+/// `4x4` SIMD shuffles and `row_workers` (`0 ULP` bit-exact).
+pub(super) fn transpose_f32_matrix(
+    src: &[f32],
+    rows: usize,
+    cols: usize,
+    workers: usize,
+    dst: &mut [f32],
+) {
+    scatter_transposed_to_batch(src, cols, rows, cols, workers, dst);
+}
+
 /// Bit-exact matrix multiplication for a pre-transposed batch `[batch, input]`
 /// using `4x8` / `4x4` SIMD tiles (or ARM64 `I8MM`/`SDOT` kernels) and `row_workers`.
 pub(super) fn multiply_batch_prepared_into(

@@ -272,9 +272,13 @@ pub(super) fn load_artifacts_mapped(
     check_cancel(cancel)?;
     let (tokenizer, prompt_tokens) = load_tokenizer(&mut index, cancel)?;
     check_cancel(cancel)?;
-    let (encoder, frontend) = encoder::load_mapped(&index, mapping, cancel)?;
+    let (encoder_res, decoder_res) = rayon::join(
+        || encoder::load_mapped(&index, mapping, &mut || false),
+        || decoder::load_mapped(&index, mapping, precision, &mut || false),
+    );
     check_cancel(cancel)?;
-    let decoder = decoder::load_mapped(&index, mapping, precision, cancel)?;
+    let (encoder, frontend) = encoder_res?;
+    let decoder = decoder_res?;
     Ok((tokenizer, prompt_tokens, encoder, frontend, decoder))
 }
 
