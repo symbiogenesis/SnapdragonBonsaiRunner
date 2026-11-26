@@ -13,7 +13,7 @@ fn installer(version: &str) -> crate::Result<policy::Installer> {
     .map_err(|error| error.to_string())
 }
 
-fn portable_fixture() -> crate::Result<(PathBuf, String, policy::Installer)> {
+fn portable_fixture_named(prefix: &str) -> crate::Result<(PathBuf, String, policy::Installer)> {
     let directory = std::env::temp_dir().join(format!(
         "Bonsai-Portable-Stage-{}",
         crate::startup_process::unique()
@@ -22,13 +22,36 @@ fn portable_fixture() -> crate::Result<(PathBuf, String, policy::Installer)> {
     fs::create_dir(&directory).map_err(|error| error.to_string())?;
     let version = Version::parse(env!("CARGO_PKG_VERSION"))?.next_for_test()?;
     let mut published = installer(&version)?;
-    published.asset.name = format!("SwiftBonsai2Runner-{version}-windows-arm64.exe");
+    published.asset.name = format!("{prefix}-{version}-windows-arm64.exe");
     published.asset.url = format!(
         "https://github.com/{REPOSITORY}/releases/download/v{version}/{}",
         published.asset.name
     );
     published.validate(&version)?;
     Ok((directory, version, published))
+}
+
+fn portable_fixture() -> crate::Result<(PathBuf, String, policy::Installer)> {
+    portable_fixture_named("SnapdragonBonsaiRunner")
+}
+
+#[test]
+fn portable_staging_accepts_snapdragon_and_legacy_executable_asset_names() -> crate::Result<()> {
+    for prefix in ["SnapdragonBonsaiRunner", "SwiftBonsai2Runner"] {
+        let (directory, version, published) = portable_fixture_named(prefix)?;
+        let path = directory.join(&published.asset.name);
+        let receipt = directory.join("verified-release.json");
+        let identity = stage_portable_with(&directory, &version, &published, |destination| {
+            fs::write(destination, b"original").map_err(|error| error.to_string())
+        })?;
+        assert_eq!(identity, published.release_identity()?);
+        drop(verify_stage(&directory, &version, &published)?);
+        fs::remove_file(path)
+            .and_then(|()| fs::remove_file(receipt))
+            .and_then(|()| fs::remove_dir(directory))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[test]

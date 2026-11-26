@@ -234,7 +234,7 @@ fn request_headers(cached: Option<&Cached>) -> Vec<(String, String)> {
         ("X-GitHub-Api-Version".into(), API_VERSION.into()),
         (
             "User-Agent".into(),
-            format!("SwiftBonsai2Runner/{}", env!("CARGO_PKG_VERSION")),
+            format!("SnapdragonBonsaiRunner/{}", env!("CARGO_PKG_VERSION")),
         ),
         // The shared client disables automatic decoding. Bound compressed and
         // expanded metadata independently before accepting a cache entry.
@@ -365,6 +365,10 @@ mod tests {
 
     #[test]
     fn update_http_cache_admits_only_exact_bounded_slots_and_conditional_headers() {
+        assert_eq!(
+            super::super::super::REPOSITORY,
+            "symbiogenesis/SnapdragonBonsaiRunner"
+        );
         let api = format!(
             "https://api.github.com/repos/{}/",
             super::super::super::REPOSITORY
@@ -373,6 +377,18 @@ mod tests {
             assert!(slot(&format!("{api}releases?per_page=100&page={page}")).is_ok());
         }
         assert!(slot(&format!("{api}releases?per_page=100&page=4")).is_err());
+        assert!(
+            slot("https://api.github.com/repos/symbiogenesis/SwiftBonsai2Runner/releases?per_page=100&page=1")
+                .is_err()
+        );
+        assert!(
+            slot("https://api.github.com/repos/symbiogenesis/SwiftBonsai2Runner/commits/v0.3.6")
+                .is_err()
+        );
+        assert!(
+            slot("https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/download/v0.3.6/release-manifest.json")
+                .is_err()
+        );
         assert!(slot("https://evil.invalid/releases").is_err());
         assert!(!header_value("\"etag\"\r\nAuthorization: secret"));
         let entry = Cached {
@@ -382,6 +398,8 @@ mod tests {
             modified: Some("date".into()),
         };
         let headers = request_headers(Some(&entry));
+        assert!(headers.iter().any(|(name, value)| name == "User-Agent"
+            && *value == format!("SnapdragonBonsaiRunner/{}", env!("CARGO_PKG_VERSION"))));
         assert!(
             headers
                 .iter()

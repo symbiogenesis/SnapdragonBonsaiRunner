@@ -12,12 +12,21 @@ pub(super) enum Distribution {
 }
 
 impl Distribution {
-    fn asset_name(self, version: &str) -> String {
+    fn asset_names(self, version: &str) -> [String; 2] {
         let extension = match self {
             Self::Installer => "msi",
             Self::Portable => "exe",
         };
-        format!("SwiftBonsai2Runner-{version}-windows-arm64.{extension}")
+        [
+            format!("SnapdragonBonsaiRunner-{version}-windows-arm64.{extension}"),
+            format!("SwiftBonsai2Runner-{version}-windows-arm64.{extension}"),
+        ]
+    }
+
+    fn matches_asset_name(self, version: &str, name: &str) -> bool {
+        self.asset_names(version)
+            .iter()
+            .any(|expected| expected == name)
     }
 }
 
@@ -140,6 +149,31 @@ fn asset(release: &Value, version: &str, name: &str, limit: u64) -> crate::Resul
     })
 }
 
+fn application_asset(
+    release: &Value,
+    version: &str,
+    distribution: Distribution,
+    limit: u64,
+) -> crate::Result<Asset> {
+    let mut matches = release["assets"]
+        .as_array()
+        .ok_or("Missing published release assets.")?
+        .iter()
+        .filter(|entry| {
+            entry["name"]
+                .as_str()
+                .is_some_and(|name| distribution.matches_asset_name(version, name))
+        });
+    let (Some(entry), None) = (matches.next(), matches.next()) else {
+        return Err(
+            "Release application asset is missing, repeated or ambiguous across package names."
+                .into(),
+        );
+    };
+    let name = text(entry, "name")?;
+    asset(release, version, name, limit)
+}
+
 pub(super) fn select(bytes: &[u8], current: &str) -> crate::Result<(bool, Option<Candidate>)> {
     select_distribution(bytes, current, Distribution::Installer)
 }
@@ -204,12 +238,7 @@ fn select_distribution(
         release_url,
         manifest: asset(release, version, "release-manifest.json", MAX_METADATA)?,
         checksums: asset(release, version, "SHA256SUMS.txt", MAX_METADATA)?,
-        msi: asset(
-            release,
-            version,
-            &distribution.asset_name(version),
-            MAX_INSTALLER,
-        )?,
+        msi: application_asset(release, version, distribution, MAX_INSTALLER)?,
     };
     Ok((published, Some(candidate)))
 }
@@ -267,16 +296,17 @@ impl Installer {
 
     pub(super) fn validate(&self, version: &str) -> crate::Result<()> {
         Version::parse(version)?;
-        let name = self.distribution().asset_name(version);
         if self.schema_version != 1
             || self.version != version
             || self.target != TARGET
             || !crate::identity::is_lower_hex(&self.source_revision, 40)
-            || self.asset.name != name
+            || !self
+                .distribution()
+                .matches_asset_name(version, &self.asset.name)
             || self.asset.bytes == 0
             || self.asset.bytes > MAX_INSTALLER
             || !crate::identity::is_lower_hex(&self.asset.sha256, 64)
-            || self.asset.url != canonical_asset(version, &name)
+            || self.asset.url != canonical_asset(version, &self.asset.name)
         {
             return Err(
                 "Staged application identity is not a project Windows ARM64 release.".into(),
@@ -336,7 +366,7 @@ fn application(
         || manifest["tag"] != expected_tag
         || manifest["version"] != candidate.version
         || manifest["target"] != TARGET
-        || candidate.msi.name != distribution.asset_name(&candidate.version)
+        || !distribution.matches_asset_name(&candidate.version, &candidate.msi.name)
         || !checked
     {
         return Err(

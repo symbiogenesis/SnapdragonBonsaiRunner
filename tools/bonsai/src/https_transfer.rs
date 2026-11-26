@@ -107,7 +107,10 @@ fn new_agent(loopback: bool) -> Agent {
         .timeout_recv_response(Some(Duration::from_secs(60)))
         .timeout_per_read(Some(Duration::from_secs(60)))
         .timeout_per_write(Some(Duration::from_secs(60)))
-        .user_agent(format!("SwiftBonsai2Runner/{}", env!("CARGO_PKG_VERSION")));
+        .user_agent(format!(
+            "SnapdragonBonsaiRunner/{}",
+            env!("CARGO_PKG_VERSION")
+        ));
     #[cfg(windows)]
     let config = config.tls_config(
         ureq::tls::TlsConfig::builder()
@@ -834,7 +837,7 @@ mod tests {
         let compressed = encoder.finish().map_err(|e| e.to_string())?;
         let mut raw = format!("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", compressed.len()).into_bytes();
         raw.extend_from_slice(&compressed);
-        let (response, _) = fixture(&raw, |agent, uri| {
+        let (response, request) = fixture(&raw, |agent, uri| {
             metadata_with(
                 &agent,
                 uri,
@@ -844,6 +847,10 @@ mod tests {
                 &AtomicBool::new(false),
             )
         })?;
+        assert!(request.to_ascii_lowercase().contains(&format!(
+            "user-agent: snapdragonbonsairunner/{}",
+            env!("CARGO_PKG_VERSION")
+        )));
         assert_eq!(response.body, compressed);
         assert_eq!(
             response.headers.get("content-encoding").map(String::as_str),

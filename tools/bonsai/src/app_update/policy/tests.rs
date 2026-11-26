@@ -34,12 +34,25 @@ fn manifest(candidate: &Candidate) -> Value {
         "assets": [{"name": candidate.msi.name, "bytes": candidate.msi.bytes, "sha256": candidate.msi.sha256}]})
 }
 
-fn portable_release(version: &str) -> Value {
+fn named_portable_release(version: &str, name: &str) -> Value {
     let mut value = release(version);
-    let name = Distribution::Portable.asset_name(version);
-    value["assets"][2]["name"] = name.clone().into();
-    value["assets"][2]["browser_download_url"] = canonical_asset(version, &name).into();
+    value["assets"][2]["name"] = name.into();
+    value["assets"][2]["browser_download_url"] = canonical_asset(version, name).into();
     value
+}
+
+fn portable_release(version: &str) -> Value {
+    named_portable_release(
+        version,
+        &format!("SnapdragonBonsaiRunner-{version}-windows-arm64.exe"),
+    )
+}
+
+fn legacy_portable_release(version: &str) -> Value {
+    named_portable_release(
+        version,
+        &format!("SwiftBonsai2Runner-{version}-windows-arm64.exe"),
+    )
 }
 
 fn selected_portable(releases: &Value) -> crate::Result<(bool, Option<Candidate>)> {
@@ -77,7 +90,7 @@ fn portable_discovery_selects_newest_published_numeric_version_without_fallback(
         assert_eq!(candidate.version, "0.1.10");
         assert_eq!(
             candidate.msi.name,
-            "SwiftBonsai2Runner-0.1.10-windows-arm64.exe"
+            "SnapdragonBonsaiRunner-0.1.10-windows-arm64.exe"
         );
     }
     let mut invalid_newest = portable_release("0.1.11");
@@ -90,6 +103,86 @@ fn portable_discovery_selects_newest_published_numeric_version_without_fallback(
     let (published, candidate) = selected_portable(&json!([]))?;
     assert!(!published);
     assert!(candidate.is_none());
+    Ok(())
+}
+
+#[test]
+fn portable_discovery_accepts_both_asset_names_but_rejects_legacy_repo_and_dual_assets()
+-> crate::Result<()> {
+    assert_eq!(REPOSITORY, "symbiogenesis/SnapdragonBonsaiRunner");
+    for (release_entry, expected_name) in [
+        (
+            portable_release("0.3.7"),
+            "SnapdragonBonsaiRunner-0.3.7-windows-arm64.exe",
+        ),
+        (
+            legacy_portable_release("0.3.7"),
+            "SwiftBonsai2Runner-0.3.7-windows-arm64.exe",
+        ),
+    ] {
+        let candidate = selected_portable(&json!([release_entry]))?
+            .1
+            .ok_or("Missing portable release.")?;
+        assert_eq!(candidate.msi.name, expected_name);
+        let manifest_json = portable_manifest(&candidate);
+        let checksum = format!("{}  {}\n", candidate.msi.sha256, candidate.msi.name);
+        let verified = portable(
+            &candidate,
+            &serde_json::to_vec(&manifest_json).map_err(|error| error.to_string())?,
+            checksum.as_bytes(),
+        )?;
+        verified.validate(&candidate.version)?;
+
+        let mut wrong_manifest = manifest_json;
+        let other_name = if expected_name.starts_with("Snapdragon") {
+            "SwiftBonsai2Runner-0.3.7-windows-arm64.exe"
+        } else {
+            "SnapdragonBonsaiRunner-0.3.7-windows-arm64.exe"
+        };
+        wrong_manifest["assets"][0]["name"] = other_name.into();
+        assert!(
+            portable(
+                &candidate,
+                &serde_json::to_vec(&wrong_manifest).map_err(|error| error.to_string())?,
+                checksum.as_bytes(),
+            )
+            .is_err()
+        );
+        let wrong_checksum = format!("{}  {other_name}\n", candidate.msi.sha256);
+        assert!(
+            portable(
+                &candidate,
+                &serde_json::to_vec(&portable_manifest(&candidate))
+                    .map_err(|error| error.to_string())?,
+                wrong_checksum.as_bytes(),
+            )
+            .is_err()
+        );
+    }
+
+    let mut dual = portable_release("0.3.7");
+    let legacy_asset = legacy_portable_release("0.3.7")["assets"][2].clone();
+    dual["assets"]
+        .as_array_mut()
+        .ok_or("Missing fixture assets.")?
+        .push(legacy_asset);
+    assert!(selected_portable(&json!([dual])).is_err());
+
+    for mutation in 0..2 {
+        let mut legacy_url = portable_release("0.1.1");
+        let old_base = "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases";
+        if mutation == 0 {
+            legacy_url["html_url"] = format!("{old_base}/tag/v0.1.1").into();
+        } else {
+            let name = legacy_url["assets"][2]["name"]
+                .as_str()
+                .ok_or("Missing fixture asset name.")?
+                .to_owned();
+            legacy_url["assets"][2]["browser_download_url"] =
+                format!("{old_base}/download/v0.1.1/{name}").into();
+        }
+        assert!(selected_portable(&json!([legacy_url])).is_err());
+    }
     Ok(())
 }
 
