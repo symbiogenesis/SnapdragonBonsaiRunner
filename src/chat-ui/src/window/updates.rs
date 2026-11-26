@@ -779,6 +779,18 @@ impl Updates {
             .map(|error| (self.status.as_str(), error))
     }
 
+    pub(super) fn dismiss_error(&mut self) {
+        self.error = None;
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_fixture_with_error(error: &str) -> io::Result<Self> {
+        let mut updates = tests::update_fixture()?;
+        updates.status = error.to_owned();
+        updates.error = Some(error.to_owned());
+        Ok(updates)
+    }
+
     pub(super) fn controls(&mut self, ui: &mut egui::Ui, can_install: bool) {
         update_header(ui);
         let idle = self.task.is_none() && !self.installing() && !self.cleanup_unconfirmed;
@@ -869,7 +881,7 @@ mod tests {
         Ok(format!("{}.{}.{}", next.0, next.1, next.2))
     }
 
-    fn update_fixture() -> io::Result<Updates> {
+    pub(super) fn update_fixture() -> io::Result<Updates> {
         let root = std::env::temp_dir().join("Bonsai model-free update controls");
         Ok(Updates {
             installation: Installation {

@@ -190,7 +190,7 @@ impl State {
         });
     }
 
-    fn clear_audio_file_status(&mut self) {
+    pub(super) fn clear_audio_file_status(&mut self) {
         self.audio_file_notice = None;
         self.audio_file_transcript.clear();
         self.audio_file_progress = None;
@@ -260,13 +260,6 @@ impl State {
                 self.focus_composer = false;
             }
             self.copy_audio_transcript(ui, "Copy transcript", false);
-        }
-        if ui
-            .button("Dismiss")
-            .accessible_name("Dismiss audio status")
-            .clicked()
-        {
-            self.clear_audio_file_status();
         }
     }
 

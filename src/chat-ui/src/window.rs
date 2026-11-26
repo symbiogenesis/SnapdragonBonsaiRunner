@@ -538,6 +538,7 @@ impl State {
                 }
                 self.setup.broker = Some(config.broker.clone());
                 self.setup.error = None;
+                self.alerts.clear_dismissed(error_ui::AlertKind::Setup);
                 self.setup.progress = None;
                 if !speech_pending {
                     self.startup.take();
@@ -574,6 +575,8 @@ impl State {
     fn fail_speech_preparation(&mut self, error: &io::Error) {
         self.speech_checked = true;
         self.setup.speech_error = Some(error.to_string());
+        self.alerts
+            .clear_dismissed(error_ui::AlertKind::SpeechSetup);
         "Speech setup could not finish. Text chat is still available. Select Retry speech setup."
             .clone_into(&mut self.speech_status);
         Self::record_into(
@@ -587,6 +590,7 @@ impl State {
     fn fail_startup(&mut self, error: &io::Error) {
         self.speech_checked = true;
         self.setup.error = Some(error.to_string());
+        self.alerts.clear_dismissed(error_ui::AlertKind::Setup);
         self.setup.progress = None;
         self.setup.pausing = false;
         if let Some(failure) = &self.startup_failure
@@ -665,6 +669,8 @@ impl State {
 
     fn attach_speech_configuration(&mut self, config: &Config) {
         self.setup.speech_error = None;
+        self.alerts
+            .clear_dismissed(error_ui::AlertKind::SpeechSetup);
         self.speech_notice = false;
         self.apply_speech_flags(config);
         self.speech = speech::start(config.canary.clone(), config.qwen_tts.clone()).ok();
@@ -688,6 +694,8 @@ impl State {
             && self.setup.speech_error.is_none()
         {
             self.setup.speech_error = Some("Swift could not finish preparing speech. Select Retry speech setup to check and repair its app-managed files. Text chat and your draft remain available.".into());
+            self.alerts
+                .clear_dismissed(error_ui::AlertKind::SpeechSetup);
             self.speech_notice = true;
         }
     }
@@ -704,6 +712,9 @@ impl State {
             .take(MAX_DIAGNOSTIC_CHARS)
             .collect();
         self.warning = warning;
+        if warning {
+            self.alerts.clear_dismissed(error_ui::AlertKind::Model);
+        }
     }
 
     fn record_into(diagnostics: &mut VecDeque<String>, revision: &mut u64, message: &str) {

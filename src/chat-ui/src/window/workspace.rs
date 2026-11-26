@@ -214,6 +214,10 @@ impl State {
             self.status = snapshot.status;
             self.status_detail = snapshot.status_detail;
             self.warning = snapshot.warning;
+            if self.warning {
+                self.alerts
+                    .clear_dismissed(super::error_ui::AlertKind::Model);
+            }
         }
         self.stage = snapshot.stage;
         self.place_composer_cursor(self.input.chars().count());

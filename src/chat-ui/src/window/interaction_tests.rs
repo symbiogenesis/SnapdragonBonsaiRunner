@@ -1601,10 +1601,10 @@ fn audio_file_progress_cancel_and_rejection_are_visible_in_wide_and_narrow_windo
         assert!(chat.get_by_label("Not enough available memory to decode this audio. Close other apps and try again. Your draft was kept.").rect().is_positive());
         // Wrapped failure actions can sit below the bounded notice viewport.
         // Bring the actual pointer target into view before dispatching the click.
-        chat.get_by_role_and_label(egui::Role::Button, "Dismiss audio status")
+        chat.get_by_role_and_label(egui::Role::Button, "Dismiss alert")
             .scroll_to_me();
         chat.run();
-        chat.get_by_role_and_label(egui::Role::Button, "Dismiss audio status")
+        chat.get_by_role_and_label(egui::Role::Button, "Dismiss alert")
             .click();
         chat.run();
         assert!(chat.state().app.audio_file_notice.is_none());

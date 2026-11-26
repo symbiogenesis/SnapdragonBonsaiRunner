@@ -91,6 +91,22 @@ pub(super) enum AlertKind {
 pub(super) struct View {
     pub(super) selection: Option<AlertKind>,
     pub(super) details: Option<AlertKind>,
+    dismissed_setup: Option<String>,
+    dismissed_model: bool,
+    dismissed_recovery: Option<String>,
+    dismissed_speech_setup: Option<String>,
+}
+
+impl View {
+    pub(super) fn clear_dismissed(&mut self, kind: AlertKind) {
+        match kind {
+            AlertKind::Setup => self.dismissed_setup = None,
+            AlertKind::Model => self.dismissed_model = false,
+            AlertKind::Recovery => self.dismissed_recovery = None,
+            AlertKind::SpeechSetup => self.dismissed_speech_setup = None,
+            AlertKind::AudioFile | AlertKind::Speech | AlertKind::Update => {}
+        }
+    }
 }
 
 impl AlertKind {
@@ -118,20 +134,51 @@ fn needs_windows_update(summary: &str, detail: &str) -> bool {
 }
 
 impl State {
+    fn prune_dismissed_alerts(&mut self) {
+        let preparing =
+            self.worker.is_none() && (self.startup_request.is_some() || self.startup.is_some());
+        if self.setup.error.is_none() || preparing {
+            self.alerts.dismissed_setup = None;
+        }
+        if (!self.warning && !self.model.retryable()) || self.setup.error.is_some() {
+            self.alerts.dismissed_model = false;
+        }
+        if !self.recovery_notice.starts_with("Could not") {
+            self.alerts.dismissed_recovery = None;
+        }
+        if self.setup.speech_error.is_none() {
+            self.alerts.dismissed_speech_setup = None;
+        }
+    }
+
     pub(super) fn active_alerts(&self) -> Vec<AlertKind> {
         let preparing =
             self.worker.is_none() && (self.startup_request.is_some() || self.startup.is_some());
         let sources = [
-            (AlertKind::Setup, self.setup.error.is_some() && !preparing),
+            (
+                AlertKind::Setup,
+                self.setup.error.is_some()
+                    && !preparing
+                    && self.alerts.dismissed_setup.as_deref() != self.setup.error.as_deref(),
+            ),
             (
                 AlertKind::Model,
-                (self.warning || self.model.retryable()) && self.setup.error.is_none(),
+                (self.warning || self.model.retryable())
+                    && self.setup.error.is_none()
+                    && !self.alerts.dismissed_model,
             ),
             (
                 AlertKind::Recovery,
-                self.recovery_notice.starts_with("Could not"),
+                self.recovery_notice.starts_with("Could not")
+                    && self.alerts.dismissed_recovery.as_deref()
+                        != Some(self.recovery_notice.as_str()),
             ),
-            (AlertKind::SpeechSetup, self.setup.speech_error.is_some()),
+            (
+                AlertKind::SpeechSetup,
+                self.setup.speech_error.is_some()
+                    && self.alerts.dismissed_speech_setup.as_deref()
+                        != self.setup.speech_error.as_deref(),
+            ),
             (
                 AlertKind::AudioFile,
                 self.audio_file_error && self.audio_file_notice.is_some(),
@@ -154,6 +201,41 @@ impl State {
             .into_iter()
             .filter_map(|(kind, active)| active.then_some(kind))
             .collect()
+    }
+
+    pub(super) fn dismiss_alert(&mut self, kind: AlertKind) {
+        if self.alerts.details == Some(kind) {
+            self.alerts.details = None;
+        }
+        if self.alerts.selection == Some(kind) {
+            self.alerts.selection = None;
+        }
+        match kind {
+            AlertKind::Setup => {
+                self.alerts.dismissed_setup = self.setup.error.clone();
+            }
+            AlertKind::Model => {
+                if self.model.ready() {
+                    self.warning = false;
+                    self.alerts.dismissed_model = false;
+                } else {
+                    self.alerts.dismissed_model = true;
+                }
+            }
+            AlertKind::Recovery => {
+                self.alerts.dismissed_recovery = Some(self.recovery_notice.clone());
+            }
+            AlertKind::SpeechSetup => {
+                self.alerts.dismissed_speech_setup = self.setup.speech_error.clone();
+            }
+            AlertKind::AudioFile => self.clear_audio_file_status(),
+            AlertKind::Speech => self.speech_notice = false,
+            AlertKind::Update => {
+                if let Some(updates) = &mut self.updates {
+                    updates.dismiss_error();
+                }
+            }
+        }
     }
 
     fn alert_text(&self, kind: AlertKind) -> (&str, &str) {
@@ -189,6 +271,7 @@ impl State {
     }
 
     pub(super) fn alert_panel(&mut self, ui: &mut egui::Ui) {
+        self.prune_dismissed_alerts();
         let alerts = self.active_alerts();
         let Some(first) = alerts.first().copied() else {
             self.alerts.selection = None;
@@ -199,6 +282,7 @@ impl State {
             .selection
             .filter(|kind| alerts.contains(kind))
             .unwrap_or(first);
+        let mut dismiss = false;
         super::navigation::bounded_width(ui, |ui| {
             egui::Frame::new()
                 .fill(ui.visuals().faint_bg_color)
@@ -211,52 +295,72 @@ impl State {
                     ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
                     ui.spacing_mut().interact_size.y = 28.0;
                     ui.horizontal(|ui| {
-                        let count = if alerts.len() == 1 {
-                            "1 alert".to_owned()
-                        } else {
-                            format!("{} alerts", alerts.len())
-                        };
-                        ui.label(
-                            RichText::new(count)
-                                .small()
-                                .color(ui.visuals().warn_fg_color),
-                        );
-                        if alerts.len() == 1 {
-                            ui.add(
-                                egui::Label::new(RichText::new(selected.title()).strong())
-                                    .truncate(),
-                            )
-                            .on_hover_text(selected.title());
-                        } else {
-                            egui::ComboBox::from_id_salt("alert-selector")
-                                .selected_text(RichText::new(selected.title()).strong())
-                                .width(ui.available_width())
-                                .truncate()
-                                .show_ui(ui, |ui| {
-                                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                                    for kind in &alerts {
-                                        if ui
-                                            .add_sized(
-                                                [ui.available_width(), 0.0],
-                                                egui::Button::selectable(
-                                                    selected == *kind,
-                                                    kind.title(),
-                                                )
-                                                .wrap(),
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            dismiss = ui
+                                .add(
+                                    super::controls::quiet_button("×")
+                                        .min_size(egui::Vec2::splat(28.0)),
+                                )
+                                .accessible_name("Dismiss alert")
+                                .on_hover_text("Dismiss alert")
+                                .clicked();
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let count = if alerts.len() == 1 {
+                                        "1 alert".to_owned()
+                                    } else {
+                                        format!("{} alerts", alerts.len())
+                                    };
+                                    ui.label(
+                                        RichText::new(count)
+                                            .small()
+                                            .color(ui.visuals().warn_fg_color),
+                                    );
+                                    if alerts.len() == 1 {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(selected.title()).strong(),
                                             )
-                                            .clicked()
-                                        {
-                                            selected = *kind;
-                                        }
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(selected.title());
+                                    } else {
+                                        egui::ComboBox::from_id_salt("alert-selector")
+                                            .selected_text(
+                                                RichText::new(selected.title()).strong(),
+                                            )
+                                            .width(ui.available_width())
+                                            .truncate()
+                                            .show_ui(ui, |ui| {
+                                                ui.style_mut().wrap_mode =
+                                                    Some(egui::TextWrapMode::Wrap);
+                                                for kind in &alerts {
+                                                    if ui
+                                                        .add_sized(
+                                                            [ui.available_width(), 0.0],
+                                                            egui::Button::selectable(
+                                                                selected == *kind,
+                                                                kind.title(),
+                                                            )
+                                                            .wrap(),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        selected = *kind;
+                                                    }
+                                                }
+                                            })
+                                            .response
+                                            .accessible_name("Current alert")
+                                            .on_hover_text(format!(
+                                                "{}\nChoose an alert to see its message and actions.",
+                                                selected.title()
+                                            ));
                                     }
-                                })
-                                .response
-                                .accessible_name("Current alert")
-                                .on_hover_text(format!(
-                                    "{}\nChoose an alert to see its message and actions.",
-                                    selected.title()
-                                ));
-                        }
+                                },
+                            );
+                        });
                     });
                     self.alerts.selection = Some(selected);
                     {
@@ -276,6 +380,10 @@ impl State {
                     });
                 });
         });
+        if dismiss {
+            self.dismiss_alert(selected);
+            ui.ctx().request_repaint();
+        }
         ui.add_space(8.0);
     }
 

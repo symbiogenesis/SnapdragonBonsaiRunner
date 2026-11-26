@@ -135,6 +135,8 @@ struct ActiveView<'a> {
 
 impl State {
     pub(super) fn attach_recovery(&mut self, opened: io::Result<crate::recovery::Opened>) {
+        self.alerts
+            .clear_dismissed(super::error_ui::AlertKind::Recovery);
         match opened {
             Ok(opened) => {
                 self.recovery = Some(opened.store);
@@ -280,6 +282,8 @@ impl State {
             )
             .changed()
         {
+            self.alerts
+                .clear_dismissed(super::error_ui::AlertKind::Recovery);
             self.recovery_dirty = self.save_conversations;
             self.recovery_erase_pending = !self.save_conversations;
             self.last_recovery_save = Instant::now()
@@ -307,10 +311,14 @@ impl State {
                 }
                 match event {
                     crate::recovery::Event::Saved(_) if self.save_conversations => {
+                        self.alerts
+                            .clear_dismissed(super::error_ui::AlertKind::Recovery);
                         "Saved on this device with Windows user encryption."
                             .clone_into(&mut self.recovery_notice);
                     }
                     crate::recovery::Event::Erased(_) if !self.save_conversations => {
+                        self.alerts
+                            .clear_dismissed(super::error_ui::AlertKind::Recovery);
                         self.recovery_erase_pending = false;
                         "Saving is off. The saved workspace has been removed."
                             .clone_into(&mut self.recovery_notice);

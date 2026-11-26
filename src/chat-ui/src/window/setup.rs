@@ -140,6 +140,8 @@ impl State {
         }
         self.startup_request = self.setup.request.clone();
         self.setup.error = None;
+        self.alerts
+            .clear_dismissed(super::error_ui::AlertKind::Setup);
         self.setup.progress = None;
         self.setup.pausing = false;
         if let Some(failure) = &self.startup_failure
@@ -183,6 +185,8 @@ impl State {
             Ok(session) => {
                 self.startup = Some(session);
                 self.setup.speech_error = None;
+                self.alerts
+                    .clear_dismissed(super::error_ui::AlertKind::SpeechSetup);
                 self.speech_notice = false;
                 self.speech_checked = false;
                 "Preparing speech services… Text chat stays available."

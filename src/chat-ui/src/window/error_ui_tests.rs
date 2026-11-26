@@ -324,7 +324,7 @@ fn error_reporting_multiple_failures_preserve_selection_and_audio_actions() {
         Some(error_ui::AlertKind::AudioFile)
     );
     assert!(chat.get_by_label("3 alerts").rect().is_positive());
-    chat.get_by_role_and_label(egui::Role::Button, "Dismiss audio status")
+    chat.get_by_role_and_label(egui::Role::Button, "Dismiss alert")
         .click();
     chat.run();
     assert_eq!(
@@ -525,5 +525,155 @@ fn error_reporting_capture_when_requested() -> io::Result<()> {
             .save(directory.join(name))
             .map_err(io::Error::other)?;
     }
+    Ok(())
+}
+
+#[test]
+fn every_regular_alert_can_be_dismissed_with_x_preserving_state_and_reappearing_on_new_failure()
+-> io::Result<()> {
+    use error_ui::AlertKind;
+
+    let mut chat = harness([1080.0, 780.0], 16.0);
+
+    // 1. Setup alert: dismissing preserves setup.error (update safety) and does not surface Model.
+    chat.state_mut()
+        .app
+        .fail_startup(&io::Error::other("Download failed"));
+    chat.run();
+    assert_eq!(chat.state().app.active_alerts(), vec![AlertKind::Setup]);
+    chat.get_by_role_and_label(egui::Role::Button, "Dismiss alert")
+        .click();
+    chat.run();
+    assert!(chat.state().app.active_alerts().is_empty());
+    assert!(chat.state().app.setup.error.is_some());
+    assert!(chat.query_by_label("1 alert").is_none());
+
+    chat.state_mut()
+        .app
+        .fail_startup(&io::Error::other("Disk full"));
+    chat.state_mut().app.alerts.details = Some(AlertKind::Setup);
+    chat.state_mut().app.dismiss_alert(AlertKind::Setup);
+    chat.run();
+    assert!(chat.state().app.active_alerts().is_empty());
+    assert_eq!(chat.state().app.alerts.details, None);
+    chat.state_mut().app.setup.error = None;
+    chat.state_mut().app.set_status("Ready", false);
+
+    // 2. Model alert (ready-state warning) and ModelLifecycle::Retryable.
+    chat.state_mut().app.model = ModelLifecycle::Ready;
+    chat.state_mut().app.set_status("Transient warning", true);
+    chat.run();
+    assert_eq!(chat.state().app.active_alerts(), vec![AlertKind::Model]);
+    chat.get_by_role_and_label(egui::Role::Button, "Dismiss alert")
+        .click();
+    chat.run();
+    assert!(chat.state().app.active_alerts().is_empty());
+    assert!(!chat.state().app.warning);
+
+    chat.state_mut()
+        .app
+        .model_event(Event::Retryable("Worker exited".into()));
+    chat.run();
+    assert_eq!(chat.state().app.model, ModelLifecycle::Retryable);
+    assert_eq!(chat.state().app.active_alerts(), vec![AlertKind::Model]);
+    chat.get_by_role_and_label(egui::Role::Button, "Dismiss alert")
+        .click();
+    chat.run();
+    assert!(chat.state().app.active_alerts().is_empty());
+    assert_eq!(chat.state().app.model, ModelLifecycle::Retryable);
+    // Unrelated non-warning status updates must not resurrect a dismissed Retryable alert.
+    chat.state_mut()
+        .app
+        .set_status("Image save cancelled.", false);
+    chat.run();
+    assert!(chat.state().app.active_alerts().is_empty());
+    chat.state_mut()
+        .app
+        .model_event(Event::Retryable("Worker exited again".into()));
+    chat.run();
+    assert_eq!(chat.state().app.active_alerts(), vec![AlertKind::Model]);
+    chat.state_mut().app.model = ModelLifecycle::Ready;
+    chat.state_mut().app.set_status("Ready", false);
+
+    // 3. Recovery alert: identical repeated failure stays dismissed; distinct failure reappears.
+    chat.state_mut().app.recovery_notice = "Could not save conversations: disk full".into();
+    chat.run();
+    assert_eq!(chat.state().app.active_alerts(), vec![AlertKind::Recovery]);
+    chat.get_by_role_and_label(egui::Role::Button, "Dismiss alert")
+        .click();
+    chat.run();
+    assert!(chat.state().app.active_alerts().is_empty());
+    assert_eq!(
+        chat.state().app.recovery_notice,
+        "Could not save conversations: disk full"
+    );
+    chat.state_mut().app.recovery_notice = "Could not save conversations: disk full".into();
+    chat.run();
+    assert!(chat.state().app.active_alerts().is_empty());
+    chat.state_mut().app.recovery_notice = "Could not save conversations: permission denied".into();
+    chat.run();
+    assert_eq!(chat.state().app.active_alerts(), vec![AlertKind::Recovery]);
+    chat.state_mut().app.recovery_notice.clear();
+
+    // 4. SpeechSetup alert: dismissing preserves speech_error and keeps Speech suppressed.
+    chat.state_mut().app.setup.speech_error = Some("Speech setup failed".into());
+    chat.state_mut().app.speech_notice = true;
+    chat.state_mut().app.speech_status = "Speech failed".into();
+    chat.run();
+    assert_eq!(
+        chat.state().app.active_alerts(),
+        vec![AlertKind::SpeechSetup]
+    );
+    chat.get_by_role_and_label(egui::Role::Button, "Dismiss alert")
+        .click();
+    chat.run();
+    assert!(chat.state().app.active_alerts().is_empty());
+    assert!(chat.state().app.setup.speech_error.is_some());
+    chat.state_mut().app.setup.speech_error = None;
+    chat.state_mut().app.speech_notice = false;
+
+    // 5. AudioFile alert.
+    chat.state_mut().app.audio_file_error = true;
+    chat.state_mut().app.audio_file_notice = Some("Audio failed".into());
+    chat.state_mut().app.audio_file_transcript = "Partial".into();
+    chat.run();
+    assert_eq!(chat.state().app.active_alerts(), vec![AlertKind::AudioFile]);
+    chat.get_by_role_and_label(egui::Role::Button, "Dismiss alert")
+        .click();
+    chat.run();
+    assert!(chat.state().app.active_alerts().is_empty());
+    assert!(chat.state().app.audio_file_notice.is_none());
+    assert!(!chat.state().app.audio_file_error);
+    assert!(chat.state().app.audio_file_transcript.is_empty());
+
+    // 6. Speech alert.
+    chat.state_mut().app.speech_notice = true;
+    chat.state_mut().app.speech_status = "Microphone unavailable".into();
+    chat.run();
+    assert_eq!(chat.state().app.active_alerts(), vec![AlertKind::Speech]);
+    chat.get_by_role_and_label(egui::Role::Button, "Dismiss alert")
+        .click();
+    chat.run();
+    assert!(chat.state().app.active_alerts().is_empty());
+    assert!(!chat.state().app.speech_notice);
+
+    // 7. Update alert.
+    chat.state_mut().app.updates = Some(updates::Updates::test_fixture_with_error(
+        "Update signature invalid",
+    )?);
+    chat.run();
+    assert_eq!(chat.state().app.active_alerts(), vec![AlertKind::Update]);
+    chat.get_by_role_and_label(egui::Role::Button, "Dismiss alert")
+        .click();
+    chat.run();
+    assert!(chat.state().app.active_alerts().is_empty());
+    assert!(
+        chat.state()
+            .app
+            .updates
+            .as_ref()
+            .and_then(updates::Updates::error_notice)
+            .is_none()
+    );
     Ok(())
 }
