@@ -55,8 +55,8 @@ pub const HEXAGON_RESIDENT_PQ2_HOST_DEDUP_BYTES: u64 = 2_888_663_040;
 pub const MAX_REUSABLE_BRANCH_CHECKPOINTS: u8 = 8;
 /// Swift's largest projection activation/output width (FFN intermediate width).
 pub const SWIFT_MAX_LAYER_WIDTH: usize = 17_408;
-/// Bounded task-slice and error-descriptor reserve for parallel tiled prefill.
-pub const SWIFT_ROW_TASK_SCRATCH_BYTES: u64 = 16 * 1024;
+/// Bounded task-slice and error-descriptor reserve for parallel tiled prefill (up to 64-token tiles).
+pub const SWIFT_ROW_TASK_SCRATCH_BYTES: u64 = 32 * 1024;
 /// Preserve room for the largest reply, template margin and a positive prompt.
 pub const MIN_CONTEXT_TOKENS: usize =
     (4_096_usize + 64).div_ceil(CONTEXT_PAGE_TOKENS) * CONTEXT_PAGE_TOKENS;
@@ -1875,15 +1875,23 @@ mod tests {
         let gib = 1024 * 1024 * 1024_u64;
         assert_eq!(
             swift_tiled_prefill_scratch_bytes(8, 8_192, SwiftKvCacheFormat::Rsq4),
-            Some(11_501_568)
+            Some(11_517_952)
         );
         assert_eq!(
             swift_tiled_prefill_scratch_bytes(8, 262_144, SwiftKvCacheFormat::Rsq4),
-            Some(19_628_032)
+            Some(19_644_416)
+        );
+        assert_eq!(
+            swift_tiled_prefill_scratch_bytes(16, 262_144, SwiftKvCacheFormat::Rsq4),
+            Some(39_190_528)
+        );
+        assert_eq!(
+            swift_tiled_prefill_scratch_bytes_for_tile(64, 262_144, SwiftKvCacheFormat::Rsq4, true),
+            Some(156_467_200)
         );
         assert_eq!(
             swift_tiled_prefill_scratch_bytes(16, 62_720, SwiftKvCacheFormat::F16),
-            Some(46_481_408)
+            Some(46_497_792)
         );
         for invalid in [0, 1, 4, 7, 15, 64] {
             assert_eq!(
@@ -1933,7 +1941,7 @@ mod tests {
         let shape = SwiftExecutionShape::for_profile(SwiftContextProfile::NativeRsq4Full)
             .with_tiled_prefill_tokens(8, 262_144)
             .ok_or("missing tiled prefill shape")?;
-        assert_eq!(shape.tile_prefill_scratch_bytes, 19_628_032);
+        assert_eq!(shape.tile_prefill_scratch_bytes, 19_644_416);
         let breakdown = shape.breakdown(262_144).ok_or("missing breakdown")?;
         let worst = breakdown.total_footprint_bytes().ok_or("overflow")?;
         let cow = breakdown.physical_cow_footprint_bytes().ok_or("overflow")?;
