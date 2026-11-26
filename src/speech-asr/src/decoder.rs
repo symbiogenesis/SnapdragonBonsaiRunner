@@ -1779,10 +1779,10 @@ fn prefill_rows_inner(
                 c.intermediate,
                 &|elem_off, gate_slice| {
                     let end = elem_off + gate_slice.len();
-                    for (gate, &up) in gate_slice.iter_mut().zip(&up_all[elem_off..end]) {
-                        *gate = (*gate / (1.0 + (-*gate).exp())) * up;
+                    if !packed::swiglu_in_place(gate_slice, &up_all[elem_off..end]) {
+                        return Err(invalid());
                     }
-                    finite(gate_slice)
+                    Ok(())
                 },
             )?;
             ws.prepared.prepare_meta(total, c.intermediate);
@@ -2152,10 +2152,9 @@ fn ffn_single_row_into(
         transposed_scratch,
         cancel,
     )?;
-    for (g, &u) in gate.iter_mut().zip(up.iter()) {
-        *g = (*g / (1.0 + (-*g).exp())) * u;
+    if !packed::swiglu_in_place(gate, up) {
+        return Err(invalid());
     }
-    finite(gate)?;
     block.down.multiply_into(gate, workers, proj, cancel)?;
     for (out, &value) in row.iter_mut().zip(proj.iter()) {
         *out += value;

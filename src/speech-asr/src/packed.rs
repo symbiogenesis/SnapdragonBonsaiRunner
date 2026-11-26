@@ -14,7 +14,7 @@ use bonsai_windows_process::quant_kernels::{self, Arm64QuantCaps, Q8_0ActBlock, 
 use std::sync::OnceLock;
 
 use crate::row_workers;
-use fearless_simd::{Level, dispatch, f32x4, prelude::*, u8x16};
+use fearless_simd::{Level, dispatch, f32x4, i32x4, prelude::*, u8x16};
 
 static SIMD_LEVEL: OnceLock<Level> = OnceLock::new();
 
@@ -3232,6 +3232,119 @@ fn max_finite_simd<S: Simd>(simd: S, scores: &[f32]) -> f32 {
     max_val
 }
 
+#[inline(always)]
+fn exp_f32x4<S: Simd>(simd: S, x: f32x4<S>) -> f32x4<S> {
+    // Cody-Waite range reduction by ln(2) = LN2_HI + LN2_LO (15-bit HI so k * LN2_HI is exact
+    // for |k| <= 512) paired with a degree-6 minimax polynomial on [-ln(2)/2, ln(2)/2] with
+    // exact c0 = 1.0 and c1 = 1.0 so exp(0.0) == 1.0 exactly.
+    const INV_LN2: f32 = std::f32::consts::LOG2_E;
+    const LN2_HI: f32 = f32::from_bits(0x3f31_7200);
+    const LN2_LO: f32 = f32::from_bits(0x35bf_be8e);
+    const MIN_NORMAL_EXP_INPUT: f32 = -87.336_54_f32;
+    const C2: f32 = 0.5_f32;
+    const C3: f32 = 0.166_664_17_f32;
+    const C4: f32 = 0.041_666_668_f32;
+    const C5: f32 = 0.008_375_039_f32;
+    const C6: f32 = 0.001_388_888_9_f32;
+
+    let zero = f32x4::splat(simd, 0.0_f32);
+    let one = f32x4::splat(simd, 1.0_f32);
+    let min_x = f32x4::splat(simd, MIN_NORMAL_EXP_INPUT);
+    let is_underflow = x.simd_lt(min_x);
+    let x_safe = is_underflow.select(zero, x);
+
+    let kf = (x_safe * f32x4::splat(simd, INV_LN2)).round_ties_even();
+    let r = f32x4::splat(simd, -LN2_HI).mul_add(kf, x_safe);
+    let r = f32x4::splat(simd, -LN2_LO).mul_add(kf, r);
+
+    let p = f32x4::splat(simd, C6).mul_add(r, f32x4::splat(simd, C5));
+    let p = p.mul_add(r, f32x4::splat(simd, C4));
+    let p = p.mul_add(r, f32x4::splat(simd, C3));
+    let p = p.mul_add(r, f32x4::splat(simd, C2));
+    let poly = p.mul_add(r * r, r) + one;
+
+    let k_i32 = i32x4::truncate_from(kf);
+    let pow2 = ((k_i32 + 127) << 23_u32).bitcast::<f32x4<S>>();
+    is_underflow.select(zero, poly * pow2)
+}
+
+#[inline(always)]
+fn swiglu_slice_simd<S: Simd>(simd: S, gate: &mut [f32], up: &[f32]) -> bool {
+    let zero = f32x4::splat(simd, 0.0_f32);
+    let one = f32x4::splat(simd, 1.0_f32);
+    let inf_v = f32x4::splat(simd, f32::INFINITY);
+    let mut all_finite = true;
+    let n = gate.len().min(up.len());
+    let (g_chunks, g_tail) = gate[..n].as_chunks_mut::<4>();
+    let (u_chunks, u_tail) = up[..n].as_chunks::<4>();
+    for (gc, uc) in g_chunks.iter_mut().zip(u_chunks) {
+        let gv = f32x4::from_slice(simd, gc);
+        let uv = f32x4::from_slice(simd, uc);
+        // Evaluate exp(-|g|) <= 0 so exp_f32x4 never overflows its k <= 127 exponent range.
+        let e = exp_f32x4(simd, -gv.abs());
+        let num = gv.simd_lt(zero).select(gv * e, gv);
+        let silu = num / (one + e);
+        let res = silu * uv;
+        if !res.abs().simd_lt(inf_v).all_true() {
+            all_finite = false;
+        }
+        res.store_slice(gc);
+    }
+    for (g, &u) in g_tail.iter_mut().zip(u_tail) {
+        let silu = *g / (1.0_f32 + (-*g).exp());
+        let res = silu * u;
+        if !res.is_finite() {
+            all_finite = false;
+        }
+        *g = res;
+    }
+    all_finite
+}
+
+/// Apply in-place SwiGLU `(gate * sigmoid(gate)) * up` across `gate[..n]`,
+/// returning `false` if any element becomes non-finite.
+pub(super) fn swiglu_in_place(gate: &mut [f32], up: &[f32]) -> bool {
+    let level = simd_level();
+    dispatch!(level, simd => swiglu_slice_simd(simd, gate, up))
+}
+
+#[inline(always)]
+fn softmax_scores_simd<S: Simd>(
+    simd: S,
+    scores: &mut [f32],
+    max: f32,
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    let max_v = f32x4::splat(simd, max);
+    let mut sum_v = f32x4::splat(simd, 0.0_f32);
+    let (chunks, tail) = scores.as_chunks_mut::<4>();
+    for chunk in chunks {
+        let sv = f32x4::from_slice(simd, chunk);
+        let ev = exp_f32x4(simd, sv - max_v);
+        ev.store_slice(chunk);
+        sum_v += ev;
+    }
+    let lanes: [f32; 4] = sum_v.into();
+    let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    for score in tail {
+        *score = (*score - max).exp();
+        sum += *score;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return Err(invalid());
+    }
+    let inv_sum = 1.0_f32 / sum;
+    let inv_v = f32x4::splat(simd, inv_sum);
+    let (chunks, tail) = scores.as_chunks_mut::<4>();
+    for chunk in chunks {
+        (f32x4::from_slice(simd, chunk) * inv_v).store_slice(chunk);
+    }
+    for score in tail {
+        *score *= inv_sum;
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Shared single-head attention kernel reuses caller score/output storage without allocating."
@@ -3278,39 +3391,27 @@ fn attend_head_impl_simd<S: Simd, T: KvSource>(
         return Err(invalid());
     }
     let max = max_finite_simd(simd, scores);
-    let mut sum = 0.0;
-    for score in &mut *scores {
-        *score = (*score - max).exp();
-        sum += *score;
-    }
-    if !sum.is_finite() || sum <= 0.0 {
-        return Err(invalid());
-    }
+    softmax_scores_simd(simd, scores, max, invalid)?;
     out_head.fill(0.0);
     for quad in 0..full_quads {
         let r = quad * 4;
-        let weights = [
-            scores[r] / sum,
-            scores[r + 1] / sum,
-            scores[r + 2] / sum,
-            scores[r + 3] / sum,
-        ];
+        let weights = [scores[r], scores[r + 1], scores[r + 2], scores[r + 3]];
         values.with_quad_rows(r, row_width, offset, head_dim, &mut buf, |v_refs| {
             weighted_value_accum_4_simd(simd, out_head, v_refs, weights);
         });
     }
-    for (row, &score) in scores
+    for (row, &weight) in scores
         .iter()
         .enumerate()
         .take(history_rows)
         .skip(full_quads * 4)
     {
         values.with_row(row, row_width, offset, head_dim, &mut buf, |v| {
-            weighted_value_accum_simd(simd, out_head, v, score / sum);
+            weighted_value_accum_simd(simd, out_head, v, weight);
         });
     }
     if let Some((_, v)) = current_kv {
-        weighted_value_accum_simd(simd, out_head, v, scores[history_rows] / sum);
+        weighted_value_accum_simd(simd, out_head, v, scores[history_rows]);
     }
     Ok(())
 }
@@ -3627,19 +3728,10 @@ fn attend_q_tile_head_simd<S: Simd, const N: usize>(
     if !ensure_finite_simd(simd, &scores[..N * win_len]) {
         return Err(invalid());
     }
-    let mut sums = [0.0_f32; N];
-    for (g, sum_slot) in sums.iter_mut().enumerate() {
+    for g in 0..N {
         let head_scores = &mut scores[g * win_len..(g + 1) * win_len];
         let max = max_finite_simd(simd, head_scores);
-        let mut sum = 0.0_f32;
-        for score in &mut *head_scores {
-            *score = (*score - max).exp();
-            sum += *score;
-        }
-        if !sum.is_finite() || sum <= 0.0 {
-            return Err(invalid());
-        }
-        *sum_slot = sum;
+        softmax_scores_simd(simd, head_scores, max, invalid)?;
     }
     for out in &mut out_tile {
         out.fill(0.0);
@@ -3647,9 +3739,8 @@ fn attend_q_tile_head_simd<S: Simd, const N: usize>(
     for quad in 0..full_quads {
         let r = quad * 4;
         let weights: [[f32; 4]; N] = std::array::from_fn(|g| {
-            let sum = sums[g];
             let s = &scores[g * win_len + r..g * win_len + r + 4];
-            [s[0] / sum, s[1] / sum, s[2] / sum, s[3] / sum]
+            [s[0], s[1], s[2], s[3]]
         });
         let v_refs = [
             &values[r * hidden + offset..r * hidden + offset + head_dim],
@@ -3666,7 +3757,7 @@ fn attend_q_tile_head_simd<S: Simd, const N: usize>(
         );
     }
     for r in (full_quads * 4)..win_len {
-        let weights: [f32; N] = std::array::from_fn(|g| scores[g * win_len + r] / sums[g]);
+        let weights: [f32; N] = std::array::from_fn(|g| scores[g * win_len + r]);
         let v = &values[r * hidden + offset..r * hidden + offset + head_dim];
         weighted_value_accum_tile_simd(
             simd,
@@ -3882,7 +3973,6 @@ fn weighted_value_accum_4_group_simd<S: Simd>(
     out_group: &mut [f32],
     v_refs: [&[f32]; 4],
     scores: &[f32],
-    sums: &[f32],
     head_dim: usize,
     gqa_group: usize,
     total_rows: usize,
@@ -3893,9 +3983,8 @@ fn weighted_value_accum_4_group_simd<S: Simd>(
         let rem = gqa_group - g_base;
         let weights_at = |local_g: usize| -> [f32; 4] {
             let g = g_base + local_g;
-            let sum = sums[g];
             let s = &scores[g * total_rows + row_base..g * total_rows + row_base + 4];
-            [s[0] / sum, s[1] / sum, s[2] / sum, s[3] / sum]
+            [s[0], s[1], s[2], s[3]]
         };
         let tile_out = &mut out_group[g_base * head_dim..];
         if rem >= 4 {
@@ -4030,29 +4119,10 @@ fn attend_kv_group_impl<T: KvSource>(
             return Err(invalid());
         }
 
-        let mut stack_sums = [0.0_f32; 16];
-        let mut heap_sums = if gqa_group > stack_sums.len() {
-            vec![0.0_f32; gqa_group]
-        } else {
-            Vec::new()
-        };
-        let sums: &mut [f32] = if gqa_group <= stack_sums.len() {
-            &mut stack_sums[..gqa_group]
-        } else {
-            &mut heap_sums[..gqa_group]
-        };
-        for (g, sum_slot) in sums.iter_mut().enumerate() {
+        for g in 0..gqa_group {
             let head_scores = &mut scores[g * total_rows..(g + 1) * total_rows];
             let max = max_finite_simd(simd, head_scores);
-            let mut sum = 0.0_f32;
-            for score in &mut *head_scores {
-                *score = (*score - max).exp();
-                sum += *score;
-            }
-            if !sum.is_finite() || sum <= 0.0 {
-                return Err(invalid());
-            }
-            *sum_slot = sum;
+            softmax_scores_simd(simd, head_scores, max, invalid)?;
         }
 
         out_group.fill(0.0);
@@ -4064,7 +4134,6 @@ fn attend_kv_group_impl<T: KvSource>(
                     out_group,
                     v_refs,
                     scores,
-                    sums,
                     head_dim,
                     gqa_group,
                     total_rows,
@@ -4074,16 +4143,16 @@ fn attend_kv_group_impl<T: KvSource>(
         }
         for row in (full_quads * 4)..history_rows {
             values.with_row(row, row_width, offset, head_dim, &mut buf, |v| {
-                for (g, &sum) in sums.iter().enumerate() {
-                    let w = scores[g * total_rows + row] / sum;
+                for g in 0..gqa_group {
+                    let w = scores[g * total_rows + row];
                     let out_head = &mut out_group[g * head_dim..(g + 1) * head_dim];
                     weighted_value_accum_simd(simd, out_head, v, w);
                 }
             });
         }
         if let Some((_, v)) = current_kv {
-            for (g, &sum) in sums.iter().enumerate() {
-                let w = scores[g * total_rows + history_rows] / sum;
+            for g in 0..gqa_group {
+                let w = scores[g * total_rows + history_rows];
                 let out_head = &mut out_group[g * head_dim..(g + 1) * head_dim];
                 weighted_value_accum_simd(simd, out_head, v, w);
             }
@@ -4371,6 +4440,7 @@ mod tests {
 
                 for batch in [1_usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, max_batch] {
                     let raw_input = &raw_input_full[..batch * input];
+                    #[cfg(all(windows, feature = "rust-qualification"))]
                     let expected = &expected_full[..batch * output];
                     let expected_bits = &expected_bits_full[..batch * output];
                     let mut worker1_batch_bits: Option<Vec<u32>> = None;
@@ -5243,8 +5313,8 @@ mod tests {
                         }
                     }
 
-                    let mut prepared = PreparedBatch::default();
                     for workers in [1_usize, 3] {
+                        let mut prepared = PreparedBatch::default();
                         prepared.prepare_meta(batch, input);
                         assert_eq!(prepared.quads_capacity(), 0);
                         let mut scratch = Vec::new();
@@ -5394,5 +5464,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn exp_f32x4_matches_scalar_exp_within_two_ulp_and_exact_zero() {
+        use fearless_simd::SimdBase as _;
+        let level = super::simd_level();
+        let mut max_ulp = 0_u32;
+        let mut samples = Vec::with_capacity(4096);
+        samples.extend_from_slice(&[
+            0.0_f32,
+            -0.0,
+            -1e-7,
+            -0.346_573_6,
+            -1.0,
+            -20.0,
+            -87.3,
+            -88.0,
+            -120.0,
+        ]);
+        for i in 0..4000_u32 {
+            let x = -87.3_f32 * (f32::from(u16::try_from(i).unwrap_or(0)) / 4000.0_f32);
+            samples.push(x);
+        }
+        for chunk in samples.chunks_exact(4) {
+            let got: [f32; 4] = super::dispatch!(level, simd => {
+                let v = super::f32x4::from_slice(simd, chunk);
+                super::exp_f32x4(simd, v).into()
+            });
+            for (&x, &g) in chunk.iter().zip(&got) {
+                if x == 0.0 {
+                    assert_eq!(g.to_bits(), 1.0_f32.to_bits());
+                } else if x < -87.336_54 {
+                    assert_eq!(g.to_bits(), 0.0_f32.to_bits());
+                } else {
+                    let want = x.exp();
+                    let ulp = g.to_bits().abs_diff(want.to_bits());
+                    max_ulp = max_ulp.max(ulp);
+                    assert!(ulp <= 2, "x={x} got={g} want={want} ulp={ulp}");
+                }
+            }
+        }
+        assert!(max_ulp <= 2);
     }
 }
