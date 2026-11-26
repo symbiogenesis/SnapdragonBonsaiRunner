@@ -2474,8 +2474,11 @@ impl CausalConv1d {
         const OC_PARALLEL_MAX_FRAMES: usize = 320;
 
         let out_len = out_frames * self.out_c;
-        out.clear();
-        out.resize(out_len, 0.0_f32);
+        if out.len() < out_len {
+            out.resize(out_len, 0.0_f32);
+        } else {
+            out.truncate(out_len);
+        }
 
         let packed_fallback;
         let weight_okic: &[f32] = if let Some(okic) = self.weight_okic.as_deref() {
@@ -2771,8 +2774,12 @@ impl CausalTransConv1d {
         }
         let emit = frames * self.stride;
         let raw_frames = emit + trim;
-        raw.clear();
-        raw.resize(raw_frames * self.out_c, 0.0_f32);
+        let raw_len = raw_frames * self.out_c;
+        if raw.len() < raw_len {
+            raw.resize(raw_len, 0.0_f32);
+        } else {
+            raw.truncate(raw_len);
+        }
 
         let level = Level::new();
         let bias_ref = self.bias.as_deref();
@@ -3722,6 +3729,19 @@ impl RvqEncodeSide {
         frames: usize,
         codes_out: &mut Vec<i32>,
     ) -> io::Result<()> {
+        self.encode_parallel(hidden, frames, 1, codes_out)
+    }
+
+    /// Parallel counterpart to [`Self::encode`] distributing independent frames across bounded workers.
+    pub fn encode_parallel(
+        &self,
+        hidden: &[f32],
+        frames: usize,
+        threads: usize,
+        codes_out: &mut Vec<i32>,
+    ) -> io::Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
         if frames == 0
             || self.num_layers == 0
             || self.codebook_size == 0
@@ -3748,6 +3768,64 @@ impl RvqEncodeSide {
         let elements = frames.checked_mul(d).ok_or_else(rvq_numerical_error)?;
         let mut res = vec![0.0_f32; elements];
         let level = Level::new();
+        let active_threads = threads.clamp(1, 18);
+        let work = frames
+            .saturating_mul(self.num_layers)
+            .saturating_mul(self.codebook_size)
+            .saturating_mul(d);
+        if active_threads > 1 && frames >= 2 && work >= 16_384 {
+            let total_codes = self
+                .num_layers
+                .checked_mul(frames)
+                .ok_or_else(rvq_numerical_error)?;
+            let atomic_codes: Vec<AtomicI32> =
+                (0..total_codes).map(|_| AtomicI32::new(0)).collect();
+            let had_error = AtomicBool::new(false);
+            row_workers::run_aligned(&mut res, active_threads, d, &|elem_off, res_chunk| {
+                let first_frame = elem_off / d;
+                for (local_t, r) in res_chunk.chunks_exact_mut(d).enumerate() {
+                    let t = first_frame + local_t;
+                    let x = &hidden[t * self.hidden_size..(t + 1) * self.hidden_size];
+                    dispatch!(
+                        level,
+                        simd => matvec_4rows_simd(simd, &self.input_proj, x, None, r)
+                    );
+                    if r.iter().any(|value| !value.is_finite()) {
+                        had_error.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    for l in 0..self.num_layers {
+                        let cb = &self.codebooks[l];
+                        let sq = &self.sqsum[l];
+                        let Some(best_e) = dispatch!(
+                            level,
+                            simd => rvq_argmin_simd(simd, cb, sq, r, self.codebook_size, d)
+                        ) else {
+                            had_error.store(true, Ordering::Relaxed);
+                            return;
+                        };
+                        let Ok(code) = i32::try_from(best_e) else {
+                            had_error.store(true, Ordering::Relaxed);
+                            return;
+                        };
+                        atomic_codes[l * frames + t].store(code, Ordering::Relaxed);
+                        let best_centroid = &cb[best_e * d..(best_e + 1) * d];
+                        dispatch!(level, simd => sub_slice_in_place_simd(simd, r, best_centroid));
+                        if r.iter().any(|value| !value.is_finite()) {
+                            had_error.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
+            });
+            if had_error.load(Ordering::Relaxed) {
+                return Err(rvq_numerical_error());
+            }
+            codes_out.reserve(total_codes);
+            codes_out.extend(atomic_codes.into_iter().map(AtomicI32::into_inner));
+            return Ok(());
+        }
+
         for t in 0..frames {
             let x = &hidden[t * self.hidden_size..(t + 1) * self.hidden_size];
             let y = &mut res[t * d..(t + 1) * d];

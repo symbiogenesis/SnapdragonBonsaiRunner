@@ -187,9 +187,9 @@ fn codec_reference_decoder_layer_has_closed_form_rope_swiglu_and_final_projectio
                 3.0 * angle.sin() + 4.0 * angle.cos(),
             ]);
         }
-        close(&state.layers[0].keys, &expected_keys, 8e-7);
+        close(&state.layers[0].ordered_keys(), &expected_keys, 8e-7);
         assert_eq!(
-            state.layers[0].values,
+            state.layers[0].ordered_values(),
             [5.0, 6.0].repeat((index + 1).min(2))
         );
     }
@@ -205,6 +205,7 @@ fn codec_reference_grouped_attention_has_literal_nonuniform_probability_and_wind
         let mut state = KvState {
             keys: vec![0.0, 0.0, 1.0, -1.0],
             values: vec![1.0, -1.0, 4.0, 8.0],
+            head: 0,
         };
         let output = append_attention(
             &query,

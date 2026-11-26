@@ -62,6 +62,7 @@ fn warm_synthesizer() -> io::Result<Synthesizer> {
             layers: vec![KvState {
                 keys: vec![-0.0],
                 values: vec![3.0],
+                head: 0,
             }],
         },
     };

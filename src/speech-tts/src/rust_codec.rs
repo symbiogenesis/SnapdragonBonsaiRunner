@@ -265,6 +265,71 @@ impl TransformerLayer {
 struct KvState {
     keys: Vec<f32>,
     values: Vec<f32>,
+    head: usize,
+}
+
+impl KvState {
+    fn logical_spans(
+        &self,
+        ring_cap: Option<usize>,
+        first: usize,
+        frames: usize,
+        stride: usize,
+    ) -> [(&[f32], &[f32]); 3] {
+        let start_el = first * stride;
+        let end_el = start_el + frames * stride;
+        let Some(cap) = ring_cap.filter(|_| self.head > 0) else {
+            return [
+                (&self.keys[start_el..end_el], &self.values[start_el..end_el]),
+                (&[], &[]),
+                (&[], &[]),
+            ];
+        };
+        let total_len = self.keys.len();
+        let len0 = cap - self.head;
+        let len1 = self.head;
+        let segs = [
+            (0_usize, len0, self.head, cap),
+            (len0, len0 + len1, 0, self.head),
+            (cap, total_len, cap, total_len),
+        ];
+        std::array::from_fn(|idx| {
+            let (seg_lo, seg_hi, phys_lo, _) = segs[idx];
+            let ov_lo = start_el.max(seg_lo);
+            let ov_hi = end_el.min(seg_hi);
+            if ov_lo < ov_hi {
+                let p_start = phys_lo + (ov_lo - seg_lo);
+                let p_end = phys_lo + (ov_hi - seg_lo);
+                (&self.keys[p_start..p_end], &self.values[p_start..p_end])
+            } else {
+                (&self.keys[0..0], &self.values[0..0])
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn ordered_keys(&self) -> Vec<f32> {
+        if self.head == 0 {
+            self.keys.clone()
+        } else {
+            let mut out = Vec::with_capacity(self.keys.len());
+            out.extend_from_slice(&self.keys[self.head..]);
+            out.extend_from_slice(&self.keys[..self.head]);
+            out
+        }
+    }
+
+    #[cfg(test)]
+    fn ordered_values(&self) -> Vec<f32> {
+        if self.head == 0 {
+            self.values.clone()
+        } else {
+            let mut out = Vec::with_capacity(self.values.len());
+            out.extend_from_slice(&self.values[self.head..]);
+            out.extend_from_slice(&self.values[..self.head]);
+            out
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -319,7 +384,7 @@ impl<T: KvTarget> Drop for KvAppend<'_, T> {
 }
 
 struct TransformerGuard {
-    lengths: Vec<(usize, usize)>,
+    lengths: Vec<(usize, usize, usize)>,
     next: usize,
     keep: Option<usize>,
 }
@@ -330,17 +395,40 @@ impl KvTarget for TransformerState {
     fn commit(&mut self, guard: Self::Guard) {
         if let Some(keep) = guard.keep {
             for layer in &mut self.layers {
-                let discard = layer.keys.len().saturating_sub(keep);
-                layer.keys.drain(..discard);
-                layer.values.drain(..discard);
+                let len = layer.keys.len();
+                if len > keep {
+                    let discard = len - keep;
+                    if discard >= keep {
+                        layer.keys.copy_within(len - keep.., 0);
+                        layer.values.copy_within(len - keep.., 0);
+                        layer.keys.truncate(keep);
+                        layer.values.truncate(keep);
+                        layer.head = 0;
+                    } else {
+                        let first_part = discard.min(keep - layer.head);
+                        layer.keys.copy_within(keep..keep + first_part, layer.head);
+                        layer
+                            .values
+                            .copy_within(keep..keep + first_part, layer.head);
+                        let second_part = discard - first_part;
+                        if second_part > 0 {
+                            layer.keys.copy_within(keep + first_part..len, 0);
+                            layer.values.copy_within(keep + first_part..len, 0);
+                        }
+                        layer.head = (layer.head + discard) % keep;
+                        layer.keys.truncate(keep);
+                        layer.values.truncate(keep);
+                    }
+                }
             }
         }
         self.position = guard.next;
     }
 
     fn rollback(&mut self, guard: Self::Guard) {
-        for (layer, &saved) in self.layers.iter_mut().zip(&guard.lengths) {
-            rollback_kv_slices(&mut layer.keys, &mut layer.values, saved);
+        for (layer, &(saved_k, saved_v, saved_head)) in self.layers.iter_mut().zip(&guard.lengths) {
+            rollback_kv_slices(&mut layer.keys, &mut layer.values, (saved_k, saved_v));
+            layer.head = saved_head;
         }
         self.layers.truncate(guard.lengths.len());
     }
@@ -354,7 +442,16 @@ impl<'a> TransformerAppend<'a> {
         stride: usize,
         window: Option<usize>,
     ) -> io::Result<Self> {
-        let next = state.position.checked_add(1).ok_or_else(invalid)?;
+        Self::new_batch(state, stride, window, 1)
+    }
+
+    fn new_batch(
+        state: &'a mut TransformerState,
+        stride: usize,
+        window: Option<usize>,
+        count: usize,
+    ) -> io::Result<Self> {
+        let next = state.position.checked_add(count).ok_or_else(invalid)?;
         let retained = window.map_or(state.position, |window| state.position.min(window));
         let expected = retained.checked_mul(stride).ok_or_else(invalid)?;
         let keep = window
@@ -363,17 +460,21 @@ impl<'a> TransformerAppend<'a> {
         if stride == 0
             || window == Some(0)
             || (state.layers.is_empty() && state.position != 0)
-            || state
-                .layers
-                .iter()
-                .any(|layer| layer.keys.len() != expected || layer.values.len() != expected)
+            || state.layers.iter().any(|layer| {
+                layer.keys.len() != expected
+                    || layer.values.len() != expected
+                    || (layer.head != 0
+                        && !keep.is_some_and(|k| {
+                            expected == k && layer.head < k && layer.head.is_multiple_of(stride)
+                        }))
+            })
         {
             return Err(invalid());
         }
         let lengths = state
             .layers
             .iter()
-            .map(|layer| (layer.keys.len(), layer.values.len()))
+            .map(|layer| (layer.keys.len(), layer.values.len(), layer.head))
             .collect();
         Ok(Self::from_guard(
             state,
@@ -667,6 +768,7 @@ impl Transformer {
             state.layers.resize_with(self.layers.len(), || KvState {
                 keys: Vec::with_capacity(reserve),
                 values: Vec::with_capacity(reserve),
+                head: 0,
             });
         }
         if state.layers.len() != self.layers.len() {
@@ -796,6 +898,217 @@ impl Transformer {
         append.commit();
         Ok(&scratch.hidden)
     }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Batched Mimi transformer executes I8MM GEMM QKV/O/FFN, RoPE, causal attention, and atomic KV commits."
+    )]
+    fn forward_batch_with_scratch(
+        &self,
+        inputs: &[f32],
+        count: usize,
+        state: &mut TransformerState,
+        scratch: &mut CodecTransformerScratch,
+        out: &mut Vec<f32>,
+    ) -> io::Result<()> {
+        if count == 0 {
+            out.clear();
+            return Ok(());
+        }
+        if count == 1 {
+            let row = self.step_with_scratch(inputs, state, scratch)?;
+            out.clear();
+            out.extend_from_slice(row);
+            return Ok(());
+        }
+        let in_width = self.input.as_ref().map_or(self.hidden, |proj| proj.in_dim);
+        let expected_in = count.checked_mul(in_width).ok_or_else(invalid)?;
+        if inputs.len() != expected_in || inputs.iter().any(|value| !value.is_finite()) {
+            return Err(invalid());
+        }
+        let stride = self
+            .kv_heads
+            .checked_mul(self.head_dim)
+            .ok_or_else(invalid)?;
+        let append = TransformerAppend::new_batch(state, stride, self.window, count)?;
+        let state = &mut *append.state;
+        if state.layers.is_empty() {
+            let reserve = self.window.map_or(count.saturating_mul(stride), |w| {
+                (w + count).saturating_mul(stride)
+            });
+            state.layers.resize_with(self.layers.len(), || KvState {
+                keys: Vec::with_capacity(reserve),
+                values: Vec::with_capacity(reserve),
+                head: 0,
+            });
+        }
+        if state.layers.len() != self.layers.len() {
+            return Err(invalid());
+        }
+
+        if let Some(proj) = &self.input {
+            proj.forward_batch_into(inputs, count, None, self.threads, &mut scratch.hidden)?;
+        } else {
+            scratch.hidden.clear();
+            scratch.hidden.extend_from_slice(inputs);
+        }
+        if scratch.hidden.len() != count * self.hidden {
+            return Err(invalid());
+        }
+
+        scratch.prepare_rope_tables_batch(self.head_dim, state.position, count, self.theta)?;
+        let half = self.head_dim / 2;
+        let query_width = self.heads * self.head_dim;
+
+        for (layer, cache) in self.layers.iter().zip(&mut state.layers) {
+            normalize_batch_into(
+                &scratch.hidden,
+                count,
+                self.hidden,
+                &layer.norm,
+                layer.norm_bias.as_deref(),
+                self.eps,
+                self.threads,
+                &mut scratch.normalized,
+            )?;
+            LinearProjection::forward_batch_group_into(
+                &mut [
+                    (&layer.q, None, &mut scratch.q),
+                    (&layer.k, None, &mut scratch.k),
+                    (&layer.v, None, &mut scratch.v),
+                ],
+                &scratch.normalized,
+                count,
+                self.threads,
+            )?;
+            apply_rope_batch(
+                &mut scratch.q,
+                count,
+                self.heads,
+                self.head_dim,
+                &scratch.rope_cos,
+                &scratch.rope_sin,
+                self.threads,
+            )?;
+            apply_rope_batch(
+                &mut scratch.k,
+                count,
+                self.kv_heads,
+                self.head_dim,
+                &scratch.rope_cos,
+                &scratch.rope_sin,
+                self.threads,
+            )?;
+            let _ = half;
+            let _ = query_width;
+            append_batch_attention_into(
+                &scratch.q,
+                &scratch.k,
+                &scratch.v,
+                count,
+                self.heads,
+                self.kv_heads,
+                self.head_dim,
+                self.window,
+                self.threads,
+                cache,
+                &mut scratch.scores,
+                &mut scratch.attended,
+            )?;
+            layer.output.forward_batch_into(
+                &scratch.attended,
+                count,
+                None,
+                self.threads,
+                &mut scratch.projected,
+            )?;
+            scaled_residual_add_batch(
+                &mut scratch.hidden,
+                &scratch.projected,
+                &layer.attn_scale,
+                self.hidden,
+                self.threads,
+            );
+            normalize_batch_into(
+                &scratch.hidden,
+                count,
+                self.hidden,
+                &layer.ffn_norm,
+                layer.ffn_bias.as_deref(),
+                self.eps,
+                self.threads,
+                &mut scratch.normalized,
+            )?;
+            if let Some(gate) = &layer.gate {
+                LinearProjection::forward_batch_group_into(
+                    &mut [
+                        (&layer.up, None, &mut scratch.up),
+                        (gate, None, &mut scratch.gate),
+                    ],
+                    &scratch.normalized,
+                    count,
+                    self.threads,
+                )?;
+                crate::engine::swiglu_in_place_parallel(
+                    &mut scratch.gate,
+                    &scratch.up,
+                    self.threads,
+                );
+                std::mem::swap(&mut scratch.up, &mut scratch.gate);
+            } else {
+                layer.up.forward_batch_into(
+                    &scratch.normalized,
+                    count,
+                    None,
+                    self.threads,
+                    &mut scratch.up,
+                )?;
+                gelu_erf_in_place_parallel(&mut scratch.up, self.threads);
+            }
+            layer.down.forward_batch_into(
+                &scratch.up,
+                count,
+                None,
+                self.threads,
+                &mut scratch.projected,
+            )?;
+            scaled_residual_add_batch(
+                &mut scratch.hidden,
+                &scratch.projected,
+                &layer.ffn_scale,
+                self.hidden,
+                self.threads,
+            );
+        }
+
+        if let Some(norm) = &self.final_norm {
+            rms_norm_checked_batch_in_place(
+                &mut scratch.hidden,
+                count,
+                self.hidden,
+                norm,
+                self.eps,
+                self.threads,
+            )?;
+        }
+        if let Some(proj) = &self.output {
+            proj.forward_batch_into(
+                &scratch.hidden,
+                count,
+                None,
+                self.threads,
+                &mut scratch.projected,
+            )?;
+            std::mem::swap(&mut scratch.hidden, &mut scratch.projected);
+        }
+        if scratch.hidden.iter().any(|value| !value.is_finite()) {
+            return Err(invalid());
+        }
+        append.commit();
+        out.clear();
+        out.extend_from_slice(&scratch.hidden);
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -818,6 +1131,16 @@ struct CodecTransformerScratch {
 
 impl CodecTransformerScratch {
     fn prepare_rope_tables(&mut self, head_dim: usize, pos: usize, theta: f32) -> io::Result<()> {
+        self.prepare_rope_tables_batch(head_dim, pos, 1, theta)
+    }
+
+    fn prepare_rope_tables_batch(
+        &mut self,
+        head_dim: usize,
+        start_pos: usize,
+        count: usize,
+        theta: f32,
+    ) -> io::Result<()> {
         if head_dim == 0 || !head_dim.is_multiple_of(2) {
             return Err(invalid());
         }
@@ -833,16 +1156,19 @@ impl CodecTransformerScratch {
             }
             self.rope_denoms_key = Some(key);
         }
+        let total = count.checked_mul(half).ok_or_else(invalid)?;
         self.rope_cos.clear();
         self.rope_sin.clear();
-        self.rope_cos.reserve(half);
-        self.rope_sin.reserve(half);
-        let pos_f = usize_to_f32(pos);
-        for &denom in &self.rope_denoms {
-            let freq = pos_f / denom;
-            let (sin_v, cos_v) = freq.sin_cos();
-            self.rope_cos.push(cos_v);
-            self.rope_sin.push(sin_v);
+        self.rope_cos.reserve(total);
+        self.rope_sin.reserve(total);
+        for t in 0..count {
+            let pos_f = usize_to_f32(start_pos + t);
+            for &denom in &self.rope_denoms {
+                let freq = pos_f / denom;
+                let (sin_v, cos_v) = freq.sin_cos();
+                self.rope_cos.push(cos_v);
+                self.rope_sin.push(sin_v);
+            }
         }
         Ok(())
     }
@@ -957,6 +1283,77 @@ fn scaled_residual_add(dst: &mut [f32], value: &[f32], scale: &[f32]) {
     dispatch!(level, simd => scaled_residual_add_simd(simd, dst, value, scale));
 }
 
+fn scaled_residual_add_batch(
+    dst: &mut [f32],
+    value: &[f32],
+    scale: &[f32],
+    hidden: usize,
+    threads: usize,
+) {
+    let level = Level::new();
+    if threads > 1 && dst.len() >= 4096 && dst.len().is_multiple_of(hidden) {
+        crate::engine::row_workers::run_aligned(dst, threads, hidden, &|elem_off, dst_chunk| {
+            let val_chunk = &value[elem_off..elem_off + dst_chunk.len()];
+            dispatch!(level, simd => {
+                for (dst_tok, val_tok) in dst_chunk
+                    .chunks_exact_mut(hidden)
+                    .zip(val_chunk.chunks_exact(hidden))
+                {
+                    scaled_residual_add_simd(simd, dst_tok, val_tok, scale);
+                }
+            });
+        });
+    } else {
+        dispatch!(level, simd => {
+            for (dst_tok, val_tok) in dst
+                .chunks_exact_mut(hidden)
+                .zip(value.chunks_exact(hidden))
+            {
+                scaled_residual_add_simd(simd, dst_tok, val_tok, scale);
+            }
+        });
+    }
+}
+
+fn apply_rope_batch(
+    buf: &mut [f32],
+    count: usize,
+    num_heads: usize,
+    head_dim: usize,
+    cos_all: &[f32],
+    sin_all: &[f32],
+    threads: usize,
+) -> io::Result<()> {
+    let width = num_heads * head_dim;
+    let half = head_dim / 2;
+    if threads > 1 && count >= 2 && buf.len() == count * width {
+        crate::engine::row_workers::run_aligned(buf, threads, width, &|elem_off, chunk| {
+            let t_start = elem_off / width;
+            for (local_t, tok) in chunk.chunks_exact_mut(width).enumerate() {
+                let t = t_start + local_t;
+                let _ = crate::engine::apply_rope_neox_with_tables(
+                    tok,
+                    num_heads,
+                    head_dim,
+                    &cos_all[t * half..(t + 1) * half],
+                    &sin_all[t * half..(t + 1) * half],
+                );
+            }
+        });
+        return Ok(());
+    }
+    for (t, tok) in buf.chunks_exact_mut(width).enumerate() {
+        crate::engine::apply_rope_neox_with_tables(
+            tok,
+            num_heads,
+            head_dim,
+            &cos_all[t * half..(t + 1) * half],
+            &sin_all[t * half..(t + 1) * half],
+        )?;
+    }
+    Ok(())
+}
+
 #[inline(always)]
 fn gelu_erf_slice_simd<S: Simd>(simd: S, values: &mut [f32]) {
     // Abramowitz & Stegun 7.1.26 erfc(|x| / sqrt(2)) paired with exp_f32x4(-z^2),
@@ -1004,6 +1401,17 @@ fn gelu_erf_slice_simd<S: Simd>(simd: S, values: &mut [f32]) {
 fn gelu_erf_in_place(values: &mut [f32]) {
     let level = Level::new();
     dispatch!(level, simd => gelu_erf_slice_simd(simd, values));
+}
+
+fn gelu_erf_in_place_parallel(values: &mut [f32], threads: usize) {
+    let level = Level::new();
+    if threads > 1 && values.len() >= 4096 {
+        crate::engine::row_workers::run_aligned(values, threads, 4, &|_, chunk| {
+            dispatch!(level, simd => gelu_erf_slice_simd(simd, chunk));
+        });
+    } else {
+        dispatch!(level, simd => gelu_erf_slice_simd(simd, values));
+    }
 }
 
 #[inline(always)]
@@ -1063,12 +1471,7 @@ fn rms_scale_in_place_simd<S: Simd>(simd: S, data: &mut [f32], weight: &[f32], s
 }
 
 fn rms_norm_checked_in_place(data: &mut [f32], weight: &[f32], eps: f32) -> io::Result<()> {
-    if data.is_empty()
-        || data.len() != weight.len()
-        || !eps.is_finite()
-        || eps <= 0.0
-        || data.iter().chain(weight).any(|value| !value.is_finite())
-    {
+    if data.is_empty() || data.len() != weight.len() || !eps.is_finite() || eps <= 0.0 {
         return Err(invalid());
     }
     let count = count_float(data.len())?;
@@ -1086,31 +1489,106 @@ fn rms_norm_checked_in_place(data: &mut [f32], weight: &[f32], eps: f32) -> io::
     Ok(())
 }
 
+fn rms_norm_checked_batch_in_place(
+    data: &mut [f32],
+    count: usize,
+    hidden: usize,
+    weight: &[f32],
+    eps: f32,
+    threads: usize,
+) -> io::Result<()> {
+    if hidden == 0
+        || weight.len() != hidden
+        || data.len() != count * hidden
+        || !eps.is_finite()
+        || eps <= 0.0
+    {
+        return Err(invalid());
+    }
+    let count_f = count_float(hidden)?;
+    let level = Level::new();
+    if threads > 1 && count >= 2 {
+        let had_error = AtomicBool::new(false);
+        crate::engine::row_workers::run_aligned(data, threads, hidden, &|_, chunk| {
+            for row in chunk.chunks_exact_mut(hidden) {
+                let mean_sq = dispatch!(level, simd => sum_sq_simd(simd, row)) / count_f;
+                let denominator = mean_sq + eps;
+                if !mean_sq.is_finite() || !denominator.is_finite() {
+                    had_error.store(true, Ordering::Relaxed);
+                    return;
+                }
+                let scale = 1.0 / denominator.sqrt();
+                dispatch!(level, simd => rms_scale_in_place_simd(simd, row, weight, scale));
+                if row.iter().any(|value| !value.is_finite()) {
+                    had_error.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        });
+        if had_error.load(Ordering::Relaxed) {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
+    for row in data.chunks_exact_mut(hidden) {
+        rms_norm_checked_in_place(row, weight, eps)?;
+    }
+    Ok(())
+}
+
+fn rms_norm_checked_slice_into(
+    level: Level,
+    input: &[f32],
+    weight: &[f32],
+    eps: f32,
+    count_f: f32,
+    dst: &mut [f32],
+) -> bool {
+    let mean_sq = dispatch!(level, simd => sum_sq_simd(simd, input)) / count_f;
+    let denominator = mean_sq + eps;
+    if !mean_sq.is_finite() || !denominator.is_finite() {
+        return false;
+    }
+    let scale = 1.0 / denominator.sqrt();
+    dispatch!(level, simd => rms_scale_simd(simd, input, weight, scale, dst));
+    !dst.iter().any(|value| !value.is_finite())
+}
+
+fn layer_norm_checked_slice_into(
+    level: Level,
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    eps: f32,
+    count_f: f32,
+    dst: &mut [f32],
+) -> bool {
+    let mean = dispatch!(level, simd => slice_sum_simd(simd, input)) / count_f;
+    let variance = dispatch!(level, simd => variance_sum_simd(simd, input, mean)) / count_f;
+    let denominator = variance + eps;
+    // A finite input can overflow the original F32 reduction. An infinite
+    // variance would otherwise yield zero scale and apparently valid output.
+    if !mean.is_finite() || !variance.is_finite() || !denominator.is_finite() {
+        return false;
+    }
+    let inv = 1.0 / denominator.sqrt();
+    dispatch!(level, simd => layer_norm_apply_simd(simd, input, weight, bias, mean, inv, dst));
+    !dst.iter().any(|value| !value.is_finite())
+}
+
 fn rms_norm_checked_into(
     input: &[f32],
     weight: &[f32],
     eps: f32,
     output: &mut Vec<f32>,
 ) -> io::Result<()> {
-    if input.is_empty()
-        || input.len() != weight.len()
-        || !eps.is_finite()
-        || eps <= 0.0
-        || input.iter().chain(weight).any(|value| !value.is_finite())
-    {
+    if input.is_empty() || input.len() != weight.len() || !eps.is_finite() || eps <= 0.0 {
         return Err(invalid());
     }
     let count = count_float(input.len())?;
     let level = Level::new();
-    let mean_sq = dispatch!(level, simd => sum_sq_simd(simd, input)) / count;
-    let denominator = mean_sq + eps;
-    if !mean_sq.is_finite() || !denominator.is_finite() {
-        return Err(invalid());
-    }
-    let scale = 1.0 / denominator.sqrt();
     output.resize(input.len(), 0.0);
-    dispatch!(level, simd => rms_scale_simd(simd, input, weight, scale, output));
-    if output.iter().any(|value| !value.is_finite()) {
+    if !rms_norm_checked_slice_into(level, input, weight, eps, count, output) {
         return Err(invalid());
     }
     Ok(())
@@ -1131,29 +1609,88 @@ fn normalize_into(
         || input.len() != bias.len()
         || !eps.is_finite()
         || eps <= 0.0
-        || input
-            .iter()
-            .chain(weight)
-            .chain(bias)
-            .any(|value| !value.is_finite())
     {
         return Err(invalid());
     }
     let count = count_float(input.len())?;
     let level = Level::new();
-    let mean = dispatch!(level, simd => slice_sum_simd(simd, input)) / count;
-    let variance = dispatch!(level, simd => variance_sum_simd(simd, input, mean)) / count;
-    let denominator = variance + eps;
-    // A finite input can overflow the original F32 reduction. An infinite
-    // variance would otherwise yield zero scale and apparently valid output.
-    if !mean.is_finite() || !variance.is_finite() || !denominator.is_finite() {
+    output.resize(input.len(), 0.0);
+    if !layer_norm_checked_slice_into(level, input, weight, bias, eps, count, output) {
         return Err(invalid());
     }
-    let inv = 1.0 / denominator.sqrt();
-    output.resize(input.len(), 0.0);
-    dispatch!(level, simd => layer_norm_apply_simd(simd, input, weight, bias, mean, inv, output));
-    if output.iter().any(|value| !value.is_finite()) {
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Normalizes batched hidden states across workers without per-frame weight finiteness rescans."
+)]
+fn normalize_batch_into(
+    inputs: &[f32],
+    count: usize,
+    hidden: usize,
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    eps: f32,
+    threads: usize,
+    output: &mut Vec<f32>,
+) -> io::Result<()> {
+    if hidden == 0
+        || weight.len() != hidden
+        || bias.is_some_and(|b| b.len() != hidden)
+        || inputs.len() != count * hidden
+        || !eps.is_finite()
+        || eps <= 0.0
+    {
         return Err(invalid());
+    }
+    if count == 0 {
+        output.clear();
+        return Ok(());
+    }
+    let count_f = count_float(hidden)?;
+    let level = Level::new();
+    output.resize(inputs.len(), 0.0);
+    if threads > 1 && count >= 2 {
+        let had_error = AtomicBool::new(false);
+        crate::engine::row_workers::run_aligned(output, threads, hidden, &|elem_off, dst_chunk| {
+            let in_chunk = &inputs[elem_off..elem_off + dst_chunk.len()];
+            for (in_row, dst_row) in in_chunk
+                .chunks_exact(hidden)
+                .zip(dst_chunk.chunks_exact_mut(hidden))
+            {
+                let ok = match bias {
+                    Some(b) => layer_norm_checked_slice_into(
+                        level, in_row, weight, b, eps, count_f, dst_row,
+                    ),
+                    None => {
+                        rms_norm_checked_slice_into(level, in_row, weight, eps, count_f, dst_row)
+                    }
+                };
+                if !ok {
+                    had_error.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        });
+        if had_error.load(Ordering::Relaxed) {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
+    for (in_row, dst_row) in inputs
+        .chunks_exact(hidden)
+        .zip(output.chunks_exact_mut(hidden))
+    {
+        let ok = match bias {
+            Some(b) => {
+                layer_norm_checked_slice_into(level, in_row, weight, b, eps, count_f, dst_row)
+            }
+            None => rms_norm_checked_slice_into(level, in_row, weight, eps, count_f, dst_row),
+        };
+        if !ok {
+            return Err(invalid());
+        }
     }
     Ok(())
 }
@@ -1235,14 +1772,12 @@ fn softmax_f32_row_simd<S: Simd>(simd: S, scores: &mut [f32], max_score: f32) ->
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Executes a contiguous range of F32 KV head groups using caller-local score scratch."
+    reason = "Executes a contiguous range of F32 KV head groups over ring-buffer spans using caller-local score scratch."
 )]
-fn attend_kv_group_range_f32(
+fn attend_kv_group_range_spans_f32(
     level: Level,
     query: &[f32],
-    keys: &[f32],
-    values: &[f32],
-    first: usize,
+    spans: [(&[f32], &[f32]); 3],
     frames: usize,
     stride: usize,
     kvh_start: usize,
@@ -1261,18 +1796,24 @@ fn attend_kv_group_range_f32(
                 let kv_head_off = kvh * width;
                 let qh_base = kvh * gqa_ratio;
                 let mut max_scores = [f32::NEG_INFINITY; 8];
-                for frame in 0..frames {
-                    let offset = (first + frame) * stride + kv_head_off;
-                    let k_row = &keys[offset..offset + width];
-                    for (g, max_slot) in max_scores[..gqa_ratio].iter_mut().enumerate() {
-                        let qh = qh_base + g;
-                        let q_vec = &query[qh * width..(qh + 1) * width];
-                        let s = f32_dot_simd(simd, q_vec, k_row) * scale;
-                        scores[g * frames + frame] = s;
-                        if s > *max_slot {
-                            *max_slot = s;
+                let mut frame_base = 0_usize;
+                for &(k_span, _) in &spans {
+                    let span_frames = k_span.len() / stride;
+                    for local_f in 0..span_frames {
+                        let offset = local_f * stride + kv_head_off;
+                        let k_row = &k_span[offset..offset + width];
+                        let frame = frame_base + local_f;
+                        for (g, max_slot) in max_scores[..gqa_ratio].iter_mut().enumerate() {
+                            let qh = qh_base + g;
+                            let q_vec = &query[qh * width..(qh + 1) * width];
+                            let s = f32_dot_simd(simd, q_vec, k_row) * scale;
+                            scores[g * frames + frame] = s;
+                            if s > *max_slot {
+                                *max_slot = s;
+                            }
                         }
                     }
+                    frame_base += span_frames;
                 }
                 let mut inv_sums = [0.0_f32; 8];
                 for g in 0..gqa_ratio {
@@ -1286,15 +1827,21 @@ fn attend_kv_group_range_f32(
                     };
                     inv_sums[g] = inv_sum;
                 }
-                for frame in 0..frames {
-                    let offset = (first + frame) * stride + kv_head_off;
-                    let v_row = &values[offset..offset + width];
-                    for (g, &inv_sum) in inv_sums[..gqa_ratio].iter().enumerate() {
-                        let local_qh = local_kvh * gqa_ratio + g;
-                        let w = scores[g * frames + frame] * inv_sum;
-                        let out_head = &mut out_chunk[local_qh * width..(local_qh + 1) * width];
-                        axpy_simd(simd, w, v_row, out_head);
+                let mut v_frame_base = 0_usize;
+                for &(_, v_span) in &spans {
+                    let span_frames = v_span.len() / stride;
+                    for local_f in 0..span_frames {
+                        let offset = local_f * stride + kv_head_off;
+                        let v_row = &v_span[offset..offset + width];
+                        let frame = v_frame_base + local_f;
+                        for (g, &inv_sum) in inv_sums[..gqa_ratio].iter().enumerate() {
+                            let local_qh = local_kvh * gqa_ratio + g;
+                            let w = scores[g * frames + frame] * inv_sum;
+                            let out_head = &mut out_chunk[local_qh * width..(local_qh + 1) * width];
+                            axpy_simd(simd, w, v_row, out_head);
+                        }
                     }
+                    v_frame_base += span_frames;
                 }
             }
         });
@@ -1312,24 +1859,35 @@ fn attend_kv_group_range_f32(
                     let local_qh = local_kvh * gqa_ratio + g;
                     let q_vec = &query[qh * width..(qh + 1) * width];
                     let mut max_score = f32::NEG_INFINITY;
-                    for (frame, score_slot) in row_scores.iter_mut().enumerate() {
-                        let offset = (first + frame) * stride + kv_head_off;
-                        let k_row = &keys[offset..offset + width];
-                        let s = f32_dot_simd(simd, q_vec, k_row) * scale;
-                        *score_slot = s;
-                        if s > max_score {
-                            max_score = s;
+                    let mut frame_base = 0_usize;
+                    for &(k_span, _) in &spans {
+                        let span_frames = k_span.len() / stride;
+                        for local_f in 0..span_frames {
+                            let offset = local_f * stride + kv_head_off;
+                            let k_row = &k_span[offset..offset + width];
+                            let s = f32_dot_simd(simd, q_vec, k_row) * scale;
+                            row_scores[frame_base + local_f] = s;
+                            if s > max_score {
+                                max_score = s;
+                            }
                         }
+                        frame_base += span_frames;
                     }
                     let Some(inv_sum) = softmax_f32_row_simd(simd, row_scores, max_score) else {
                         ok = false;
                         return;
                     };
                     let out_head = &mut out_chunk[local_qh * width..(local_qh + 1) * width];
-                    for (frame, &prob_unnorm) in row_scores.iter().enumerate() {
-                        let offset = (first + frame) * stride + kv_head_off;
-                        let v_row = &values[offset..offset + width];
-                        axpy_simd(simd, prob_unnorm * inv_sum, v_row, out_head);
+                    let mut v_frame_base = 0_usize;
+                    for &(_, v_span) in &spans {
+                        let span_frames = v_span.len() / stride;
+                        for local_f in 0..span_frames {
+                            let offset = local_f * stride + kv_head_off;
+                            let v_row = &v_span[offset..offset + width];
+                            let prob_unnorm = row_scores[v_frame_base + local_f];
+                            axpy_simd(simd, prob_unnorm * inv_sum, v_row, out_head);
+                        }
+                        v_frame_base += span_frames;
                     }
                 }
             }
@@ -1381,6 +1939,8 @@ fn append_attention_into(
     let total = state.keys.len() / stride;
     let frames = window.map_or(total, |window| total.min(window));
     let first = total - frames;
+    let ring_cap = window.and_then(|w| w.checked_mul(stride));
+    let spans = state.logical_spans(ring_cap, first, frames, stride);
     zero_workspace(output, query.len());
     let scale = 1.0 / count_float(width)?.sqrt();
     let gqa_ratio = heads / kv_heads;
@@ -1401,12 +1961,10 @@ fn append_attention_into(
                 let kvh_start = elem_off / group_width;
                 let kvh_count = out_chunk.len() / group_width;
                 let ok = with_codec_attn_scores(needed_scores, |local_scores| {
-                    attend_kv_group_range_f32(
+                    attend_kv_group_range_spans_f32(
                         level,
                         query,
-                        &state.keys,
-                        &state.values,
-                        first,
+                        spans,
                         frames,
                         stride,
                         kvh_start,
@@ -1430,12 +1988,10 @@ fn append_attention_into(
         if scores.len() < needed_scores {
             scores.resize(needed_scores, 0.0_f32);
         }
-        if !attend_kv_group_range_f32(
+        if !attend_kv_group_range_spans_f32(
             level,
             query,
-            &state.keys,
-            &state.values,
-            first,
+            spans,
             frames,
             stride,
             0,
@@ -1447,6 +2003,153 @@ fn append_attention_into(
             output,
         ) {
             return Err(invalid());
+        }
+    }
+    if output.iter().any(|value| !value.is_finite()) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Executes batched causal sliding-window F32 attention across tokens and KV head groups."
+)]
+fn append_batch_attention_into(
+    q_all: &[f32],
+    k_all: &[f32],
+    v_all: &[f32],
+    count: usize,
+    heads: usize,
+    kv_heads: usize,
+    width: usize,
+    window: Option<usize>,
+    threads: usize,
+    state: &mut KvState,
+    scores: &mut Vec<f32>,
+    output: &mut Vec<f32>,
+) -> io::Result<()> {
+    let stride = kv_heads.checked_mul(width).ok_or_else(invalid)?;
+    let query_width = heads.checked_mul(width).ok_or_else(invalid)?;
+    if heads == 0
+        || kv_heads == 0
+        || width == 0
+        || !heads.is_multiple_of(kv_heads)
+        || q_all.len() != count * query_width
+        || k_all.len() != count * stride
+        || v_all.len() != count * stride
+        || state.keys.len() != state.values.len()
+        || !state.keys.len().is_multiple_of(stride)
+        || window == Some(0)
+        || q_all
+            .iter()
+            .chain(k_all)
+            .chain(v_all)
+            .any(|value| !value.is_finite())
+    {
+        return Err(invalid());
+    }
+    let prior_frames = state.keys.len() / stride;
+    state.keys.extend_from_slice(k_all);
+    state.values.extend_from_slice(v_all);
+    let ring_cap = window.and_then(|w| w.checked_mul(stride));
+    zero_workspace(output, q_all.len());
+    let scale = 1.0 / count_float(width)?.sqrt();
+    let gqa_ratio = heads / kv_heads;
+    let max_total = prior_frames + count;
+    let max_frames = window.map_or(max_total, |w| max_total.min(w));
+    let max_needed_scores = if gqa_ratio <= 8 {
+        gqa_ratio * max_frames
+    } else {
+        max_frames
+    };
+    let level = Level::new();
+    let group_width = gqa_ratio * width;
+    if threads > 1 && count * kv_heads >= 2 && output.len() == count * query_width {
+        let had_error = AtomicBool::new(false);
+        crate::engine::row_workers::run_aligned(
+            output,
+            threads,
+            group_width,
+            &|elem_off, out_chunk| {
+                let first_group = elem_off / group_width;
+                let groups_here = out_chunk.len() / group_width;
+                let ok = with_codec_attn_scores(max_needed_scores, |local_scores| {
+                    for local_g in 0..groups_here {
+                        let flat_group = first_group + local_g;
+                        let t = flat_group / kv_heads;
+                        let kvh = flat_group % kv_heads;
+                        let total_t = prior_frames + t + 1;
+                        let frames_t = window.map_or(total_t, |w| total_t.min(w));
+                        let first_t = total_t - frames_t;
+                        let needed_t = if gqa_ratio <= 8 {
+                            gqa_ratio * frames_t
+                        } else {
+                            frames_t
+                        };
+                        let spans = state.logical_spans(ring_cap, first_t, frames_t, stride);
+                        let q_tok = &q_all[t * query_width..(t + 1) * query_width];
+                        let dst_group =
+                            &mut out_chunk[local_g * group_width..(local_g + 1) * group_width];
+                        if !attend_kv_group_range_spans_f32(
+                            level,
+                            q_tok,
+                            spans,
+                            frames_t,
+                            stride,
+                            kvh,
+                            1,
+                            width,
+                            gqa_ratio,
+                            scale,
+                            &mut local_scores[..needed_t],
+                            dst_group,
+                        ) {
+                            return false;
+                        }
+                    }
+                    true
+                });
+                if !ok {
+                    had_error.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        if had_error.load(Ordering::Relaxed) {
+            return Err(invalid());
+        }
+    } else {
+        if scores.len() < max_needed_scores {
+            scores.resize(max_needed_scores, 0.0_f32);
+        }
+        for t in 0..count {
+            let total_t = prior_frames + t + 1;
+            let frames_t = window.map_or(total_t, |w| total_t.min(w));
+            let first_t = total_t - frames_t;
+            let needed_t = if gqa_ratio <= 8 {
+                gqa_ratio * frames_t
+            } else {
+                frames_t
+            };
+            let spans = state.logical_spans(ring_cap, first_t, frames_t, stride);
+            let q_tok = &q_all[t * query_width..(t + 1) * query_width];
+            let out_tok = &mut output[t * query_width..(t + 1) * query_width];
+            if !attend_kv_group_range_spans_f32(
+                level,
+                q_tok,
+                spans,
+                frames_t,
+                stride,
+                0,
+                kv_heads,
+                width,
+                gqa_ratio,
+                scale,
+                &mut scores[..needed_t],
+                out_tok,
+            ) {
+                return Err(invalid());
+            }
         }
     }
     if output.iter().any(|value| !value.is_finite()) {
@@ -1676,22 +2379,24 @@ impl Encoder {
         let mut state = TransformerState::default();
         let mut scratch = CodecTransformerScratch::default();
         let mut transformed = Vec::with_capacity(hidden.len());
-        for frame in hidden.chunks_exact(self.transformer.hidden) {
-            cancel()?;
-            transformed.extend_from_slice(self.transformer.step_with_scratch(
-                frame,
-                &mut state,
-                &mut scratch,
-            )?);
-        }
+        cancel()?;
+        self.transformer.forward_batch_with_scratch(
+            &hidden,
+            frames,
+            &mut state,
+            &mut scratch,
+            &mut transformed,
+        )?;
         cancel()?;
         (hidden, frames) = self
             .down
             .forward_parallel(&transformed, frames, self.threads)?;
         let mut flat = Vec::with_capacity(frames * 16);
-        self.semantic.encode(&hidden, frames, &mut flat)?;
+        self.semantic
+            .encode_parallel(&hidden, frames, self.threads, &mut flat)?;
         cancel()?;
-        self.acoustic.encode(&hidden, frames, &mut flat)?;
+        self.acoustic
+            .encode_parallel(&hidden, frames, self.threads, &mut flat)?;
         codebook_major_to_frames(&flat, frames)
     }
 }
@@ -2167,27 +2872,22 @@ impl Codec {
         if pre_width == 0 || pre_width * count != self.decode_scratch.pre_out.len() {
             return Err(invalid());
         }
-        self.decode_scratch.latents.clear();
-        for t in 0..count {
-            cancel()?;
-            let pre_row = &self.decode_scratch.pre_out[t * pre_width..(t + 1) * pre_width];
-            let latent = self.transformer.step_with_scratch(
-                pre_row,
-                &mut self.state.transformer,
-                &mut self.transformer_scratch,
-            )?;
-            if run_audio {
-                if t == 0 {
-                    let need = count * latent.len();
-                    if self.decode_scratch.latents.capacity() < need {
-                        self.decode_scratch
-                            .latents
-                            .reserve(need - self.decode_scratch.latents.capacity());
-                    }
-                }
-                self.decode_scratch.latents.extend_from_slice(latent);
-            }
+        cancel()?;
+        let mut latents = std::mem::take(&mut self.decode_scratch.latents);
+        let tfm_res = self.transformer.forward_batch_with_scratch(
+            &self.decode_scratch.pre_out,
+            count,
+            &mut self.state.transformer,
+            &mut self.transformer_scratch,
+            &mut latents,
+        );
+        if run_audio {
+            self.decode_scratch.latents = latents;
+        } else {
+            latents.clear();
+            self.decode_scratch.latents = latents;
         }
+        tfm_res?;
         if !run_audio {
             self.state.audio.pos = self
                 .state
@@ -3509,6 +4209,116 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn mimi_transformer_batch_and_ring_buffer_match_sequential_bit_exact() -> std::io::Result<()> {
+        for decoder in [false, true] {
+            let mut graph = transformer_fixture(decoder)?;
+            graph.threads = 4;
+            let total_steps = 9_usize;
+            let mut inputs = Vec::with_capacity(total_steps * 64);
+            let mut seq_state = super::TransformerState::default();
+            let mut seq_out = Vec::with_capacity(total_steps * 64);
+            for step in 0..total_steps {
+                let row: Vec<f32> = (0_u16..64)
+                    .map(|idx| {
+                        f32::from(idx + u16::try_from(step).unwrap_or(0)).mul_add(0.01, -0.3)
+                    })
+                    .collect();
+                inputs.extend_from_slice(&row);
+                seq_out.extend_from_slice(&graph.step(&row, &mut seq_state)?);
+            }
+
+            // Exercise two batch sizes (1 warmup + 3 crossing window + 5 exceeding window).
+            let mut batch_state = super::TransformerState::default();
+            let mut batch_scratch = super::CodecTransformerScratch::default();
+            let mut batch_out = Vec::new();
+            let mut actual_all = Vec::with_capacity(total_steps * 64);
+            for (start, count) in [(0_usize, 1_usize), (1, 3), (4, 5)] {
+                let slice = &inputs[start * 64..(start + count) * 64];
+                graph.forward_batch_with_scratch(
+                    slice,
+                    count,
+                    &mut batch_state,
+                    &mut batch_scratch,
+                    &mut batch_out,
+                )?;
+                actual_all.extend_from_slice(&batch_out);
+            }
+
+            assert_eq!(
+                actual_all.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                seq_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "batched Mimi transformer mismatch for decoder={decoder}"
+            );
+            assert_eq!(batch_state.position, seq_state.position);
+            assert_eq!(batch_state.layers.len(), seq_state.layers.len());
+            for (b_layer, s_layer) in batch_state.layers.iter().zip(&seq_state.layers) {
+                assert_eq!(
+                    b_layer
+                        .ordered_keys()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    s_layer
+                        .ordered_keys()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    b_layer
+                        .ordered_values()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    s_layer
+                        .ordered_values()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rvq_encode_parallel_matches_serial_bit_exact() -> std::io::Result<()> {
+        let frames = 32_usize;
+        let hidden_size = 16_usize;
+        let codebook_dim = 8_usize;
+        let codebook_size = 32_usize;
+        let num_layers = 4_usize;
+        let input_proj: Vec<f32> = (0..codebook_dim * hidden_size)
+            .map(|i| f32::from(u8::try_from(i % 23).unwrap_or(0)).mul_add(0.03, -0.3))
+            .collect();
+        let codebooks: Vec<Vec<f32>> = (0..num_layers)
+            .map(|l| {
+                (0..codebook_size * codebook_dim)
+                    .map(|i| {
+                        f32::from(u8::try_from((i + l * 7) % 31).unwrap_or(0)).mul_add(0.05, -0.7)
+                    })
+                    .collect()
+            })
+            .collect();
+        let side = crate::codec::RvqEncodeSide::new(
+            codebook_size,
+            codebook_dim,
+            hidden_size,
+            input_proj,
+            codebooks,
+        )?;
+        let hidden: Vec<f32> = (0..frames * hidden_size)
+            .map(|i| f32::from(u8::try_from(i % 29).unwrap_or(0)).mul_add(0.04, -0.5))
+            .collect();
+        let mut serial_codes = Vec::new();
+        let mut parallel_codes = Vec::new();
+        side.encode(&hidden, frames, &mut serial_codes)?;
+        side.encode_parallel(&hidden, frames, 4, &mut parallel_codes)?;
+        assert_eq!(parallel_codes, serial_codes);
         Ok(())
     }
 }

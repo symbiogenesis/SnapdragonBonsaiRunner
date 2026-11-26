@@ -54,6 +54,7 @@ fn same_state(actual: &TransformerState, expected: &TransformerState) {
     assert_eq!(actual.position, expected.position);
     assert_eq!(actual.layers.len(), expected.layers.len());
     for (actual, expected) in actual.layers.iter().zip(&expected.layers) {
+        assert_eq!(actual.head, expected.head);
         for (actual, expected) in [
             (&actual.keys, &expected.keys),
             (&actual.values, &expected.values),
@@ -95,10 +96,10 @@ fn codec_transaction_complete_two_layer_graph_has_literal_outputs_and_window_sta
         for layer in &state.layers {
             // Zero-valued RoPE lanes may carry either zero sign. The
             // separate rollback control requires their exact preservation.
-            assert_eq!(layer.keys, vec![0.0; rows * 2]);
+            assert_eq!(layer.ordered_keys(), vec![0.0; rows * 2]);
         }
-        assert_eq!(state.layers[0].values, [1.0, 2.0].repeat(rows));
-        assert_eq!(state.layers[1].values, [-2.0, 4.0].repeat(rows));
+        assert_eq!(state.layers[0].ordered_values(), [1.0, 2.0].repeat(rows));
+        assert_eq!(state.layers[1].ordered_values(), [-2.0, 4.0].repeat(rows));
     }
     Ok(())
 }
@@ -114,6 +115,7 @@ fn codec_transaction_late_layer_and_final_projection_failures_restore_complete_s
         // Distinct historical rows make accidental eviction detectable.
         state.layers[0].keys = vec![-0.0, 0.0, 0.0, -0.0];
         state.layers[0].values = vec![8.0, -3.0, 1.0, 2.0];
+        state.layers[0].head = 0;
         let previous = state.clone();
         match failure {
             0 => graph.layers[1].down.bias = Some(Vec::new()),
@@ -126,7 +128,7 @@ fn codec_transaction_late_layer_and_final_projection_failures_restore_complete_s
         let graph = self::graph()?;
         assert_eq!(graph.step(&[0.5, 1.0], &mut state)?, [0.5, 6.5]);
         assert_eq!(state.position, 3);
-        assert_eq!(state.layers[0].values, [1.0, 2.0, 1.0, 2.0]);
+        assert_eq!(state.layers[0].ordered_values(), [1.0, 2.0, 1.0, 2.0]);
     }
     Ok(())
 }
