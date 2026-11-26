@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{MAX_INSTALLER, MAX_METADATA, REPOSITORY, TARGET};
+use super::{LEGACY_REPOSITORY, MAX_INSTALLER, MAX_METADATA, REPOSITORY, TARGET};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Distribution {
@@ -98,7 +98,7 @@ pub(super) struct Candidate {
     pub(super) msi: Asset,
 }
 
-#[derive(Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Installer {
     schema_version: u32,
@@ -114,8 +114,12 @@ fn text<'a>(value: &'a Value, key: &str) -> crate::Result<&'a str> {
         .ok_or_else(|| format!("Missing release field: {key}"))
 }
 
+fn canonical_asset_for(repository: &str, version: &str, name: &str) -> String {
+    format!("https://github.com/{repository}/releases/download/v{version}/{name}")
+}
+
 fn canonical_asset(version: &str, name: &str) -> String {
-    format!("https://github.com/{REPOSITORY}/releases/download/v{version}/{name}")
+    canonical_asset_for(REPOSITORY, version, name)
 }
 
 fn asset(release: &Value, version: &str, name: &str, limit: u64) -> crate::Result<Asset> {
@@ -281,6 +285,34 @@ impl Installer {
             );
         }
         Ok(())
+    }
+
+    pub(super) fn legacy_portable_handoff(&self) -> Option<Self> {
+        if self.distribution() != Distribution::Portable
+            || self.asset.name != format!("SwiftBonsai2Runner-{}-windows-arm64.exe", self.version)
+        {
+            return None;
+        }
+        let mut legacy = self.clone();
+        legacy.asset.url = canonical_asset_for(LEGACY_REPOSITORY, &self.version, &self.asset.name);
+        Some(legacy)
+    }
+
+    pub(super) fn resolve_portable_replacement(&self, expected: &str) -> crate::Result<Self> {
+        if crate::identity::is_lower_hex(expected, 64) {
+            if self.release_identity()? == expected {
+                return Ok(self.clone());
+            }
+            if let Some(legacy) = self.legacy_portable_handoff()
+                && legacy.release_identity()? == expected
+            {
+                return Ok(legacy);
+            }
+        }
+        Err(
+            "The published update changed after it was downloaded. Check for updates and confirm the verified download again. No application was replaced."
+                .into(),
+        )
     }
 
     pub(super) fn distribution(&self) -> Distribution {

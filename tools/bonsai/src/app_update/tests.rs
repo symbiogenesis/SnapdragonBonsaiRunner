@@ -227,6 +227,132 @@ fn final_stage_requires_published_identity_and_retains_immutable_ancestry() -> c
 }
 
 #[test]
+fn portable_replacement_stage_accepts_legacy_repo_handoff_and_rejects_mismatched_or_foreign_receipts()
+-> crate::Result<()> {
+    let (directory, version, published) = portable_fixture_named("SwiftBonsai2Runner")?;
+    let path = directory.join(&published.asset.name);
+    let receipt = directory.join("verified-release.json");
+    fs::write(&path, b"original").map_err(|error| error.to_string())?;
+    let legacy = published
+        .legacy_portable_handoff()
+        .ok_or("Missing legacy portable handoff.")?;
+    let canonical_id = published.release_identity()?;
+    let legacy_id = legacy.release_identity()?;
+
+    let encoded_legacy = serde_json::to_vec(&legacy).map_err(|error| error.to_string())?;
+    fs::write(&receipt, &encoded_legacy).map_err(|error| error.to_string())?;
+    assert!(verify_stage(&directory, &version, &published).is_err());
+    drop(verify_portable_replacement_stage(
+        &directory,
+        &version,
+        &published,
+        Some(&legacy_id),
+    )?);
+    drop(verify_portable_replacement_stage(
+        &directory, &version, &published, None,
+    )?);
+    assert!(
+        verify_portable_replacement_stage(&directory, &version, &published, Some(&canonical_id))
+            .is_err()
+    );
+
+    let encoded_canonical = serde_json::to_vec(&published).map_err(|error| error.to_string())?;
+    fs::write(&receipt, &encoded_canonical).map_err(|error| error.to_string())?;
+    drop(verify_portable_replacement_stage(
+        &directory,
+        &version,
+        &published,
+        Some(&canonical_id),
+    )?);
+    drop(verify_portable_replacement_stage(
+        &directory, &version, &published, None,
+    )?);
+    assert!(
+        verify_portable_replacement_stage(&directory, &version, &published, Some(&legacy_id))
+            .is_err()
+    );
+
+    let mut foreign = legacy.clone();
+    foreign.asset.url = format!(
+        "https://github.com/symbiogenesis/SwiftBonsai2/releases/download/v{version}/{}",
+        foreign.asset.name
+    );
+    let foreign_id = foreign.release_identity()?;
+    fs::write(
+        &receipt,
+        serde_json::to_vec(&foreign).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    assert!(verify_portable_replacement_stage(&directory, &version, &published, None).is_err());
+    assert!(
+        verify_portable_replacement_stage(&directory, &version, &published, Some(&foreign_id))
+            .is_err()
+    );
+
+    let mut tampered_receipt = legacy;
+    tampered_receipt.asset.sha256 = "f".repeat(64);
+    let tampered_id = tampered_receipt.release_identity()?;
+    fs::write(
+        &receipt,
+        serde_json::to_vec(&tampered_receipt).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    assert!(verify_portable_replacement_stage(&directory, &version, &published, None).is_err());
+    assert!(
+        verify_portable_replacement_stage(&directory, &version, &published, Some(&tampered_id))
+            .is_err()
+    );
+
+    fs::write(&receipt, &encoded_legacy).map_err(|error| error.to_string())?;
+    fs::write(&path, b"tampered").map_err(|error| error.to_string())?;
+    assert!(verify_portable_replacement_stage(&directory, &version, &published, None).is_err());
+    assert!(
+        verify_portable_replacement_stage(&directory, &version, &published, Some(&legacy_id))
+            .is_err()
+    );
+
+    fs::remove_file(&path)
+        .and_then(|()| fs::remove_file(&receipt))
+        .and_then(|()| fs::remove_dir(&directory))
+        .map_err(|error| error.to_string())?;
+
+    let (directory, version, snapdragon_published) =
+        portable_fixture_named("SnapdragonBonsaiRunner")?;
+    let path = directory.join(&snapdragon_published.asset.name);
+    let receipt = directory.join("verified-release.json");
+    fs::write(&path, b"original").map_err(|error| error.to_string())?;
+    let mut synthetic = snapdragon_published.clone();
+    synthetic.asset.url = format!(
+        "https://github.com/{LEGACY_REPOSITORY}/releases/download/v{version}/{}",
+        synthetic.asset.name
+    );
+    let synthetic_id = synthetic.release_identity()?;
+    fs::write(
+        &receipt,
+        serde_json::to_vec(&synthetic).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    assert!(
+        verify_portable_replacement_stage(&directory, &version, &snapdragon_published, None)
+            .is_err()
+    );
+    assert!(
+        verify_portable_replacement_stage(
+            &directory,
+            &version,
+            &snapdragon_published,
+            Some(&synthetic_id),
+        )
+        .is_err()
+    );
+
+    fs::remove_file(path)
+        .and_then(|()| fs::remove_file(receipt))
+        .and_then(|()| fs::remove_dir(directory))
+        .map_err(|error| error.to_string())
+}
+
+#[test]
 fn missing_update_handoff_is_an_error() {
     let path = std::env::temp_dir().join(format!(
         "Bonsai-Missing-Update-{}.json",

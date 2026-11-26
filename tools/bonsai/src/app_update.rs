@@ -16,6 +16,7 @@ mod transfer;
 use policy::{Candidate, Version};
 
 const REPOSITORY: &str = "symbiogenesis/SnapdragonBonsaiRunner";
+const LEGACY_REPOSITORY: &str = "symbiogenesis/SwiftBonsai2Runner";
 const TARGET: &str = "aarch64-pc-windows-msvc";
 const MAX_METADATA: u64 = 2 * 1024 * 1024;
 const MAX_INSTALLER: u64 = 512 * 1024 * 1024;
@@ -425,6 +426,42 @@ fn verify_stage(
         );
     }
     verify_asset(directory, &installer)
+}
+
+fn verify_portable_replacement_stage(
+    directory: &Path,
+    version: &str,
+    published: &policy::Installer,
+    release_identity: Option<&str>,
+) -> crate::Result<bonsai_artifacts::VerifiedFile> {
+    published.validate(version)?;
+    if published.distribution() != policy::Distribution::Portable {
+        return Err(
+            "Portable replacement requires a published portable executable release.".into(),
+        );
+    }
+    let expected = release_identity
+        .map(|identity| published.resolve_portable_replacement(identity))
+        .transpose()?;
+    let bytes = transfer::read_bounded(&directory.join("verified-release.json"), MAX_METADATA)?;
+    let staged: policy::Installer =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let matches = match expected {
+        Some(expected) => staged == expected,
+        None => {
+            staged == *published
+                || published
+                    .legacy_portable_handoff()
+                    .is_some_and(|legacy| staged == legacy)
+        }
+    };
+    if !matches {
+        return Err(
+            "The staged update differs from the published release; download and confirm it again."
+                .into(),
+        );
+    }
+    verify_asset(directory, &staged)
 }
 
 fn verify_asset(

@@ -283,10 +283,12 @@ pub(super) fn replace(request: &Replacement) -> crate::Result<Value> {
     let _lock = crate::startup_cache::lock_file(&directory.join("update.lock"))?;
     let candidate = super::published_portable_release(&request.version, &directory)?;
     let published = super::verified_portable_release(&candidate, &directory)?;
-    if let Some(identity) = &request.release_identity {
-        published.verify_release_identity(identity)?;
-    }
-    let source = super::verify_stage(&directory, &request.version, &published)?;
+    let source = super::verify_portable_replacement_stage(
+        &directory,
+        &request.version,
+        &published,
+        request.release_identity.as_deref(),
+    )?;
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let canonical_source = fs::canonicalize(source.path()).map_err(|error| error.to_string())?;
     if fs::canonicalize(&executable).map_err(|error| error.to_string())? != canonical_source
