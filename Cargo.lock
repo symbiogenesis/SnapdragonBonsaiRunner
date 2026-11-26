@@ -575,9 +575,9 @@ dependencies = [
 
 [[package]]
 name = "bonsai-gguf"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67708c1fdc5bd3cb0c8e06b6d6f748920e04ad9baf218b4c6a527589fdd1aac6"
+checksum = "ada9abd144f64c9d71cd748d5b47e5252139a34eaad08e729215f669d7415f7e"
 dependencies = [
  "bonsai-native-hash",
  "hex",
@@ -595,9 +595,9 @@ dependencies = [
 
 [[package]]
 name = "bonsai-native-hash"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "935893c6124862f846bf1465e0d22bbfa249911e0c667b4595d2de29b5e1f086"
+checksum = "5cf129636ceb950c7555e42322c2097a234b14287850c84e5d38da75e7d34385"
 dependencies = [
  "sha2",
  "windows-sys 0.61.2",
@@ -605,9 +605,9 @@ dependencies = [
 
 [[package]]
 name = "bonsai-neon-dot"
-version = "0.1.8"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9ebcb94052b4446a8675e604590060ae7cbd106d88c44457a9d32f2d3e20738"
+checksum = "210d3eb31190ca7b24af45ccad37e25eca65882a66c2fd83a333beea6ea46897"
 dependencies = [
  "bonsai-ternary",
 ]
@@ -671,9 +671,9 @@ dependencies = [
 
 [[package]]
 name = "bonsai-ternary"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0934aa0d3e74deaf52b12154cfdcf6ee37332d4690b8bb5e17538962973e76b"
+checksum = "7f281d1c16780e92902cd997e90845b7b8d34da0056f57c7bf6631decd086802"
 
 [[package]]
 name = "bonsai-tools"
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-windows-credentials"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "bonsai-native-hash",
  "hex",
@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "bonsai-windows-process"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ash",
  "bonsai-neon-dot",
