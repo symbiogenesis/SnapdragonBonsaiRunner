@@ -118,6 +118,10 @@ pub(super) struct DrG2CaptureConfig {
 #[derive(Clone, Debug)]
 struct CandidateAdapterMeta {
     sha256: String,
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "Used when launching Windows capture servers.")
+    )]
     bytes: u64,
     max_rank: Option<u16>,
     target_count: Option<usize>,
@@ -175,6 +179,7 @@ fn prompt_timing_entry(
     })
 }
 
+#[cfg(windows)]
 fn validate_regular_external_file(path: &Path, label: &str) -> crate::Result<()> {
     bonsai_artifacts::validate_external_path(path).map_err(|e| format!("{label}: {e}"))?;
     let meta = fs::symlink_metadata(path).map_err(|e| format!("{label}: {e}"))?;
@@ -549,7 +554,7 @@ fn calibrated_server_memory_bytes(
 }
 
 #[cfg_attr(
-    not(windows),
+    all(not(windows), not(test)),
     expect(
         dead_code,
         reason = "Server CLI builder is executed on Windows and verified cross-platform in unit tests."
@@ -641,6 +646,7 @@ fn build_server_arguments(
     Ok(args)
 }
 
+#[cfg(windows)]
 fn verify_capture_inputs(config: &DrG2CaptureConfig) -> crate::Result<CandidateAdapterMeta> {
     validate_regular_external_file(&config.server_path, "captureConfig.serverPath")?;
     validate_regular_external_file(&config.model_path, "captureConfig.modelPath")?;

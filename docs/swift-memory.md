@@ -5,7 +5,7 @@ CPU row workers on Snapdragon X1 and Snapdragon X2 Elite Extreme (`X2`; four whe
 the host family is unknown or in fixed-four qualification controls), standard adapter
 scale 1.3, default `calibrated-cow` Job-commit admission, and [X2 NPU placement](hexagon.md) when initialization
 succeeds. `--publisher-engine` explicitly selects rollback; PTQ1 and opt-in
-[Ternary Bonsai 2.5 27B](model-selection.md#opt-in-ternary-bonsai-25-27b-representations)
+[Ternary Bonsai 2.5 27B](model-selection.md#native-default-ternary-bonsai-25-27b-representations)
 (`--bonsai-2-5 pq2|ptq1`) remain explicit opt-ins (see
 [Bonsai 2.5 X2 vetting](evidence/bonsai-2-5-x2-vet.md) for the `-1.173 GiB` `PTQ1_0` Peak WS vs `PQ2_0` decode latency trade-off),
 and explicit `--cpu-prefill-tokens 8|16|32` enables CPU tiled FFN prefill with
