@@ -1036,6 +1036,7 @@ fn run_writer<W: Write>(
     }
 
     let mut batch = Vec::new();
+    let mut frame_scratch = Vec::with_capacity(FRAME_HEADER_BYTES + MAX_FRAME_PAYLOAD);
     loop {
         let batch_seq = {
             let mut state = lock_unpoisoned(&tx.state);
@@ -1074,7 +1075,6 @@ fn run_writer<W: Write>(
             seq
         };
 
-        let mut frame_scratch = Vec::with_capacity(FRAME_HEADER_BYTES + MAX_FRAME_PAYLOAD);
         let mut io_result = Ok(());
         for frame in batch.drain(..) {
             let write_result = write_raw_frame_into(
@@ -1108,6 +1108,7 @@ fn run_writer<W: Write>(
             waker.wake();
         }
     }
+    crate::scrub_bytes(&mut frame_scratch);
 }
 
 #[cfg(test)]

@@ -2736,6 +2736,8 @@ async fn wait_ready_models(
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<Vec<u8>, LaunchError> {
     run_startup_with_timeout(shutdown, async {
+        const READINESS_POLL_BACKOFF_MS: [u64; 4] = [5, 10, 20, 50];
+        let mut poll_step = 0_usize;
         loop {
             guard.check()?;
             match listener_process_id(port).map_err(|_| LaunchError::Backend)? {
@@ -2750,7 +2752,8 @@ async fn wait_ready_models(
                 }
                 _ => {}
             }
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(READINESS_POLL_BACKOFF_MS[poll_step])).await;
+            poll_step = (poll_step + 1).min(READINESS_POLL_BACKOFF_MS.len() - 1);
         }
     })
     .await

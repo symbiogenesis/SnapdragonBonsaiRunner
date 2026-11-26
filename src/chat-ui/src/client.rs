@@ -41,6 +41,7 @@ pub(crate) use event_queue::{
 use sse::Sse;
 
 const POLL: Duration = Duration::from_millis(100);
+const READINESS_POLL_BACKOFF_MS: [u64; 4] = [5, 10, 20, 50];
 const IO_POLL: Duration = Duration::from_millis(50);
 const SOCKET_POLL: Duration = Duration::from_millis(25);
 const STARTUP_TIMEOUT: Duration = Duration::from_mins(10);
@@ -1311,6 +1312,7 @@ fn wait_ready(
     stderr_path: &Path,
 ) -> Result<(RetainedCredential, usize, bool, DaisyRoseReadiness, bool)> {
     let until = Instant::now() + STARTUP_TIMEOUT;
+    let mut poll_step = 0_usize;
     loop {
         check_startup_commands(commands, history)?;
         let output = read_bounded_file(stdout_path, MAX_HEAD)?;
@@ -1346,7 +1348,8 @@ fn wait_ready(
                 "The local model did not become ready within ten minutes.",
             ));
         }
-        thread::sleep(POLL);
+        thread::sleep(Duration::from_millis(READINESS_POLL_BACKOFF_MS[poll_step]));
+        poll_step = (poll_step + 1).min(READINESS_POLL_BACKOFF_MS.len() - 1);
     }
 }
 

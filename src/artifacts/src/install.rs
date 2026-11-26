@@ -220,7 +220,6 @@ fn extract<R: Read + Seek>(
             buffer,
             &mut || Ok(()),
         )?;
-        output.sync_all().map_err(|_| ArtifactError::Installation)?;
         verify_pe_if_binary(&path, &mut output)?;
         files.push(VerifiedRuntimeFile {
             path,
@@ -228,6 +227,9 @@ fn extract<R: Read + Seek>(
             sha256,
         });
         handles.push(output);
+    }
+    if let Some(last) = handles.last() {
+        last.sync_all().map_err(|_| ArtifactError::Installation)?;
     }
     Ok((files, handles))
 }

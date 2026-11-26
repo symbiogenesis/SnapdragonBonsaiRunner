@@ -881,6 +881,21 @@ trait Operations {
     }
     fn artifacts(&mut self, request: &Request, working: &Path) -> crate::Result<()>;
     fn inference(&mut self, request: &Request, working: &Path) -> crate::Result<()>;
+    fn inference_and_artifacts(
+        &mut self,
+        request: &Request,
+        working: &Path,
+        run_inference: bool,
+        run_artifacts: bool,
+    ) -> crate::Result<()> {
+        if run_inference {
+            self.inference(request, working)?;
+        }
+        if run_artifacts {
+            self.artifacts(request, working)?;
+        }
+        Ok(())
+    }
     fn model_apps(
         &mut self,
         request: &Request,
@@ -1009,6 +1024,61 @@ impl Operations for Native {
             &mut |phase, artifact| setup::runtime_status(working, kind, phase, artifact))
             .map(|_| ())
             .map_err(|error| format!("The selected Rust runtime could not be prepared in {}: {error}. Check available disk space and folder permissions, then select Retry setup.", request.data_directory.display()))
+    }
+
+    fn inference_and_artifacts(
+        &mut self,
+        request: &Request,
+        working: &Path,
+        run_inference: bool,
+        run_artifacts: bool,
+    ) -> crate::Result<()> {
+        if run_inference && run_artifacts && setup::kind(request)? == "existing" {
+            // Cached verification checks independent runtime and model artifacts.
+            // Suppress routine runtime progress writes while `setup::prepare` owns
+            // `chat-setup-progress.json` so concurrent status renames cannot race.
+            parallel_model_preparation(
+                || {
+                    crate::provision::prepare_chat_runtime_observed(
+                        inference_request(request, working),
+                        &mut |phase, artifact| {
+                            if matches!(
+                                phase,
+                                crate::startup_download::RepairActivity::Downloading { .. }
+                                    | crate::startup_download::RepairActivity::VerifyingDownloaded
+                            ) {
+                                setup::runtime_status(working, "existing", phase, artifact)
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )
+                    .map(|_| ())
+                    .map_err(|error| {
+                        format!(
+                            "The selected Rust runtime could not be prepared in {}: {error}. Check available disk space and folder permissions, then select Retry setup.",
+                            request.data_directory.display()
+                        )
+                    })
+                },
+                || Self.artifacts(request, working).map(|()| Value::Null),
+            )?;
+            return setup::status(
+                working,
+                "ready",
+                "Starting your local model\u{2026}",
+                "existing",
+                "ready",
+                None,
+            );
+        }
+        if run_inference {
+            self.inference(request, working)?;
+        }
+        if run_artifacts {
+            self.artifacts(request, working)?;
+        }
+        Ok(())
     }
 
     fn model_apps(
@@ -1425,14 +1495,14 @@ fn prepare_backend(
     } else {
         None
     };
-    if stage == PreparationStage::All && request.native_engine && !request.speech_models_only {
+    let run_inference =
+        stage == PreparationStage::All && request.native_engine && !request.speech_models_only;
+    let run_artifacts = stage != PreparationStage::Speech && !request.speech_models_only;
+    if run_inference || run_artifacts {
         // Run only in the owned preparation worker after the first UI frame.
         // Setup checks the exact release inventory and hashes and restores only
         // the selected pinned runtime before any model handoff.
-        operations.inference(&request, working)?;
-    }
-    if stage != PreparationStage::Speech && !request.speech_models_only {
-        operations.artifacts(&request, working)?;
+        operations.inference_and_artifacts(&request, working, run_inference, run_artifacts)?;
     }
     let models = if let Some(model) = model_selection {
         Some(operations.models(&request, model, working)?)
