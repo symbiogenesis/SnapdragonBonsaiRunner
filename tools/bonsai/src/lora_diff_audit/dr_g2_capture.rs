@@ -2,15 +2,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+#[cfg(windows)]
 use std::fs;
 use std::io::{self, BufReader, Read as _, Write as _};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(windows)]
+use std::net::TcpListener;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+#[cfg(windows)]
 use super::gguf_adapter::{VerifyPolicy, verify_lora_gguf};
 use super::readiness::{
     BaseModelProfile, BlindResponseEntry, DrG2Evidence, MAX_DR_G2_RESPONSES_BYTES, ThinkingOffArm,
