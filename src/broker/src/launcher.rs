@@ -4842,7 +4842,10 @@ mod tests {
             ]
             .map(OsString::from),
         );
-        assert_eq!(LaunchConfig::parse(admitted_64)?.cpu_prefill_tokens, Some(64));
+        assert_eq!(
+            LaunchConfig::parse(admitted_64)?.cpu_prefill_tokens,
+            Some(64)
+        );
         let mut publisher = arguments();
         publisher.extend(
             [
