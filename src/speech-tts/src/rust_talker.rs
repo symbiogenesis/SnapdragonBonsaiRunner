@@ -598,12 +598,54 @@ impl Talker {
         self.text_fc2.forward_vec_parallel(&h, None, self.threads)
     }
 
-    fn codec_row(&self, id: i32) -> io::Result<Vec<f32>> {
+    fn project_text_batch(
+        &self,
+        ids: &[i32],
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
+    ) -> io::Result<Vec<Vec<f32>>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ids.len() == 1 {
+            cancel()?;
+            return Ok(vec![self.project_text(ids[0])?]);
+        }
+        let seq_len = ids.len();
+        let in_dim = self.text_fc1.in_dim;
+        let out_dim = self.text_fc2.out_dim;
+        let mut emb = vec![0.0_f32; seq_len * in_dim];
+        for (t, &id) in ids.iter().enumerate() {
+            cancel()?;
+            let id = usize::try_from(id).map_err(|_| invalid("Negative speech text token."))?;
+            self.text_embedding
+                .row_into(id, &mut emb[t * in_dim..(t + 1) * in_dim])?;
+        }
+        let mut h = Vec::new();
+        self.text_fc1
+            .forward_batch_into(&emb, seq_len, None, self.threads, &mut h)?;
+        for value in &mut h {
+            *value /= 1.0 + (-*value).exp();
+        }
+        let mut projected = Vec::new();
+        self.text_fc2
+            .forward_batch_into(&h, seq_len, None, self.threads, &mut projected)?;
+        Ok(projected
+            .chunks_exact(out_dim)
+            .map(<[f32]>::to_vec)
+            .collect())
+    }
+
+    fn codec_row_into(&self, id: i32, row: &mut Vec<f32>) -> io::Result<()> {
         let index = usize::try_from(id).map_err(|_| invalid("Negative speech codec token."))?;
-        let mut row = vec![0.0_f32; self.geometry.hidden];
+        row.resize(self.geometry.hidden, 0.0);
         self.codec_embedding
-            .row_into(index, &mut row)
-            .map_err(|_| invalid("Speech codec token exceeds embedding bounds."))?;
+            .row_into(index, row)
+            .map_err(|_| invalid("Speech codec token exceeds embedding bounds."))
+    }
+
+    fn codec_row(&self, id: i32) -> io::Result<Vec<f32>> {
+        let mut row = Vec::new();
+        self.codec_row_into(id, &mut row)?;
         Ok(row)
     }
 
@@ -614,15 +656,25 @@ impl Talker {
             .map_err(|_| invalid("Speech codec token exceeds embedding bounds."))
     }
 
-    fn sum_codes(&self, frame: &[i32; TOTAL_CODE_GROUPS]) -> io::Result<Vec<f32>> {
-        let mut row = self.codec_row(frame[0])?;
+    fn sum_codes_into(
+        &self,
+        frame: &[i32; TOTAL_CODE_GROUPS],
+        row: &mut Vec<f32>,
+    ) -> io::Result<()> {
+        self.codec_row_into(frame[0], row)?;
         for (table, &code) in self.predictor.codec_embeddings.iter().zip(&frame[1..]) {
             let index =
                 usize::try_from(code).map_err(|_| invalid("Negative speech codec token."))?;
             table
-                .add_row_into(index, &mut row)
+                .add_row_into(index, row)
                 .map_err(|_| invalid("Speech codec token exceeds embedding bounds."))?;
         }
+        Ok(())
+    }
+
+    fn sum_codes(&self, frame: &[i32; TOTAL_CODE_GROUPS]) -> io::Result<Vec<f32>> {
+        let mut row = Vec::new();
+        self.sum_codes_into(frame, &mut row)?;
         Ok(row)
     }
 
@@ -643,12 +695,7 @@ impl Talker {
     ) -> io::Result<Vec<Vec<f32>>> {
         let reference_ids = self.framed_ids(REFERENCE_TEXT)?;
         let reference_body = &reference_ids[3..reference_ids.len() - 5];
-        let mut text_rows = Vec::with_capacity(reference_body.len());
-        for &id in reference_body {
-            cancel()?;
-            text_rows.push(self.project_text(id)?);
-        }
-        Ok(text_rows)
+        self.project_text_batch(reference_body, cancel)
     }
 
     fn compute_reference_codec_rows(
@@ -709,10 +756,7 @@ impl Talker {
         let ref_text_count = ref_text.len();
         let mut full_text_rows = Vec::with_capacity(ref_text_count + body.len() + 1);
         full_text_rows.extend_from_slice(ref_text);
-        for &id in body {
-            cancel()?;
-            full_text_rows.push(self.project_text(id)?);
-        }
+        full_text_rows.extend(self.project_text_batch(body, cancel)?);
         full_text_rows.push(self.tts_eos.clone());
         Ok((full_text_rows, ref_text_count))
     }
@@ -798,15 +842,9 @@ impl Talker {
             if head.len() > MAX_CONTEXT {
                 return Err(invalid("Speech instruction is too long."));
             }
-            for id in head {
-                cancel()?;
-                rows.push(self.project_text(id)?);
-            }
+            rows.extend(self.project_text_batch(&head, cancel)?);
         }
-        for &id in &ids[..3] {
-            cancel()?;
-            rows.push(self.project_text(id)?);
-        }
+        rows.extend(self.project_text_batch(&ids[..3], cancel)?);
         for id in [
             self.specials.nothink,
             self.specials.think_bos,
@@ -842,9 +880,7 @@ impl Talker {
             rows.extend(aligned.rows);
             aligned.trailing
         } else {
-            for &id in body {
-                cancel()?;
-                let mut row = self.project_text(id)?;
+            for mut row in self.project_text_batch(body, cancel)? {
                 self.add_codec_row(self.specials.pad, &mut row)?;
                 rows.push(row);
             }
@@ -866,20 +902,20 @@ impl Talker {
         })
     }
 
-    fn forward_into(
+    fn forward_into_buffers(
         &self,
-        row: &[f32],
+        h_a: &mut Vec<f32>,
+        h_b: &mut Vec<f32>,
         caches: &mut [LayerKvCache],
         cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
         workspace: &mut DecoderWorkspace,
         out: &mut Vec<f32>,
     ) -> io::Result<()> {
-        let mut h_a = row.to_vec();
-        let mut h_b = vec![0.0_f32; row.len()];
+        h_b.resize(h_a.len(), 0.0);
         for (layer, cache) in self.layers.iter().zip(caches) {
             cancel()?;
             layer.forward_step_into(
-                &h_a,
+                h_a,
                 self.geometry.heads,
                 self.geometry.kv_heads,
                 self.geometry.head_dim,
@@ -889,11 +925,11 @@ impl Talker {
                 None,
                 self.threads,
                 workspace,
-                &mut h_b,
+                h_b,
             )?;
-            std::mem::swap(&mut h_a, &mut h_b);
+            std::mem::swap(h_a, h_b);
         }
-        rms_norm_into(&h_a, &self.norm, self.geometry.norm_eps, out)
+        rms_norm_into(h_a, &self.norm, self.geometry.norm_eps, out)
     }
 
     #[cfg(test)]
@@ -948,6 +984,7 @@ impl Talker {
         caches: &mut [LayerKvCache],
         final_ffn_last_only: bool,
         cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
+        workspace: &mut DecoderWorkspace,
     ) -> io::Result<Vec<f32>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -963,7 +1000,7 @@ impl Talker {
         for (layer_idx, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
             cancel()?;
             let slice_ffn = final_ffn_last_only && layer_idx == last_layer;
-            layer.forward_batch_into(
+            layer.forward_batch_reusing(
                 &cur,
                 seq_len,
                 self.geometry.heads,
@@ -975,6 +1012,7 @@ impl Talker {
                 None,
                 self.threads,
                 slice_ffn,
+                workspace,
                 &mut next,
             )?;
             std::mem::swap(&mut cur, &mut next);
@@ -995,7 +1033,7 @@ impl Talker {
         prompt: &Prompt,
         snapshot: &mut Option<PrefillCache>,
         cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
-        _workspace: &mut DecoderWorkspace,
+        workspace: &mut DecoderWorkspace,
     ) -> io::Result<(Vec<LayerKvCache>, Vec<f32>)> {
         cancel()?;
         let prefix = prompt
@@ -1022,14 +1060,20 @@ impl Talker {
         let (mut caches, _cached_hidden) = restored
             .unwrap_or_else(|| (vec![LayerKvCache::default(); self.layers.len()], Vec::new()));
         let hidden = if reused {
-            self.forward_batch_range(&prompt.rows[prefix..], &mut caches, true, cancel)?
+            self.forward_batch_range(&prompt.rows[prefix..], &mut caches, true, cancel, workspace)?
         } else if prefix > 0 && prefix < prompt.rows.len() {
-            let prefix_hidden =
-                self.forward_batch_range(&prompt.rows[..prefix], &mut caches, true, cancel)?;
+            let prefix_hidden = self.forward_batch_range(
+                &prompt.rows[..prefix],
+                &mut caches,
+                true,
+                cancel,
+                workspace,
+            )?;
             *snapshot = PrefillCache::capture(&prompt.rows[..prefix], &caches, &prefix_hidden);
-            self.forward_batch_range(&prompt.rows[prefix..], &mut caches, true, cancel)?
+            self.forward_batch_range(&prompt.rows[prefix..], &mut caches, true, cancel, workspace)?
         } else {
-            let full_hidden = self.forward_batch_range(&prompt.rows, &mut caches, true, cancel)?;
+            let full_hidden =
+                self.forward_batch_range(&prompt.rows, &mut caches, true, cancel, workspace)?;
             if prefix != 0 && prefix == prompt.rows.len() {
                 *snapshot = PrefillCache::capture(&prompt.rows[..prefix], &caches, &full_hidden);
             }
@@ -1086,6 +1130,8 @@ impl Talker {
         };
         // Current Base serving keeps the residual codebooks at full top-p.
         params.subtalker_top_p = 1.0;
+        let mut h_a = Vec::with_capacity(self.geometry.hidden);
+        let mut h_b = Vec::with_capacity(self.geometry.hidden);
         for step in 0..MAX_NEW_TOKENS {
             cancel()?;
             self.head
@@ -1161,11 +1207,12 @@ impl Talker {
                     "Speech reached its context limit before a complete end marker.",
                 ));
             }
-            let mut next = self.sum_codes(&frame)?;
+            self.sum_codes_into(&frame, &mut h_a)?;
             let overlay = prompt.trailing.get(step).unwrap_or(&self.tts_pad);
-            add(&mut next, overlay)?;
-            self.forward_into(
-                &next,
+            add(&mut h_a, overlay)?;
+            self.forward_into_buffers(
+                &mut h_a,
+                &mut h_b,
                 &mut caches,
                 cancel,
                 predictor_workspace.decoder(),

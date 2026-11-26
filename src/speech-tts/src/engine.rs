@@ -1377,6 +1377,140 @@ mod quant_dispatch {
         static ACT_Q8_0: RefCell<Vec<Q8_0ActBlock>> = const { RefCell::new(Vec::new()) };
         static ACT_Q8_K: RefCell<Vec<Q8_KActBlock>> = const { RefCell::new(Vec::new()) };
         static GROUP_COMBINED: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+        static BATCH_DISPATCH_DUMMY: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn quantize_batch_parallel<Act: Send>(
+        inputs: &[f32],
+        in_dim: usize,
+        seq_len: usize,
+        blocks_per_tok: usize,
+        acts: &mut [Act],
+        workers: usize,
+        quantize_row: impl Fn(&[f32], &mut [Act]) + Sync,
+    ) {
+        let active = workers.clamp(1, 18).min(seq_len);
+        if active <= 1 || seq_len < 2 || seq_len.saturating_mul(in_dim) < 4096 {
+            for t in 0..seq_len {
+                quantize_row(
+                    &inputs[t * in_dim..(t + 1) * in_dim],
+                    &mut acts[t * blocks_per_tok..(t + 1) * blocks_per_tok],
+                );
+            }
+            return;
+        }
+        let chunk_toks = seq_len.div_ceil(active);
+        let act_chunks: Vec<(usize, std::sync::Mutex<&mut [Act]>)> = acts
+            [..seq_len * blocks_per_tok]
+            .chunks_mut(chunk_toks * blocks_per_tok)
+            .enumerate()
+            .map(|(idx, slice)| (idx * chunk_toks, std::sync::Mutex::new(slice)))
+            .collect();
+        let run_with_dummy = |dummy: &mut [f32]| {
+            run_row_chunks_aligned(dummy, active, 4, |elem_off, slice| {
+                let t_start = elem_off / 4;
+                let t_end = t_start + slice.len() / 4;
+                if t_start >= t_end {
+                    return;
+                }
+                let first_c = t_start / chunk_toks;
+                let last_c = (t_end - 1) / chunk_toks;
+                for (c_start, mtx) in &act_chunks[first_c..=last_c] {
+                    let mut guard = mtx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let c_len = guard.len() / blocks_per_tok;
+                    let c_end = c_start + c_len;
+                    let lo = t_start.max(*c_start);
+                    let hi = t_end.min(c_end);
+                    for t in lo..hi {
+                        let local = t - *c_start;
+                        quantize_row(
+                            &inputs[t * in_dim..(t + 1) * in_dim],
+                            &mut guard[local * blocks_per_tok..(local + 1) * blocks_per_tok],
+                        );
+                    }
+                }
+            });
+        };
+        let needed = seq_len * 4;
+        if needed <= 512 {
+            let mut stack_dummy = [0.0_f32; 512];
+            run_with_dummy(&mut stack_dummy[..needed]);
+        } else {
+            BATCH_DISPATCH_DUMMY.with(|cell| {
+                if let Ok(mut buf) = cell.try_borrow_mut() {
+                    buf.resize(needed, 0.0_f32);
+                    run_with_dummy(&mut buf[..needed]);
+                } else {
+                    let mut fallback = vec![0.0_f32; needed];
+                    run_with_dummy(&mut fallback);
+                }
+            });
+        }
+    }
+
+    fn with_batch_group_workspace<R>(
+        combined_len: usize,
+        q8_blocks: usize,
+        qk_blocks: usize,
+        action: impl FnOnce(&mut [f32], &mut [Q8_0ActBlock], &mut [Q8_KActBlock]) -> R,
+    ) -> R {
+        GROUP_COMBINED.with(|comb_cell| {
+            let mut comb_fallback = Vec::new();
+            let mut comb_guard = comb_cell.try_borrow_mut().ok();
+            let combined = match comb_guard.as_deref_mut() {
+                Some(buf) => {
+                    buf.resize(combined_len, 0.0);
+                    &mut buf[..combined_len]
+                }
+                None => {
+                    comb_fallback.resize(combined_len, 0.0);
+                    &mut comb_fallback[..combined_len]
+                }
+            };
+            ACT_Q8_0.with(|q8_cell| {
+                ACT_Q8_K.with(|qk_cell| {
+                    let mut q8_fallback = Vec::new();
+                    let mut q8_guard = (q8_blocks > 0)
+                        .then(|| q8_cell.try_borrow_mut().ok())
+                        .flatten();
+                    let q8_slice: &mut [Q8_0ActBlock] = if q8_blocks > 0 {
+                        match q8_guard.as_deref_mut() {
+                            Some(buf) => {
+                                buf.resize(q8_blocks, Q8_0ActBlock::default());
+                                &mut buf[..q8_blocks]
+                            }
+                            None => {
+                                q8_fallback.resize(q8_blocks, Q8_0ActBlock::default());
+                                &mut q8_fallback[..q8_blocks]
+                            }
+                        }
+                    } else {
+                        &mut []
+                    };
+                    let mut qk_fallback = Vec::new();
+                    let mut qk_guard = (qk_blocks > 0)
+                        .then(|| qk_cell.try_borrow_mut().ok())
+                        .flatten();
+                    let qk_slice: &mut [Q8_KActBlock] = if qk_blocks > 0 {
+                        match qk_guard.as_deref_mut() {
+                            Some(buf) => {
+                                buf.resize(qk_blocks, Q8_KActBlock::default());
+                                &mut buf[..qk_blocks]
+                            }
+                            None => {
+                                qk_fallback.resize(qk_blocks, Q8_KActBlock::default());
+                                &mut qk_fallback[..qk_blocks]
+                            }
+                        }
+                    } else {
+                        &mut []
+                    };
+                    action(combined, q8_slice, qk_slice)
+                })
+            })
+        })
     }
 
     pub(super) fn with_q8_0_act<R>(input: &[f32], action: impl FnOnce(&[Q8_0ActBlock]) -> R) -> R {
@@ -1768,21 +1902,31 @@ mod quant_dispatch {
         }
     }
 
-    fn transpose_to_row_major(src: &[f32], out_dim: usize, seq_len: usize, dst: &mut [f32]) {
+    fn transpose_to_row_major_range(
+        src: &[f32],
+        out_dim: usize,
+        seq_len: usize,
+        t_start: usize,
+        t_count: usize,
+        dst: &mut [f32],
+    ) {
         use fearless_simd::{Level, dispatch, f32x4, prelude::*};
 
         let r_tiles = out_dim / 4;
         let r_tail = r_tiles * 4;
-        let t_tiles = seq_len / 4;
+        let t_tiles = t_count / 4;
         let t_tail = t_tiles * 4;
         let level = Level::new();
         dispatch!(level, simd => {
             for rt in 0..r_tiles {
                 let r0 = rt * 4;
-                let row0 = &src[r0 * seq_len..(r0 + 1) * seq_len];
-                let row1 = &src[(r0 + 1) * seq_len..(r0 + 2) * seq_len];
-                let row2 = &src[(r0 + 2) * seq_len..(r0 + 3) * seq_len];
-                let row3 = &src[(r0 + 3) * seq_len..(r0 + 4) * seq_len];
+                let row0 = &src[r0 * seq_len + t_start..r0 * seq_len + t_start + t_count];
+                let row1 =
+                    &src[(r0 + 1) * seq_len + t_start..(r0 + 1) * seq_len + t_start + t_count];
+                let row2 =
+                    &src[(r0 + 2) * seq_len + t_start..(r0 + 2) * seq_len + t_start + t_count];
+                let row3 =
+                    &src[(r0 + 3) * seq_len + t_start..(r0 + 3) * seq_len + t_start + t_count];
                 for tt in 0..t_tiles {
                     let t0 = tt * 4;
                     let cols = super::packed::transpose_4x4(
@@ -1799,7 +1943,7 @@ mod quant_dispatch {
                         col.store_slice(&mut dst[base..base + 4]);
                     }
                 }
-                for t in t_tail..seq_len {
+                for t in t_tail..t_count {
                     let base = t * out_dim + r0;
                     dst[base] = row0[t];
                     dst[base + 1] = row1[t];
@@ -1809,10 +1953,28 @@ mod quant_dispatch {
             }
         });
         for r in r_tail..out_dim {
-            let row = &src[r * seq_len..(r + 1) * seq_len];
+            let row = &src[r * seq_len + t_start..r * seq_len + t_start + t_count];
             for (t, &val) in row.iter().enumerate() {
                 dst[t * out_dim + r] = val;
             }
+        }
+    }
+
+    fn transpose_to_row_major_parallel(
+        src: &[f32],
+        out_dim: usize,
+        seq_len: usize,
+        dst: &mut [f32],
+        workers: usize,
+    ) {
+        if workers > 1 && seq_len >= 2 && out_dim.saturating_mul(seq_len) >= 4096 {
+            run_row_chunks_aligned(dst, workers, out_dim, |elem_off, dst_chunk| {
+                let t_start = elem_off / out_dim;
+                let t_count = dst_chunk.len() / out_dim;
+                transpose_to_row_major_range(src, out_dim, seq_len, t_start, t_count, dst_chunk);
+            });
+        } else {
+            transpose_to_row_major_range(src, out_dim, seq_len, 0, seq_len, dst);
         }
     }
 
@@ -2031,40 +2193,17 @@ mod quant_dispatch {
             });
             total_out += proj.out_dim;
         }
-        let mut combined = vec![0.0_f32; total_out * seq_len];
-        for (seg, (proj, _, _)) in segments.iter().zip(targets.iter()) {
-            if let Some(bias) = &proj.bias {
-                for (r, &b) in bias.iter().enumerate() {
-                    let off = (seg.start + r) * seq_len;
-                    combined[off..off + seq_len].fill(b);
-                }
-            }
-        }
         let in_dim = segments[0].in_dim;
-        let q8_opt = need_q8.then(|| {
-            let blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
-            let mut buf = vec![Q8_0ActBlock::default(); seq_len * blocks_per_tok];
-            for t in 0..seq_len {
-                quantize_row_q8_0(
-                    &inputs[t * in_dim..(t + 1) * in_dim],
-                    &mut buf[t * blocks_per_tok..(t + 1) * blocks_per_tok],
-                );
-            }
-            buf
-        });
-        let qk_opt = need_qk.then(|| {
-            let blocks_per_tok = in_dim / QK_K;
-            let mut buf = vec![Q8_KActBlock::default(); seq_len * blocks_per_tok];
-            for t in 0..seq_len {
-                quantize_row_q8_k(
-                    &inputs[t * in_dim..(t + 1) * in_dim],
-                    &mut buf[t * blocks_per_tok..(t + 1) * blocks_per_tok],
-                );
-            }
-            buf
-        });
-        let q8_slice = q8_opt.as_deref().unwrap_or(&[]);
-        let qk_slice = qk_opt.as_deref().unwrap_or(&[]);
+        let q8_blocks = if need_q8 {
+            seq_len * (in_dim / Q8_0_BLOCK_ELEMENTS)
+        } else {
+            0
+        };
+        let qk_blocks = if need_qk {
+            seq_len * (in_dim / QK_K)
+        } else {
+            0
+        };
         let row_align = if segments.iter().all(|s| s.len.is_multiple_of(8)) {
             8
         } else if segments.iter().all(|s| s.len.is_multiple_of(4)) {
@@ -2073,41 +2212,79 @@ mod quant_dispatch {
             1
         };
         let workers = worker_count.clamp(1, 18).min(total_out.max(1));
-        run_row_chunks_aligned(
-            &mut combined,
-            workers,
-            row_align * seq_len,
-            |flat_off, dst| {
-                let global_row = flat_off / seq_len;
-                let rows_total = dst.len() / seq_len;
-                let chunk_end = global_row + rows_total;
-                for seg in &segments {
-                    let seg_end = seg.start + seg.len;
-                    let ov_start = global_row.max(seg.start);
-                    let ov_end = chunk_end.min(seg_end);
-                    if ov_start >= ov_end {
-                        continue;
+        with_batch_group_workspace(
+            total_out * seq_len,
+            q8_blocks,
+            qk_blocks,
+            |combined, q8_buf, qk_buf| {
+                for (seg, (proj, _, _)) in segments.iter().zip(targets.iter()) {
+                    if let Some(bias) = &proj.bias {
+                        for (r, &b) in bias.iter().enumerate() {
+                            let off = (seg.start + r) * seq_len;
+                            combined[off..off + seq_len].fill(b);
+                        }
+                    } else {
+                        combined[seg.start * seq_len..(seg.start + seg.len) * seq_len].fill(0.0);
                     }
-                    let dst_slice = &mut dst
-                        [(ov_start - global_row) * seq_len..(ov_end - global_row) * seq_len];
-                    dispatch_batch_segment(
-                        seg.kind,
-                        dst_slice,
-                        seg.in_dim,
+                }
+                if need_q8 {
+                    let blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
+                    quantize_batch_parallel(
+                        inputs,
+                        in_dim,
                         seq_len,
-                        ov_start - seg.start,
-                        ov_end - ov_start,
-                        caps,
-                        q8_slice,
-                        qk_slice,
+                        blocks_per_tok,
+                        q8_buf,
+                        worker_count,
+                        quantize_row_q8_0,
                     );
+                }
+                if need_qk {
+                    let blocks_per_tok = in_dim / QK_K;
+                    quantize_batch_parallel(
+                        inputs,
+                        in_dim,
+                        seq_len,
+                        blocks_per_tok,
+                        qk_buf,
+                        worker_count,
+                        quantize_row_q8_k,
+                    );
+                }
+                let q8_slice: &[Q8_0ActBlock] = q8_buf;
+                let qk_slice: &[Q8_KActBlock] = qk_buf;
+                run_row_chunks_aligned(combined, workers, row_align * seq_len, |flat_off, dst| {
+                    let global_row = flat_off / seq_len;
+                    let rows_total = dst.len() / seq_len;
+                    let chunk_end = global_row + rows_total;
+                    for seg in &segments {
+                        let seg_end = seg.start + seg.len;
+                        let ov_start = global_row.max(seg.start);
+                        let ov_end = chunk_end.min(seg_end);
+                        if ov_start >= ov_end {
+                            continue;
+                        }
+                        let dst_slice = &mut dst
+                            [(ov_start - global_row) * seq_len..(ov_end - global_row) * seq_len];
+                        dispatch_batch_segment(
+                            seg.kind,
+                            dst_slice,
+                            seg.in_dim,
+                            seq_len,
+                            ov_start - seg.start,
+                            ov_end - ov_start,
+                            caps,
+                            q8_slice,
+                            qk_slice,
+                        );
+                    }
+                });
+                for (seg, (_, _, out)) in segments.iter().zip(targets.iter_mut()) {
+                    let src_slice = &combined[seg.start * seq_len..(seg.start + seg.len) * seq_len];
+                    transpose_to_row_major_parallel(src_slice, seg.len, seq_len, out, worker_count);
                 }
             },
         );
-        for (seg, (_, _, out)) in segments.iter().zip(targets.iter_mut()) {
-            let src_slice = &combined[seg.start * seq_len..(seg.start + seg.len) * seq_len];
-            transpose_to_row_major(src_slice, seg.len, seq_len, out);
-        }
         true
     }
 
@@ -2127,13 +2304,14 @@ mod quant_dispatch {
         };
         let in_dim = proj.in_dim;
         let out_dim = proj.out_dim;
-        let mut transposed = vec![0.0_f32; out_dim * seq_len];
-        if let Some(bias) = &proj.bias {
-            for (r, row) in transposed.chunks_exact_mut(seq_len).enumerate() {
-                row.fill(bias[r]);
-            }
-        }
-        let worker_count = worker_count.clamp(1, 18).min(out_dim.max(1));
+        let is_q8 = matches!(kind, GroupKind::Packed { ggml_type: 8, .. });
+        let q8_blocks = if is_q8 {
+            seq_len * (in_dim / Q8_0_BLOCK_ELEMENTS)
+        } else {
+            0
+        };
+        let qk_blocks = if is_q8 { 0 } else { seq_len * (in_dim / QK_K) };
+        let row_workers_active = worker_count.clamp(1, 18).min(out_dim.max(1));
         let row_align = match kind {
             GroupKind::Repacked(_)
             | GroupKind::Packed {
@@ -2141,70 +2319,59 @@ mod quant_dispatch {
             } => 8,
             GroupKind::Packed { .. } => 4,
         };
-        match kind {
-            GroupKind::Packed { ggml_type: 8, .. } => {
-                let blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
-                let mut acts = vec![Q8_0ActBlock::default(); seq_len * blocks_per_tok];
-                for t in 0..seq_len {
-                    quantize_row_q8_0(
-                        &inputs[t * in_dim..(t + 1) * in_dim],
-                        &mut acts[t * blocks_per_tok..(t + 1) * blocks_per_tok],
+        with_batch_group_workspace(
+            out_dim * seq_len,
+            q8_blocks,
+            qk_blocks,
+            |transposed, q8_buf, qk_buf| {
+                if let Some(bias) = &proj.bias {
+                    for (r, row) in transposed.chunks_exact_mut(seq_len).enumerate() {
+                        row.fill(bias[r]);
+                    }
+                } else {
+                    transposed.fill(0.0);
+                }
+                if is_q8 {
+                    let blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
+                    quantize_batch_parallel(
+                        inputs,
+                        in_dim,
+                        seq_len,
+                        blocks_per_tok,
+                        q8_buf,
+                        worker_count,
+                        quantize_row_q8_0,
+                    );
+                } else {
+                    let blocks_per_tok = in_dim / QK_K;
+                    quantize_batch_parallel(
+                        inputs,
+                        in_dim,
+                        seq_len,
+                        blocks_per_tok,
+                        qk_buf,
+                        worker_count,
+                        quantize_row_q8_k,
                     );
                 }
+                let q8_slice: &[Q8_0ActBlock] = q8_buf;
+                let qk_slice: &[Q8_KActBlock] = qk_buf;
                 run_row_chunks_aligned(
-                    &mut transposed,
-                    worker_count,
+                    transposed,
+                    row_workers_active,
                     row_align * seq_len,
                     |flat_off, dst| {
                         let start_row = flat_off / seq_len;
                         let rows_here = dst.len() / seq_len;
                         dispatch_batch_segment(
-                            kind,
-                            dst,
-                            in_dim,
-                            seq_len,
-                            start_row,
-                            rows_here,
-                            caps,
-                            &acts,
-                            &[],
+                            kind, dst, in_dim, seq_len, start_row, rows_here, caps, q8_slice,
+                            qk_slice,
                         );
                     },
                 );
-            }
-            _ => {
-                let blocks_per_tok = in_dim / QK_K;
-                let mut acts = vec![Q8_KActBlock::default(); seq_len * blocks_per_tok];
-                for t in 0..seq_len {
-                    quantize_row_q8_k(
-                        &inputs[t * in_dim..(t + 1) * in_dim],
-                        &mut acts[t * blocks_per_tok..(t + 1) * blocks_per_tok],
-                    );
-                }
-                run_row_chunks_aligned(
-                    &mut transposed,
-                    worker_count,
-                    row_align * seq_len,
-                    |flat_off, dst| {
-                        let start_row = flat_off / seq_len;
-                        let rows_here = dst.len() / seq_len;
-                        dispatch_batch_segment(
-                            kind,
-                            dst,
-                            in_dim,
-                            seq_len,
-                            start_row,
-                            rows_here,
-                            caps,
-                            &[],
-                            &acts,
-                        );
-                    },
-                );
-            }
-        }
-
-        transpose_to_row_major(&transposed, out_dim, seq_len, out);
+                transpose_to_row_major_parallel(transposed, out_dim, seq_len, out, worker_count);
+            },
+        );
         Ok(true)
     }
 }
@@ -2803,6 +2970,164 @@ fn with_rope_batch_tables(
     Ok(())
 }
 
+fn with_rope_batch_slices(
+    head_dim: usize,
+    initial_seq: usize,
+    seq_len: usize,
+    theta: f32,
+    action: impl FnOnce(&[f32], &[f32]) -> io::Result<()>,
+) -> Option<io::Result<()>> {
+    const MAX_CACHED_BATCH_ELEMS: usize = 1_048_576;
+    let half = head_dim / 2;
+    if half == 0 || seq_len == 0 {
+        return Some(Ok(()));
+    }
+    let within_cache = seq_len
+        .checked_mul(half)
+        .is_some_and(|n| n <= MAX_CACHED_BATCH_ELEMS);
+    if !within_cache {
+        return None;
+    }
+    ROPE_CACHE.with(|cell| {
+        let Ok(mut cache) = cell.try_borrow_mut() else {
+            return None;
+        };
+        let (cos_all, sin_all) = cache.ensure_batch(head_dim, initial_seq, seq_len, theta);
+        Some(action(cos_all, sin_all))
+    })
+}
+
+fn normalize_heads_in_place_level(
+    level: Level,
+    buf: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    weight: &[f32],
+    eps: f32,
+) {
+    let inv_n = 1.0_f32 / usize_to_f32(head_dim);
+    for head in buf.chunks_exact_mut(head_dim).take(num_heads) {
+        let mean_sq = head.iter().map(|&v| v * v).sum::<f32>() * inv_n;
+        let scale = 1.0_f32 / (mean_sq + eps).sqrt();
+        dispatch!(level, simd => rms_norm_in_place_simd(simd, head, weight, scale));
+    }
+}
+
+fn apply_rope_neox_with_tables_level(
+    level: Level,
+    heads: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    cos: &[f32],
+    sin: &[f32],
+) {
+    let half = head_dim / 2;
+    dispatch!(level, simd => {
+        for slice in heads.chunks_exact_mut(head_dim).take(num_heads) {
+            let (lo, hi) = slice.split_at_mut(half);
+            rope_head_simd(simd, lo, hi, cos, sin);
+        }
+    });
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Normalizes and RoPE-rotates batched Q and K tensors using shared precomputed trig tables."
+)]
+fn normalize_and_rope_qk_batch(
+    q_all: &mut [f32],
+    k_all: &mut [f32],
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    q_norm_w: &[f32],
+    k_norm_w: &[f32],
+    initial_seq: usize,
+    rope_theta: f32,
+    rms_eps: f32,
+    workers: usize,
+) -> io::Result<()> {
+    let query_width = num_q_heads * head_dim;
+    let kv_width = num_kv_heads * head_dim;
+    let half = head_dim / 2;
+    let level = Level::new();
+    if workers > 1
+        && seq_len >= 2
+        && let Some(res) = with_rope_batch_slices(
+            head_dim,
+            initial_seq,
+            seq_len,
+            rope_theta,
+            |cos_all, sin_all| {
+                row_workers::run_aligned(q_all, workers, query_width, &|elem_off, q_chunk| {
+                    let t_start = elem_off / query_width;
+                    for (local_t, q_tok) in q_chunk.chunks_exact_mut(query_width).enumerate() {
+                        let t = t_start + local_t;
+                        normalize_heads_in_place_level(
+                            level,
+                            q_tok,
+                            num_q_heads,
+                            head_dim,
+                            q_norm_w,
+                            rms_eps,
+                        );
+                        apply_rope_neox_with_tables_level(
+                            level,
+                            q_tok,
+                            num_q_heads,
+                            head_dim,
+                            &cos_all[t * half..(t + 1) * half],
+                            &sin_all[t * half..(t + 1) * half],
+                        );
+                    }
+                });
+                row_workers::run_aligned(k_all, workers, kv_width, &|elem_off, k_chunk| {
+                    let t_start = elem_off / kv_width;
+                    for (local_t, k_tok) in k_chunk.chunks_exact_mut(kv_width).enumerate() {
+                        let t = t_start + local_t;
+                        normalize_heads_in_place_level(
+                            level,
+                            k_tok,
+                            num_kv_heads,
+                            head_dim,
+                            k_norm_w,
+                            rms_eps,
+                        );
+                        apply_rope_neox_with_tables_level(
+                            level,
+                            k_tok,
+                            num_kv_heads,
+                            head_dim,
+                            &cos_all[t * half..(t + 1) * half],
+                            &sin_all[t * half..(t + 1) * half],
+                        );
+                    }
+                });
+                Ok(())
+            },
+        )
+    {
+        return res;
+    }
+
+    with_rope_batch_tables(
+        head_dim,
+        initial_seq,
+        seq_len,
+        rope_theta,
+        |t, cos_buf, sin_buf| {
+            let q_tok = &mut q_all[t * query_width..(t + 1) * query_width];
+            normalize_heads_in_place(q_tok, num_q_heads, head_dim, q_norm_w, rms_eps)?;
+            let k_tok = &mut k_all[t * kv_width..(t + 1) * kv_width];
+            normalize_heads_in_place(k_tok, num_kv_heads, head_dim, k_norm_w, rms_eps)?;
+            apply_rope_neox_with_tables(q_tok, num_q_heads, head_dim, cos_buf, sin_buf)?;
+            apply_rope_neox_with_tables(k_tok, num_kv_heads, head_dim, cos_buf, sin_buf)?;
+            Ok(())
+        },
+    )
+}
+
 fn prefetch_rope_step(head_dim: usize, pos: usize, theta: f32) {
     with_rope_step_tables(head_dim, pos, theta, |_, _| {});
 }
@@ -3387,9 +3712,9 @@ impl QwenDecoderLayer {
     ///
     /// When `final_ffn_last_only` is `true`, only the last token (`seq_len - 1`) executes the
     /// MLP/SwiGLU block because downstream logits read only that final hidden vector.
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
-        clippy::too_many_lines,
         reason = "Batched prefill executes GEMM QKV/O/FFN, causal RoPE/attention, and atomic KV commits."
     )]
     pub(crate) fn forward_batch_into(
@@ -3407,6 +3732,45 @@ impl QwenDecoderLayer {
         final_ffn_last_only: bool,
         output: &mut Vec<f32>,
     ) -> io::Result<()> {
+        let mut ws = decoder_workspace::DecoderWorkspace::default();
+        self.forward_batch_reusing(
+            inputs,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_theta,
+            rms_eps,
+            kv,
+            adapter,
+            workers,
+            final_ffn_last_only,
+            &mut ws,
+            output,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "Batched prefill reuses caller workspace across layers while keeping atomic KV commits."
+    )]
+    pub(crate) fn forward_batch_reusing(
+        &self,
+        inputs: &[f32],
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+        rms_eps: f32,
+        kv: &mut LayerKvCache,
+        adapter: Option<&TalkerLoraAdapter>,
+        workers: usize,
+        final_ffn_last_only: bool,
+        workspace: &mut decoder_workspace::DecoderWorkspace,
+        output: &mut Vec<f32>,
+    ) -> io::Result<()> {
         let invalid_geometry =
             || io::Error::new(io::ErrorKind::InvalidInput, "Invalid GQA geometry.");
         let hidden = self.attn_norm_w.len();
@@ -3418,7 +3782,6 @@ impl QwenDecoderLayer {
         }
         if seq_len == 1 {
             output.resize(hidden, 0.0);
-            let mut ws = decoder_workspace::DecoderWorkspace::default();
             return self.forward_step_into(
                 inputs,
                 num_q_heads,
@@ -3429,7 +3792,7 @@ impl QwenDecoderLayer {
                 kv,
                 adapter,
                 workers,
-                &mut ws,
+                workspace,
                 output,
             );
         }
@@ -3448,57 +3811,59 @@ impl QwenDecoderLayer {
             return Err(invalid_geometry());
         }
 
-        let mut h_norm = Vec::new();
-        rms_norm_batch_into(
-            inputs,
-            seq_len,
-            &self.attn_norm_w,
-            rms_eps,
-            workers,
-            &mut h_norm,
-        )?;
+        let decoder_workspace::DecoderWorkspace {
+            norm: h_norm,
+            q: q_all,
+            k: k_all,
+            v: v_all,
+            attention: attn_seq,
+            scores: _,
+            projected,
+            gate: gate_all,
+            up: up_all,
+            residual: row_norm,
+        } = workspace;
+
+        rms_norm_batch_into(inputs, seq_len, &self.attn_norm_w, rms_eps, workers, h_norm)?;
 
         let patch = |proj: &LinearProjection| adapter.and_then(|a| a.patches.get(&proj.name));
-        let mut q_all = Vec::new();
-        let mut k_all = Vec::new();
-        let mut v_all = Vec::new();
         LinearProjection::forward_batch_group_into(
             &mut [
-                (&self.q_proj, patch(&self.q_proj), &mut q_all),
-                (&self.k_proj, patch(&self.k_proj), &mut k_all),
-                (&self.v_proj, patch(&self.v_proj), &mut v_all),
+                (&self.q_proj, patch(&self.q_proj), q_all),
+                (&self.k_proj, patch(&self.k_proj), k_all),
+                (&self.v_proj, patch(&self.v_proj), v_all),
             ],
-            &h_norm,
+            h_norm,
             seq_len,
             workers,
         )?;
 
-        with_rope_batch_tables(
-            head_dim,
-            initial_seq,
+        normalize_and_rope_qk_batch(
+            q_all,
+            k_all,
             seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            &self.q_norm_w,
+            &self.k_norm_w,
+            initial_seq,
             rope_theta,
-            |t, cos_buf, sin_buf| {
-                let q_tok = &mut q_all[t * query_width..(t + 1) * query_width];
-                normalize_heads_in_place(q_tok, num_q_heads, head_dim, &self.q_norm_w, rms_eps)?;
-                let k_tok = &mut k_all[t * kv_width..(t + 1) * kv_width];
-                normalize_heads_in_place(k_tok, num_kv_heads, head_dim, &self.k_norm_w, rms_eps)?;
-                apply_rope_neox_with_tables(q_tok, num_q_heads, head_dim, cos_buf, sin_buf)?;
-                apply_rope_neox_with_tables(k_tok, num_kv_heads, head_dim, cos_buf, sin_buf)?;
-                Ok(())
-            },
+            rms_eps,
+            workers,
         )?;
 
-        let append = kv_append::KvAppend::new_batch(kv, seq_len, &k_all, &v_all)?;
+        let append = kv_append::KvAppend::new_batch(kv, seq_len, k_all, v_all)?;
         let kv = append.cache();
 
         let level = Level::new();
         let gqa_ratio = num_q_heads / num_kv_heads;
         let scale = 1.0_f32 / usize_to_f32(head_dim).sqrt();
-        let mut attn_seq = vec![0.0_f32; seq_len * query_width];
+        decoder_workspace::resize(attn_seq, seq_len * query_width)?;
+        attn_seq.fill(0.0);
         attend_batch_f16(
             level,
-            &q_all,
+            q_all,
             kv,
             initial_seq,
             seq_len,
@@ -3508,82 +3873,64 @@ impl QwenDecoderLayer {
             head_dim,
             gqa_ratio,
             scale,
-            &mut attn_seq,
+            attn_seq,
             workers,
         )?;
 
-        let mut projected = Vec::new();
         self.o_proj.forward_batch_into(
-            &attn_seq,
+            attn_seq,
             seq_len,
             patch(&self.o_proj),
             workers,
-            &mut projected,
+            projected,
         )?;
         output.resize(inputs.len(), 0.0);
-        for ((dst, &inp), &proj) in output.iter_mut().zip(inputs).zip(&projected) {
+        for ((dst, &inp), &proj) in output.iter_mut().zip(inputs).zip(projected.iter()) {
             *dst = inp + proj;
         }
 
         if final_ffn_last_only {
             let last_start = (seq_len - 1) * hidden;
-            let mut row_norm = Vec::with_capacity(hidden);
-            rms_norm_into(
-                &output[last_start..],
-                &self.ffn_norm_w,
-                rms_eps,
-                &mut row_norm,
-            )?;
-            let mut gate = Vec::new();
-            let mut up = Vec::new();
+            rms_norm_into(&output[last_start..], &self.ffn_norm_w, rms_eps, row_norm)?;
             LinearProjection::forward_pair_into(
                 &self.gate_proj,
                 &self.up_proj,
-                &row_norm,
+                row_norm,
                 patch(&self.gate_proj),
                 patch(&self.up_proj),
                 workers,
-                &mut gate,
-                &mut up,
+                gate_all,
+                up_all,
             )?;
-            swiglu_in_place(&mut gate, &up);
+            swiglu_in_place(gate_all, up_all);
             self.down_proj.forward_vec_into(
-                &gate,
+                gate_all,
                 None,
                 patch(&self.down_proj),
                 workers,
-                &mut projected,
+                projected,
             )?;
-            dispatch!(level, simd => axpy_simd(simd, 1.0_f32, &projected, &mut output[last_start..]));
+            dispatch!(level, simd => axpy_simd(simd, 1.0_f32, projected, &mut output[last_start..]));
         } else {
-            rms_norm_batch_into(
-                output,
-                seq_len,
-                &self.ffn_norm_w,
-                rms_eps,
-                workers,
-                &mut h_norm,
-            )?;
-            let mut gate_all = Vec::new();
-            let mut up_all = Vec::new();
+            rms_norm_batch_into(output, seq_len, &self.ffn_norm_w, rms_eps, workers, h_norm)?;
             LinearProjection::forward_batch_group_into(
                 &mut [
-                    (&self.gate_proj, patch(&self.gate_proj), &mut gate_all),
-                    (&self.up_proj, patch(&self.up_proj), &mut up_all),
+                    (&self.gate_proj, patch(&self.gate_proj), gate_all),
+                    (&self.up_proj, patch(&self.up_proj), up_all),
                 ],
-                &h_norm,
+                h_norm,
                 seq_len,
                 workers,
             )?;
-            swiglu_in_place_parallel(&mut gate_all, &up_all, workers);
+            swiglu_in_place_parallel(gate_all, up_all, workers);
             self.down_proj.forward_batch_into(
-                &gate_all,
+                gate_all,
                 seq_len,
                 patch(&self.down_proj),
                 workers,
-                &mut projected,
+                projected,
             )?;
-            dispatch!(level, simd => axpy_simd(simd, 1.0_f32, &projected, output));
+            dispatch!(level, simd => axpy_simd(simd, 1.0_f32, projected, output));
         }
 
         if output.iter().any(|v| !v.is_finite()) {
