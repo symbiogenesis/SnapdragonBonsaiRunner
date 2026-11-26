@@ -2,6 +2,9 @@
 use super::egui;
 use egui::{Color32, Pos2, Stroke, epaint::CubicBezierShape};
 
+const BRAND_NAME: &str = "Snapdragon Bonsai";
+const BRAND_TAGLINE: &str = "Your private, local AI companion";
+
 pub(super) fn logo(ui: &mut egui::Ui) {
     super::navigation::bounded_width(ui, |ui| {
         ui.horizontal(|ui| {
@@ -14,7 +17,7 @@ pub(super) fn logo(ui: &mut egui::Ui) {
             }
             // Keep both lines beside the seedling, using text line spacing only.
             ui.add(egui::Label::new(text).extend())
-                .on_hover_text("SwiftBonsai2 - Your private, local AI companion");
+                .on_hover_text(format!("{BRAND_NAME} - {BRAND_TAGLINE}"));
         });
     });
 }
@@ -22,8 +25,8 @@ pub(super) fn logo(ui: &mut egui::Ui) {
 fn wording(ui: &egui::Ui, separator: &str) -> egui::text::LayoutJob {
     let mut text = egui::text::LayoutJob::default();
     for span in [
-        egui::RichText::new("SwiftBonsai2").strong().size(14.0),
-        egui::RichText::new(format!("{separator}Your private, local AI companion"))
+        egui::RichText::new(BRAND_NAME).strong().size(14.0),
+        egui::RichText::new(format!("{separator}{BRAND_TAGLINE}"))
             .size(12.0)
             .weak(),
     ] {
@@ -39,9 +42,8 @@ fn wording(ui: &egui::Ui, separator: &str) -> egui::text::LayoutJob {
 
 fn mark(ui: &mut egui::Ui) {
     let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(26.0), egui::Sense::hover());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::Role::Image, ui.is_enabled(), "SwiftBonsai2")
-    });
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, ui.is_enabled(), BRAND_NAME));
     if !ui.is_rect_visible(rect) {
         return;
     }
@@ -98,4 +100,34 @@ fn leaf(painter: &egui::Painter, points: [Pos2; 6], ink: Color32) {
     // The polygon closes itself; duplicate endpoints interrupt edge feathering.
     let _closing_point = outline.pop();
     painter.add(egui::Shape::convex_polygon(outline, ink, Stroke::NONE));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT as _, Queryable as _},
+    };
+
+    #[test]
+    fn sidebar_logo_displays_snapdragon_bonsai_label_and_mark() {
+        let mut harness = Harness::builder()
+            .with_size([240.0, 80.0])
+            .with_context_setup(super::super::configure_test_context)
+            .build_ui(|ui| {
+                logo(ui);
+            });
+        harness.run();
+        let _ = harness.get_by_role_and_label(egui::Role::Image, "Snapdragon Bonsai");
+        assert!(harness.query_all_by_role(egui::Role::Label).any(|node| {
+            node.accesskit_node()
+                .value()
+                .or_else(|| node.accesskit_node().label())
+                .is_some_and(|text| {
+                    text.contains("Snapdragon Bonsai")
+                        && text.contains("Your private, local AI companion")
+                })
+        }));
+    }
 }

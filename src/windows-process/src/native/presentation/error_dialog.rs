@@ -173,14 +173,14 @@ pub(super) fn show(message: &str) {
             })
             .collect();
         let fallback = terminated(&format!(
-            "Swift Bonsai could not start.\n\n{short}\n\nThe detailed error controls could not open."
+            "Snapdragon Bonsai could not start.\n\n{short}\n\nThe detailed error controls could not open."
         ));
         // SAFETY: Both terminated strings and `user32` remain live throughout the synchronous call.
         let _ = unsafe {
             (user32.message_box_w)(
                 ptr::null_mut(),
                 fallback.as_ptr(),
-                w!("Swift Bonsai 2"),
+                w!("Snapdragon Bonsai"),
                 MB_OK | MB_ICONERROR,
             )
         };
@@ -332,7 +332,7 @@ fn template() -> Vec<u32> {
     );
     push_dword(&mut words, 0);
     words.extend([6, 0, 0, 280, 164, 0, 0]); // Count, fixed bounds, no menu/default dialog class.
-    words.extend(terminated("Swift Bonsai 2"));
+    words.extend(terminated("Snapdragon Bonsai"));
     words.push(9);
     words.extend(terminated("Segoe UI"));
     control(
@@ -341,7 +341,7 @@ fn template() -> Vec<u32> {
         0x82,
         0,
         [12, 10, 256, 14],
-        "Swift Bonsai could not start",
+        "Snapdragon Bonsai could not start",
     );
     control(
         &mut words,
@@ -441,12 +441,12 @@ mod tests {
         let width = word(&mut input)?;
         let height = word(&mut input)?;
         assert_eq!([word(&mut input)?, word(&mut input)?], [0, 0]);
-        assert_eq!(text(&mut input)?, "Swift Bonsai 2");
+        assert_eq!(text(&mut input)?, "Snapdragon Bonsai");
         assert!(word(&mut input)? > 0);
         assert_eq!(text(&mut input)?, "Segoe UI");
 
         for (id, class, required, label) in [
-            (1003, 0x82, 0, "Swift Bonsai could not start"),
+            (1003, 0x82, 0, "Snapdragon Bonsai could not start"),
             (1004, 0x82, 0, "Error details (preview)"),
             (
                 1000,

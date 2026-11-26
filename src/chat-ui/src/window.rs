@@ -2902,6 +2902,9 @@ fn open_persisted_stores(
     }
 }
 
+const WINDOW_TITLE: &str = "Snapdragon Bonsai";
+const PREVIEW_WINDOW_TITLE: &str = "Snapdragon Bonsai · Preview";
+
 fn run_native_window(
     title: &str,
     build: impl FnOnce(&eframe::CreationContext<'_>, Sender<Command>, client::EventReceiver) -> State
@@ -2924,7 +2927,7 @@ fn run_native_window(
 
 pub(super) fn run(config: Config) -> io::Result<()> {
     let attach_stores = open_persisted_stores(&config.data);
-    run_native_window("Swift Bonsai", move |cc, commands, incoming_events| {
+    run_native_window(WINDOW_TITLE, move |cc, commands, incoming_events| {
         let microphone = microphone::Microphone::new().ok();
         let mut state = State::create(commands, incoming_events, None, microphone);
         state.model = ModelLifecycle::Preparing;
@@ -2960,7 +2963,7 @@ pub(super) fn run_startup(request: crate::startup::Request) -> io::Result<bool> 
     let reported_failure = std::sync::Arc::clone(&failure);
     let update_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let approved_update = std::sync::Arc::clone(&update_exit);
-    run_native_window("Swift Bonsai", move |cc, commands, incoming_events| {
+    run_native_window(WINDOW_TITLE, move |cc, commands, incoming_events| {
         let mut state = State::pending_startup(commands, incoming_events, request);
         state.startup_failure = Some(reported_failure);
         state.update_exit = Some(approved_update);
@@ -2978,7 +2981,7 @@ pub(super) fn run_startup(request: crate::startup::Request) -> io::Result<bool> 
 }
 /// Opens only a seeded interface; no backend, credential or audio operation runs.
 pub(super) fn run_preview() -> io::Result<()> {
-    run_native_window("Swift Bonsai · Preview", |_, commands, incoming_events| {
+    run_native_window(PREVIEW_WINDOW_TITLE, |_, commands, incoming_events| {
         let mut state = State::create(commands, incoming_events, None, None);
         state.model = ModelLifecycle::Ready;
         "Interface preview".clone_into(&mut state.status);
