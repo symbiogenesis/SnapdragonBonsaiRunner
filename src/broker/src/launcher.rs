@@ -1962,10 +1962,12 @@ impl LaunchConfig {
         let verification = crate::inference::pinned_version()
             .map_err(|_| NativeIdentityError::ReleasePin)
             .and_then(|version| {
+                let base = WorkerReadiness::for_version(&version, self.native_row_workers);
                 identity::validate_native_identity_for_representation(
                     models,
                     self.weight_representation,
                     WorkerReadiness {
+                        prefill_row_workers: self.prefill_row_workers.or(base.prefill_row_workers),
                         prompt_reuse: self.prompt_reuse,
                         prompt_reuse_checkpoints: self.prompt_reuse_checkpoints.unwrap_or(1),
                         vision: vision_enabled,
@@ -1978,7 +1980,7 @@ impl LaunchConfig {
                         cpu_speculation,
                         placement: self.placement,
                         context_tokens,
-                        ..WorkerReadiness::for_version(&version, self.native_row_workers)
+                        ..base
                     },
                 )
             });
@@ -4069,6 +4071,7 @@ mod tests {
             "context_tokens": 8192,
             "seed": 42,
             "row_workers": 4,
+            "prefill_row_workers": 4,
             "kv_cache": "rsq4",
             "startup_graph_identity": format!(
                 "{}:qwen35-text-v1:nonflash-f16:kv-rsq4-d256-rht3-v1:gdn-f32:prism-arm64-fused-v1",
@@ -4113,6 +4116,8 @@ mod tests {
             ("runtime", json!("Prism")),
             ("context_tokens", json!(8193)),
             ("seed", json!(43)),
+            ("prefill_row_workers", json!(8)),
+            ("prefill_row_workers", json!(null)),
             ("weight_representation", json!(null)),
         ] {
             let mut changed_model = model.clone();
@@ -4188,6 +4193,7 @@ mod tests {
                 "context_tokens": 8192,
                 "seed": 42,
                 "row_workers": 4,
+                "prefill_row_workers": 4,
                 "kv_cache": "rsq4",
                 "startup_graph_identity": format!(
                     "{}:qwen35-text-v1:nonflash-f16:kv-rsq4-d256-rht3-v1:gdn-f32:prism-arm64-fused-v1",

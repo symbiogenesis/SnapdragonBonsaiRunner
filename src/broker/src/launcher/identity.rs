@@ -58,6 +58,7 @@ fn prism_zero_one_patch(version: &str) -> Option<u32> {
 #[derive(Clone, Copy)]
 pub(super) struct WorkerReadiness<'a> {
     pub(super) expected: u8,
+    pub(super) prefill_row_workers: Option<u8>,
     pub(super) context_tokens: usize,
     pub(super) legacy_missing_allowed: bool,
     pub(super) projection_startup_required: bool,
@@ -77,6 +78,10 @@ impl<'a> WorkerReadiness<'a> {
         let patch = prism_zero_one_patch(version);
         Self {
             expected,
+            // Reviewed 0.1.38+ releases always publish their effective prefill worker
+            // budget (`prefill_row_workers`), defaulting to `row_workers` when split
+            // prefill workers are not explicitly overridden.
+            prefill_row_workers: patch.is_some_and(|number| number >= 38).then_some(expected),
             context_tokens: crate::CONTEXT_TOKENS,
             // Only these reviewed historical releases omit this identity. A
             // later pin must report its graph's effective worker budget.
@@ -102,6 +107,11 @@ impl<'a> WorkerReadiness<'a> {
     }
 
     #[cfg(test)]
+    pub(super) const fn expected_prefill_row_workers(self) -> Option<u8> {
+        self.prefill_row_workers
+    }
+
+    #[cfg(test)]
     pub(super) const fn requires_projection_startup(self) -> bool {
         self.projection_startup_required
     }
@@ -111,6 +121,13 @@ impl<'a> WorkerReadiness<'a> {
             && observed.map_or(self.legacy_missing_allowed, |workers| {
                 workers == self.expected
             })
+    }
+
+    fn accepts_prefill_row_workers(self, observed: Option<u8>) -> bool {
+        match self.prefill_row_workers {
+            Some(expected) => matches!(expected, 1 | 4 | 8 | 12 | 16) && observed == Some(expected),
+            None => observed.is_none(),
+        }
     }
 }
 
@@ -156,6 +173,8 @@ struct NativeModel<'a> {
     seed: u32,
     #[serde(default, deserialize_with = "crate::deserialize_present")]
     row_workers: Option<u8>,
+    #[serde(default, deserialize_with = "crate::deserialize_present")]
+    prefill_row_workers: Option<u8>,
     #[serde(default, borrow, deserialize_with = "crate::deserialize_present")]
     weight_representation: Option<Text<'a>>,
     #[serde(default, deserialize_with = "crate::deserialize_present")]
@@ -430,7 +449,9 @@ pub(super) fn validate_native_identity_for_representation(
     if model.context_tokens != workers.context_tokens {
         return Err(NativeIdentityError::ContextTokens);
     }
-    if !workers.accepts(model.row_workers) {
+    if !workers.accepts(model.row_workers)
+        || !workers.accepts_prefill_row_workers(model.prefill_row_workers)
+    {
         return Err(NativeIdentityError::RowWorkers);
     }
     let expected_checkpoints =
@@ -1516,32 +1537,38 @@ mod context_tests {
         use crate::inference::{KvCache, Placement};
         use serde_json::json;
 
-        for (version, legacy_workers, proj_required) in [
-            ("0.1.8", true, false),
-            ("0.1.10", true, false),
-            ("0.1.11", false, false),
-            ("0.1.27", false, false),
-            ("0.1.28", false, true),
-            ("0.1.29", false, true),
-            ("0.1.30", false, true),
-            ("0.1.31", false, true),
-            ("0.1.32", false, true),
-            ("0.1.34", false, true),
-            ("0.1.35", false, true),
-            ("0.1.38", false, true),
-            ("1.0.0", false, false),
-            ("0.1.031", false, false),
-            ("0.1.31-dev", false, false),
+        for (version, legacy_workers, proj_required, prefill_required) in [
+            ("0.1.8", true, false, false),
+            ("0.1.10", true, false, false),
+            ("0.1.11", false, false, false),
+            ("0.1.27", false, false, false),
+            ("0.1.28", false, true, false),
+            ("0.1.29", false, true, false),
+            ("0.1.30", false, true, false),
+            ("0.1.31", false, true, false),
+            ("0.1.32", false, true, false),
+            ("0.1.34", false, true, false),
+            ("0.1.35", false, true, false),
+            ("0.1.38", false, true, true),
+            ("1.0.0", false, false, false),
+            ("0.1.031", false, false, false),
+            ("0.1.31-dev", false, false, false),
         ] {
             let w = WorkerReadiness::for_version(version, 4);
             assert_eq!(w.allows_missing_row_workers(), legacy_workers, "{version}");
             assert_eq!(w.requires_projection_startup(), proj_required, "{version}");
+            assert_eq!(
+                w.expected_prefill_row_workers(),
+                prefill_required.then_some(4),
+                "{version}"
+            );
         }
 
         let pinned = crate::inference::pinned_version().map_err(|err| format!("{err:?}"))?;
         let base_policy = WorkerReadiness::for_version(&pinned, 4);
         assert!(!base_policy.allows_missing_row_workers());
         assert!(base_policy.requires_projection_startup());
+        assert_eq!(base_policy.expected_prefill_row_workers(), Some(4));
 
         let build_payload = |variant: Bonsai25Variant,
                              vision: bool,
@@ -1596,6 +1623,7 @@ mod context_tests {
                 "context_tokens": context_tokens,
                 "seed": 42,
                 "row_workers": row_workers,
+                "prefill_row_workers": row_workers,
                 "startup_projection": startup_projection,
             });
             if placement == Placement::Cpu {
@@ -1883,6 +1911,65 @@ mod context_tests {
             .is_ok()
         );
 
+        for prefill_workers in [12_u8, 16] {
+            let mut split_model = cognitive_on.clone();
+            split_model["row_workers"] = json!(8);
+            split_model["prefill_row_workers"] = json!(prefill_workers);
+            let split_wire = wire(&split_model)?;
+            let split_policy = WorkerReadiness {
+                prefill_row_workers: Some(prefill_workers),
+                vision: true,
+                kv_cache: Some(KvCache::Rsq4),
+                context_tokens: 32_768,
+                ..WorkerReadiness::for_version(&pinned, 8)
+            };
+            assert!(super::native_supports_cognitive_controls(&split_wire));
+            assert_eq!(
+                super::validate_native_identity_for_representation(
+                    &split_wire,
+                    default_repr,
+                    split_policy,
+                ),
+                Ok(())
+            );
+        }
+        let mut wrong_prefill_workers = cognitive_on.clone();
+        wrong_prefill_workers["prefill_row_workers"] = json!(8);
+        assert_mutated_err(
+            &wrong_prefill_workers,
+            WorkerReadiness {
+                prefill_row_workers: Some(16),
+                ..default_policy
+            },
+            NativeIdentityError::RowWorkers,
+        )?;
+        let mut missing_prefill_workers = cognitive_on.clone();
+        if let Some(object) = missing_prefill_workers.as_object_mut() {
+            object.remove("prefill_row_workers");
+        }
+        assert_mutated_err(
+            &missing_prefill_workers,
+            default_policy,
+            NativeIdentityError::RowWorkers,
+        )?;
+        assert_mutated_err(
+            &cognitive_on,
+            WorkerReadiness {
+                vision: true,
+                kv_cache: Some(KvCache::Rsq4),
+                context_tokens: 32_768,
+                ..WorkerReadiness::for_version("0.1.35", 4)
+            },
+            NativeIdentityError::RowWorkers,
+        )?;
+        let mut null_prefill_workers = cognitive_on;
+        null_prefill_workers["prefill_row_workers"] = json!(null);
+        assert_mutated_err(
+            &null_prefill_workers,
+            default_policy,
+            NativeIdentityError::Schema,
+        )?;
+
         Ok(())
     }
 
@@ -1907,6 +1994,7 @@ mod context_tests {
             "context_tokens": 32_768,
             "seed": 42,
             "row_workers": 4,
+            "prefill_row_workers": 4,
             "weight_representation": variant.representation_name(),
             "supports_daisyrose_scale": true,
             "daisyrose_scale_range": [0, 2],
@@ -1994,6 +2082,7 @@ mod context_tests {
                 "context_tokens": 32_768,
                 "seed": 42,
                 "row_workers": 4,
+                "prefill_row_workers": 4,
                 "vision": true,
                 "mmproj_sha256": crate::inference::MMPROJ_SHA256,
                 "image_max_tokens": bonsai_cpu_policy::DEFAULT_IMAGE_MAX_TOKENS,
@@ -2081,6 +2170,7 @@ mod context_tests {
                 "context_tokens": 32_768,
                 "seed": 42,
                 "row_workers": 4,
+                "prefill_row_workers": 4,
                 "weight_representation": variant.representation_name(),
                 "supports_daisyrose_scale": true,
                 "daisyrose_scale_range": [0, 2],
