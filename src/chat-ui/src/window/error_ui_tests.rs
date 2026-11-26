@@ -677,3 +677,66 @@ fn every_regular_alert_can_be_dismissed_with_x_preserving_state_and_reappearing_
     );
     Ok(())
 }
+
+#[test]
+fn deleted_conversation_notice_auto_dismisses_and_supports_manual_dismiss() {
+    let mut chat = harness([1080.0, 780.0], 16.0);
+
+    // Manual dismissal still works immediately.
+    chat.state_mut().app.new_chat();
+    let second = chat.state().app.active_conversation;
+    chat.state_mut().app.remove_conversation(second);
+    chat.run();
+    assert!(chat.query_by_label("Conversation deleted.").is_some());
+    chat.get_by_role_and_label(egui::Role::Button, "Dismiss")
+        .click();
+    chat.run();
+    assert!(chat.query_by_label("Conversation deleted.").is_none());
+    assert!(chat.state().app.conversation_notice.is_none());
+
+    // Auto-dismissal waits for the configured duration and resets when another deletion occurs.
+    let duration = CONVERSATION_DELETED_NOTICE_DURATION.as_secs_f64();
+    chat.state_mut().app.new_chat();
+    let third = chat.state().app.active_conversation;
+    chat.state_mut().app.remove_conversation(third);
+    let start = 100.0;
+    chat.input_mut().time = Some(start);
+    chat.step();
+    assert!(chat.query_by_label("Conversation deleted.").is_some());
+
+    chat.input_mut().time = Some(start + duration - 0.5);
+    chat.step();
+    assert!(chat.query_by_label("Conversation deleted.").is_some());
+
+    chat.state_mut().app.new_chat();
+    let fourth = chat.state().app.active_conversation;
+    chat.state_mut().app.remove_conversation(fourth);
+    let reset_start = start + duration - 0.5;
+    chat.input_mut().time = Some(reset_start);
+    chat.step();
+    assert!(chat.query_by_label("Conversation deleted.").is_some());
+
+    // Past the first deadline, the reset timer keeps the notice visible.
+    chat.input_mut().time = Some(start + duration + 0.5);
+    chat.step();
+    assert!(chat.query_by_label("Conversation deleted.").is_some());
+
+    // Past the second deadline, the notice auto-dismisses.
+    chat.input_mut().time = Some(reset_start + duration + 0.1);
+    chat.step();
+    assert!(chat.query_by_label("Conversation deleted.").is_none());
+    assert!(chat.state().app.conversation_notice.is_none());
+
+    // Persistent conversation notices do not auto-dismiss over time.
+    chat.state_mut().app.conversation_notice = Some(ConversationNotice::persistent(
+        "Created a branch. The original conversation is unchanged.",
+    ));
+    chat.input_mut().time = Some(200.0);
+    chat.step();
+    chat.input_mut().time = Some(260.0);
+    chat.step();
+    assert!(
+        chat.query_by_label("Created a branch. The original conversation is unchanged.")
+            .is_some()
+    );
+}

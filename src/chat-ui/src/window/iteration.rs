@@ -364,8 +364,9 @@ impl State {
             return false;
         }
         let Some(next) = self.next_conversation.checked_add(1) else {
-            self.conversation_notice =
-                Some("Cannot create another conversation in this workspace.");
+            self.conversation_notice = Some(super::ConversationNotice::persistent(
+                "Cannot create another conversation in this workspace.",
+            ));
             return false;
         };
         let history = self.committed[..end].to_vec();
@@ -416,8 +417,9 @@ impl State {
         if self.model == ModelLifecycle::Ready {
             self.set_status("Ready in your new branch.", false);
         }
-        self.conversation_notice =
-            Some("Created a branch. The original conversation is unchanged.");
+        self.conversation_notice = Some(super::ConversationNotice::persistent(
+            "Created a branch. The original conversation is unchanged.",
+        ));
         self.recovery_dirty = true;
         true
     }

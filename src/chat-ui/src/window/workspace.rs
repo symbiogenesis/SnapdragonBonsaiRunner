@@ -448,6 +448,9 @@ impl State {
         self.conversations
             .retain(|conversation| conversation.id != id);
         self.recovery_dirty = true;
-        self.conversation_notice = Some("Conversation deleted.");
+        self.conversation_notice = Some(super::ConversationNotice::auto_dismiss(
+            "Conversation deleted.",
+            super::CONVERSATION_DELETED_NOTICE_DURATION,
+        ));
     }
 }

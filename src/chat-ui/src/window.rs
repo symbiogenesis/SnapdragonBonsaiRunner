@@ -94,6 +94,32 @@ const INPUT_LIMIT: usize = 1_048_576;
 const VOICE_LIMIT: usize = 1_024;
 const MAX_DIAGNOSTICS: usize = 128;
 const MAX_DIAGNOSTIC_CHARS: usize = 4_096;
+pub(super) const CONVERSATION_DELETED_NOTICE_DURATION: Duration = Duration::from_secs(4);
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ConversationNotice {
+    text: &'static str,
+    auto_dismiss_after: Option<Duration>,
+    dismiss_at: Option<f64>,
+}
+
+impl ConversationNotice {
+    pub(super) const fn persistent(text: &'static str) -> Self {
+        Self {
+            text,
+            auto_dismiss_after: None,
+            dismiss_at: None,
+        }
+    }
+
+    pub(super) const fn auto_dismiss(text: &'static str, duration: Duration) -> Self {
+        Self {
+            text,
+            auto_dismiss_after: Some(duration),
+            dismiss_at: None,
+        }
+    }
+}
 
 fn initial_theme_check() -> Instant {
     // Synchronize native appearance on the first frame without waiting two seconds.
@@ -167,7 +193,7 @@ struct State {
     edit_message: Option<iteration::EditMessage>,
     branch_comparison: Option<iteration::BranchComparison>,
     branch_diff_generation: u64,
-    conversation_notice: Option<&'static str>,
+    conversation_notice: Option<ConversationNotice>,
     recovery: Option<crate::recovery::Recovery>,
     placement: Option<placement::Placement>,
     save_conversations: bool,
@@ -898,8 +924,9 @@ impl State {
             return;
         }
         let Some(next) = self.next_conversation.checked_add(1) else {
-            self.conversation_notice =
-                Some("Cannot create another conversation in this workspace.");
+            self.conversation_notice = Some(ConversationNotice::persistent(
+                "Cannot create another conversation in this workspace.",
+            ));
             return;
         };
         self.update_worker_conversation(Command::NewChat);
@@ -2405,9 +2432,23 @@ impl State {
     }
 
     fn conversation_notices(&mut self, ui: &mut egui::Ui) {
+        if let Some(notice) = &mut self.conversation_notice
+            && let Some(duration) = notice.auto_dismiss_after
+        {
+            let now = ui.input(|input| input.time);
+            let deadline = *notice
+                .dismiss_at
+                .get_or_insert_with(|| now + duration.as_secs_f64());
+            if !now.is_finite() || now >= deadline {
+                self.conversation_notice = None;
+                ui.ctx().request_repaint();
+            } else if let Ok(remaining) = Duration::try_from_secs_f64(deadline - now) {
+                ui.ctx().request_repaint_after(remaining);
+            }
+        }
         if let Some(notice) = self.conversation_notice {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(notice).small());
+                ui.label(RichText::new(notice.text).small());
                 if ui.small_button("Dismiss").clicked() {
                     self.conversation_notice = None;
                 }
