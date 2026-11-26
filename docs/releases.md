@@ -1,7 +1,7 @@
 # Windows distribution
 
 Runner is available as a
-[Windows ARM64 prerelease](https://github.com/symbiogenesis/SwiftBonsai2Runner/releases).
+[Windows ARM64 prerelease](https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases).
 Build a portable executable with the
 [development guide](development-guide.md#build-a-single-executable).
 The format, setup and update behavior below still require the acceptance work
@@ -128,7 +128,7 @@ releases must use the canonical tag URL.
 To recover interrupted publication, rerun the failed job from the same run:
 
 ```powershell
-gh run rerun RUN_ID --failed --repo symbiogenesis/SwiftBonsai2Runner
+gh run rerun RUN_ID --failed --repo symbiogenesis/SnapdragonBonsaiRunner
 ```
 
 Recovery reuses retained packaging assets and requires matching source, description,

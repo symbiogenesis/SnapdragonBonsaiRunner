@@ -30,7 +30,7 @@ env:
   CPU_BUNDLE_RUNTIME_COMMIT: 99bab71270b1e6a6fb6d47eec2e34b8097cdcd4c
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/main' && github.repository == 'symbiogenesis/SwiftBonsai2Runner'
+    if: github.ref == 'refs/heads/main' && github.repository == 'symbiogenesis/SnapdragonBonsaiRunner'
     runs-on: windows-11-arm
     timeout-minutes: 45
     outputs:

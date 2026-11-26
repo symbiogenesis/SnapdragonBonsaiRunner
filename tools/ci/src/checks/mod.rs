@@ -630,10 +630,10 @@ fn github_release_context(value: impl Fn(&str) -> String) -> bool {
         && value("RUNNER_ENVIRONMENT") == "github-hosted"
         && value("RUNNER_OS") == "Windows"
         && value("RUNNER_ARCH") == "ARM64"
-        && value("GITHUB_REPOSITORY") == "symbiogenesis/SwiftBonsai2Runner"
+        && value("GITHUB_REPOSITORY") == "symbiogenesis/SnapdragonBonsaiRunner"
         && value("GITHUB_REF") == "refs/heads/main"
         && value("GITHUB_WORKFLOW_REF")
-            == "symbiogenesis/SwiftBonsai2Runner/.github/workflows/release.yml@refs/heads/main"
+            == "symbiogenesis/SnapdragonBonsaiRunner/.github/workflows/release.yml@refs/heads/main"
 }
 
 fn select_lane(

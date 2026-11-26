@@ -190,22 +190,23 @@ mod tests {
     use super::*;
 
     fn url_request(url: &str, draft: bool) -> Value {
-        json!({"repository":"symbiogenesis/SwiftBonsai2Runner","tag":"v0.3.1","sourceRevision":"a".repeat(40),"notes":"notes","prerelease":true,"expectedDraft":draft,"complete":true,"expectedId":445_527_014,
+        json!({"repository":"symbiogenesis/SnapdragonBonsaiRunner","tag":"v0.3.1","sourceRevision":"a".repeat(40),"notes":"notes","prerelease":true,"expectedDraft":draft,"complete":true,"expectedId":445_527_014,
             "assets":{},"release":{"id":445_527_014,"tag_name":"v0.3.1","target_commitish":"a".repeat(40),"name":"Swift Bonsai 2 Runner v0.3.1","html_url":url,"body":"notes","draft":draft,"prerelease":true,"assets":[]}})
     }
 
     #[test]
     fn release_publication_accepts_temporary_urls_only_for_same_repository_drafts() -> Result<()> {
-        let canonical = "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/v0.3.1";
-        let actual_draft = "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-9e752f591542a514f849";
+        let canonical =
+            "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/v0.3.1";
+        let actual_draft = "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-9e752f591542a514f849";
         validate(&url_request(canonical, true))?;
         validate(&url_request(canonical, false))?;
         validate(&url_request(actual_draft, true))?;
         assert!(validate(&url_request(actual_draft, false)).is_err());
-        let future_draft =
-            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-Draft_A-42";
+        let future_draft = "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-Draft_A-42";
         validate(&url_request(future_draft, true))?;
-        let prefix = "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-";
+        let prefix =
+            "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-";
         validate(&url_request(&format!("{prefix}{}", "a".repeat(128)), true))?;
         assert!(validate(&url_request(&format!("{prefix}{}", "a".repeat(129)), true)).is_err());
         Ok(())
@@ -214,20 +215,20 @@ mod tests {
     #[test]
     fn release_publication_rejects_untrusted_or_malformed_draft_urls() {
         for url in [
-            "https://github.com/another/SwiftBonsai2Runner/releases/tag/untagged-9e752f591542a514f849",
-            "https://github.com/symbiogenesis/SwiftBonsai2Runner-foreign/releases/tag/untagged-9e752f591542a514f849",
-            "https://github.com.example/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a",
-            "https://github.com@foreign.example/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a",
-            "http://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a",
-            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-",
-            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a/extra",
-            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a?draft=true",
-            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a#fragment",
-            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a.exe",
-            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a%2fextra",
-            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-a\\extra",
-            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/untagged-α",
-            "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases/tag/v0.3.1?draft=true",
+            "https://github.com/another/SnapdragonBonsaiRunner/releases/tag/untagged-9e752f591542a514f849",
+            "https://github.com/symbiogenesis/SnapdragonBonsaiRunner-foreign/releases/tag/untagged-9e752f591542a514f849",
+            "https://github.com.example/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-a",
+            "https://github.com@foreign.example/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-a",
+            "http://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-a",
+            "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-",
+            "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-a/extra",
+            "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-a?draft=true",
+            "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-a#fragment",
+            "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-a.exe",
+            "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-a%2fextra",
+            "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-a\\extra",
+            "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/untagged-α",
+            "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases/tag/v0.3.1?draft=true",
         ] {
             assert!(validate(&url_request(url, true)).is_err(), "Accepted {url}");
         }

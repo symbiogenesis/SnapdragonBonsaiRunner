@@ -28,7 +28,7 @@ defaults:
     shell: pwsh
 jobs:
   validate:
-    if: github.ref == 'refs/heads/main' && github.repository == 'symbiogenesis/SwiftBonsai2Runner'
+    if: github.ref == 'refs/heads/main' && github.repository == 'symbiogenesis/SnapdragonBonsaiRunner'
     runs-on: windows-11-arm
     outputs:
       tag: ${{ steps.release.outputs.tag }}

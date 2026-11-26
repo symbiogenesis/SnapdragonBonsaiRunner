@@ -845,7 +845,7 @@ pub(super) fn manual_controls(ui: &mut egui::Ui) {
     ui.label("Automatic updates are unavailable for this launch.");
     ui.hyperlink_to(
         "Open GitHub releases",
-        "https://github.com/symbiogenesis/SwiftBonsai2Runner/releases",
+        "https://github.com/symbiogenesis/SnapdragonBonsaiRunner/releases",
     )
     .on_hover_text("Close Swift, verify the new Windows ARM64 executable against its published SHA-256, then replace your copy. Keep the same data directory to preserve models and conversations.");
 }

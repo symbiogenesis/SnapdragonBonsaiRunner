@@ -7,7 +7,7 @@ use std::ffi::OsString;
 
 use crate::Result;
 
-const REPOSITORY: &str = "symbiogenesis/SwiftBonsai2Runner";
+const REPOSITORY: &str = "symbiogenesis/SnapdragonBonsaiRunner";
 const USAGE: &str = "Usage: bonsai-ci release-prerequisites --revision SHA";
 
 #[derive(Deserialize)]

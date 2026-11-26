@@ -344,7 +344,7 @@ pub(super) fn publish(value: &Value) -> Result<Value> {
     let prerelease = value["prerelease"]
         .as_bool()
         .ok_or("Missing release prerelease policy.")?;
-    if repository != "symbiogenesis/SwiftBonsai2Runner"
+    if repository != "symbiogenesis/SnapdragonBonsaiRunner"
         || std::env::var("GITHUB_REPOSITORY").as_deref() != Ok(repository)
         || std::env::var("GITHUB_REF").as_deref() != Ok("refs/heads/main")
         || std::env::var("GITHUB_SHA").as_deref() != Ok(revision)

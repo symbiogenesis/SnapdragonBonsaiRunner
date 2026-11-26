@@ -512,11 +512,11 @@ fn release_deadlines_require_the_explicit_exact_hosted_workflow() {
         ("RUNNER_ENVIRONMENT", "github-hosted"),
         ("RUNNER_OS", "Windows"),
         ("RUNNER_ARCH", "ARM64"),
-        ("GITHUB_REPOSITORY", "symbiogenesis/SwiftBonsai2Runner"),
+        ("GITHUB_REPOSITORY", "symbiogenesis/SnapdragonBonsaiRunner"),
         ("GITHUB_REF", "refs/heads/main"),
         (
             "GITHUB_WORKFLOW_REF",
-            "symbiogenesis/SwiftBonsai2Runner/.github/workflows/release.yml@refs/heads/main",
+            "symbiogenesis/SnapdragonBonsaiRunner/.github/workflows/release.yml@refs/heads/main",
         ),
     ]);
     assert!(github_release_context(|name| environment[name].into()));

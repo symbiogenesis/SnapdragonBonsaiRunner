@@ -15,7 +15,7 @@ mod transfer;
 
 use policy::{Candidate, Version};
 
-const REPOSITORY: &str = "symbiogenesis/SwiftBonsai2Runner";
+const REPOSITORY: &str = "symbiogenesis/SnapdragonBonsaiRunner";
 const TARGET: &str = "aarch64-pc-windows-msvc";
 const MAX_METADATA: u64 = 2 * 1024 * 1024;
 const MAX_INSTALLER: u64 = 512 * 1024 * 1024;
