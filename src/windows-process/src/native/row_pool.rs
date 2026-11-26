@@ -20,7 +20,13 @@ fn wait_unpoisoned<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<
 }
 
 const MAX_POOL_WORKERS: usize = 32;
-const SPIN_ITERATIONS: usize = 512;
+const SPIN_ITERATIONS: usize = 4096;
+const GEN_SHIFT: u32 = 8;
+const SLOT_MASK: usize = (1 << GEN_SHIFT) - 1;
+const GEN_MASK: usize = usize::MAX >> GEN_SHIFT;
+
+#[repr(align(64))]
+struct CachePadded<T>(T);
 
 thread_local! {
     static IN_ROW_POOL: Cell<bool> = const { Cell::new(false) };
@@ -74,12 +80,15 @@ unsafe fn call_closure<F: Fn(usize, &mut [f32]) + Sync>(
 
 struct Shared {
     worker_count: usize,
-    generation: AtomicUsize,
-    next_chunk: AtomicUsize,
     num_chunks: AtomicUsize,
-    workers_remaining: AtomicUsize,
-    parked_count: AtomicUsize,
     shutdown: AtomicBool,
+    has_panic: AtomicBool,
+    generation: CachePadded<AtomicUsize>,
+    dispatch_state: CachePadded<AtomicUsize>,
+    next_chunk: CachePadded<AtomicUsize>,
+    workers_remaining: CachePadded<AtomicUsize>,
+    done_waiting: CachePadded<AtomicBool>,
+    parked_count: CachePadded<AtomicUsize>,
     park_mutex: Mutex<()>,
     park_cv: Condvar,
     done_mutex: Mutex<()>,
@@ -104,12 +113,15 @@ impl Shared {
     fn new(worker_count: usize) -> Self {
         Self {
             worker_count,
-            generation: AtomicUsize::new(0),
-            next_chunk: AtomicUsize::new(0),
             num_chunks: AtomicUsize::new(0),
-            workers_remaining: AtomicUsize::new(0),
-            parked_count: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            has_panic: AtomicBool::new(false),
+            generation: CachePadded(AtomicUsize::new(0)),
+            dispatch_state: CachePadded(AtomicUsize::new(0)),
+            next_chunk: CachePadded(AtomicUsize::new(0)),
+            workers_remaining: CachePadded(AtomicUsize::new(0)),
+            done_waiting: CachePadded(AtomicBool::new(false)),
+            parked_count: CachePadded(AtomicUsize::new(0)),
             park_mutex: Mutex::new(()),
             park_cv: Condvar::new(),
             done_mutex: Mutex::new(()),
@@ -121,10 +133,31 @@ impl Shared {
         }
     }
 
+    fn try_claim_slot_for_gen(&self, gen_id: usize) -> bool {
+        let mut state = self.dispatch_state.0.load(Ordering::Acquire);
+        loop {
+            let state_gen = state >> GEN_SHIFT;
+            let remaining = state & SLOT_MASK;
+            if state_gen != gen_id || remaining == 0 {
+                return false;
+            }
+            let next = (gen_id << GEN_SHIFT) | (remaining - 1);
+            match self.dispatch_state.0.compare_exchange_weak(
+                state,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
     fn drain_chunks(&self, task: TaskPtr) {
         let count = self.num_chunks.load(Ordering::Acquire);
         loop {
-            let idx = self.next_chunk.fetch_add(1, Ordering::AcqRel);
+            let idx = self.next_chunk.0.fetch_add(1, Ordering::AcqRel);
             if idx >= count {
                 break;
             }
@@ -151,36 +184,39 @@ fn worker_loop(shared: &Shared) {
         if shared.shutdown.load(Ordering::Acquire) {
             return;
         }
-        let mut current_gen = shared.generation.load(Ordering::Acquire);
+        let mut current_gen = shared.generation.0.load(Ordering::Acquire);
         if current_gen == last_gen {
             for _ in 0..SPIN_ITERATIONS {
-                if shared.shutdown.load(Ordering::Acquire) {
+                if shared.shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                current_gen = shared.generation.load(Ordering::Acquire);
-                if current_gen != last_gen {
+                if shared.generation.0.load(Ordering::Relaxed) != last_gen {
+                    current_gen = shared.generation.0.load(Ordering::Acquire);
                     break;
                 }
                 std::hint::spin_loop();
             }
         }
         if current_gen == last_gen {
-            shared.parked_count.fetch_add(1, Ordering::SeqCst);
+            shared.parked_count.0.fetch_add(1, Ordering::SeqCst);
             let mut guard = lock_unpoisoned(&shared.park_mutex);
             while !shared.shutdown.load(Ordering::SeqCst) {
-                current_gen = shared.generation.load(Ordering::SeqCst);
+                current_gen = shared.generation.0.load(Ordering::SeqCst);
                 if current_gen != last_gen {
                     break;
                 }
                 guard = wait_unpoisoned(&shared.park_cv, guard);
             }
-            shared.parked_count.fetch_sub(1, Ordering::SeqCst);
+            shared.parked_count.0.fetch_sub(1, Ordering::SeqCst);
             drop(guard);
             if shared.shutdown.load(Ordering::Acquire) {
                 return;
             }
         }
         last_gen = current_gen;
+        if !shared.try_claim_slot_for_gen(current_gen) {
+            continue;
+        }
         // SAFETY: `task` was published prior to incrementing `generation` and
         // stays valid until `workers_remaining` drops to zero below.
         let task = unsafe { *shared.task.get() };
@@ -192,8 +228,11 @@ fn worker_loop(shared: &Shared) {
             if panic_guard.is_none() {
                 *panic_guard = Some(payload);
             }
+            shared.has_panic.store(true, Ordering::Release);
         }
-        if shared.workers_remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+        if shared.workers_remaining.0.fetch_sub(1, Ordering::SeqCst) == 1
+            && shared.done_waiting.0.load(Ordering::SeqCst)
+        {
             let _done_guard = lock_unpoisoned(&shared.done_mutex);
             shared.done_cv.notify_all();
         }
@@ -208,18 +247,20 @@ struct ScopeGuard<'a> {
 
 impl Drop for ScopeGuard<'_> {
     fn drop(&mut self) {
-        if self.shared.workers_remaining.load(Ordering::Acquire) != 0 {
+        if self.shared.workers_remaining.0.load(Ordering::Acquire) != 0 {
             for _ in 0..SPIN_ITERATIONS {
-                if self.shared.workers_remaining.load(Ordering::Acquire) == 0 {
+                if self.shared.workers_remaining.0.load(Ordering::Relaxed) == 0 {
                     break;
                 }
                 std::hint::spin_loop();
             }
-            if self.shared.workers_remaining.load(Ordering::Acquire) != 0 {
+            if self.shared.workers_remaining.0.load(Ordering::Acquire) != 0 {
                 let mut guard = lock_unpoisoned(&self.shared.done_mutex);
-                while self.shared.workers_remaining.load(Ordering::Acquire) != 0 {
+                self.shared.done_waiting.0.store(true, Ordering::SeqCst);
+                while self.shared.workers_remaining.0.load(Ordering::SeqCst) != 0 {
                     guard = wait_unpoisoned(&self.shared.done_cv, guard);
                 }
+                self.shared.done_waiting.0.store(false, Ordering::Release);
             }
         }
         self.shared.num_chunks.store(0, Ordering::Release);
@@ -230,9 +271,12 @@ impl Drop for ScopeGuard<'_> {
         // SAFETY: No worker can access `task` after reporting completion.
         unsafe { *self.shared.task.get() = TaskPtr::default() };
         IN_ROW_POOL.with(|flag| flag.set(self.previous_in_pool));
-        if !std::thread::panicking() {
+        if self.shared.has_panic.load(Ordering::Acquire) {
+            self.shared.has_panic.store(false, Ordering::Release);
             let panic_payload = lock_unpoisoned(&self.shared.panic_slot).take();
-            if let Some(payload) = panic_payload {
+            if !std::thread::panicking()
+                && let Some(payload) = panic_payload
+            {
                 std::panic::resume_unwind(payload);
             }
         }
@@ -313,6 +357,18 @@ impl NativeRowWorkerPool {
             prev
         });
 
+        let active_bg = chunk_count.saturating_sub(1).min(bg_count);
+        let next_gen = match self
+            .shared
+            .generation
+            .0
+            .load(Ordering::Relaxed)
+            .wrapping_add(1)
+            & GEN_MASK
+        {
+            0 => 1,
+            g => g,
+        };
         let task = TaskPtr {
             call: call_closure::<F>,
             env: (&raw const *compute).cast::<()>(),
@@ -320,10 +376,15 @@ impl NativeRowWorkerPool {
         // SAFETY: Previous generation completed (`workers_remaining == 0`).
         unsafe { *self.shared.task.get() = task };
         self.shared.num_chunks.store(chunk_count, Ordering::Release);
-        self.shared.next_chunk.store(0, Ordering::Release);
+        self.shared.next_chunk.0.store(0, Ordering::Release);
+        self.shared
+            .dispatch_state
+            .0
+            .store((next_gen << GEN_SHIFT) | active_bg, Ordering::Release);
         self.shared
             .workers_remaining
-            .store(bg_count, Ordering::SeqCst);
+            .0
+            .store(active_bg, Ordering::SeqCst);
 
         let _guard = ScopeGuard {
             shared: &self.shared,
@@ -331,10 +392,17 @@ impl NativeRowWorkerPool {
             chunks_written: chunk_count,
         };
 
-        self.shared.generation.fetch_add(1, Ordering::SeqCst);
-        if self.shared.parked_count.load(Ordering::SeqCst) > 0 {
+        self.shared.generation.0.store(next_gen, Ordering::SeqCst);
+        let parked = self.shared.parked_count.0.load(Ordering::SeqCst);
+        if parked > 0 && active_bg > 0 {
             let _park = lock_unpoisoned(&self.shared.park_mutex);
-            self.shared.park_cv.notify_all();
+            if active_bg >= parked {
+                self.shared.park_cv.notify_all();
+            } else {
+                for _ in 0..active_bg {
+                    self.shared.park_cv.notify_one();
+                }
+            }
         }
 
         self.shared.drain_chunks(task);
@@ -379,5 +447,94 @@ impl Drop for NativeRowWorkerPool {
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_hot_atomics_are_cache_line_padded() {
+        assert_eq!(align_of::<CachePadded<AtomicUsize>>(), 64);
+        assert_eq!(align_of::<CachePadded<AtomicBool>>(), 64);
+    }
+
+    #[test]
+    fn partial_active_workers_and_park_wake_cycles_complete_accurately() -> io::Result<()> {
+        let pool = NativeRowWorkerPool::new(8, "test-partial-row")?;
+        let mut out = vec![0.0_f32; 128];
+        for active in [1_usize, 2, 3, 5, 8, 2, 4] {
+            out.fill(0.0);
+            pool.run_aligned(&mut out, active, 4, &|offset, slice| {
+                for (i, slot) in slice.iter_mut().enumerate() {
+                    *slot = u16::try_from(offset + i + active).map_or(0.0, f32::from);
+                }
+            });
+            for (idx, &val) in out.iter().enumerate() {
+                let expected = u16::try_from(idx + active).map_or(0.0, f32::from);
+                assert_eq!(val.to_bits(), expected.to_bits());
+            }
+        }
+        // Let workers park, then wake only a subset.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        out.fill(0.0);
+        pool.run_aligned(&mut out, 2, 8, &|offset, slice| {
+            for (i, slot) in slice.iter_mut().enumerate() {
+                *slot = u16::try_from(offset + i + 10).map_or(0.0, f32::from);
+            }
+        });
+        for (idx, &val) in out.iter().enumerate() {
+            let expected = u16::try_from(idx + 10).map_or(0.0, f32::from);
+            assert_eq!(val.to_bits(), expected.to_bits());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn worker_panic_sets_has_panic_and_recovers_cleanly() -> io::Result<()> {
+        let pool = NativeRowWorkerPool::new(4, "test-panic-row")?;
+        let coordinator_id = std::thread::current().id();
+        let mut out = vec![0.0_f32; 32];
+        // Warm up workers so they are spinning, then force a background worker to run a chunk and panic.
+        pool.run_aligned(&mut out, 4, 8, &|_, _| {});
+        // Worker-only panic: coordinator returns normally into ScopeGuard::drop and resumes the worker panic.
+        let worker_res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            pool.run_aligned(&mut out, 4, 8, &|offset, _slice| {
+                if std::thread::current().id() == coordinator_id {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                } else {
+                    assert!(
+                        std::thread::current().id() == coordinator_id,
+                        "deliberate worker panic at offset {offset}"
+                    );
+                }
+            });
+        }));
+        assert!(worker_res.is_err());
+        assert!(!pool.shared.has_panic.load(Ordering::Acquire));
+
+        // Coordinator + worker panic: ScopeGuard::drop still clears has_panic/panic_slot when unwinding.
+        let coord_res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            pool.run_aligned(&mut out, 4, 8, &|offset, _slice| {
+                assert!(offset == 0, "deliberate panic at offset {offset}");
+            });
+        }));
+        assert!(coord_res.is_err());
+        assert!(!pool.shared.has_panic.load(Ordering::Acquire));
+
+        out.fill(0.0);
+        pool.run_aligned(&mut out, 4, 8, &|offset, slice| {
+            for (i, slot) in slice.iter_mut().enumerate() {
+                *slot = u16::try_from(offset + i).map_or(0.0, f32::from);
+            }
+        });
+        for (idx, &val) in out.iter().enumerate() {
+            assert_eq!(
+                val.to_bits(),
+                u16::try_from(idx).map_or(0.0, f32::from).to_bits()
+            );
+        }
+        Ok(())
     }
 }
