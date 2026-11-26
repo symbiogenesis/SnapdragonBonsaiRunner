@@ -30,6 +30,8 @@ struct Cached {
 struct Cooldown {
     until: u64,
     failures: u32,
+    #[serde(default)]
+    offline: bool,
 }
 
 fn now() -> u64 {
@@ -250,16 +252,33 @@ fn request_headers(cached: Option<&Cached>) -> Vec<(String, String)> {
     headers
 }
 
+fn cooldown_error(cooldown: &Cooldown) -> String {
+    if cooldown.offline {
+        format!(
+            "{} GitHub update requests are paused until Unix time {} after a network failure. Your installed app is unchanged.",
+            crate::https_transfer::OFFLINE_PREFIX,
+            cooldown.until
+        )
+    } else {
+        format!(
+            "GitHub update requests are paused until Unix time {} after a server or network failure. Your installed app is unchanged.",
+            cooldown.until
+        )
+    }
+}
+
 fn record_failure(
     root: &Path,
     headers: &BTreeMap<String, String>,
     previous: &Cooldown,
+    offline: bool,
 ) -> crate::Result<()> {
     store_cooldown(
         root,
         &Cooldown {
             until: cooldown_delay(headers, now(), previous.failures),
             failures: previous.failures.saturating_add(1),
+            offline,
         },
     )
 }
@@ -302,10 +321,7 @@ pub(super) fn metadata(
     }
     let cooldown = load_cooldown(&root);
     if cooldown.until > now() {
-        return Err(format!(
-            "GitHub update requests are paused until Unix time {} after a server or network failure. Your installed app is unchanged.",
-            cooldown.until
-        ));
+        return Err(cooldown_error(&cooldown));
     }
     let result = crate::https_transfer::metadata(
         url,
@@ -316,14 +332,19 @@ pub(super) fn metadata(
     let response = match result {
         Ok(response) => response,
         Err(error) => {
-            record_failure(&root, &BTreeMap::new(), &cooldown)?;
+            record_failure(
+                &root,
+                &BTreeMap::new(),
+                &cooldown,
+                crate::https_transfer::is_offline_message(&error),
+            )?;
             return Err(error);
         }
     };
     let body = match response_body(&response, cached.as_ref()) {
         Ok(body) => body,
         Err(error) => {
-            record_failure(&root, &response.headers, &cooldown)?;
+            record_failure(&root, &response.headers, &cooldown, false)?;
             return Err(error);
         }
     };
@@ -549,5 +570,23 @@ mod tests {
         fs::remove_file(root.join("releases-1.body")).map_err(|error| error.to_string())?;
         fs::remove_file(root.join("releases-1.json")).map_err(|error| error.to_string())?;
         fs::remove_dir(root).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn cooldown_preserves_legacy_schema_and_offline_classification() -> crate::Result<()> {
+        let legacy: Cooldown = serde_json::from_str(r#"{"until":1234,"failures":2}"#)
+            .map_err(|error| error.to_string())?;
+        assert!(!legacy.offline);
+        let server_message = cooldown_error(&legacy);
+        assert!(!crate::https_transfer::is_offline_message(&server_message));
+
+        let offline = Cooldown {
+            until: 1234,
+            failures: 1,
+            offline: true,
+        };
+        let offline_message = cooldown_error(&offline);
+        assert!(crate::https_transfer::is_offline_message(&offline_message));
+        Ok(())
     }
 }

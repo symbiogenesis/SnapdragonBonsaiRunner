@@ -235,6 +235,70 @@ fn agent() -> Agent {
     })
 }
 
+pub(crate) const OFFLINE_PREFIX: &str = "No internet connection:";
+
+fn is_network_offline_io(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkDown
+            | std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    ) {
+        return true;
+    }
+    // Windows `getaddrinfo` failures arrive as `ErrorKind::Uncategorized` with
+    // localized OS text, so match the Winsock error codes directly.
+    matches!(
+        error.raw_os_error(),
+        Some(
+            10050
+                | 10051
+                | 10052
+                | 10053
+                | 10054
+                | 10057
+                | 10060
+                | 10061
+                | 10064
+                | 10065
+                | 11001
+                | 11002
+                | 11003
+                | 11004
+        )
+    )
+}
+
+fn is_network_offline_error(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed
+        | ureq::Error::ConnectProxyFailed(_)
+        | ureq::Error::Timeout(_) => true,
+        ureq::Error::Io(io_error) => is_network_offline_io(io_error),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_offline_message(error: &str) -> bool {
+    error.starts_with(OFFLINE_PREFIX)
+        || error == "Native HTTPS operation exceeded its aggregate allowance."
+}
+
+fn read_error(error: &std::io::Error) -> String {
+    if is_network_offline_io(error) {
+        format!("{OFFLINE_PREFIX} Native HTTPS read failed: {error}")
+    } else {
+        error.to_string()
+    }
+}
+
 fn get(
     agent: &Agent,
     uri: &str,
@@ -251,9 +315,13 @@ fn get(
     for (name, value) in headers {
         request = request.header(name, value);
     }
-    request
-        .call()
-        .map_err(|e| format!("Native HTTPS request failed: {e}"))
+    request.call().map_err(|e| {
+        if is_network_offline_error(&e) {
+            format!("{OFFLINE_PREFIX} Native HTTPS request failed: {e}")
+        } else {
+            format!("Native HTTPS request failed: {e}")
+        }
+    })
 }
 
 fn response_headers(response: &http::Response<Body>) -> crate::Result<BTreeMap<String, String>> {
@@ -325,7 +393,7 @@ fn metadata_with_redirects(
         let mut buffer = [0; 16 * 1024];
         loop {
             active(until, cancelled)?;
-            let count = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+            let count = reader.read(&mut buffer).map_err(|e| read_error(&e))?;
             active(until, cancelled)?;
             if count == 0 {
                 break;
@@ -482,7 +550,7 @@ fn download_with_mode(
     let mut reader = response.body_mut().as_reader();
     loop {
         active(until, cancelled)?;
-        let count = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        let count = reader.read(&mut buffer).map_err(|e| read_error(&e))?;
         active(until, cancelled)?;
         if count == 0 {
             break;
@@ -611,7 +679,7 @@ fn fetch_range_with(
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         active(until, cancelled)?;
-        let count = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        let count = reader.read(&mut buffer).map_err(|e| read_error(&e))?;
         active(until, cancelled)?;
         if count == 0 {
             break;
@@ -1217,5 +1285,51 @@ mod tests {
             assert!(err.is_err(), "Expected failure for range response");
         }
         Ok(())
+    }
+
+    #[test]
+    fn offline_network_errors_are_classified_without_masking_http_or_tls_failures() {
+        assert!(is_network_offline_error(&ureq::Error::HostNotFound));
+        assert!(is_network_offline_error(&ureq::Error::ConnectionFailed));
+        assert!(is_network_offline_error(&ureq::Error::ConnectProxyFailed(
+            "proxy unreachable".into()
+        )));
+        assert!(is_network_offline_error(&ureq::Error::Timeout(
+            ureq::Timeout::Global
+        )));
+        for code in [11001, 10051, 10065] {
+            let io_error = std::io::Error::from_raw_os_error(code);
+            assert!(is_network_offline_io(&io_error));
+            assert!(is_network_offline_error(&ureq::Error::Io(io_error)));
+        }
+        assert!(is_network_offline_io(&std::io::Error::new(
+            std::io::ErrorKind::NetworkUnreachable,
+            "unreachable"
+        )));
+        assert!(!is_network_offline_io(&std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt payload"
+        )));
+        assert!(!is_network_offline_error(&ureq::Error::StatusCode(403)));
+        assert!(!is_network_offline_error(&ureq::Error::BadUri(
+            "bad".into()
+        )));
+        assert!(!is_network_offline_error(&ureq::Error::Tls(
+            "handshake failed"
+        )));
+
+        assert!(is_offline_message(
+            "No internet connection: Native HTTPS request failed: host not found"
+        ));
+        assert!(is_offline_message(
+            "Native HTTPS operation exceeded its aggregate allowance."
+        ));
+        assert!(!is_offline_message(
+            "Native HTTPS request failed: tls handshake failed"
+        ));
+        assert!(!is_offline_message("Native HTTPS operation cancelled."));
+        assert!(!is_offline_message(
+            "GitHub update check failed (HTTP 403). Your installed app is unchanged."
+        ));
     }
 }
