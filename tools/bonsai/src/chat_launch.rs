@@ -421,6 +421,48 @@ impl Request {
         }
     }
 
+    fn calibrated_pq2_profile_and_options(
+        &self,
+    ) -> (
+        bonsai_cpu_policy::context::SwiftContextProfile,
+        bonsai_cpu_policy::context::SwiftCalibratedOptions,
+    ) {
+        use bonsai_cpu_policy::context::{
+            SwiftCalibratedOptions, SwiftCalibratedReuse, SwiftContextProfile, SwiftWeightPacking,
+        };
+
+        let profile = match self.kv_cache {
+            None | Some(KvCache::Rsq4 | KvCache::Rsq4Kvf) => SwiftContextProfile::NativeRsq4Full,
+            Some(KvCache::Rsq4K3v) => SwiftContextProfile::NativeRsq4K3v,
+            Some(KvCache::F16) => SwiftContextProfile::NativeF16,
+        };
+        let checkpoints = self.prompt_reuse_checkpoints.unwrap_or(1);
+        let prompt_reuse = match self.prompt_reuse {
+            None | Some(PromptReuse::Disabled) => SwiftCalibratedReuse::Disabled,
+            Some(PromptReuse::Latest) => SwiftCalibratedReuse::Latest {
+                checkpoints,
+                checkpoint_bytes: self.prompt_reuse_checkpoint_bytes,
+            },
+            Some(PromptReuse::PromptEndAndLatest) => SwiftCalibratedReuse::PromptEndAndLatest {
+                checkpoints,
+                checkpoint_bytes: self.prompt_reuse_checkpoint_bytes,
+            },
+        };
+        let speculation_tokens = (self.spec_type == Some(SpeculationType::Suffix))
+            .then_some(self.draft_max.unwrap_or(4));
+        (
+            profile,
+            SwiftCalibratedOptions {
+                weight_packing: SwiftWeightPacking::Bonsai25Pq2,
+                request_vision: !self.no_mmproj,
+                prefill_tokens: self.cpu_prefill_tokens.map(usize::from),
+                chunkwise_gdn_wy_f32: self.cpu_prefill_gdn == Some(CpuPrefillGdn::WyF32),
+                speculation_tokens,
+                prompt_reuse,
+            },
+        )
+    }
+
     const fn native_row_workers(&self) -> u8 {
         self.native_row_workers_for_family(None)
     }
@@ -674,15 +716,62 @@ fn observed_host_family() -> Option<bonsai_cpu_policy::hardware::SnapdragonFamil
     }
 }
 
+fn observed_host_memory() -> Option<bonsai_cpu_policy::Bonsai25MemorySnapshot> {
+    #[cfg(windows)]
+    {
+        bonsai_windows_process::memory_status().ok().map(|status| {
+            bonsai_cpu_policy::Bonsai25MemorySnapshot {
+                total_physical_bytes: status.total_physical_bytes,
+                available_physical_bytes: status.available_physical_bytes,
+            }
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn is_ordinary_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.is_file() && !bonsai_artifacts::is_redirect(&metadata))
+}
+
+fn cached_bonsai25_variants(data_directory: &Path) -> bonsai_cpu_policy::Bonsai25CachedVariants {
+    let has_variant = |variant| {
+        bonsai_cpu_policy::bonsai25_model_artifact(data_directory, variant)
+            .ok()
+            .is_some_and(|artifact| {
+                is_ordinary_file(&artifact.path)
+                    || is_ordinary_file(&artifact.path.with_added_extension("partial"))
+            })
+    };
+    bonsai_cpu_policy::Bonsai25CachedVariants {
+        pq2_present: has_variant(bonsai_cpu_policy::Bonsai25Variant::Pq2),
+        ptq1_present: has_variant(bonsai_cpu_policy::Bonsai25Variant::Ptq1),
+    }
+}
+
 #[cfg(test)]
 fn prepare(request: Request, native_host: bool) -> crate::Result<Plan> {
     prepare_for_family(request, native_host, None)
 }
 
+#[cfg(test)]
 fn prepare_for_family(
+    request: Request,
+    native_host: bool,
+    family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
+) -> crate::Result<Plan> {
+    prepare_for_host(request, native_host, family, None)
+}
+
+fn prepare_for_host(
     mut request: Request,
     native_host: bool,
     family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
+    memory: Option<bonsai_cpu_policy::Bonsai25MemorySnapshot>,
 ) -> crate::Result<Plan> {
     request.validate_native_runtime(family)?;
     if !request.speech_models_only && !native_host {
@@ -731,6 +820,16 @@ fn prepare_for_family(
         return Err("NoTts cannot be combined with TtsKeyFile.".into());
     }
     validate_paths(&request)?;
+    if request.native_engine
+        && request.nariq_variant.is_none()
+        && request.bonsai25_variant.is_none()
+    {
+        let (profile, options) = request.calibrated_pq2_profile_and_options();
+        let cached = cached_bonsai25_variants(&request.data_directory);
+        request.bonsai25_variant = Some(bonsai_cpu_policy::select_default_bonsai25_variant(
+            memory, cached, profile, options, false,
+        ));
+    }
     let own_canary = request.canary_key_file.is_none() && !request.no_speech_models;
     let own_tts = request.tts_key_file.is_none() && !request.no_tts && !request.no_speech_models;
     if !own_tts && (request.tts_quantization != "Q8_0" || request.tts_threads != 0) {
@@ -1571,10 +1670,11 @@ pub fn run(value: Value) -> crate::Result<Value> {
         };
         Some(guard)
     };
-    let plan = prepare_for_family(
+    let plan = prepare_for_host(
         request,
         cfg!(all(windows, target_arch = "aarch64")),
         observed_host_family(),
+        observed_host_memory(),
     )?;
     let working = working_directory(plan.request.working_directory.as_deref())?;
     if plan.request.speech_models_only {
@@ -1604,10 +1704,11 @@ pub fn run(value: Value) -> crate::Result<Value> {
 pub fn prepare_run(value: Value) -> crate::Result<Value> {
     crate::startup_cancel::checkpoint()?;
     let request: Request = serde_json::from_value(value).map_err(|error| error.to_string())?;
-    let plan = prepare_for_family(
+    let plan = prepare_for_host(
         request,
         cfg!(all(windows, target_arch = "aarch64")),
         observed_host_family(),
+        observed_host_memory(),
     )?;
     if plan.request.speech_models_only {
         return Err("Use chat-launch for SpeechModelsOnly provisioning.".into());

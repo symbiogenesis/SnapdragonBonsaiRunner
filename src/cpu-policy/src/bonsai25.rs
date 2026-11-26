@@ -111,6 +111,95 @@ impl std::str::FromStr for Bonsai25Variant {
     }
 }
 
+/// Maximum installed/OS-usable physical memory (`18 GiB`) classified as
+/// structurally super memory-constrained for `PQ2_0` on first load, catching
+/// `16 GiB` devices without affecting `24`/`32`/`48 GiB` machines.
+pub const BONSAI25_PTQ1_AUTO_TOTAL_PHYSICAL_MAX_BYTES: u64 = 18 * 1024 * 1024 * 1024;
+
+/// Host physical RAM snapshot used to select a default Bonsai 2.5 variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bonsai25MemorySnapshot {
+    /// OS-usable physical memory in bytes.
+    pub total_physical_bytes: u64,
+    /// Physical memory currently available to the system in bytes.
+    pub available_physical_bytes: u64,
+}
+
+/// On-disk presence of pinned Bonsai 2.5 `GGUF` variants in the data folder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bonsai25CachedVariants {
+    /// Whether `Ternary-Bonsai-2.5-27B-PQ2_0.gguf` (or an active partial) is present.
+    pub pq2_present: bool,
+    /// Whether `Ternary-Bonsai-2.5-27B-PTQ1_0.gguf` (or an active partial) is present.
+    pub ptq1_present: bool,
+}
+
+/// Returns whether a host RAM snapshot is super memory-constrained for `PQ2_0`
+/// under the selected native runtime profile and calibrated options.
+///
+/// Hosts with `<= 18 GiB` total usable RAM or insufficient currently available
+/// RAM to admit `PQ2_0`'s minimum calibrated context (`MIN_CONTEXT_TOKENS`)
+/// classify as super memory-constrained. Invalid option combinations never
+/// classify as memory pressure.
+#[must_use]
+pub fn is_super_memory_constrained_for_pq2(
+    memory: Bonsai25MemorySnapshot,
+    profile: crate::context::SwiftContextProfile,
+    mut pq2_options: crate::context::SwiftCalibratedOptions,
+    allow_tile_64: bool,
+) -> bool {
+    pq2_options.weight_packing = crate::context::SwiftWeightPacking::Bonsai25Pq2;
+    if crate::context::SwiftContextPlan::for_calibrated_execution_with_tile_64(
+        u64::MAX / 2,
+        profile,
+        pq2_options,
+        allow_tile_64,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    if memory.total_physical_bytes <= BONSAI25_PTQ1_AUTO_TOTAL_PHYSICAL_MAX_BYTES {
+        return true;
+    }
+    crate::context::SwiftContextPlan::for_calibrated_execution_with_tile_64(
+        memory.available_physical_bytes,
+        profile,
+        pq2_options,
+        allow_tile_64,
+    )
+    .is_err()
+}
+
+/// Selects the default Bonsai 2.5 variant when the user omitted `--bonsai-2-5`.
+///
+/// Preserves an existing single-variant local cache so live memory changes
+/// never force a multi-gigabyte re-download, while first loads (or caches with
+/// both variants present) automatically select `Ptq1` when `memory` shows a
+/// super memory-constrained host and `Pq2` otherwise.
+#[must_use]
+pub fn select_default_bonsai25_variant(
+    memory: Option<Bonsai25MemorySnapshot>,
+    cached: Bonsai25CachedVariants,
+    profile: crate::context::SwiftContextProfile,
+    pq2_options: crate::context::SwiftCalibratedOptions,
+    allow_tile_64: bool,
+) -> Bonsai25Variant {
+    match (cached.pq2_present, cached.ptq1_present) {
+        (true, false) => Bonsai25Variant::Pq2,
+        (false, true) => Bonsai25Variant::Ptq1,
+        (false, false) | (true, true) => {
+            if memory.is_some_and(|snapshot| {
+                is_super_memory_constrained_for_pq2(snapshot, profile, pq2_options, allow_tile_64)
+            }) {
+                Bonsai25Variant::Ptq1
+            } else {
+                Bonsai25Variant::Pq2
+            }
+        }
+    }
+}
+
 /// Verified compiled provenance and lexical path for a Ternary Bonsai 2.5 27B `GGUF` artifact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bonsai25ModelArtifact {
@@ -490,6 +579,228 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_default_selects_ptq1_when_super_memory_constrained_and_respects_cache()
+    -> Result<(), String> {
+        use crate::context::{
+            SwiftCalibratedOptions, SwiftCalibratedReuse, SwiftContextPlan, SwiftContextProfile,
+            SwiftWeightPacking,
+        };
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let options = SwiftCalibratedOptions {
+            weight_packing: SwiftWeightPacking::Bonsai25Pq2,
+            request_vision: true,
+            prefill_tokens: Some(16),
+            chunkwise_gdn_wy_f32: true,
+            speculation_tokens: None,
+            prompt_reuse: SwiftCalibratedReuse::PromptEndAndLatest {
+                checkpoints: 1,
+                checkpoint_bytes: None,
+            },
+        };
+        let profile = SwiftContextProfile::NativeRsq4Full;
+        let min_probe_options = SwiftCalibratedOptions {
+            request_vision: false,
+            ..options
+        };
+        let min_pq2_threshold = {
+            let mut probe = 15 * GIB;
+            while SwiftContextPlan::for_calibrated_execution(probe, profile, min_probe_options)
+                .is_ok()
+            {
+                probe -= 64 * 1024 * 1024;
+            }
+            probe += 1;
+            while SwiftContextPlan::for_calibrated_execution(probe, profile, min_probe_options)
+                .is_err()
+            {
+                probe += 1;
+            }
+            probe
+        };
+        assert!(
+            SwiftContextPlan::for_calibrated_execution(
+                min_pq2_threshold - 1,
+                profile,
+                min_probe_options,
+            )
+            .is_err()
+        );
+        assert!(
+            SwiftContextPlan::for_calibrated_execution(
+                min_pq2_threshold,
+                profile,
+                min_probe_options,
+            )
+            .is_ok()
+        );
+
+        // 16 GiB devices always flip to PTQ1 on first load even if available RAM looks close.
+        assert_eq!(
+            select_default_bonsai25_variant(
+                Some(Bonsai25MemorySnapshot {
+                    total_physical_bytes: 16 * GIB,
+                    available_physical_bytes: 15 * GIB,
+                }),
+                Bonsai25CachedVariants::default(),
+                profile,
+                options,
+                false,
+            ),
+            Bonsai25Variant::Ptq1
+        );
+
+        // 32 GiB X1 / 48 GiB X2 with healthy available RAM select PQ2 on first load.
+        for total in [32 * GIB, 48 * GIB] {
+            assert_eq!(
+                select_default_bonsai25_variant(
+                    Some(Bonsai25MemorySnapshot {
+                        total_physical_bytes: total,
+                        available_physical_bytes: 20 * GIB,
+                    }),
+                    Bonsai25CachedVariants::default(),
+                    profile,
+                    options,
+                    false,
+                ),
+                Bonsai25Variant::Pq2
+            );
+        }
+
+        // Exact boundary on >18 GiB machine: min_pq2_threshold - 1 triggers PTQ1, min_pq2_threshold stays PQ2.
+        assert_eq!(
+            select_default_bonsai25_variant(
+                Some(Bonsai25MemorySnapshot {
+                    total_physical_bytes: 32 * GIB,
+                    available_physical_bytes: min_pq2_threshold - 1,
+                }),
+                Bonsai25CachedVariants::default(),
+                profile,
+                min_probe_options,
+                false,
+            ),
+            Bonsai25Variant::Ptq1
+        );
+        assert_eq!(
+            select_default_bonsai25_variant(
+                Some(Bonsai25MemorySnapshot {
+                    total_physical_bytes: 32 * GIB,
+                    available_physical_bytes: min_pq2_threshold,
+                }),
+                Bonsai25CachedVariants::default(),
+                profile,
+                min_probe_options,
+                false,
+            ),
+            Bonsai25Variant::Pq2
+        );
+
+        // Constrained 32 GiB host (e.g. heavy background apps) selects PTQ1 on first load.
+        let constrained_snapshot = Bonsai25MemorySnapshot {
+            total_physical_bytes: 32 * GIB,
+            available_physical_bytes: 11 * GIB,
+        };
+        let constrained = Some(constrained_snapshot);
+        assert!(is_super_memory_constrained_for_pq2(
+            constrained_snapshot,
+            profile,
+            options,
+            false
+        ));
+        assert_eq!(
+            select_default_bonsai25_variant(
+                constrained,
+                Bonsai25CachedVariants::default(),
+                profile,
+                options,
+                false,
+            ),
+            Bonsai25Variant::Ptq1
+        );
+
+        // Single-variant cache stickiness avoids surprise 6-7 GB re-downloads.
+        assert_eq!(
+            select_default_bonsai25_variant(
+                constrained,
+                Bonsai25CachedVariants {
+                    pq2_present: true,
+                    ptq1_present: false,
+                },
+                profile,
+                options,
+                false,
+            ),
+            Bonsai25Variant::Pq2
+        );
+        assert_eq!(
+            select_default_bonsai25_variant(
+                Some(Bonsai25MemorySnapshot {
+                    total_physical_bytes: 48 * GIB,
+                    available_physical_bytes: 40 * GIB,
+                }),
+                Bonsai25CachedVariants {
+                    pq2_present: false,
+                    ptq1_present: true,
+                },
+                profile,
+                options,
+                false,
+            ),
+            Bonsai25Variant::Ptq1
+        );
+
+        // Both cached: follow live memory constraint check.
+        assert_eq!(
+            select_default_bonsai25_variant(
+                constrained,
+                Bonsai25CachedVariants {
+                    pq2_present: true,
+                    ptq1_present: true,
+                },
+                profile,
+                options,
+                false,
+            ),
+            Bonsai25Variant::Ptq1
+        );
+        assert_eq!(
+            select_default_bonsai25_variant(
+                Some(Bonsai25MemorySnapshot {
+                    total_physical_bytes: 48 * GIB,
+                    available_physical_bytes: 40 * GIB,
+                }),
+                Bonsai25CachedVariants {
+                    pq2_present: true,
+                    ptq1_present: true,
+                },
+                profile,
+                options,
+                false,
+            ),
+            Bonsai25Variant::Pq2
+        );
+
+        // Missing memory observation defaults safely to PQ2; invalid profile never claims pressure.
+        assert_eq!(
+            select_default_bonsai25_variant(
+                None,
+                Bonsai25CachedVariants::default(),
+                profile,
+                options,
+                false,
+            ),
+            Bonsai25Variant::Pq2
+        );
+        assert!(!is_super_memory_constrained_for_pq2(
+            constrained_snapshot,
+            SwiftContextProfile::PublisherF16,
+            options,
+            false,
+        ));
         Ok(())
     }
 }

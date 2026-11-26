@@ -206,6 +206,24 @@ struct VerifiedLaunchGuards {
     )>,
 }
 
+fn is_ordinary_file(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.is_file() && !bonsai_artifacts::is_redirect(&metadata))
+}
+
+fn cached_bonsai25_variants(data: &std::path::Path) -> bonsai_cpu_policy::Bonsai25CachedVariants {
+    let has_variant = |variant| {
+        bonsai_cpu_policy::bonsai25_model_artifact(data, variant)
+            .ok()
+            .is_some_and(|artifact| is_ordinary_file(&artifact.path))
+    };
+    bonsai_cpu_policy::Bonsai25CachedVariants {
+        pq2_present: has_variant(bonsai_cpu_policy::Bonsai25Variant::Pq2),
+        ptq1_present: has_variant(bonsai_cpu_policy::Bonsai25Variant::Ptq1),
+    }
+}
+
 impl LaunchConfig {
     /// Parse the launcher arguments, including an explicit containment selection.
     ///
@@ -216,7 +234,8 @@ impl LaunchConfig {
     }
 
     /// Parse the launcher arguments using the observed Windows ARM64 host family
-    /// when `--native-row-workers` is omitted.
+    /// and physical RAM snapshot when `--native-row-workers` or `--bonsai-2-5`
+    /// is omitted.
     ///
     /// # Errors
     /// Rejects unknown/repeated options, nondecimal ports and missing opt-ins.
@@ -231,7 +250,13 @@ impl LaunchConfig {
                     &host.processor_name,
                 )
             });
-        Self::parse_for_family(args, family)
+        let memory = bonsai_windows_process::memory_status().ok().map(|status| {
+            bonsai_cpu_policy::Bonsai25MemorySnapshot {
+                total_physical_bytes: status.total_physical_bytes,
+                available_physical_bytes: status.available_physical_bytes,
+            }
+        });
+        Self::parse_for_host(args, family, memory)
     }
 
     /// Parse the launcher arguments using an explicit Snapdragon host family for
@@ -242,6 +267,20 @@ impl LaunchConfig {
     pub fn parse_for_family(
         args: impl IntoIterator<Item = OsString>,
         family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
+    ) -> Result<Self, LaunchError> {
+        Self::parse_for_host(args, family, None)
+    }
+
+    /// Parse the launcher arguments using an explicit Snapdragon host family
+    /// and host physical RAM snapshot for default worker and Bonsai 2.5 variant
+    /// selection.
+    ///
+    /// # Errors
+    /// Rejects unknown/repeated options, nondecimal ports and missing opt-ins.
+    pub fn parse_for_host(
+        args: impl IntoIterator<Item = OsString>,
+        family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
+        memory: Option<bonsai_cpu_policy::Bonsai25MemorySnapshot>,
     ) -> Result<Self, LaunchError> {
         fn set_flag(slot: &mut bool) -> Result<(), LaunchError> {
             if *slot {
@@ -430,7 +469,7 @@ impl LaunchConfig {
             cpu_family,
         )?;
         let placement = crate::inference::pinned_placement(native_engine, placement)?;
-        let configuration = Self {
+        let mut configuration = Self {
             data: data.ok_or(LaunchError::Arguments)?,
             evidence_parent: evidence_parent.ok_or(LaunchError::Arguments)?,
             frontend_port,
@@ -469,6 +508,14 @@ impl LaunchConfig {
             },
         };
         configuration.validate_selection(nariq_variant.is_some() || bonsai25_variant.is_some())?;
+        if nariq_variant.is_none()
+            && bonsai25_variant.is_none()
+            && configuration.profile == LaunchProfile::SwiftPq2Assessment
+            && configuration.native_engine
+        {
+            let resolved = configuration.resolve_default_bonsai25_variant(memory)?;
+            configuration.weight_representation = WeightRepresentation::Bonsai25(resolved);
+        }
         if let Some(cache_dir) = &configuration.hexagon_arena_cache {
             validate_hexagon_arena_cache_dir(cache_dir)?;
         }
@@ -719,20 +766,13 @@ impl LaunchConfig {
         self.calibrated_context_plan_with_daisyrose(available_bytes, request_vision, 0)
     }
 
-    fn calibrated_context_plan_with_daisyrose(
+    fn swift_calibrated_options(
         &self,
-        available_bytes: u64,
+        weight_packing: bonsai_cpu_policy::context::SwiftWeightPacking,
         request_vision: bool,
-        daisyrose_reserve_bytes: u64,
-    ) -> Result<bonsai_cpu_policy::context::SwiftCalibratedPlan, LaunchError> {
-        use bonsai_cpu_policy::context::{
-            SwiftCalibratedOptions, SwiftCalibratedReuse, SwiftContextPlan, SwiftWeightPacking,
-        };
-        let weight_packing = match self.weight_representation {
-            WeightRepresentation::Source => SwiftWeightPacking::Pq2_0,
-            WeightRepresentation::NariQ(variant) => SwiftWeightPacking::from_nariq(variant),
-            WeightRepresentation::Bonsai25(variant) => SwiftWeightPacking::from_bonsai25(variant),
-        };
+    ) -> bonsai_cpu_policy::context::SwiftCalibratedOptions {
+        use bonsai_cpu_policy::context::{SwiftCalibratedOptions, SwiftCalibratedReuse};
+
         let checkpoints = self.prompt_reuse_checkpoints.unwrap_or(1);
         let checkpoint_bytes = self.prompt_reuse_checkpoint_bytes;
         let prompt_reuse = match self.prompt_reuse {
@@ -748,19 +788,54 @@ impl LaunchConfig {
                 }
             }
         };
+        SwiftCalibratedOptions {
+            weight_packing,
+            request_vision,
+            prefill_tokens: self.cpu_prefill_tokens.map(usize::from),
+            chunkwise_gdn_wy_f32: self
+                .cpu_prefill_gdn
+                .is_some_and(crate::inference::CpuPrefillGdn::is_wy_f32),
+            speculation_tokens: self.effective_speculation_tokens(),
+            prompt_reuse,
+        }
+    }
+
+    fn resolve_default_bonsai25_variant(
+        &self,
+        memory: Option<bonsai_cpu_policy::Bonsai25MemorySnapshot>,
+    ) -> Result<bonsai_cpu_policy::Bonsai25Variant, LaunchError> {
+        let cached = cached_bonsai25_variants(&self.data);
+        let profile = self.swift_context_profile()?;
+        let options = self.swift_calibrated_options(
+            bonsai_cpu_policy::context::SwiftWeightPacking::Bonsai25Pq2,
+            !self.no_mmproj,
+        );
+        let allow_tile_64 = crate::inference::prefill_tile_64_supported()?;
+        Ok(bonsai_cpu_policy::select_default_bonsai25_variant(
+            memory,
+            cached,
+            profile,
+            options,
+            allow_tile_64,
+        ))
+    }
+
+    fn calibrated_context_plan_with_daisyrose(
+        &self,
+        available_bytes: u64,
+        request_vision: bool,
+        daisyrose_reserve_bytes: u64,
+    ) -> Result<bonsai_cpu_policy::context::SwiftCalibratedPlan, LaunchError> {
+        use bonsai_cpu_policy::context::{SwiftContextPlan, SwiftWeightPacking};
+        let weight_packing = match self.weight_representation {
+            WeightRepresentation::Source => SwiftWeightPacking::Pq2_0,
+            WeightRepresentation::NariQ(variant) => SwiftWeightPacking::from_nariq(variant),
+            WeightRepresentation::Bonsai25(variant) => SwiftWeightPacking::from_bonsai25(variant),
+        };
         SwiftContextPlan::for_calibrated_execution_with_adapter_reserve_and_tile_64(
             available_bytes,
             self.swift_context_profile()?,
-            SwiftCalibratedOptions {
-                weight_packing,
-                request_vision,
-                prefill_tokens: self.cpu_prefill_tokens.map(usize::from),
-                chunkwise_gdn_wy_f32: self
-                    .cpu_prefill_gdn
-                    .is_some_and(crate::inference::CpuPrefillGdn::is_wy_f32),
-                speculation_tokens: self.effective_speculation_tokens(),
-                prompt_reuse,
-            },
+            self.swift_calibrated_options(weight_packing, request_vision),
             daisyrose_reserve_bytes,
             crate::inference::prefill_tile_64_supported()?,
         )
@@ -3726,6 +3801,113 @@ mod tests {
                 .native_row_workers,
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn host_memory_constraint_selects_ptq1_dynamically_while_respecting_cache_and_overrides()
+    -> Result<(), LaunchError> {
+        use bonsai_cpu_policy::{Bonsai25MemorySnapshot, Bonsai25Variant, bonsai25_model_artifact};
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let healthy = Some(Bonsai25MemorySnapshot {
+            total_physical_bytes: 32 * GIB,
+            available_physical_bytes: 20 * GIB,
+        });
+        let constrained_16g = Some(Bonsai25MemorySnapshot {
+            total_physical_bytes: 16 * GIB,
+            available_physical_bytes: 15 * GIB,
+        });
+        let constrained_32g = Some(Bonsai25MemorySnapshot {
+            total_physical_bytes: 32 * GIB,
+            available_physical_bytes: 11 * GIB,
+        });
+
+        let root =
+            std::env::temp_dir().join(format!("Bonsai-broker-dyn-ptq1-{}", std::process::id()));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).map_err(|_| LaunchError::Path)?;
+        }
+        std::fs::create_dir_all(&root).map_err(|_| LaunchError::Path)?;
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).map_err(|_| LaunchError::Path)?;
+
+        let make_args = |extra: &[&str]| -> Vec<OsString> {
+            let mut out = vec![
+                "--launch-development".into(),
+                "--require-native-sandbox".into(),
+                "--profile".into(),
+                "swift-pq2-assessment".into(),
+                "--data-directory".into(),
+                data.clone().into_os_string(),
+                "--evidence-parent".into(),
+                root.clone().into_os_string(),
+                "--frontend-port".into(),
+                "0".into(),
+                "--backend-port".into(),
+                "8081".into(),
+            ];
+            out.extend(extra.iter().map(OsString::from));
+            out
+        };
+
+        // No files cached yet: constrained hosts select PTQ1, healthy hosts keep PQ2.
+        assert_eq!(
+            LaunchConfig::parse_for_host(make_args(&[]), None, constrained_16g)?.bonsai25_variant(),
+            Some(Bonsai25Variant::Ptq1)
+        );
+        assert_eq!(
+            LaunchConfig::parse_for_host(make_args(&[]), None, constrained_32g)?.bonsai25_variant(),
+            Some(Bonsai25Variant::Ptq1)
+        );
+        assert_eq!(
+            LaunchConfig::parse_for_host(make_args(&[]), None, healthy)?.bonsai25_variant(),
+            Some(Bonsai25Variant::Pq2)
+        );
+
+        // Explicit flags override host memory.
+        assert_eq!(
+            LaunchConfig::parse_for_host(
+                make_args(&["--bonsai-2-5", "pq2"]),
+                None,
+                constrained_16g
+            )?
+            .bonsai25_variant(),
+            Some(Bonsai25Variant::Pq2)
+        );
+        assert_eq!(
+            LaunchConfig::parse_for_host(make_args(&["--bonsai-2-5", "ptq1"]), None, healthy)?
+                .bonsai25_variant(),
+            Some(Bonsai25Variant::Ptq1)
+        );
+
+        // Single cached PTQ1 file stays selected even with healthy RAM.
+        let ptq1_path = bonsai25_model_artifact(&data, Bonsai25Variant::Ptq1)
+            .map_err(|_| LaunchError::Policy)?
+            .path;
+        std::fs::create_dir_all(ptq1_path.parent().ok_or(LaunchError::Path)?)
+            .map_err(|_| LaunchError::Path)?;
+        std::fs::write(&ptq1_path, b"placeholder").map_err(|_| LaunchError::Path)?;
+        assert_eq!(
+            LaunchConfig::parse_for_host(make_args(&[]), None, healthy)?.bonsai25_variant(),
+            Some(Bonsai25Variant::Ptq1)
+        );
+
+        // Both cached: switches back to dynamic memory constraint selection.
+        let pq2_path = bonsai25_model_artifact(&data, Bonsai25Variant::Pq2)
+            .map_err(|_| LaunchError::Policy)?
+            .path;
+        std::fs::write(&pq2_path, b"placeholder").map_err(|_| LaunchError::Path)?;
+        assert_eq!(
+            LaunchConfig::parse_for_host(make_args(&[]), None, healthy)?.bonsai25_variant(),
+            Some(Bonsai25Variant::Pq2)
+        );
+        assert_eq!(
+            LaunchConfig::parse_for_host(make_args(&[]), None, constrained_32g)?.bonsai25_variant(),
+            Some(Bonsai25Variant::Ptq1)
+        );
+
+        std::fs::remove_dir_all(&root).map_err(|_| LaunchError::Path)?;
         Ok(())
     }
 

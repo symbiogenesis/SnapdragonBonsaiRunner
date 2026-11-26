@@ -2037,3 +2037,159 @@ fn bonsai25_chat_request_allows_mmproj_composite_and_explicit_daisyrose() -> cra
 
     fs::remove_dir_all(fixture.root).map_err(|error| error.to_string())
 }
+
+#[test]
+fn dynamic_first_load_selects_ptq1_under_memory_constraint_and_preserves_cache_or_overrides()
+-> crate::Result<()> {
+    use bonsai_cpu_policy::{Bonsai25MemorySnapshot, Bonsai25Variant};
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let healthy = Some(Bonsai25MemorySnapshot {
+        total_physical_bytes: 32 * GIB,
+        available_physical_bytes: 20 * GIB,
+    });
+    let constrained_16g = Some(Bonsai25MemorySnapshot {
+        total_physical_bytes: 16 * GIB,
+        available_physical_bytes: 15 * GIB,
+    });
+    let constrained_32g = Some(Bonsai25MemorySnapshot {
+        total_physical_bytes: 32 * GIB,
+        available_physical_bytes: 11 * GIB,
+    });
+
+    // Helper returning the resolved variant, deferred JSON field, and `--bonsai-2-5` arg.
+    let resolve_case = |name: &str,
+                        memory: Option<Bonsai25MemorySnapshot>,
+                        explicit: Option<&str>,
+                        seed_files: &[Bonsai25Variant],
+                        use_partial: bool|
+     -> crate::Result<(Bonsai25Variant, String, Vec<String>)> {
+        let mut fixture = fixture(name)?;
+        fixture.request["NativeEngine"] = json!(true);
+        fixture.request["NoSpeechModels"] = json!(true);
+        if let Some(variant) = explicit {
+            fixture.request["Bonsai25Variant"] = json!(variant);
+        }
+        let data_dir = fixture.root.join("data");
+        for &variant in seed_files {
+            let artifact = bonsai_cpu_policy::bonsai25_model_artifact(&data_dir, variant)?;
+            let target = if use_partial {
+                artifact.path.with_added_extension("partial")
+            } else {
+                artifact.path
+            };
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            fs::write(&target, b"placeholder").map_err(|error| error.to_string())?;
+        }
+        let req: Request =
+            serde_json::from_value(fixture.request).map_err(|error| error.to_string())?;
+        let plan = prepare_for_host(req, true, None, memory)?;
+        let selected = plan
+            .request
+            .bonsai25_variant
+            .ok_or("Missing resolved Bonsai25Variant.")?;
+        let mut recorder = Recorder::new(fixture.root.clone());
+        launch_pending(
+            plan.request,
+            &mut recorder,
+            &fixture.working,
+            &fixture.root.join("maintenance.exe"),
+        )?;
+        let (_, arguments, _) = recorder.launch()?;
+        let request_path = PathBuf::from(value_after(arguments, "--startup-request")?);
+        let serialized: Value =
+            serde_json::from_slice(&fs::read(request_path).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        let json_variant = serialized["Bonsai25Variant"]
+            .as_str()
+            .ok_or("Missing serialized Bonsai25Variant.")?
+            .to_owned();
+        let prepared = prepare_backend(
+            prepare_for_host(
+                serde_json::from_value(serialized).map_err(|error| error.to_string())?,
+                true,
+                None,
+                healthy,
+            )?,
+            &mut recorder,
+            &fixture.working,
+        )?;
+        let args = prepared["Arguments"]
+            .as_array()
+            .ok_or("Missing arguments.")?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        fs::remove_dir_all(fixture.root).map_err(|error| error.to_string())?;
+        Ok((selected, json_variant, args))
+    };
+
+    // First load on super-constrained hosts picks PTQ1 and locks it into serialized startup JSON.
+    for (label, memory) in [
+        ("dyn-first-16g", constrained_16g),
+        ("dyn-first-32g-low", constrained_32g),
+    ] {
+        let (selected, serialized, args) = resolve_case(label, memory, None, &[], false)?;
+        assert_eq!(selected, Bonsai25Variant::Ptq1);
+        assert_eq!(serialized, "ptq1");
+        assert!(args.windows(2).any(|w| w == ["--bonsai-2-5", "ptq1"]));
+    }
+
+    // First load on healthy 32 GiB host keeps PQ2.
+    let (selected, serialized, args) =
+        resolve_case("dyn-first-healthy", healthy, None, &[], false)?;
+    assert_eq!(selected, Bonsai25Variant::Pq2);
+    assert_eq!(serialized, "pq2");
+    assert!(args.windows(2).any(|w| w == ["--bonsai-2-5", "pq2"]));
+
+    // Single-variant cache stickiness (final .gguf and active .partial).
+    for use_partial in [false, true] {
+        let (pq2_sticky, _, _) = resolve_case(
+            "dyn-sticky-pq2",
+            constrained_16g,
+            None,
+            &[Bonsai25Variant::Pq2],
+            use_partial,
+        )?;
+        assert_eq!(pq2_sticky, Bonsai25Variant::Pq2);
+
+        let (ptq1_sticky, _, _) = resolve_case(
+            "dyn-sticky-ptq1",
+            healthy,
+            None,
+            &[Bonsai25Variant::Ptq1],
+            use_partial,
+        )?;
+        assert_eq!(ptq1_sticky, Bonsai25Variant::Ptq1);
+    }
+
+    // Dual-variant cache dynamically switches based on current memory constraint.
+    let (dual_constrained, _, _) = resolve_case(
+        "dyn-dual-low",
+        constrained_32g,
+        None,
+        &[Bonsai25Variant::Pq2, Bonsai25Variant::Ptq1],
+        false,
+    )?;
+    assert_eq!(dual_constrained, Bonsai25Variant::Ptq1);
+    let (dual_healthy, _, _) = resolve_case(
+        "dyn-dual-high",
+        healthy,
+        None,
+        &[Bonsai25Variant::Pq2, Bonsai25Variant::Ptq1],
+        false,
+    )?;
+    assert_eq!(dual_healthy, Bonsai25Variant::Pq2);
+
+    // Explicit overrides always win regardless of RAM constraint.
+    let (explicit_pq2, _, _) =
+        resolve_case("dyn-explicit-pq2", constrained_16g, Some("pq2"), &[], false)?;
+    assert_eq!(explicit_pq2, Bonsai25Variant::Pq2);
+    let (explicit_ptq1, _, _) =
+        resolve_case("dyn-explicit-ptq1", healthy, Some("ptq1"), &[], false)?;
+    assert_eq!(explicit_ptq1, Bonsai25Variant::Ptq1);
+
+    Ok(())
+}

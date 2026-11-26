@@ -34,7 +34,9 @@ pub use nariq::{
 };
 mod bonsai25;
 pub use bonsai25::{
-    BONSAI_2_5_LOCK, Bonsai25ModelArtifact, Bonsai25Variant, bonsai25_model_artifact,
+    BONSAI_2_5_LOCK, BONSAI25_PTQ1_AUTO_TOTAL_PHYSICAL_MAX_BYTES, Bonsai25CachedVariants,
+    Bonsai25MemorySnapshot, Bonsai25ModelArtifact, Bonsai25Variant, bonsai25_model_artifact,
+    is_super_memory_constrained_for_pq2, select_default_bonsai25_variant,
 };
 
 const REFERENCE_LOCK: &str = include_str!("../../../config/runtime.lock.json");
