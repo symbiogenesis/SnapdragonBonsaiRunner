@@ -63,12 +63,28 @@ jobs:
       - name: Check CI orchestration fixtures
         working-directory: ${{ runner.temp }}
         run: |
-          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_foundation_handoff.ps1"
-          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_device_concurrency.ps1"
-          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_native_ci_cache.ps1"
-          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_tools_cache_inputs.ps1"
-          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_rust_toolchain.ps1"
-          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/cpu-bundle/test_cpu_bundle.ps1"
+          set -euo pipefail
+          log_dir="$RUNNER_TEMP/foundation-fixture-logs"
+          rm -rf "$log_dir"
+          mkdir -p "$log_dir"
+          trap 'rm -rf "$log_dir"' EXIT
+          pids=()
+          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_foundation_handoff.ps1" >"$log_dir/0.log" 2>&1 & pids+=($!)
+          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_device_concurrency.ps1" >"$log_dir/1.log" 2>&1 & pids+=($!)
+          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_native_ci_cache.ps1" >"$log_dir/2.log" 2>&1 & pids+=($!)
+          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_tools_cache_inputs.ps1" >"$log_dir/3.log" 2>&1 & pids+=($!)
+          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/ci/test_rust_toolchain.ps1" >"$log_dir/4.log" 2>&1 & pids+=($!)
+          pwsh -NoProfile -File "$GITHUB_WORKSPACE/tools/cpu-bundle/test_cpu_bundle.ps1" >"$log_dir/5.log" 2>&1 & pids+=($!)
+          failed=0
+          for i in "${!pids[@]}"; do
+            status=0
+            wait "${pids[$i]}" || status=$?
+            cat "$log_dir/$i.log"
+            if [[ $status -ne 0 ]]; then
+              failed=1
+            fi
+          done
+          exit "$failed"
       - name: Check CI selection and gate regressions
         id: ci-regressions
         working-directory: ${{ runner.temp }}

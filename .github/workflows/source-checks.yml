@@ -42,20 +42,38 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           & ./tools/ci/select_source_checks.ps1
-      - name: Check source-check routing regression fixtures
-        run: pwsh -NoProfile -File tools/ci/test_source_checks.ps1
-      - name: Reject owned Python code and runtime setup
-        run: pwsh -NoProfile -File tools/ci/check_owned_languages.ps1
-      - name: Check source-language policy regression fixtures
-        run: pwsh -NoProfile -File tools/ci/test_owned_languages.ps1
-      - name: Check exact startup lock coverage and full action pins offline
-        run: pwsh -NoProfile -File tools/ci/check_workflow_startup.ps1
-      - name: Check GitHub Actions syntax and expressions
-        run: pwsh -NoLogo -NoProfile -File tools/ci/check_workflow_syntax.ps1 -CheckFixtures
-      - name: Check startup lock regression fixtures
-        run: pwsh -NoProfile -File tools/ci/test_workflow_startup.ps1
-      - name: Check staged workflow guard regression fixtures
-        run: pwsh -NoProfile -File tools/ci/test_staged_workflows.ps1
+      - name: Check offline source, language, and workflow guards in parallel
+        run: |
+          set -euo pipefail
+          log_dir="$RUNNER_TEMP/source-checks-logs"
+          rm -rf "$log_dir"
+          mkdir -p "$log_dir"
+          trap 'rm -rf "$log_dir"' EXIT
+          scripts=(
+            "pwsh -NoProfile -File tools/ci/test_source_checks.ps1"
+            "pwsh -NoProfile -File tools/ci/check_owned_languages.ps1"
+            "pwsh -NoProfile -File tools/ci/test_owned_languages.ps1"
+            "pwsh -NoProfile -File tools/ci/check_workflow_startup.ps1"
+            "pwsh -NoLogo -NoProfile -File tools/ci/check_workflow_syntax.ps1 -CheckFixtures"
+            "pwsh -NoProfile -File tools/ci/test_workflow_startup.ps1"
+            "pwsh -NoProfile -File tools/ci/test_staged_workflows.ps1"
+          )
+          pids=()
+          for i in "${!scripts[@]}"; do
+            ${scripts[$i]} >"$log_dir/$i.log" 2>&1 &
+            pids+=($!)
+          done
+          failed=0
+          for i in "${!pids[@]}"; do
+            status=0
+            wait "${pids[$i]}" || status=$?
+            echo "=== ${scripts[$i]} (exit $status) ==="
+            cat "$log_dir/$i.log"
+            if [[ $status -ne 0 ]]; then
+              failed=1
+            fi
+          done
+          exit "$failed"
       - name: Download and verify the sole additional CI security tool
         run: |
           set -euo pipefail
@@ -136,30 +154,78 @@ jobs:
           --package bonsai-ci --package bonsai-cpu-policy --package bonsai-broker
           --all-targets
       - name: Run selected model-free routing and policy regressions
+        shell: pwsh
         working-directory: ${{ runner.temp }}
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/SwiftBonsai-Premerge
         run: |
-          set -euo pipefail
-          exact_test() {
-            local case_name="$1"
-            shift
-            # An accidentally renamed/removed case must not silently pass with
-            # zero tests. Listing compiles the target without executing it.
-            local listed
-            listed="$(cargo +nightly-2026-11-26 test --locked --release --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" "$@" "$case_name" -- --exact --list)"
-            if ! printf '%s\n' "$listed" | grep -Fx -- "$case_name: test"; then
-              echo "Required focused regression is missing: $case_name" >&2
-              return 1
-            fi
-            cargo +nightly-2026-11-26 test --locked --release --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" "$@" "$case_name" -- --exact
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          function Get-CompiledTestBinary([string]$Package, [string]$TargetKind, [string]$TargetName) {
+            $cargoArgs = @('+nightly-2026-11-26', 'test', '--locked', '--release', '--manifest-path', "$env:GITHUB_WORKSPACE/Cargo.toml", '--package', $Package)
+            if ($TargetKind -ceq 'lib') {
+              $cargoArgs += '--lib'
+            } else {
+              $cargoArgs += @("--$TargetKind", $TargetName)
+            }
+            $cargoArgs += @('--no-run', '--message-format=json-render-diagnostics')
+            $lines = @(& cargo @cargoArgs)
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            $matches = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($line in $lines) {
+              if ([string]::IsNullOrWhiteSpace($line)) { continue }
+              $artifact = $null
+              try { $artifact = $line | ConvertFrom-Json -AsHashtable } catch { continue }
+              if (-not ($artifact -is [Collections.IDictionary]) -or
+                  $artifact['reason'] -cne 'compiler-artifact' -or
+                  -not ($artifact['profile'] -is [Collections.IDictionary]) -or
+                  $artifact['profile']['test'] -ne $true -or
+                  -not $artifact['executable']) {
+                continue
+              }
+              $pkgId = [string]$artifact['package_id']
+              $pkgMatches = $pkgId -like "*#${Package}@*" -or $pkgId.EndsWith("#${Package}") -or $pkgId.StartsWith("${Package} ")
+              if (-not $pkgMatches -or [string]$artifact['target']['name'] -cne $TargetName) { continue }
+              $kinds = @($artifact['target']['kind'])
+              $kindMatches = if ($TargetKind -ceq 'lib') {
+                ($kinds -contains 'lib') -or ($kinds -contains 'rlib') -or ($kinds -contains 'cdylib') -or ($kinds -contains 'staticlib') -or ($kinds -contains 'proc-macro')
+              } else {
+                $kinds -contains $TargetKind
+              }
+              if ($kindMatches) {
+                [void]$matches.Add([string]$artifact['executable'])
+              }
+            }
+            if ($matches.Count -ne 1) {
+              throw "Expected one compiled test binary for $Package ($TargetKind $TargetName), found $($matches.Count)."
+            }
+            $binary = @($matches)[0]
+            if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+              throw "Compiled test binary is missing: $binary"
+            }
+            return $binary
           }
-          exact_test leaf_change_selects_transitive_consumers_without_sibling --package bonsai-ci --test routing
-          exact_test failed_planner_and_malformed_results_cannot_pass --package bonsai-ci --test routing
-          exact_test tests::swift_development_budget_keeps_four_gib_reserve_for_every_artifact --package bonsai-cpu-policy --lib
-          exact_test rejects_alternate_hosts_and_browser_origins --package bonsai-broker --test request_policy
-          exact_test typed_schema_rejects_aliases_controls_tools_and_media --package bonsai-broker --test request_policy
-          exact_test context_admission_fails_closed_at_boundary_and_overflow --package bonsai-broker --test request_policy
+          function Invoke-ExactTest([string]$Binary, [string]$CaseName) {
+            # An accidentally renamed/removed case must not silently pass with
+            # zero tests. Listing inspects the compiled binary once per target.
+            $listed = @(& $Binary $CaseName --exact --list)
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            if (-not ($listed -contains "${CaseName}: test")) {
+              throw "Required focused regression is missing: $CaseName"
+            }
+            & $Binary $CaseName --exact
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          $routingBinary = Get-CompiledTestBinary 'bonsai-ci' 'test' 'routing'
+          $cpuPolicyBinary = Get-CompiledTestBinary 'bonsai-cpu-policy' 'lib' 'bonsai_cpu_policy'
+          $requestPolicyBinary = Get-CompiledTestBinary 'bonsai-broker' 'test' 'request_policy'
+          Invoke-ExactTest $routingBinary 'leaf_change_selects_transitive_consumers_without_sibling'
+          Invoke-ExactTest $routingBinary 'failed_planner_and_malformed_results_cannot_pass'
+          Invoke-ExactTest $cpuPolicyBinary 'tests::swift_development_budget_keeps_four_gib_reserve_for_every_artifact'
+          Invoke-ExactTest $requestPolicyBinary 'rejects_alternate_hosts_and_browser_origins'
+          Invoke-ExactTest $requestPolicyBinary 'typed_schema_rejects_aliases_controls_tools_and_media'
+          Invoke-ExactTest $requestPolicyBinary 'context_admission_fails_closed_at_boundary_and_overflow'
       - name: Preserve portable compiler outputs after checks
         if: ${{ !cancelled() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-primary-key != '' && steps.cargo-cache.outputs.cache-hit != 'true' && (steps.compile.outcome == 'success' || steps.compile.outcome == 'failure') }}
         continue-on-error: true
