@@ -1066,10 +1066,7 @@ impl Work {
         }
         if plan.device_concurrency
             && [
-                ".github/workflows/native-runtime-acceptance.yml",
-                ".github/workflows/native-ptq1-numerics.yml",
-                ".github/workflows/x2-cpu-evaluation.yml",
-                ".github/workflows/cpu-bundle-comparison.yml",
+                ".github/workflows/sandbox-qualification.yml",
                 ".github/workflows/tts-evaluation.yml",
             ]
             .into_iter()

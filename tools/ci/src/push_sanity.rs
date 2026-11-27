@@ -175,10 +175,7 @@ fn selection(paths: &[String]) -> Selection {
         }),
         device_concurrency: owned.iter().any(|path| {
             [
-                ".github/workflows/native-runtime-acceptance.yml",
-                ".github/workflows/native-ptq1-numerics.yml",
-                ".github/workflows/x2-cpu-evaluation.yml",
-                ".github/workflows/cpu-bundle-comparison.yml",
+                ".github/workflows/sandbox-qualification.yml",
                 ".github/workflows/tts-evaluation.yml",
                 "tools/ci/test_device_concurrency.ps1",
                 "tools/ci/test_support.ps1",
@@ -382,7 +379,10 @@ mod tests {
         assert!(plan.workflows && plan.source_fixture);
         assert_eq!(plan.cache_actions, Vec::<&str>::new());
         assert!(selection(&[".github/workflows/foundation.yml".into()]).foundation_handoff);
-        assert!(selection(&[".github/workflows/x2-cpu-evaluation.yml".into()]).device_concurrency);
+        assert!(
+            selection(&[".github/workflows/sandbox-qualification.yml".into()]).device_concurrency
+        );
+        assert!(selection(&[".github/workflows/tts-evaluation.yml".into()]).device_concurrency);
         assert!(
             selection(&[".github/actions/rust-toolchain/action.yml".into()]).rust_toolchain_fixture
         );

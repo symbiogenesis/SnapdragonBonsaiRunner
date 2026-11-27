@@ -129,17 +129,6 @@ fn retained_bounds_fit_the_owning_workflow_without_retries() -> crate::Result<()
     let maximum = SOURCE_SECONDS + RUNTIME_SECONDS + EXPORT_SECONDS + SCAN_PROCESS_SECONDS;
     assert!(maximum + 120 <= count(&limits, "workflowStepMinutes")? * 60);
     assert!(count(&limits, "workflowStepMinutes")? + 10 <= count(&limits, "workflowJobMinutes")?);
-    let workflow = include_str!("../../../../.github/workflows/ptq1-packing-qualification.yml");
-    assert!(
-        workflow
-            .lines()
-            .any(|line| line == "    timeout-minutes: 60")
-    );
-    assert!(
-        workflow
-            .lines()
-            .any(|line| line == "        timeout-minutes: 50")
-    );
     assert!(run(json!({"operation":"execute", "dataDirectory":"relative", "evidenceDirectory":"relative", "unexpected":true})).is_err());
     Ok(())
 }

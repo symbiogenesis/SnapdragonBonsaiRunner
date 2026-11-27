@@ -3,48 +3,27 @@ param([string]$Case,[string]$CandidateRoot)
 . (Join-Path $PSScriptRoot 'test_support.ps1')
 $repository=if ($CandidateRoot) { (Resolve-Path -LiteralPath $CandidateRoot).ProviderPath } else { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
 $workflows=@{}
-foreach ($name in @('native-runtime-acceptance','native-ptq1-numerics','x2-cpu-evaluation','cpu-bundle-comparison','tts-evaluation')) {
+foreach ($name in @('sandbox-qualification','tts-evaluation')) {
     $workflows[$name]=[IO.File]::ReadAllText((Join-Path $repository ".github/workflows/$name.yml")).Replace("`r`n","`n")
 }
-function Assert-DeviceLane([string]$Workflow) {
+function Assert-SandboxDeviceLane([string]$Workflow) {
     $header=($Workflow -split '(?m)^jobs:\s*$',2)[0]
-    # Only an explicit device request can take the common mutex. Hosted-only
-    # dispatches receive a run-specific group and cannot supersede one another.
-    Assert-Ci ($header -cmatch '(?m)^  group: \$\{\{ inputs\.run_device && ''swift-lora-snapdragon'' \|\| format\(''[a-z0-9-]+-\{0\}'', github\.run_id\) \}\}$') 'Expected conditional device group and run-specific hosted fallback.'
+    # Only an explicit snapdragon target can take the shared physical-device mutex.
+    Assert-Ci ($header -cmatch '(?m)^  group: \$\{\{ inputs\.target == ''snapdragon'' && ''swift-lora-snapdragon'' \|\| ''sandbox-qualification-hosted-arm64'' \}\}$') 'Expected conditional sandbox device group and hosted fallback.'
     Assert-Ci ($header -cmatch '(?m)^  cancel-in-progress: false$') 'Device captures must not be cancelled by another dispatch.'
 }
 $cases=[ordered]@{
- hosted_preparation_never_reserves_device={
-    foreach ($name in @('native-runtime-acceptance','native-ptq1-numerics','x2-cpu-evaluation','cpu-bundle-comparison')) {
-        $workflow=$workflows[$name]
-        Assert-DeviceLane $workflow
-        Assert-Ci ($workflow -cmatch '(?s)      run_device:\n.*?        type: boolean\n        default: false\n') "$name requires an explicit device request."
-        Assert-CiReject { Assert-DeviceLane ($workflow -replace '(?m)^  group: .*$', '  group: swift-lora-snapdragon') } 'Expected conditional device group'
-        Assert-CiReject { Assert-DeviceLane ($workflow.Replace('github.run_id','github.ref')) } 'Expected conditional device group'
-        Assert-CiReject { Assert-DeviceLane ($workflow.Replace('  cancel-in-progress: false','  cancel-in-progress: true')) } 'must not be cancelled'
-    }
- }
- device_jobs_still_require_explicit_selection={
-    foreach ($workflowName in @('native-runtime-acceptance','native-ptq1-numerics','x2-cpu-evaluation','cpu-bundle-comparison')) {
-        $jobs=Get-CiJobBlocks $workflows[$workflowName]
-        # Preparation may run without a device. Every selected device lane must
-        # still wait for preparation and test the dispatch boolean itself.
-        $device=@($jobs.Keys | Where-Object { $jobs[$_] -cmatch '(?m)^    if: .*inputs\.run_device' })
-        Assert-Ci ($device.Count -gt 0) ($workflowName+' has no explicitly selected device job.')
-        foreach ($name in $device) { Assert-Ci ('prepare' -cin (Get-CiDependencies $jobs[$name])) ($workflowName+' device job must consume preparation.') }
-    }
- }
- native_owner_clocks_and_jobs_stay_in_rust={
-    $x2=(Get-CiJobBlocks $workflows['x2-cpu-evaluation']).evaluate
-    Assert-Ci ($x2.IndexOf("operation = 'ci-owner-admit'") -lt $x2.IndexOf('uses: actions/checkout@')) 'Original native receipt must be admitted before checkout/intake.'
-    foreach ($operation in @('ci-capture','ci-owner-finalize')) { Assert-Ci ($x2.Contains("operation = '$operation'")) "Missing native $operation handoff." }
-    foreach ($scriptPolicy in @('Diagnostics.Stopwatch','ProcessStartInfo','WaitForExit','.Kill(')) { Assert-Ci (-not $x2.Contains($scriptPolicy)) 'Owner clocks and process lifetime must stay native.' }
-    Assert-Ci ($x2.Contains("env.BONSAI_X2_UPLOAD_ALLOWED == 'true'")) 'Native original-budget upload gate is required.'
-    Assert-Ci ($x2.Contains('timeout-minutes: 1')) 'The upload must have its predeclared one-minute bound.'
-    $bundle=(Get-CiJobBlocks $workflows['cpu-bundle-comparison']).compare
-    if (-not $bundle) { $bundle=@((Get-CiJobBlocks $workflows['cpu-bundle-comparison']).Values | Where-Object { $_.Contains("operation = 'bundle-owner-admit'") })[0] }
-    Assert-Ci ($bundle.IndexOf("operation = 'bundle-owner-admit'") -lt $bundle.IndexOf('uses: actions/checkout@')) 'Frozen comparison must admit its original native budget first.'
-    Assert-Ci (-not $bundle.Contains('Diagnostics.Stopwatch')) 'Frozen comparison clocks must stay native.'
+ sandbox_hosted_target_never_reserves_device={
+    $workflow=$workflows['sandbox-qualification']
+    Assert-SandboxDeviceLane $workflow
+    Assert-Ci ($workflow -cmatch '(?s)      target:\n.*?        default: hosted-arm64\n') 'sandbox-qualification must default to hosted-arm64.'
+    Assert-CiReject { Assert-SandboxDeviceLane ($workflow -replace '(?m)^  group: .*$', '  group: swift-lora-snapdragon') } 'Expected conditional sandbox device group'
+    Assert-CiReject { Assert-SandboxDeviceLane ($workflow.Replace('  cancel-in-progress: false','  cancel-in-progress: true')) } 'must not be cancelled'
+    $jobs=Get-CiJobBlocks $workflow
+    Assert-Ci ($jobs.prepare.Contains('runs-on: windows-11-arm')) 'Hosted preparation must run on windows-11-arm.'
+    Assert-Ci (-not $jobs.prepare.Contains('self-hosted')) 'Hosted preparation must not reserve self-hosted runners.'
+    Assert-Ci ('prepare' -cin (Get-CiDependencies $jobs.qualify)) 'qualify job must consume prepare.'
+    Assert-Ci ($jobs.qualify -cmatch '(?m)^    runs-on: \$\{\{ fromJSON\(inputs\.target == ''snapdragon'' && ''\["self-hosted","Windows","ARM64","swift-bonsai-snapdragon"\]'' \|\| ''"windows-11-arm"''\) \}\}$') 'qualify must only use self-hosted runner when target is snapdragon.'
  }
  rejected_tts_target_stays_hosted={
     $workflow=$workflows['tts-evaluation']; $header=($workflow -split '(?m)^jobs:\s*$',2)[0]
