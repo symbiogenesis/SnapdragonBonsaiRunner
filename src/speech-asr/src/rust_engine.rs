@@ -567,15 +567,7 @@ fn decode_budget(audio_rows: usize, prompt: usize, context: usize) -> io::Result
 }
 
 fn argmax(logits: &[f32]) -> io::Result<u32> {
-    if logits.is_empty() || logits.iter().any(|value| !value.is_finite()) {
-        return Err(invalid());
-    }
-    let mut best = 0;
-    for index in 1..logits.len() {
-        if logits[index] > logits[best] {
-            best = index;
-        }
-    }
+    let best = crate::packed::argmax_finite_f32(logits).ok_or_else(invalid)?;
     u32::try_from(best).map_err(|_| invalid())
 }
 

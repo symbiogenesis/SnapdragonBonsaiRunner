@@ -90,8 +90,15 @@ impl Linear {
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<()> {
         self.weights
-            .multiply_batch_prepared_into(prepared, raw_input, workers, scratch, output, cancel)?;
-        add_batch_bias(output, &self.bias, workers)
+            .multiply_batch_prepared_biased_prevalidated_into(
+                prepared,
+                raw_input,
+                Some(&self.bias),
+                workers,
+                scratch,
+                output,
+                cancel,
+            )
     }
 }
 
@@ -518,14 +525,17 @@ impl Encoder {
         }
         if layout.audio_rows > 0 {
             prepared.prepare_meta(layout.audio_rows, flat_dim);
-            self.weights.convolution_out.multiply_batch_prepared_into(
-                &mut prepared,
-                &flat_in[..layout.audio_rows * flat_dim],
-                workers,
-                &mut conv_scratch,
-                &mut rows,
-                cancel,
-            )?;
+            self.weights
+                .convolution_out
+                .multiply_batch_prepared_biased_prevalidated_into(
+                    &mut prepared,
+                    &flat_in[..layout.audio_rows * flat_dim],
+                    None,
+                    workers,
+                    &mut conv_scratch,
+                    &mut rows,
+                    cancel,
+                )?;
             add_chunk_sinusoids_parallel(
                 &mut rows,
                 &self.sinusoids,
@@ -1094,10 +1104,13 @@ fn transform_block(
     let (q, kv_mut) = qkv.split_at_mut(part);
     let (k, v) = kv_mut.split_at_mut(part);
     prepared.prepare_meta(num_rows, c.hidden);
-    Projection::multiply_batch_triple_into(
+    Projection::multiply_batch_triple_biased_prevalidated_into(
         &block.query.weights,
         &block.key.weights,
         &block.value.weights,
+        &block.query.bias,
+        &block.key.bias,
+        &block.value.bias,
         prepared,
         norm_buf,
         workers,
@@ -1106,14 +1119,6 @@ fn transform_block(
         k,
         v,
         cancel,
-    )?;
-    add_batch_bias_triple(
-        qkv,
-        &block.query.bias,
-        &block.key.bias,
-        &block.value.bias,
-        part,
-        workers,
     )?;
 
     for _ in 0..(num_rows * c.heads) {
@@ -1244,6 +1249,7 @@ fn attention(
     Ok(output)
 }
 
+#[cfg(test)]
 #[expect(
     clippy::inline_always,
     reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
@@ -1273,6 +1279,7 @@ fn add_bias_rows_simd<S: Simd>(simd: S, rows: &mut [f32], bias: &[f32]) -> bool 
     all_finite
 }
 
+#[cfg(test)]
 fn add_batch_bias(out: &mut [f32], bias: &[f32], workers: usize) -> io::Result<()> {
     let out_width = bias.len();
     if out_width == 0 {
@@ -1285,45 +1292,6 @@ fn add_batch_bias(out: &mut [f32], bias: &[f32], workers: usize) -> io::Result<(
     row_workers::try_run_aligned(out, workers, out_width, &|_, slice| {
         let ok = dispatch!(level, simd => add_bias_rows_simd(simd, slice, bias));
         if ok { Ok(()) } else { Err(invalid()) }
-    })
-}
-
-fn add_batch_bias_triple(
-    qkv: &mut [f32],
-    q_bias: &[f32],
-    k_bias: &[f32],
-    v_bias: &[f32],
-    part: usize,
-    workers: usize,
-) -> io::Result<()> {
-    let width = q_bias.len();
-    if k_bias.len() != width || v_bias.len() != width {
-        return Err(invalid());
-    }
-    if width == 0 {
-        return finite(qkv);
-    }
-    if !part.is_multiple_of(width) || qkv.len() != part.checked_mul(3).ok_or_else(invalid)? {
-        return Err(invalid());
-    }
-    let level = packed::simd_level();
-    let biases = [q_bias, k_bias, v_bias];
-    row_workers::try_run_aligned(qkv, workers, width, &|elem_off, slice| {
-        let mut cursor = elem_off;
-        let mut local_off = 0_usize;
-        while local_off < slice.len() {
-            let section = cursor / part;
-            let section_end = (section + 1) * part;
-            let take = (section_end - cursor).min(slice.len() - local_off);
-            let subslice = &mut slice[local_off..local_off + take];
-            let ok = dispatch!(level, simd => add_bias_rows_simd(simd, subslice, biases[section]));
-            if !ok {
-                return Err(invalid());
-            }
-            cursor += take;
-            local_off += take;
-        }
-        Ok(())
     })
 }
 

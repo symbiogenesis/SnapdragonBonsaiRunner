@@ -370,11 +370,37 @@ impl Projection {
         Ok(output)
     }
 
-    /// Compute batched `[batch, input]` rows using a shared `PreparedBatch` and `4x8` SIMD tiles.
-    pub(super) fn multiply_batch_prepared_into(
+    /// Compute batched `[batch, input]` rows with optional bias on pre-validated internal inputs,
+    /// verifying output finiteness in-register during scatter.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Fuses optional bias and in-register finiteness checks into batch projection scatter."
+    )]
+    pub(super) fn multiply_batch_prepared_biased_prevalidated_into(
         &self,
         prepared: &mut PreparedBatch,
         raw_input: &[f32],
+        bias: Option<&[f32]>,
+        workers: usize,
+        scratch: &mut Vec<f32>,
+        out: &mut [f32],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        self.multiply_batch_prepared_biased_checked_into(
+            prepared, raw_input, bias, false, workers, scratch, out, cancel,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Shared batch projection helper parameterizes optional bias and input validation."
+    )]
+    fn multiply_batch_prepared_biased_checked_into(
+        &self,
+        prepared: &mut PreparedBatch,
+        raw_input: &[f32],
+        bias: Option<&[f32]>,
+        check_input: bool,
         workers: usize,
         scratch: &mut Vec<f32>,
         out: &mut [f32],
@@ -384,22 +410,28 @@ impl Projection {
         if prepared.input() != self.input
             || raw_input.len() != batch.checked_mul(self.input).ok_or_else(invalid)?
             || out.len() != batch.checked_mul(self.output).ok_or_else(invalid)?
+            || bias.is_some_and(|b| b.len() != self.output)
         {
             return Err(invalid());
         }
-        finite(raw_input)?;
+        if check_input {
+            finite(raw_input)?;
+        }
         for _ in 0..(batch + self.output) {
             check(cancel)?;
         }
-        packed::multiply_batch_prepared_into(
+        if !packed::multiply_batch_prepared_biased_into(
             self.as_weight_matrix(),
             prepared,
             raw_input,
+            bias,
             workers,
             scratch,
             out,
-        );
-        finite(out)
+        ) {
+            return Err(invalid());
+        }
+        Ok(())
     }
 
     pub(super) const fn is_float(&self) -> bool {
@@ -495,8 +527,8 @@ impl Projection {
         Ok(())
     }
 
-    pub(super) fn multiply_batch_group_into<const N: usize>(
-        pairs: [(&Self, &mut [f32]); N],
+    pub(super) fn multiply_batch_group_prevalidated_into<const N: usize>(
+        pairs: [(&Self, Option<&[f32]>, &mut [f32]); N],
         prepared: &mut PreparedBatch,
         raw_input: &[f32],
         workers: usize,
@@ -508,34 +540,42 @@ impl Projection {
             return Err(invalid());
         }
         let mut checks = 0_usize;
-        for (p, out) in &pairs {
+        for (p, bias, out) in &pairs {
             if prepared.input() != p.input
                 || out.len() != batch.checked_mul(p.output).ok_or_else(invalid)?
+                || bias.is_some_and(|b| b.len() != p.output)
             {
                 return Err(invalid());
             }
             checks += batch + p.output;
         }
-        finite(raw_input)?;
         for _ in 0..checks {
             check(cancel)?;
         }
-        let mut targets = pairs.map(|(p, out)| (p.as_weight_matrix(), out));
-        packed::multiply_batch_group_into(&mut targets, prepared, raw_input, workers, scratch);
-        for (_, out) in &targets {
-            finite(out)?;
+        let mut targets = pairs.map(|(p, bias, out)| (p.as_weight_matrix(), bias, out));
+        if !packed::multiply_batch_group_biased_into(
+            &mut targets,
+            prepared,
+            raw_input,
+            workers,
+            scratch,
+        ) {
+            return Err(invalid());
         }
         Ok(())
     }
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "Fuses three sibling batched projections (`q+k+v`) sharing `prepared` and quantized activations."
+        reason = "Fuses three sibling batched projections (`q+k+v`) with biases and unified scatter."
     )]
-    pub(super) fn multiply_batch_triple_into(
+    pub(super) fn multiply_batch_triple_biased_prevalidated_into(
         p0: &Self,
         p1: &Self,
         p2: &Self,
+        b0: &[f32],
+        b1: &[f32],
+        b2: &[f32],
         prepared: &mut PreparedBatch,
         raw_input: &[f32],
         workers: usize,
@@ -545,8 +585,12 @@ impl Projection {
         out2: &mut [f32],
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<()> {
-        Self::multiply_batch_group_into(
-            [(p0, out0), (p1, out1), (p2, out2)],
+        Self::multiply_batch_group_prevalidated_into(
+            [
+                (p0, Some(b0), out0),
+                (p1, Some(b1), out1),
+                (p2, Some(b2), out2),
+            ],
             prepared,
             raw_input,
             workers,
@@ -961,21 +1005,112 @@ impl LayerState {
         }
     }
 
-    fn write_append(&mut self, start_kv: usize, src_k: &[f32], src_v: &[f32]) -> io::Result<()> {
+    fn write_append(
+        &mut self,
+        start_kv: usize,
+        src_k: &[f32],
+        src_v: &[f32],
+        workers: usize,
+    ) -> io::Result<()> {
+        let len = src_k.len();
+        if len != src_v.len() {
+            return Err(invalid());
+        }
+        let active_workers = workers.clamp(1, threads::MAX_WORKERS);
         match &mut self.data {
             LayerKv::F32(pair) => {
-                finite(src_k)?;
-                finite(src_v)?;
-                pair.keys[start_kv..start_kv + src_k.len()].copy_from_slice(src_k);
-                pair.values[start_kv..start_kv + src_v.len()].copy_from_slice(src_v);
+                if active_workers > 1 && len >= 4_096 {
+                    let chunk_len = len.div_ceil(active_workers).next_multiple_of(4);
+                    let num_tasks = len.div_ceil(chunk_len);
+                    let mut slots: [Option<std::sync::Mutex<(&mut [f32], &mut [f32])>>;
+                        threads::MAX_WORKERS] = [const { None }; threads::MAX_WORKERS];
+                    for (task_idx, (k_chunk, v_chunk)) in pair.keys[start_kv..start_kv + len]
+                        .chunks_mut(chunk_len)
+                        .zip(pair.values[start_kv..start_kv + len].chunks_mut(chunk_len))
+                        .enumerate()
+                    {
+                        slots[task_idx] = Some(std::sync::Mutex::new((k_chunk, v_chunk)));
+                    }
+                    let mut task_tokens = [0.0_f32; threads::MAX_WORKERS];
+                    row_workers::try_run_aligned(
+                        &mut task_tokens[..num_tasks],
+                        active_workers,
+                        1,
+                        &|start_task, slice| {
+                            for task_idx in start_task..(start_task + slice.len()) {
+                                let Some(slot) = slots.get(task_idx).and_then(Option::as_ref)
+                                else {
+                                    continue;
+                                };
+                                let mut guard = slot
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let off = task_idx * chunk_len;
+                                let take = guard.0.len();
+                                let ks = &src_k[off..off + take];
+                                let vs = &src_v[off..off + take];
+                                finite(ks)?;
+                                finite(vs)?;
+                                guard.0.copy_from_slice(ks);
+                                guard.1.copy_from_slice(vs);
+                            }
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    finite(src_k)?;
+                    finite(src_v)?;
+                    pair.keys[start_kv..start_kv + len].copy_from_slice(src_k);
+                    pair.values[start_kv..start_kv + len].copy_from_slice(src_v);
+                }
             }
             LayerKv::F16(pair) => {
-                if !packed::narrow_f32_to_f16_slice(
+                if active_workers > 1 && len >= 4_096 {
+                    let chunk_len = len.div_ceil(active_workers).next_multiple_of(8);
+                    let num_tasks = len.div_ceil(chunk_len);
+                    let mut slots: [Option<std::sync::Mutex<(&mut [u16], &mut [u16])>>;
+                        threads::MAX_WORKERS] = [const { None }; threads::MAX_WORKERS];
+                    for (task_idx, (k_chunk, v_chunk)) in pair.keys[start_kv..start_kv + len]
+                        .chunks_mut(chunk_len)
+                        .zip(pair.values[start_kv..start_kv + len].chunks_mut(chunk_len))
+                        .enumerate()
+                    {
+                        slots[task_idx] = Some(std::sync::Mutex::new((k_chunk, v_chunk)));
+                    }
+                    let mut task_tokens = [0.0_f32; threads::MAX_WORKERS];
+                    row_workers::try_run_aligned(
+                        &mut task_tokens[..num_tasks],
+                        active_workers,
+                        1,
+                        &|start_task, slice| {
+                            for task_idx in start_task..(start_task + slice.len()) {
+                                let Some(slot) = slots.get(task_idx).and_then(Option::as_ref)
+                                else {
+                                    continue;
+                                };
+                                let mut guard = slot
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let off = task_idx * chunk_len;
+                                let take = guard.0.len();
+                                let ks = &src_k[off..off + take];
+                                let vs = &src_v[off..off + take];
+                                let (k_dst, v_dst) = &mut *guard;
+                                if !packed::narrow_f32_to_f16_slice(ks, k_dst)
+                                    || !packed::narrow_f32_to_f16_slice(vs, v_dst)
+                                {
+                                    return Err(invalid());
+                                }
+                            }
+                            Ok(())
+                        },
+                    )?;
+                } else if !packed::narrow_f32_to_f16_slice(
                     src_k,
-                    &mut pair.keys[start_kv..start_kv + src_k.len()],
+                    &mut pair.keys[start_kv..start_kv + len],
                 ) || !packed::narrow_f32_to_f16_slice(
                     src_v,
-                    &mut pair.values[start_kv..start_kv + src_v.len()],
+                    &mut pair.values[start_kv..start_kv + len],
                 ) {
                     return Err(invalid());
                 }
@@ -1050,6 +1185,8 @@ struct DecoderWorkspace {
     batch_up: Vec<f32>,
     rope_sin: Vec<f32>,
     rope_cos: Vec<f32>,
+    prefill_k_hm: Vec<f32>,
+    prefill_v_hm: Vec<f32>,
     transposed_scratch: Vec<f32>,
     prepared: PreparedBatch,
 }
@@ -1137,6 +1274,8 @@ impl DecoderWorkspace {
         let retain_rope = retain_pos.saturating_mul((c.head_dim / 2).max(1));
         clear_bounded(&mut self.rope_sin, retain_rope);
         clear_bounded(&mut self.rope_cos, retain_rope);
+        clear_bounded(&mut self.prefill_k_hm, retain_pos.saturating_mul(kv_width));
+        clear_bounded(&mut self.prefill_v_hm, retain_pos.saturating_mul(kv_width));
         clear_bounded(
             &mut self.transposed_scratch,
             retain_pos.saturating_mul(max_proj_out),
@@ -1662,10 +1801,10 @@ fn prefill_rows_inner(
             ws.batch_a[..total * hidden].copy_from_slice(audio);
         }
     }
-    finite(&ws.batch_a)?;
 
     let start_kv = start_pos * kv_width;
     let add_kv = total * kv_width;
+    let total_kv_rows = start_pos + total;
     for state in &mut *layers {
         if start_pos == 0 {
             state.prepare_prefill(add_kv)?;
@@ -1673,6 +1812,8 @@ fn prefill_rows_inner(
             state.prepare_append(start_kv, add_kv)?;
         }
     }
+    ensure_len(&mut ws.prefill_k_hm, total_kv_rows * kv_width)?;
+    ensure_len(&mut ws.prefill_v_hm, total_kv_rows * kv_width)?;
 
     let divisor = scalar(c.head_dim).sqrt();
     let gqa_group = c.heads / c.kv_heads;
@@ -1697,11 +1838,11 @@ fn prefill_rows_inner(
             workers,
         )?;
         ws.prepared.prepare_meta(total, hidden);
-        Projection::multiply_batch_group_into(
+        Projection::multiply_batch_group_prevalidated_into(
             [
-                (&block.query, &mut ws.batch_q),
-                (&block.key, &mut ws.batch_k),
-                (&block.value, &mut ws.batch_v),
+                (&block.query, None, &mut ws.batch_q),
+                (&block.key, None, &mut ws.batch_k),
+                (&block.value, None, &mut ws.batch_v),
             ],
             &mut ws.prepared,
             &ws.batch_norm,
@@ -1729,65 +1870,46 @@ fn prefill_rows_inner(
             c,
         )?;
 
-        state.write_append(start_kv, &ws.batch_k, &ws.batch_v)?;
+        state.write_append(start_kv, &ws.batch_k, &ws.batch_v, workers)?;
+        widen_transpose_kv_to_head_major(
+            state,
+            total_kv_rows,
+            c.kv_heads,
+            c.head_dim,
+            workers,
+            &mut ws.prefill_k_hm,
+            &mut ws.prefill_v_hm,
+        );
 
         for _ in 0..(total * c.heads) {
             check(cancel)?;
         }
-        let queries = &ws.batch_q;
-        let group_width = gqa_group * c.head_dim;
-        row_workers::try_run_aligned(
-            &mut ws.batch_attn,
+        prefill_causal_attention_hm(
+            &ws.batch_q,
+            &ws.prefill_k_hm,
+            &ws.prefill_v_hm,
+            start_pos,
+            total,
+            total_kv_rows,
+            c,
+            gqa_group,
+            divisor,
             workers,
-            q_width,
-            &|elem_off, attn_slice| {
-                let local_start = elem_off / q_width;
-                let rows = attn_slice.len() / q_width;
-                let max_history = start_pos + local_start + rows;
-                with_score_scratch(gqa_group * max_history, |scores| {
-                    for (local_pos, out_row) in attn_slice.chunks_exact_mut(q_width).enumerate() {
-                        let local_row = local_start + local_pos;
-                        let pos = start_pos + local_row;
-                        let q_row = &queries[local_row * q_width..(local_row + 1) * q_width];
-                        let history_rows = pos + 1;
-                        let row_scores = &mut scores[..gqa_group * history_rows];
-                        for kv_head in 0..c.kv_heads {
-                            let offset = kv_head * c.head_dim;
-                            let q_group =
-                                &q_row[kv_head * group_width..(kv_head + 1) * group_width];
-                            let out_group =
-                                &mut out_row[kv_head * group_width..(kv_head + 1) * group_width];
-                            attend_kv_group_causal(
-                                q_group,
-                                state,
-                                None,
-                                None,
-                                history_rows,
-                                kv_width,
-                                offset,
-                                c.head_dim,
-                                gqa_group,
-                                divisor,
-                                row_scores,
-                                out_group,
-                            )?;
-                        }
-                        finite(out_row)?;
-                    }
-                    Ok(())
-                })
-            },
+            &mut ws.batch_attn,
         )?;
 
         ws.prepared.prepare_meta(total, q_width);
-        block.attention_out.multiply_batch_prepared_into(
-            &mut ws.prepared,
-            &ws.batch_attn,
-            workers,
-            &mut ws.transposed_scratch,
-            &mut ws.batch_proj,
-            cancel,
-        )?;
+        block
+            .attention_out
+            .multiply_batch_prepared_biased_prevalidated_into(
+                &mut ws.prepared,
+                &ws.batch_attn,
+                None,
+                workers,
+                &mut ws.transposed_scratch,
+                &mut ws.batch_proj,
+                cancel,
+            )?;
         add_residual_batch(&mut ws.batch_a, &ws.batch_proj, workers, hidden)?;
 
         if layer_idx == last_layer && !need_logits {
@@ -1823,10 +1945,10 @@ fn prefill_rows_inner(
                 workers,
             )?;
             ws.prepared.prepare_meta(total, hidden);
-            Projection::multiply_batch_group_into(
+            Projection::multiply_batch_group_prevalidated_into(
                 [
-                    (&block.gate, &mut ws.batch_gate),
-                    (&block.up, &mut ws.batch_up),
+                    (&block.gate, None, &mut ws.batch_gate),
+                    (&block.up, None, &mut ws.batch_up),
                 ],
                 &mut ws.prepared,
                 &ws.batch_norm,
@@ -1848,9 +1970,10 @@ fn prefill_rows_inner(
                 },
             )?;
             ws.prepared.prepare_meta(total, c.intermediate);
-            block.down.multiply_batch_prepared_into(
+            block.down.multiply_batch_prepared_biased_prevalidated_into(
                 &mut ws.prepared,
                 &ws.batch_gate,
+                None,
                 workers,
                 &mut ws.transposed_scratch,
                 &mut ws.batch_proj,
@@ -1875,6 +1998,250 @@ fn prefill_rows_inner(
     }
     check(cancel)?;
     Ok(())
+}
+
+fn widen_transpose_kv_to_head_major(
+    state: &LayerState,
+    total_kv_rows: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    workers: usize,
+    k_hm: &mut [f32],
+    v_hm: &mut [f32],
+) {
+    let total_slots = kv_heads * total_kv_rows;
+    if total_slots == 0 || head_dim == 0 {
+        return;
+    }
+    let kv_width = kv_heads * head_dim;
+    let copy_range = |start_slot: usize, k_dst: &mut [f32], v_dst: &mut [f32]| {
+        let slots_here = k_dst.len() / head_dim;
+        match &state.data {
+            LayerKv::F16(pair) => {
+                for local_slot in 0..slots_here {
+                    let slot = start_slot + local_slot;
+                    let kv_head = slot / total_kv_rows;
+                    let pos = slot % total_kv_rows;
+                    let src_off = pos * kv_width + kv_head * head_dim;
+                    let dst_off = local_slot * head_dim;
+                    packed::widen_f16_slice(
+                        &pair.keys[src_off..src_off + head_dim],
+                        &mut k_dst[dst_off..dst_off + head_dim],
+                    );
+                    packed::widen_f16_slice(
+                        &pair.values[src_off..src_off + head_dim],
+                        &mut v_dst[dst_off..dst_off + head_dim],
+                    );
+                }
+            }
+            LayerKv::F32(pair) => {
+                for local_slot in 0..slots_here {
+                    let slot = start_slot + local_slot;
+                    let kv_head = slot / total_kv_rows;
+                    let pos = slot % total_kv_rows;
+                    let src_off = pos * kv_width + kv_head * head_dim;
+                    let dst_off = local_slot * head_dim;
+                    k_dst[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&pair.keys[src_off..src_off + head_dim]);
+                    v_dst[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&pair.values[src_off..src_off + head_dim]);
+                }
+            }
+        }
+    };
+
+    let active_workers = workers.clamp(1, threads::MAX_WORKERS).min(total_slots);
+    if active_workers > 1 && total_kv_rows * kv_width >= 4_096 {
+        let chunk_slots = total_slots.div_ceil(active_workers);
+        let num_tasks = total_slots.div_ceil(chunk_slots);
+        let chunk_elems = chunk_slots * head_dim;
+        let mut slots: [Option<std::sync::Mutex<(&mut [f32], &mut [f32])>>; threads::MAX_WORKERS] =
+            [const { None }; threads::MAX_WORKERS];
+        for (task_idx, (k_chunk, v_chunk)) in k_hm
+            .chunks_mut(chunk_elems)
+            .zip(v_hm.chunks_mut(chunk_elems))
+            .enumerate()
+        {
+            slots[task_idx] = Some(std::sync::Mutex::new((k_chunk, v_chunk)));
+        }
+        let mut task_tokens = [0.0_f32; threads::MAX_WORKERS];
+        row_workers::run_aligned(
+            &mut task_tokens[..num_tasks],
+            active_workers,
+            1,
+            &|start_task, slice| {
+                for task_idx in start_task..(start_task + slice.len()) {
+                    let Some(slot) = slots.get(task_idx).and_then(Option::as_ref) else {
+                        continue;
+                    };
+                    let mut guard = slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let (k_dst, v_dst) = &mut *guard;
+                    copy_range(task_idx * chunk_slots, k_dst, v_dst);
+                }
+            },
+        );
+    } else {
+        copy_range(0, k_hm, v_hm);
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Runs 2-position GQA causal attention over head-major F32 KV with symmetric load balancing."
+)]
+fn prefill_causal_attention_hm(
+    queries: &[f32],
+    k_hm: &[f32],
+    v_hm: &[f32],
+    start_pos: usize,
+    total: usize,
+    total_kv_rows: usize,
+    c: Config,
+    gqa_group: usize,
+    divisor: f32,
+    workers: usize,
+    batch_attn: &mut [f32],
+) -> io::Result<()> {
+    if total == 0 {
+        return Ok(());
+    }
+    let q_width = c.heads * c.head_dim;
+    let group_width = gqa_group * c.head_dim;
+    let kv_head_stride = total_kv_rows * c.head_dim;
+    let num_row_tiles = total.div_ceil(2);
+    let num_pairs = num_row_tiles.div_ceil(2);
+    let total_tasks = c.kv_heads * num_pairs;
+    let max_history = start_pos + total;
+    let score_needed = 2 * gqa_group * max_history;
+
+    let run_tile = |kv_head: usize,
+                    tile_idx: usize,
+                    scores: &mut [f32],
+                    out_a: &mut [f32],
+                    out_b: Option<&mut [f32]>|
+     -> io::Result<()> {
+        let r0 = tile_idx * 2;
+        let k_slab = &k_hm[kv_head * kv_head_stride..(kv_head + 1) * kv_head_stride];
+        let v_slab = &v_hm[kv_head * kv_head_stride..(kv_head + 1) * kv_head_stride];
+        let q_a = &queries[r0 * q_width + kv_head * group_width
+            ..r0 * q_width + (kv_head + 1) * group_width];
+        let len_a = start_pos + r0 + 1;
+        if let Some(out_b_slice) = out_b {
+            let r1 = r0 + 1;
+            let len_b = len_a + 1;
+            let q_b = &queries[r1 * q_width + kv_head * group_width
+                ..r1 * q_width + (kv_head + 1) * group_width];
+            let (sa, sb_rest) = scores.split_at_mut(gqa_group * len_a);
+            let sb = &mut sb_rest[..gqa_group * len_b];
+            packed::attend_kv_group_2pos_f32(
+                q_a,
+                q_b,
+                k_slab,
+                v_slab,
+                len_a,
+                len_b,
+                c.head_dim,
+                gqa_group,
+                divisor,
+                sa,
+                sb,
+                out_a,
+                out_b_slice,
+                invalid,
+            )
+        } else {
+            packed::attend_kv_group_f32(
+                q_a,
+                k_slab,
+                v_slab,
+                len_a,
+                c.head_dim,
+                0,
+                c.head_dim,
+                gqa_group,
+                divisor,
+                None,
+                &mut scores[..gqa_group * len_a],
+                out_a,
+                invalid,
+            )?;
+            finite(out_a)
+        }
+    };
+
+    let active_workers = workers.clamp(1, threads::MAX_WORKERS).min(total_tasks);
+    if active_workers > 1 && total_tasks >= 2 {
+        let mut attn_slots = Vec::new();
+        attn_slots
+            .try_reserve_exact(total * c.kv_heads)
+            .map_err(io::Error::other)?;
+        for chunk in batch_attn.chunks_exact_mut(group_width) {
+            attn_slots.push(std::sync::Mutex::new(chunk));
+        }
+        let next_task = std::sync::atomic::AtomicUsize::new(0);
+        let mut task_tokens = [0.0_f32; threads::MAX_WORKERS];
+        row_workers::try_run_aligned(
+            &mut task_tokens[..active_workers],
+            active_workers,
+            1,
+            &|_, _| {
+                with_score_scratch(score_needed, |scores| {
+                    loop {
+                        let task_id = next_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if task_id >= total_tasks {
+                            break;
+                        }
+                        let kv_head = task_id / num_pairs;
+                        let pair_idx = task_id % num_pairs;
+                        let t_lo = pair_idx;
+                        let t_hi = num_row_tiles - 1 - pair_idx;
+                        for tile_idx in [Some(t_lo), (t_hi != t_lo).then_some(t_hi)]
+                            .into_iter()
+                            .flatten()
+                        {
+                            let r0 = tile_idx * 2;
+                            let mut out_a = attn_slots[r0 * c.kv_heads + kv_head]
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if r0 + 1 < total {
+                                let mut out_b = attn_slots[(r0 + 1) * c.kv_heads + kv_head]
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                run_tile(kv_head, tile_idx, scores, &mut out_a, Some(&mut out_b))?;
+                            } else {
+                                run_tile(kv_head, tile_idx, scores, &mut out_a, None)?;
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+            },
+        )?;
+        return Ok(());
+    }
+
+    with_score_scratch(score_needed, |scores| {
+        for (tile_idx, rows_chunk) in batch_attn.chunks_mut(2 * q_width).enumerate() {
+            let r0 = tile_idx * 2;
+            if r0 + 1 < total {
+                let (row_a, row_b) = rows_chunk.split_at_mut(q_width);
+                for (kv_head, (out_a, out_b)) in row_a
+                    .chunks_exact_mut(group_width)
+                    .zip(row_b.chunks_exact_mut(group_width))
+                    .enumerate()
+                {
+                    run_tile(kv_head, tile_idx, scores, out_a, Some(out_b))?;
+                }
+            } else {
+                for (kv_head, out_a) in rows_chunk.chunks_exact_mut(group_width).enumerate() {
+                    run_tile(kv_head, tile_idx, scores, out_a, None)?;
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 struct TruncateGuard<'a> {

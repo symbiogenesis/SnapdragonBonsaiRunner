@@ -14,7 +14,7 @@ use bonsai_windows_process::quant_kernels::{self, Arm64QuantCaps, Q8_0ActBlock, 
 use std::sync::OnceLock;
 
 use crate::row_workers;
-use fearless_simd::{Level, dispatch, f32x4, i32x4, prelude::*, u8x16};
+use fearless_simd::{Level, dispatch, f32x4, i32x4, prelude::*, u8x16, u32x4};
 
 static SIMD_LEVEL: OnceLock<Level> = OnceLock::new();
 
@@ -2049,8 +2049,11 @@ fn scatter_quads_simd<S: Simd>(
     row_stride: usize,
     output: usize,
     start_elem: usize,
+    bias: Option<&[f32]>,
     out_quads: &mut [f32],
-) {
+) -> bool {
+    let inf = f32x4::splat(simd, f32::INFINITY);
+    let mut all_finite = true;
     let start_quad = start_elem / (4 * output);
     let quad_count = out_quads.len() / (4 * output);
     let row_quads = output / 4;
@@ -2078,7 +2081,22 @@ fn scatter_quads_simd<S: Simd>(
                 simd,
                 &transposed[(r + 3) * row_stride + q * 4..(r + 3) * row_stride + q * 4 + 4],
             );
-            let cols = transpose_4x4(simd, [r0, r1, r2, r3]);
+            let mut cols = transpose_4x4(simd, [r0, r1, r2, r3]);
+            if let Some(b) = bias {
+                let bv = f32x4::from_slice(simd, &b[r..r + 4]);
+                cols[0] += bv;
+                cols[1] += bv;
+                cols[2] += bv;
+                cols[3] += bv;
+            }
+            if !(cols[0].abs().simd_lt(inf)
+                & cols[1].abs().simd_lt(inf)
+                & cols[2].abs().simd_lt(inf)
+                & cols[3].abs().simd_lt(inf))
+                .all_true()
+            {
+                all_finite = false;
+            }
             cols[0].store_slice(&mut p0[r..r + 4]);
             cols[1].store_slice(&mut p1[r..r + 4]);
             cols[2].store_slice(&mut p2[r..r + 4]);
@@ -2086,12 +2104,32 @@ fn scatter_quads_simd<S: Simd>(
         }
         for r in (row_quads * 4)..output {
             let base = r * row_stride + q * 4;
-            p0[r] = transposed[base];
-            p1[r] = transposed[base + 1];
-            p2[r] = transposed[base + 2];
-            p3[r] = transposed[base + 3];
+            let (v0, v1, v2, v3) = if let Some(b) = bias {
+                let bv = b[r];
+                (
+                    transposed[base] + bv,
+                    transposed[base + 1] + bv,
+                    transposed[base + 2] + bv,
+                    transposed[base + 3] + bv,
+                )
+            } else {
+                (
+                    transposed[base],
+                    transposed[base + 1],
+                    transposed[base + 2],
+                    transposed[base + 3],
+                )
+            };
+            if !(v0.is_finite() && v1.is_finite() && v2.is_finite() && v3.is_finite()) {
+                all_finite = false;
+            }
+            p0[r] = v0;
+            p1[r] = v1;
+            p2[r] = v2;
+            p3[r] = v3;
         }
     }
+    all_finite
 }
 
 #[cfg(all(windows, feature = "rust-qualification"))]
@@ -2552,50 +2590,85 @@ fn batch_rows_quant_arm64(
     }
 }
 
+fn scatter_tail_rows(
+    transposed: &[f32],
+    row_stride: usize,
+    output: usize,
+    batch: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> bool {
+    let full_quads = batch / 4;
+    let rem = batch % 4;
+    if rem == 0 {
+        return true;
+    }
+    let mut all_finite = true;
+    let tail_quad = full_quads * 4;
+    let tail_out = &mut out[tail_quad * output..batch * output];
+    for pos in 0..rem {
+        let dst_row = &mut tail_out[pos * output..(pos + 1) * output];
+        if let Some(b) = bias {
+            for ((r, dst), &bv) in dst_row.iter_mut().enumerate().zip(b) {
+                let v = transposed[r * row_stride + tail_quad + pos] + bv;
+                if !v.is_finite() {
+                    all_finite = false;
+                }
+                *dst = v;
+            }
+        } else {
+            for (r, dst) in dst_row.iter_mut().enumerate() {
+                let v = transposed[r * row_stride + tail_quad + pos];
+                if !v.is_finite() {
+                    all_finite = false;
+                }
+                *dst = v;
+            }
+        }
+    }
+    all_finite
+}
+
 fn scatter_transposed_to_batch(
     transposed: &[f32],
     row_stride: usize,
     output: usize,
     batch: usize,
     workers: usize,
+    bias: Option<&[f32]>,
     out: &mut [f32],
-) {
+) -> bool {
     const PARALLEL_SCATTER_WORK: usize = 8_192;
     if batch == 0 || output == 0 {
-        return;
+        return true;
     }
     let level = simd_level();
     let full_quads = batch / 4;
+    let all_finite = std::sync::atomic::AtomicBool::new(true);
     if full_quads > 0 {
         let quad_out = &mut out[..full_quads * 4 * output];
         if workers > 1 && full_quads >= 2 && quad_out.len() >= PARALLEL_SCATTER_WORK {
             row_workers::run_aligned(quad_out, workers, 4 * output, &|elem_off, slice| {
-                dispatch!(
+                let ok = dispatch!(
                     level,
-                    simd => scatter_quads_simd(simd, transposed, row_stride, output, elem_off, slice)
+                    simd => scatter_quads_simd(simd, transposed, row_stride, output, elem_off, bias, slice)
                 );
+                if !ok {
+                    all_finite.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
             });
-        } else {
-            dispatch!(
-                level,
-                simd => scatter_quads_simd(simd, transposed, row_stride, output, 0, quad_out)
-            );
+        } else if !dispatch!(
+            level,
+            simd => scatter_quads_simd(simd, transposed, row_stride, output, 0, bias, quad_out)
+        ) {
+            all_finite.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    let rem = batch % 4;
-    if rem > 0 {
-        let tail_quad = full_quads * 4;
-        let tail_out = &mut out[tail_quad * output..batch * output];
-        for pos in 0..rem {
-            let dst_row = &mut tail_out[pos * output..(pos + 1) * output];
-            for (r, dst) in dst_row.iter_mut().enumerate() {
-                *dst = transposed[r * row_stride + tail_quad + pos];
-            }
-        }
-    }
+    let tail_ok = scatter_tail_rows(transposed, row_stride, output, batch, bias, out);
+    all_finite.load(std::sync::atomic::Ordering::Relaxed) && tail_ok
 }
 
-#[cfg(any(test, all(windows, feature = "rust-qualification")))]
+#[cfg(test)]
 fn scatter_rows_to_batch(
     transposed: &[f32],
     output: usize,
@@ -2603,7 +2676,144 @@ fn scatter_rows_to_batch(
     workers: usize,
     out: &mut [f32],
 ) {
-    scatter_transposed_to_batch(transposed, batch, output, batch, workers, out);
+    let _ = scatter_transposed_to_batch(transposed, batch, output, batch, workers, None, out);
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Scatters all sibling group outputs, fuses optional biases, and checks finiteness in one barrier."
+)]
+fn scatter_group_to_batch(
+    transposed: &[f32],
+    row_offsets: &[usize],
+    row_stride: usize,
+    outputs: &[usize],
+    biases: &[Option<&[f32]>],
+    batch: usize,
+    workers: usize,
+    outs: &mut [&mut [f32]],
+) -> bool {
+    const PARALLEL_SCATTER_WORK: usize = 8_192;
+    let count = outs.len();
+    if batch == 0 || count == 0 {
+        return true;
+    }
+    let level = simd_level();
+    let full_quads = batch / 4;
+    let total_quad_elems: usize = outputs.iter().map(|&o| full_quads * 4 * o).sum();
+    let all_finite = std::sync::atomic::AtomicBool::new(true);
+
+    if full_quads > 0 {
+        let active_workers = workers.clamp(1, crate::threads::MAX_WORKERS).min(full_quads);
+        if active_workers > 1 && total_quad_elems >= PARALLEL_SCATTER_WORK {
+            let chunk_quads = full_quads.div_ceil(active_workers);
+            let num_tasks = full_quads.div_ceil(chunk_quads);
+            let mut task_slots: [Option<std::sync::Mutex<[Option<&mut [f32]>; 4]>>;
+                crate::threads::MAX_WORKERS] = [const { None }; crate::threads::MAX_WORKERS];
+            let mut per_target: [Option<std::vec::IntoIter<&mut [f32]>>; 4] =
+                [const { None }; 4];
+            for (idx, out) in outs.iter_mut().enumerate() {
+                let output = outputs[idx];
+                if output > 0 {
+                    let quad_len = full_quads * 4 * output;
+                    let chunk_elems = chunk_quads * 4 * output;
+                    let chunks: Vec<&mut [f32]> = out[..quad_len].chunks_mut(chunk_elems).collect();
+                    per_target[idx] = Some(chunks.into_iter());
+                }
+            }
+            for (task_idx, slot) in task_slots.iter_mut().take(num_tasks).enumerate() {
+                let mut arr: [Option<&mut [f32]>; 4] = [const { None }; 4];
+                for idx in 0..count {
+                    if let Some(iter) = per_target[idx].as_mut() {
+                        arr[idx] = iter.next();
+                    }
+                }
+                let _ = task_idx;
+                *slot = Some(std::sync::Mutex::new(arr));
+            }
+            let mut task_tokens = [0.0_f32; crate::threads::MAX_WORKERS];
+            row_workers::run_aligned(
+                &mut task_tokens[..num_tasks],
+                active_workers,
+                1,
+                &|start_task, slice| {
+                    for task_idx in start_task..(start_task + slice.len()) {
+                        let Some(slot) = task_slots.get(task_idx).and_then(Option::as_ref) else {
+                            continue;
+                        };
+                        let mut guard = slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let q_start = task_idx * chunk_quads;
+                        for idx in 0..count {
+                            if let Some(out_chunk) = guard[idx].as_deref_mut() {
+                                let output = outputs[idx];
+                                let t_base = row_offsets[idx] * row_stride;
+                                let elem_off = q_start * 4 * output;
+                                let ok = dispatch!(
+                                    level,
+                                    simd => scatter_quads_simd(
+                                        simd,
+                                        &transposed[t_base..],
+                                        row_stride,
+                                        output,
+                                        elem_off,
+                                        biases[idx],
+                                        out_chunk,
+                                    )
+                                );
+                                if !ok {
+                                    all_finite.store(false, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                },
+            );
+        } else {
+            for idx in 0..count {
+                let output = outputs[idx];
+                if output == 0 {
+                    continue;
+                }
+                let t_base = row_offsets[idx] * row_stride;
+                let quad_out = &mut outs[idx][..full_quads * 4 * output];
+                if !dispatch!(
+                    level,
+                    simd => scatter_quads_simd(
+                        simd,
+                        &transposed[t_base..],
+                        row_stride,
+                        output,
+                        0,
+                        biases[idx],
+                        quad_out,
+                    )
+                ) {
+                    all_finite.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    let mut tail_ok = true;
+    for idx in 0..count {
+        let output = outputs[idx];
+        if output > 0 {
+            let t_base = row_offsets[idx] * row_stride;
+            if !scatter_tail_rows(
+                &transposed[t_base..],
+                row_stride,
+                output,
+                batch,
+                biases[idx],
+                outs[idx],
+            ) {
+                tail_ok = false;
+            }
+        }
+    }
+    all_finite.load(std::sync::atomic::Ordering::Relaxed) && tail_ok
 }
 
 /// Transpose row-major `[rows, cols]` `f32` matrix into `[cols, rows]` using
@@ -2615,29 +2825,61 @@ pub(super) fn transpose_f32_matrix(
     workers: usize,
     dst: &mut [f32],
 ) {
-    scatter_transposed_to_batch(src, cols, rows, cols, workers, dst);
+    let _ = scatter_transposed_to_batch(src, cols, rows, cols, workers, None, dst);
+}
+
+#[inline(always)]
+fn add_bias_and_check_finite_simd<S: Simd>(
+    simd: S,
+    values: &mut [f32],
+    bias: Option<&[f32]>,
+) -> bool {
+    let inf = f32x4::splat(simd, f32::INFINITY);
+    let mut all_finite = true;
+    if let Some(b) = bias {
+        let (v_chunks, v_tail) = values.as_chunks_mut::<4>();
+        let (b_chunks, b_tail) = b.as_chunks::<4>();
+        for (vc, bc) in v_chunks.iter_mut().zip(b_chunks) {
+            let sum = f32x4::from_slice(simd, vc) + f32x4::from_slice(simd, bc);
+            if !sum.abs().simd_lt(inf).all_true() {
+                all_finite = false;
+            }
+            sum.store_slice(vc);
+        }
+        for (v, &bv) in v_tail.iter_mut().zip(b_tail) {
+            *v += bv;
+            if !v.is_finite() {
+                all_finite = false;
+            }
+        }
+    } else {
+        all_finite = ensure_finite_simd(simd, values);
+    }
+    all_finite
 }
 
 /// Bit-exact matrix multiplication for a pre-transposed batch `[batch, input]`
-/// using `4x8` / `4x4` SIMD tiles (or ARM64 `I8MM`/`SDOT` kernels) and `row_workers`.
-pub(super) fn multiply_batch_prepared_into(
+/// with optional fused bias and in-register finiteness check, returning `false` on non-finite output.
+pub(super) fn multiply_batch_prepared_biased_into(
     weights: WeightMatrix<'_>,
     prepared: &mut PreparedBatch,
     raw_input: &[f32],
+    bias: Option<&[f32]>,
     workers: usize,
     transposed_scratch: &mut Vec<f32>,
     out: &mut [f32],
-) {
+) -> bool {
     let output = weights.output;
     let batch = prepared.batch;
     if batch == 0 || output == 0 {
-        return;
+        return true;
     }
+    let level = simd_level();
     #[cfg(all(windows, feature = "rust-qualification"))]
     if !matches!(weights.data, WeightSlice::Float(_)) {
         if batch == 1 {
             multiply_single_into(weights, raw_input, workers, out);
-            return;
+            return dispatch!(level, simd => add_bias_and_check_finite_simd(simd, out, bias));
         }
         let caps = quantize_batch_activations_into(
             prepared,
@@ -2670,13 +2912,11 @@ pub(super) fn multiply_batch_prepared_into(
                 );
             },
         );
-        scatter_rows_to_batch(transposed, output, batch, workers, out);
-        return;
+        return scatter_transposed_to_batch(transposed, batch, output, batch, workers, bias, out);
     }
 
     prepared.ensure_quads(raw_input, workers);
     let num_quads = prepared.num_quads;
-    let level = simd_level();
     if num_quads > 0 && output > 0 {
         let row_stride = num_quads * 4;
         let needed = output * row_stride;
@@ -2691,8 +2931,39 @@ pub(super) fn multiply_batch_prepared_into(
                 simd => batch_rows_simd(simd, weights, start_row, &prepared.quads, num_quads, slice)
             );
         });
-        scatter_transposed_to_batch(transposed, row_stride, output, prepared.batch, workers, out);
+        return scatter_transposed_to_batch(
+            transposed,
+            row_stride,
+            output,
+            prepared.batch,
+            workers,
+            bias,
+            out,
+        );
     }
+    true
+}
+
+/// Bit-exact matrix multiplication for a pre-transposed batch `[batch, input]`
+/// using `4x8` / `4x4` SIMD tiles (or ARM64 `I8MM`/`SDOT` kernels) and `row_workers`.
+#[cfg(test)]
+pub(super) fn multiply_batch_prepared_into(
+    weights: WeightMatrix<'_>,
+    prepared: &mut PreparedBatch,
+    raw_input: &[f32],
+    workers: usize,
+    transposed_scratch: &mut Vec<f32>,
+    out: &mut [f32],
+) {
+    let _ = multiply_batch_prepared_biased_into(
+        weights,
+        prepared,
+        raw_input,
+        None,
+        workers,
+        transposed_scratch,
+        out,
+    );
 }
 
 /// Bit-exact batched matrix multiplication writing directly in `[output, batch]` channel-major
@@ -2785,51 +3056,89 @@ pub(super) fn multiply_batch_channel_major_into(
 }
 
 /// Compute batched sibling projections sharing `prepared` / `raw_input` (`query + key + value`
-/// or `gate + up`) in one quantized activation pass and unified worker pass.
-pub(super) fn multiply_batch_group_into(
-    targets: &mut [(WeightMatrix<'_>, &mut [f32])],
+/// or `gate + up`) with optional biases in one activation pass, one compute pass, and one
+/// unified scatter+finite pass, returning `false` if any output element is non-finite.
+pub(super) fn multiply_batch_group_biased_into(
+    targets: &mut [(WeightMatrix<'_>, Option<&[f32]>, &mut [f32])],
     prepared: &mut PreparedBatch,
     raw_input: &[f32],
     workers: usize,
     transposed_scratch: &mut Vec<f32>,
-) {
+) -> bool {
     if targets.is_empty() {
-        return;
+        return true;
     }
     if targets.len() == 1 {
-        let (weights, out) = &mut targets[0];
-        multiply_batch_prepared_into(
+        let (weights, bias, out) = &mut targets[0];
+        return multiply_batch_prepared_biased_into(
             *weights,
             prepared,
             raw_input,
+            *bias,
             workers,
             transposed_scratch,
             out,
         );
-        return;
     }
     let batch = prepared.batch;
     if batch == 0 {
-        return;
+        return true;
     }
+    let level = simd_level();
     if batch == 1 {
-        multiply_single_group_into(targets, raw_input, workers, transposed_scratch);
-        return;
+        let mut single_targets: [(WeightMatrix<'_>, &mut [f32]); 4] = [
+            (targets[0].0, &mut []),
+            (targets[0].0, &mut []),
+            (targets[0].0, &mut []),
+            (targets[0].0, &mut []),
+        ];
+        let count = targets.len();
+        let mut biases: [Option<&[f32]>; 4] = [None; 4];
+        for (idx, (w, bias, out)) in targets.iter_mut().enumerate() {
+            single_targets[idx] = (*w, *out);
+            biases[idx] = *bias;
+        }
+        multiply_single_group_into(
+            &mut single_targets[..count],
+            raw_input,
+            workers,
+            transposed_scratch,
+        );
+        let mut all_finite = true;
+        for (idx, (_, out)) in single_targets[..count].iter_mut().enumerate() {
+            if !dispatch!(level, simd => add_bias_and_check_finite_simd(simd, out, biases[idx])) {
+                all_finite = false;
+            }
+        }
+        return all_finite;
     }
+
+    let count = targets.len();
+    let matrices = [
+        targets[0].0,
+        targets[1].0,
+        targets.get(2).map_or(targets[0].0, |t| t.0),
+        targets.get(3).map_or(targets[0].0, |t| t.0),
+    ];
+    let outputs = [
+        targets[0].0.output,
+        targets[1].0.output,
+        targets.get(2).map_or(0, |t| t.0.output),
+        targets.get(3).map_or(0, |t| t.0.output),
+    ];
+    let biases = [
+        targets[0].1,
+        targets[1].1,
+        targets.get(2).and_then(|t| t.1),
+        targets.get(3).and_then(|t| t.1),
+    ];
 
     #[cfg(all(windows, feature = "rust-qualification"))]
     {
         let all_quant = targets
             .iter()
-            .all(|(w, _)| !matches!(w.data, WeightSlice::Float(_)));
+            .all(|(w, _, _)| !matches!(w.data, WeightSlice::Float(_)));
         if all_quant {
-            let count = targets.len();
-            let matrices = [
-                targets[0].0,
-                targets[1].0,
-                targets.get(2).map_or(targets[0].0, |t| t.0),
-                targets.get(3).map_or(targets[0].0, |t| t.0),
-            ];
             let caps = quantize_batch_activations_into(
                 prepared,
                 matrices[..count].iter().copied(),
@@ -2883,30 +3192,129 @@ pub(super) fn multiply_batch_group_into(
                     }
                 },
             );
-            for (idx, (w, out)) in targets.iter_mut().enumerate() {
-                let elem_off = offsets[idx] * batch;
-                scatter_rows_to_batch(
-                    &transposed[elem_off..elem_off + w.output * batch],
-                    w.output,
-                    batch,
-                    workers,
-                    out,
-                );
+            let mut outs: [&mut [f32]; 4] = [&mut [], &mut [], &mut [], &mut []];
+            for (idx, (_, _, out)) in targets.iter_mut().enumerate() {
+                outs[idx] = *out;
             }
-            return;
+            return scatter_group_to_batch(
+                transposed,
+                &offsets[..count],
+                batch,
+                &outputs[..count],
+                &biases[..count],
+                batch,
+                workers,
+                &mut outs[..count],
+            );
         }
     }
 
-    for (weights, out) in targets.iter_mut() {
-        multiply_batch_prepared_into(
+    let all_float = targets
+        .iter()
+        .all(|(w, _, _)| matches!(w.data, WeightSlice::Float(_)));
+    if all_float {
+        prepared.ensure_quads(raw_input, workers);
+        let num_quads = prepared.num_quads;
+        if num_quads == 0 {
+            return true;
+        }
+        let row_stride = num_quads * 4;
+        let mut offsets = [0_usize; 4];
+        let mut padded_rows = 0_usize;
+        for (idx, w) in matrices[..count].iter().enumerate() {
+            offsets[idx] = padded_rows;
+            padded_rows += w.output.next_multiple_of(4);
+        }
+        let needed = padded_rows * row_stride;
+        if transposed_scratch.len() < needed {
+            transposed_scratch.resize(needed, 0.0);
+        }
+        let transposed = &mut transposed_scratch[..needed];
+        row_workers::run_aligned(transposed, workers, 4 * row_stride, &|elem_off, slice| {
+            let start_row_global = elem_off / row_stride;
+            let end_row_global = start_row_global + slice.len() / row_stride;
+            for (idx, w) in matrices[..count].iter().enumerate() {
+                let t_start = offsets[idx];
+                let t_end = t_start + w.output;
+                let lo = start_row_global.max(t_start);
+                let hi = end_row_global.min(t_end);
+                if lo >= hi {
+                    continue;
+                }
+                let slice_lo = (lo - start_row_global) * row_stride;
+                let slice_hi = (hi - start_row_global) * row_stride;
+                dispatch!(
+                    level,
+                    simd => batch_rows_simd(
+                        simd,
+                        *w,
+                        lo - t_start,
+                        &prepared.quads,
+                        num_quads,
+                        &mut slice[slice_lo..slice_hi],
+                    )
+                );
+            }
+        });
+        let mut outs: [&mut [f32]; 4] = [&mut [], &mut [], &mut [], &mut []];
+        for (idx, (_, _, out)) in targets.iter_mut().enumerate() {
+            outs[idx] = *out;
+        }
+        return scatter_group_to_batch(
+            transposed,
+            &offsets[..count],
+            row_stride,
+            &outputs[..count],
+            &biases[..count],
+            batch,
+            workers,
+            &mut outs[..count],
+        );
+    }
+
+    let mut all_finite = true;
+    for (weights, bias, out) in targets.iter_mut() {
+        if !multiply_batch_prepared_biased_into(
             *weights,
             prepared,
             raw_input,
+            *bias,
             workers,
             transposed_scratch,
             out,
-        );
+        ) {
+            all_finite = false;
+        }
     }
+    all_finite
+}
+
+#[cfg(test)]
+/// Compute batched sibling projections sharing `prepared` / `raw_input`.
+pub(super) fn multiply_batch_group_into(
+    targets: &mut [(WeightMatrix<'_>, &mut [f32])],
+    prepared: &mut PreparedBatch,
+    raw_input: &[f32],
+    workers: usize,
+    transposed_scratch: &mut Vec<f32>,
+) {
+    let count = targets.len();
+    let mut biased: [(WeightMatrix<'_>, Option<&[f32]>, &mut [f32]); 4] = [
+        (targets[0].0, None, &mut []),
+        (targets[0].0, None, &mut []),
+        (targets[0].0, None, &mut []),
+        (targets[0].0, None, &mut []),
+    ];
+    for (idx, (w, out)) in targets.iter_mut().enumerate() {
+        biased[idx] = (*w, None, *out);
+    }
+    let _ = multiply_batch_group_biased_into(
+        &mut biased[..count],
+        prepared,
+        raw_input,
+        workers,
+        transposed_scratch,
+    );
 }
 
 #[cfg(test)]
@@ -4248,6 +4656,352 @@ pub(super) fn attend_kv_group_f16(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "2-position GQA causal attention shares head-major F32 KV loads across adjacent queries."
+)]
+#[inline(always)]
+fn attend_kv_group_2pos_f32_simd<S: Simd>(
+    simd: S,
+    q_group_a: &[f32],
+    q_group_b: &[f32],
+    keys_hm: &[f32],
+    values_hm: &[f32],
+    len_a: usize,
+    len_b: usize,
+    head_dim: usize,
+    gqa_group: usize,
+    divisor: f32,
+    scores_a: &mut [f32],
+    scores_b: &mut [f32],
+    out_group_a: &mut [f32],
+    out_group_b: &mut [f32],
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    let shared_quads = len_a / 4;
+    for quad in 0..shared_quads {
+        let r = quad * 4;
+        let k_refs = [
+            &keys_hm[r * head_dim..(r + 1) * head_dim],
+            &keys_hm[(r + 1) * head_dim..(r + 2) * head_dim],
+            &keys_hm[(r + 2) * head_dim..(r + 3) * head_dim],
+            &keys_hm[(r + 3) * head_dim..(r + 4) * head_dim],
+        ];
+        let mut g_base = 0_usize;
+        while g_base + 1 < gqa_group {
+            let qa0 = &q_group_a[g_base * head_dim..(g_base + 1) * head_dim];
+            let qa1 = &q_group_a[(g_base + 1) * head_dim..(g_base + 2) * head_dim];
+            let qb0 = &q_group_b[g_base * head_dim..(g_base + 1) * head_dim];
+            let qb1 = &q_group_b[(g_base + 1) * head_dim..(g_base + 2) * head_dim];
+            let res = dot_4keys_tile_simd(simd, [qa0, qa1, qb0, qb1], k_refs, head_dim, divisor);
+            scores_a[g_base * len_a + r..g_base * len_a + r + 4].copy_from_slice(&res[0]);
+            scores_a[(g_base + 1) * len_a + r..(g_base + 1) * len_a + r + 4]
+                .copy_from_slice(&res[1]);
+            scores_b[g_base * len_b + r..g_base * len_b + r + 4].copy_from_slice(&res[2]);
+            scores_b[(g_base + 1) * len_b + r..(g_base + 1) * len_b + r + 4]
+                .copy_from_slice(&res[3]);
+            g_base += 2;
+        }
+        if g_base < gqa_group {
+            let qa0 = &q_group_a[g_base * head_dim..(g_base + 1) * head_dim];
+            let qb0 = &q_group_b[g_base * head_dim..(g_base + 1) * head_dim];
+            let res = dot_4keys_tile_simd(simd, [qa0, qb0], k_refs, head_dim, divisor);
+            scores_a[g_base * len_a + r..g_base * len_a + r + 4].copy_from_slice(&res[0]);
+            scores_b[g_base * len_b + r..g_base * len_b + r + 4].copy_from_slice(&res[1]);
+        }
+    }
+    for row in (shared_quads * 4)..len_a {
+        let k = &keys_hm[row * head_dim..(row + 1) * head_dim];
+        let mut g_base = 0_usize;
+        while g_base + 1 < gqa_group {
+            let qa0 = &q_group_a[g_base * head_dim..(g_base + 1) * head_dim];
+            let qa1 = &q_group_a[(g_base + 1) * head_dim..(g_base + 2) * head_dim];
+            let qb0 = &q_group_b[g_base * head_dim..(g_base + 1) * head_dim];
+            let qb1 = &q_group_b[(g_base + 1) * head_dim..(g_base + 2) * head_dim];
+            let res = dot_row_tile_simd(simd, [qa0, qa1, qb0, qb1], k, head_dim, divisor);
+            scores_a[g_base * len_a + row] = res[0];
+            scores_a[(g_base + 1) * len_a + row] = res[1];
+            scores_b[g_base * len_b + row] = res[2];
+            scores_b[(g_base + 1) * len_b + row] = res[3];
+            g_base += 2;
+        }
+        if g_base < gqa_group {
+            let qa0 = &q_group_a[g_base * head_dim..(g_base + 1) * head_dim];
+            let qb0 = &q_group_b[g_base * head_dim..(g_base + 1) * head_dim];
+            let res = dot_row_tile_simd(simd, [qa0, qb0], k, head_dim, divisor);
+            scores_a[g_base * len_a + row] = res[0];
+            scores_b[g_base * len_b + row] = res[1];
+        }
+    }
+    {
+        let k_last = &keys_hm[len_a * head_dim..(len_a + 1) * head_dim];
+        let mut g_base = 0_usize;
+        while g_base + 1 < gqa_group {
+            let qb0 = &q_group_b[g_base * head_dim..(g_base + 1) * head_dim];
+            let qb1 = &q_group_b[(g_base + 1) * head_dim..(g_base + 2) * head_dim];
+            let res = dot_row_tile_simd(simd, [qb0, qb1], k_last, head_dim, divisor);
+            scores_b[g_base * len_b + len_a] = res[0];
+            scores_b[(g_base + 1) * len_b + len_a] = res[1];
+            g_base += 2;
+        }
+        if g_base < gqa_group {
+            let qb0 = &q_group_b[g_base * head_dim..(g_base + 1) * head_dim];
+            scores_b[g_base * len_b + len_a] = dot_row_simd(simd, qb0, k_last, divisor);
+        }
+    }
+
+    if !ensure_finite_simd(simd, scores_a) || !ensure_finite_simd(simd, scores_b) {
+        return Err(invalid());
+    }
+    for g in 0..gqa_group {
+        let ha = &mut scores_a[g * len_a..(g + 1) * len_a];
+        let max_a = max_finite_simd(simd, ha);
+        softmax_scores_simd(simd, ha, max_a, invalid)?;
+        let hb = &mut scores_b[g * len_b..(g + 1) * len_b];
+        let max_b = max_finite_simd(simd, hb);
+        softmax_scores_simd(simd, hb, max_b, invalid)?;
+    }
+
+    out_group_a.fill(0.0);
+    out_group_b.fill(0.0);
+    for quad in 0..shared_quads {
+        let r = quad * 4;
+        let v_refs = [
+            &values_hm[r * head_dim..(r + 1) * head_dim],
+            &values_hm[(r + 1) * head_dim..(r + 2) * head_dim],
+            &values_hm[(r + 2) * head_dim..(r + 3) * head_dim],
+            &values_hm[(r + 3) * head_dim..(r + 4) * head_dim],
+        ];
+        let weights_a = |g: usize| -> [f32; 4] {
+            let s = &scores_a[g * len_a + r..g * len_a + r + 4];
+            [s[0], s[1], s[2], s[3]]
+        };
+        let weights_b = |g: usize| -> [f32; 4] {
+            let s = &scores_b[g * len_b + r..g * len_b + r + 4];
+            [s[0], s[1], s[2], s[3]]
+        };
+        let mut g_base = 0_usize;
+        while g_base + 1 < gqa_group {
+            let (oa0, oa1) = out_group_a[g_base * head_dim..(g_base + 2) * head_dim]
+                .split_at_mut(head_dim);
+            let (ob0, ob1) = out_group_b[g_base * head_dim..(g_base + 2) * head_dim]
+                .split_at_mut(head_dim);
+            weighted_value_accum_4_tile_simd(
+                simd,
+                [oa0, oa1, ob0, ob1],
+                v_refs,
+                [
+                    weights_a(g_base),
+                    weights_a(g_base + 1),
+                    weights_b(g_base),
+                    weights_b(g_base + 1),
+                ],
+                head_dim,
+            );
+            g_base += 2;
+        }
+        if g_base < gqa_group {
+            let oa0 = &mut out_group_a[g_base * head_dim..(g_base + 1) * head_dim];
+            let ob0 = &mut out_group_b[g_base * head_dim..(g_base + 1) * head_dim];
+            weighted_value_accum_4_tile_simd(
+                simd,
+                [oa0, ob0],
+                v_refs,
+                [weights_a(g_base), weights_b(g_base)],
+                head_dim,
+            );
+        }
+    }
+    for row in (shared_quads * 4)..len_a {
+        let v = &values_hm[row * head_dim..(row + 1) * head_dim];
+        let mut g_base = 0_usize;
+        while g_base + 1 < gqa_group {
+            let (oa0, oa1) = out_group_a[g_base * head_dim..(g_base + 2) * head_dim]
+                .split_at_mut(head_dim);
+            let (ob0, ob1) = out_group_b[g_base * head_dim..(g_base + 2) * head_dim]
+                .split_at_mut(head_dim);
+            weighted_value_accum_tile_simd(
+                simd,
+                [oa0, oa1, ob0, ob1],
+                v,
+                [
+                    scores_a[g_base * len_a + row],
+                    scores_a[(g_base + 1) * len_a + row],
+                    scores_b[g_base * len_b + row],
+                    scores_b[(g_base + 1) * len_b + row],
+                ],
+                head_dim,
+            );
+            g_base += 2;
+        }
+        if g_base < gqa_group {
+            let oa0 = &mut out_group_a[g_base * head_dim..(g_base + 1) * head_dim];
+            let ob0 = &mut out_group_b[g_base * head_dim..(g_base + 1) * head_dim];
+            weighted_value_accum_tile_simd(
+                simd,
+                [oa0, ob0],
+                v,
+                [
+                    scores_a[g_base * len_a + row],
+                    scores_b[g_base * len_b + row],
+                ],
+                head_dim,
+            );
+        }
+    }
+    {
+        let v_last = &values_hm[len_a * head_dim..(len_a + 1) * head_dim];
+        let mut g_base = 0_usize;
+        while g_base + 1 < gqa_group {
+            let (ob0, ob1) = out_group_b[g_base * head_dim..(g_base + 2) * head_dim]
+                .split_at_mut(head_dim);
+            weighted_value_accum_tile_simd(
+                simd,
+                [ob0, ob1],
+                v_last,
+                [
+                    scores_b[g_base * len_b + len_a],
+                    scores_b[(g_base + 1) * len_b + len_a],
+                ],
+                head_dim,
+            );
+            g_base += 2;
+        }
+        if g_base < gqa_group {
+            let ob0 = &mut out_group_b[g_base * head_dim..(g_base + 1) * head_dim];
+            weighted_value_accum_simd(simd, ob0, v_last, scores_b[g_base * len_b + len_a]);
+        }
+    }
+
+    if !ensure_finite_simd(simd, out_group_a) || !ensure_finite_simd(simd, out_group_b) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Evaluate two adjacent causal positions `(pos_a, pos_a + 1)` sharing one head-major `F32` KV
+/// slab (`keys_hm`, `values_hm`) at `0-ULP` parity with independent `attend_kv_group_f32` calls.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "2-position GQA causal attention shares head-major F32 KV loads across adjacent queries."
+)]
+pub(super) fn attend_kv_group_2pos_f32(
+    q_group_a: &[f32],
+    q_group_b: &[f32],
+    keys_hm: &[f32],
+    values_hm: &[f32],
+    len_a: usize,
+    len_b: usize,
+    head_dim: usize,
+    gqa_group: usize,
+    divisor: f32,
+    scores_a: &mut [f32],
+    scores_b: &mut [f32],
+    out_group_a: &mut [f32],
+    out_group_b: &mut [f32],
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    let group_elems = gqa_group.checked_mul(head_dim).ok_or_else(invalid)?;
+    let sa_elems = gqa_group.checked_mul(len_a).ok_or_else(invalid)?;
+    let sb_elems = gqa_group.checked_mul(len_b).ok_or_else(invalid)?;
+    let kv_elems = len_b.checked_mul(head_dim).ok_or_else(invalid)?;
+    if gqa_group == 0
+        || head_dim == 0
+        || len_a == 0
+        || len_b != len_a + 1
+        || q_group_a.len() != group_elems
+        || q_group_b.len() != group_elems
+        || out_group_a.len() != group_elems
+        || out_group_b.len() != group_elems
+        || scores_a.len() != sa_elems
+        || scores_b.len() != sb_elems
+        || keys_hm.len() < kv_elems
+        || values_hm.len() < kv_elems
+    {
+        return Err(invalid());
+    }
+    let level = simd_level();
+    dispatch!(
+        level,
+        simd => attend_kv_group_2pos_f32_simd(
+            simd,
+            q_group_a,
+            q_group_b,
+            keys_hm,
+            values_hm,
+            len_a,
+            len_b,
+            head_dim,
+            gqa_group,
+            divisor,
+            scores_a,
+            scores_b,
+            out_group_a,
+            out_group_b,
+            invalid,
+        )
+    )
+}
+
+#[inline(always)]
+fn argmax_finite_f32_simd<S: Simd>(simd: S, values: &[f32]) -> Option<usize> {
+    if values.is_empty() || u32::try_from(values.len()).is_err() {
+        return None;
+    }
+    let inf_v = f32x4::splat(simd, f32::INFINITY);
+    let mut best_vals = f32x4::splat(simd, f32::NEG_INFINITY);
+    let mut best_idxs = u32x4::splat(simd, u32::MAX);
+    let mut idx_v = u32x4::from_slice(simd, &[0_u32, 1, 2, 3]);
+    let step_v = u32x4::splat(simd, 4);
+    let mut valid_mask = inf_v.simd_lt(inf_v) | f32x4::splat(simd, 0.0).simd_lt(inf_v);
+
+    let (chunks, tail) = values.as_chunks::<4>();
+    for chunk in chunks {
+        let v = f32x4::from_slice(simd, chunk);
+        valid_mask = valid_mask & v.abs().simd_lt(inf_v);
+        let better = v.simd_gt(best_vals);
+        best_vals = better.select(v, best_vals);
+        best_idxs = better.select(idx_v, best_idxs);
+        idx_v += step_v;
+    }
+    if !valid_mask.all_true() {
+        return None;
+    }
+
+    let mut best_val = f32::NEG_INFINITY;
+    let mut best_idx = usize::MAX;
+    if !chunks.is_empty() {
+        let vals: [f32; 4] = best_vals.into();
+        let idxs: [u32; 4] = best_idxs.into();
+        for l in 0..4 {
+            let idx = usize::try_from(idxs[l]).ok()?;
+            if vals[l] > best_val || (vals[l] == best_val && idx < best_idx) {
+                best_val = vals[l];
+                best_idx = idx;
+            }
+        }
+    }
+
+    let tail_base = chunks.len() * 4;
+    for (offset, &val) in tail.iter().enumerate() {
+        if !val.is_finite() {
+            return None;
+        }
+        let idx = tail_base + offset;
+        if val > best_val {
+            best_val = val;
+            best_idx = idx;
+        }
+    }
+    Some(best_idx)
+}
+
+/// Single-pass SIMD argmax rejecting empty or non-finite slices, with strict lowest-index tie-breaking.
+pub(super) fn argmax_finite_f32(values: &[f32]) -> Option<usize> {
+    let level = simd_level();
+    dispatch!(level, simd => argmax_finite_f32_simd(simd, values))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5517,5 +6271,185 @@ mod tests {
             }
         }
         assert!(max_ulp <= 2);
+    }
+
+    #[test]
+    fn attend_kv_group_2pos_matches_single_position_bit_exact() -> io::Result<()> {
+        let inv = || io::Error::other("attn err");
+        for gqa_group in [1_usize, 2, 3, 4] {
+            for head_dim in [6_usize, 64] {
+                for len_a in [1_usize, 3, 4, 5, 19, 35] {
+                    let len_b = len_a + 1;
+                    let group_elems = gqa_group * head_dim;
+                    let q_a: Vec<f32> = (0..group_elems)
+                        .map(|i| (f32::from(u16::try_from((i * 11 + 3) % 29).unwrap_or(0)) - 14.0) * 0.0625)
+                        .collect();
+                    let q_b: Vec<f32> = (0..group_elems)
+                        .map(|i| (f32::from(u16::try_from((i * 17 + 7) % 31).unwrap_or(0)) - 15.0) * 0.0625)
+                        .collect();
+                    let keys_hm: Vec<f32> = (0..len_b * head_dim)
+                        .map(|i| (f32::from(u16::try_from((i * 7 + 5) % 23).unwrap_or(0)) - 11.0) * 0.05)
+                        .collect();
+                    let values_hm: Vec<f32> = (0..len_b * head_dim)
+                        .map(|i| (f32::from(u16::try_from((i * 13 + 1) % 25).unwrap_or(0)) - 12.0) * 0.0625)
+                        .collect();
+                    let divisor = super::scalar_f32(head_dim).sqrt();
+
+                    let mut exp_a = vec![0.0_f32; group_elems];
+                    let mut exp_b = vec![0.0_f32; group_elems];
+                    let mut sa_exp = vec![0.0_f32; gqa_group * len_a];
+                    let mut sb_exp = vec![0.0_f32; gqa_group * len_b];
+                    super::attend_kv_group_f32(
+                        &q_a,
+                        &keys_hm,
+                        &values_hm,
+                        len_a,
+                        head_dim,
+                        0,
+                        head_dim,
+                        gqa_group,
+                        divisor,
+                        None,
+                        &mut sa_exp,
+                        &mut exp_a,
+                        inv,
+                    )?;
+                    super::attend_kv_group_f32(
+                        &q_b,
+                        &keys_hm,
+                        &values_hm,
+                        len_b,
+                        head_dim,
+                        0,
+                        head_dim,
+                        gqa_group,
+                        divisor,
+                        None,
+                        &mut sb_exp,
+                        &mut exp_b,
+                        inv,
+                    )?;
+
+                    let mut got_a = vec![f32::NAN; group_elems];
+                    let mut got_b = vec![f32::NAN; group_elems];
+                    let mut sa_got = vec![0.0_f32; gqa_group * len_a];
+                    let mut sb_got = vec![0.0_f32; gqa_group * len_b];
+                    super::attend_kv_group_2pos_f32(
+                        &q_a,
+                        &q_b,
+                        &keys_hm,
+                        &values_hm,
+                        len_a,
+                        len_b,
+                        head_dim,
+                        gqa_group,
+                        divisor,
+                        &mut sa_got,
+                        &mut sb_got,
+                        &mut got_a,
+                        &mut got_b,
+                        inv,
+                    )?;
+                    assert_eq!(
+                        got_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        exp_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "2pos A mismatch gqa={gqa_group} dim={head_dim} len_a={len_a}"
+                    );
+                    assert_eq!(
+                        got_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        exp_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "2pos B mismatch gqa={gqa_group} dim={head_dim} len_a={len_a}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn argmax_finite_f32_preserves_lowest_index_ties_and_rejects_nonfinite() {
+        assert_eq!(super::argmax_finite_f32(&[]), None);
+        assert_eq!(super::argmax_finite_f32(&[-0.0, 0.0]), Some(0));
+        assert_eq!(super::argmax_finite_f32(&[-f32::MAX; 7]), Some(0));
+        for len in 1_usize..=19 {
+            for pos in 0..len {
+                let mut v = vec![-1.0_f32; len];
+                v[pos] = 5.0;
+                if pos + 3 < len {
+                    v[pos + 3] = 5.0;
+                }
+                assert_eq!(super::argmax_finite_f32(&v), Some(pos));
+                for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                    let mut bad_v = v.clone();
+                    bad_v[pos] = bad;
+                    assert_eq!(super::argmax_finite_f32(&bad_v), None);
+                }
+            }
+        }
+        let mut large = vec![-3.0_f32; 1029];
+        large[511] = 9.0;
+        large[1028] = 9.0;
+        assert_eq!(super::argmax_finite_f32(&large), Some(511));
+        large[1028] = f32::NAN;
+        assert_eq!(super::argmax_finite_f32(&large), None);
+    }
+
+    #[test]
+    fn scatter_group_to_batch_fuses_bias_and_detects_nonfinite() {
+        let outputs = [5_usize, 1025];
+        let batch = 17_usize;
+        let t0: Vec<f32> = (0..outputs[0] * batch)
+            .map(|i| f32::from(u16::try_from(i % 23).unwrap_or(0)) * 0.25 - 2.0)
+            .collect();
+        let t1: Vec<f32> = (0..outputs[1] * batch)
+            .map(|i| f32::from(u16::try_from((i * 7) % 31).unwrap_or(0)) * 0.125 - 1.5)
+            .collect();
+        let b0: Vec<f32> = (0..outputs[0])
+            .map(|i| f32::from(u16::try_from(i).unwrap_or(0)) * 0.5)
+            .collect();
+        let b1: Vec<f32> = (0..outputs[1])
+            .map(|i| f32::from(u16::try_from(i % 13).unwrap_or(0)) * 0.25)
+            .collect();
+        let mut combined = Vec::with_capacity((outputs[0] + outputs[1]) * batch);
+        combined.extend_from_slice(&t0);
+        combined.extend_from_slice(&t1);
+        let mut out0 = vec![0.0_f32; batch * outputs[0]];
+        let mut out1 = vec![0.0_f32; batch * outputs[1]];
+        let ok = super::scatter_group_to_batch(
+            &combined,
+            &[0, outputs[0]],
+            batch,
+            &outputs,
+            &[Some(&b0), Some(&b1)],
+            batch,
+            4,
+            &mut [&mut out0, &mut out1],
+        );
+        assert!(ok);
+        for t in 0..batch {
+            for r in 0..outputs[0] {
+                assert_eq!(
+                    out0[t * outputs[0] + r].to_bits(),
+                    (t0[r * batch + t] + b0[r]).to_bits()
+                );
+            }
+            for r in 0..outputs[1] {
+                assert_eq!(
+                    out1[t * outputs[1] + r].to_bits(),
+                    (t1[r * batch + t] + b1[r]).to_bits()
+                );
+            }
+        }
+        combined[outputs[0] * batch + 13] = f32::NAN;
+        assert!(!super::scatter_group_to_batch(
+            &combined,
+            &[0, outputs[0]],
+            batch,
+            &outputs,
+            &[Some(&b0), Some(&b1)],
+            batch,
+            4,
+            &mut [&mut out0, &mut out1],
+        ));
     }
 }
