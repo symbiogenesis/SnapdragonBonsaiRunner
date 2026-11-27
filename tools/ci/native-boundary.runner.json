@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "checked-in-native-retirement-boundary",
   "repository": "runner",
-  "sourceRevision": "e3c5826467de20da0cdc6f9d2791f733c58a2df2",
+  "sourceRevision": "6e0bf4eea91ff6828d6a90bab0cfe0cb5c65543f",
   "exclusions": [
     {
       "path": ".git",
@@ -99,14 +99,14 @@
     },
     {
       "path": "Cargo.lock",
-      "bytes": 140023,
-      "sha256": "efafab72c161485ab8ed94084e41a3460ede835090224d37cbec2a83060aedf7",
+      "bytes": 137664,
+      "sha256": "bf970c5fdde99aa7b374037034c138ab675e767b377c708f70dd7e818791d280",
       "family": "native-asr"
     },
     {
       "path": "Cargo.toml",
-      "bytes": 5108,
-      "sha256": "7f748d78f0bfc8549ef7e6d49bfc69acd563029d3526608ce8431a1605819b22",
+      "bytes": 5268,
+      "sha256": "0712f4bbd1d2bfc07d5cd6af4c1fff048691db23e7607375c258190fdcfdf068",
       "family": "msvc-unwind"
     },
     {
@@ -135,8 +135,8 @@
     },
     {
       "path": "src/speech-asr/Cargo.toml",
-      "bytes": 1984,
-      "sha256": "07a25afe4e52b34152aefeeb3c98ee1038496747d5ad665da7503689ef6c4c99",
+      "bytes": 1912,
+      "sha256": "f7caa6b69e95ae01ba8e7e61a2722c1628ac3297e5e007c34925f3aa72402cf5",
       "family": "native-asr"
     },
     {
