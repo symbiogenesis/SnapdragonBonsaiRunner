@@ -9,9 +9,9 @@ function Test-PythonInterpreter([string]$Name) {
     [IO.Path]::GetFileName($Name.Replace('\','/')) -imatch '^(?:python(?:[23](?:\.[0-9]+)*)?w?|py)(?:\.exe)?$'
 }
 
-function Get-PowerShellPythonCalls([string]$Path, [Func[Management.Automation.Language.Ast,bool]]$CommandPredicate) {
+function Get-PowerShellPythonCalls([string]$Path, [string]$Text, [Func[Management.Automation.Language.Ast,bool]]$CommandPredicate) {
     $tokens=$null; $parseErrors=$null
-    $syntax=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$parseErrors)
+    $syntax=[Management.Automation.Language.Parser]::ParseInput($Text,$Path,[ref]$tokens,[ref]$parseErrors)
     $commands=$syntax.FindAll($CommandPredicate,$true)
     foreach ($command in $commands) {
         $name=$command.GetCommandName()
@@ -66,15 +66,15 @@ function Test-OwnedLanguages([string]$RepositoryRoot) {
             } else {
                 $relative=$null
             }
+            $text=[IO.File]::ReadAllText($entry)
+            if ($text.IndexOf('py',[StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
             if ($extension -in @('.ps1','.psm1')) {
-                foreach ($lineNumber in (Get-PowerShellPythonCalls $entry $commandPredicate)) {
+                foreach ($lineNumber in (Get-PowerShellPythonCalls $entry $text $commandPredicate)) {
                     if ($null -eq $relative) { $relative=[IO.Path]::GetRelativePath($rootPath,$entry).Replace('\','/') }
                     $errors.Add("${relative}:${lineNumber}: Python execution is prohibited")
                 }
                 continue
             }
-            $text=[IO.File]::ReadAllText($entry)
-            if ($text.IndexOf('py',[StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
             # Most files have no candidate. Scan those in .NET without entering
             # a PowerShell loop for every line; retain exact per-line diagnostics
             # for candidates, including CR-only files and multiline false alarms.

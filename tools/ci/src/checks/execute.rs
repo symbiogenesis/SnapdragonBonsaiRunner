@@ -408,9 +408,18 @@ pub(in crate::command) fn command_with_deadline(
     );
     let child =
         OwnedProcess::start_tool_with_removed(spec, removed).map_err(|error| error.to_string())?;
-    let wait_started = Instant::now();
+    const OUTPUT_CHECK_INTERVAL: Duration = Duration::from_millis(20);
     let code = loop {
-        if let Some(code) = child.try_wait().map_err(|error| error.to_string())? {
+        let wait = match deadline {
+            Some(deadline) => deadline
+                .saturating_duration_since(Instant::now())
+                .min(OUTPUT_CHECK_INTERVAL),
+            None => OUTPUT_CHECK_INTERVAL,
+        };
+        if let Some(code) = child
+            .wait_for_exit(wait)
+            .map_err(|error| error.to_string())?
+        {
             break code;
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline)
@@ -428,15 +437,6 @@ pub(in crate::command) fn command_with_deadline(
             write_failure_logs(&mut output, spec);
             return Err("Rust command exceeded its deadline or output limit; owned descendants were stopped.".into());
         }
-        let elapsed = wait_started.elapsed();
-        let step = if elapsed < Duration::from_millis(25) {
-            Duration::from_millis(1)
-        } else if elapsed < Duration::from_millis(250) {
-            Duration::from_millis(5)
-        } else {
-            Duration::from_millis(20)
-        };
-        std::thread::sleep(step);
     };
     let survivors = if reject_survivors {
         // Root signaling can precede final Job accounting or normal child exit.

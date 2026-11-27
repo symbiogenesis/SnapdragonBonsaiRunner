@@ -94,36 +94,44 @@ try {
             }
             [pscustomobject]@{ Path = $workflow; Source = ($lines -join "`n") }
         })
-        $results = @($prepared | ForEach-Object -ThrottleLimit 8 -Parallel {
-            $item = $_
-            $start = [Diagnostics.ProcessStartInfo]::new($using:ActionlintPath)
-            $start.WorkingDirectory = $using:Root
+        $invokeActionlint = {
+            param($Item, [string]$Exe, [string]$WorkingDir, [string[]]$ArgsList)
+            $start = [Diagnostics.ProcessStartInfo]::new($Exe)
+            $start.WorkingDirectory = $WorkingDir
             $start.UseShellExecute = $false
             $start.CreateNoWindow = $true
             $start.RedirectStandardInput = $true
             $start.RedirectStandardOutput = $true
             $start.RedirectStandardError = $true
-            foreach ($argument in $using:lintArguments) { $start.ArgumentList.Add($argument) }
+            foreach ($argument in $ArgsList) { $start.ArgumentList.Add($argument) }
             $start.ArgumentList.Add('-stdin-filename')
-            $start.ArgumentList.Add($item.Path)
+            $start.ArgumentList.Add($Item.Path)
             $start.ArgumentList.Add('-')
             $process = [Diagnostics.Process]::Start($start)
             try {
                 $stdoutTask = $process.StandardOutput.ReadToEndAsync()
                 $stderrTask = $process.StandardError.ReadToEndAsync()
                 $utf8 = [Text.UTF8Encoding]::new($false)
-                $bytes = $utf8.GetBytes($item.Source)
+                $bytes = $utf8.GetBytes($Item.Source)
                 $process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
                 $process.StandardInput.Close()
                 $process.WaitForExit()
                 [pscustomobject]@{
-                    Path = $item.Path
+                    Path = $Item.Path
                     ExitCode = $process.ExitCode
                     Stdout = $stdoutTask.GetAwaiter().GetResult()
                     Stderr = $stderrTask.GetAwaiter().GetResult()
                 }
             } finally { $process.Dispose() }
-        })
+        }
+        $results = if ($prepared.Count -eq 1) {
+            @(& $invokeActionlint $prepared[0] $ActionlintPath $Root $lintArguments)
+        } else {
+            $invokeText = $invokeActionlint.ToString()
+            @($prepared | ForEach-Object -ThrottleLimit 8 -Parallel {
+                & ([scriptblock]::Create($using:invokeText)) $_ $using:ActionlintPath $using:Root $using:lintArguments
+            })
+        }
         foreach ($res in $results) {
             if ($res.Stdout) { [Console]::Out.Write($res.Stdout) }
             if ($res.Stderr) { [Console]::Error.Write($res.Stderr) }
