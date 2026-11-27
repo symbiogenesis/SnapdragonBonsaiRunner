@@ -2193,3 +2193,92 @@ fn dynamic_first_load_selects_ptq1_under_memory_constraint_and_preserves_cache_o
 
     Ok(())
 }
+
+#[test]
+fn staged_model_with_prebuilt_binaries_enters_inference_and_artifacts() -> crate::Result<()> {
+    struct StageSpy {
+        inner: Recorder,
+        model_apps_calls: usize,
+        inference_and_artifacts_calls: Vec<(bool, bool)>,
+    }
+
+    impl Operations for StageSpy {
+        fn artifacts(&mut self, request: &Request, working: &Path) -> crate::Result<()> {
+            self.inner.artifacts(request, working)
+        }
+        fn inference(&mut self, request: &Request, working: &Path) -> crate::Result<()> {
+            self.inner.inference(request, working)
+        }
+        fn inference_and_artifacts(
+            &mut self,
+            request: &Request,
+            working: &Path,
+            run_inference: bool,
+            run_artifacts: bool,
+        ) -> crate::Result<()> {
+            self.inference_and_artifacts_calls
+                .push((run_inference, run_artifacts));
+            if run_inference {
+                self.inner.inference(request, working)?;
+            }
+            if run_artifacts {
+                self.inner.artifacts(request, working)?;
+            }
+            Ok(())
+        }
+        fn model_apps(
+            &mut self,
+            request: &Request,
+            packages: &[&str],
+            working: &Path,
+        ) -> crate::Result<Option<Value>> {
+            self.model_apps_calls += 1;
+            self.inner.model_apps(request, packages, working)
+        }
+        fn models(&mut self, request: &Request, model: &str, working: &Path) -> crate::Result<Value> {
+            self.inner.models(request, model, working)
+        }
+        fn apps(
+            &mut self,
+            request: &Request,
+            packages: &[&str],
+            working: &Path,
+        ) -> crate::Result<Value> {
+            self.inner.apps(request, packages, working)
+        }
+        fn native(&mut self, request: &Request, model: &str, working: &Path) -> crate::Result<Value> {
+            self.inner.native(request, model, working)
+        }
+        fn keys(&mut self, parent: &Path) -> crate::Result<PathBuf> {
+            self.inner.keys(parent)
+        }
+        fn launch(
+            &mut self,
+            executable: &Path,
+            arguments: &[OsString],
+            working: &Path,
+            environment: &BTreeMap<String, String>,
+        ) -> crate::Result<u32> {
+            <Recorder as Operations>::launch(
+                &mut self.inner,
+                executable,
+                arguments,
+                working,
+                environment,
+            )
+        }
+    }
+
+    let mut prebuilt = fixture("staged-model-prebuilt")?;
+    prebuilt.request["NativeEngine"] = json!(true);
+    prebuilt.request["PreparationStage"] = json!("model");
+    let mut spy = StageSpy {
+        inner: Recorder::new(prebuilt.root.clone()),
+        model_apps_calls: 0,
+        inference_and_artifacts_calls: Vec::new(),
+    };
+    prepare_backend(plan(prebuilt.request)?, &mut spy, &prebuilt.working)?;
+    assert_eq!(spy.model_apps_calls, 0);
+    assert_eq!(spy.inference_and_artifacts_calls, vec![(true, true)]);
+    fs::remove_dir_all(prebuilt.root).map_err(|error| error.to_string())
+}

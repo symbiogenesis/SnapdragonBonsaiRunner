@@ -1,6 +1,7 @@
 //! First-run Swift artifacts bound to the same immutable policy as the broker.
 
 use super::{Request, external};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -83,6 +84,20 @@ pub(super) fn model(request: &Request) -> crate::Result<Model> {
     })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct StatusReport<'a> {
+    schema_version: u8,
+    stage: &'a str,
+    message: &'a str,
+    kind: &'a str,
+    activity: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact_path: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_bytes: Option<u64>,
+}
+
 pub(super) fn status(
     working: &Path,
     stage: &str,
@@ -91,26 +106,41 @@ pub(super) fn status(
     activity: &str,
     artifact: Option<(&Path, u64)>,
 ) -> crate::Result<()> {
+    external(working)?;
     let path = working.join("chat-setup-progress.json");
-    external(&path)?;
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && (metadata.file_type().is_symlink()
+            || bonsai_artifacts::is_redirect(&metadata)
+            || metadata.is_dir())
+    {
+        return Err("Setup progress path must be a regular file.".into());
+    }
     let temporary = working.join(format!(
         ".chat-setup-progress-{}.json",
         crate::startup_process::unique()
     ));
-    external(&temporary)?;
-    let mut report =
-        json!({"SchemaVersion":2,"Stage":stage,"Message":message,"Kind":kind,"Activity":activity});
-    if let Some((path, bytes)) = artifact {
-        report["ArtifactPath"] = json!(path);
-        report["ExpectedBytes"] = json!(bytes);
-    }
+    let (artifact_path, expected_bytes) = match artifact {
+        Some((artifact_path, expected_bytes)) => (Some(artifact_path), Some(expected_bytes)),
+        None => (None, None),
+    };
+    let report = StatusReport {
+        schema_version: 2,
+        stage,
+        message,
+        kind,
+        activity,
+        artifact_path,
+        expected_bytes,
+    };
+    let encoded = serde_json::to_vec(&report).map_err(|error| error.to_string())?;
     let mut output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
         .map_err(|error| format!("Cannot write setup progress: {error}"))?;
-    serde_json::to_writer(&mut output, &report).map_err(|error| error.to_string())?;
-    output.flush().map_err(|error| error.to_string())?;
+    output
+        .write_all(&encoded)
+        .map_err(|error| format!("Cannot write setup progress: {error}"))?;
     drop(output);
     fs::rename(&temporary, &path).map_err(|error| format!("Cannot publish setup progress: {error}"))
 }
@@ -318,6 +348,20 @@ fn prepare_weights(
     )
 }
 
+fn emit_checking_status_unless_cached(
+    working: &Path,
+    stage: &str,
+    message: &str,
+    kind: &str,
+    path: &Path,
+    bytes: u64,
+) -> crate::Result<()> {
+    if kind == "existing" && crate::startup_download::verify_length(path, bytes).is_ok() {
+        return Ok(());
+    }
+    status(working, stage, message, kind, "checking", Some((path, bytes)))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Shares pre-resolved model, existence, kind, mmproj, and daisyrose state from prepare without reparsing."
@@ -334,19 +378,26 @@ fn prepare_weights_with(
     mut verify: impl FnMut(&Path, u64, &str) -> crate::Result<()>,
 ) -> crate::Result<()> {
     preflight(&request.data_directory, selected, model_exists)?;
-    let (activity, message) = ("checking", "Checking Swift model files…");
-    status(
-        working,
-        "model",
-        message,
-        kind,
-        activity,
-        Some((&selected.path, selected.bytes)),
-    )?;
     if let Some(url) = selected.url.as_deref() {
+        emit_checking_status_unless_cached(
+            working,
+            "model",
+            "Checking Swift model files…",
+            kind,
+            &selected.path,
+            selected.bytes,
+        )?;
         receive(url, &selected.path, selected.bytes, &selected.sha256, working)
             .map_err(|error| format!("Swift model setup failed at {}: {error}. Check the internet connection, free storage and folder permissions, then select Retry setup. Partial downloads are kept for resume.", selected.path.display()))?;
     } else {
+        status(
+            working,
+            "model",
+            "Checking Swift model files…",
+            kind,
+            "checking",
+            Some((&selected.path, selected.bytes)),
+        )?;
         verify(&selected.path, selected.bytes, &selected.sha256).map_err(|error| {
             format!(
                 "The selected model export at {} could not be verified: {error}.",
@@ -355,13 +406,13 @@ fn prepare_weights_with(
         })?;
     }
     if let Some(mmproj) = mmproj {
-        status(
+        emit_checking_status_unless_cached(
             working,
             "mmproj",
             "Checking vision projector files…",
             kind,
-            "checking",
-            Some((&mmproj.path, mmproj.bytes)),
+            &mmproj.path,
+            mmproj.bytes,
         )?;
         receive(&mmproj.url, &mmproj.path, mmproj.bytes, &mmproj.sha256, working)
             .map_err(|error| format!("Vision projector setup failed at {}: {error}. Check the internet connection, free storage and folder permissions, then select Retry setup.", mmproj.path.display()))?;
@@ -374,13 +425,13 @@ fn prepare_weights_with(
             && !request.no_daisyrose_lora
             && request.daisyrose_lora.is_none()
     }) {
-        status(
+        emit_checking_status_unless_cached(
             working,
             "daisyrose-lora",
             "Checking DaisyRose adapter files…",
             kind,
-            "checking",
-            Some((&daisyrose.path, daisyrose.bytes)),
+            &daisyrose.path,
+            daisyrose.bytes,
         )?;
         receive(
             &daisyrose.url,
@@ -975,6 +1026,80 @@ mod tests {
             repairs, 2,
             "1-byte length mismatch must enter verified receive/repair"
         );
+
+        fs::remove_dir_all(working).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn status_writes_expected_json_and_skips_checking_on_cached_existing_lengths()
+    -> crate::Result<()> {
+        let working = std::env::temp_dir().join(format!(
+            "Bonsai-SetupStatusSkip-{}",
+            crate::startup_process::unique()
+        ));
+        fs::create_dir(&working).map_err(|error| error.to_string())?;
+        let data = working.join("data");
+        fs::create_dir(&data).map_err(|error| error.to_string())?;
+        let request: Request = serde_json::from_value(json!({
+            "DataDirectory": data,
+            "RepositoryRoot": working.join("source"),
+            "NativeEngine": true,
+            "NoMmproj": true,
+        }))
+        .map_err(|error| error.to_string())?;
+
+        let cached_file = working.join("cached-model.gguf");
+        fs::write(&cached_file, b"123456").map_err(|error| error.to_string())?;
+        let selected = Model {
+            path: cached_file.clone(),
+            bytes: 6,
+            sha256: "a".repeat(64),
+            url: Some("https://huggingface.co/example/resolve/main/cached-model.gguf".into()),
+        };
+
+        let mut received = 0_usize;
+        prepare_weights_with(
+            &request,
+            &working,
+            &selected,
+            true,
+            "existing",
+            None,
+            None,
+            |_, _, _, _, _| {
+                received += 1;
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        )?;
+        assert_eq!(received, 1);
+        let progress: Value = serde_json::from_slice(
+            &fs::read(working.join("chat-setup-progress.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(progress["SchemaVersion"], 2);
+        assert_eq!(progress["Stage"], "ready");
+        assert_eq!(progress["Kind"], "existing");
+        assert_eq!(progress["Activity"], "ready");
+        assert!(progress.get("ArtifactPath").is_none());
+
+        status(
+            &working,
+            "model",
+            "Checking Swift model files…",
+            "first-run",
+            "checking",
+            Some((&cached_file, 6)),
+        )?;
+        let with_artifact: Value = serde_json::from_slice(
+            &fs::read(working.join("chat-setup-progress.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(with_artifact["SchemaVersion"], 2);
+        assert_eq!(with_artifact["ArtifactPath"], json!(cached_file));
+        assert_eq!(with_artifact["ExpectedBytes"], 6);
 
         fs::remove_dir_all(working).map_err(|error| error.to_string())
     }

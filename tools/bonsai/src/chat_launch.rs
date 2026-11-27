@@ -1490,13 +1490,18 @@ fn prepare_backend(
     })?;
     external(&request.data_directory)?;
     operations.check_sandbox(&request)?;
-    let model_apps = if stage == PreparationStage::Model && !request.speech_models_only {
+    let model_apps = if stage == PreparationStage::Model
+        && !request.speech_models_only
+        && !app_packages.is_empty()
+    {
         operations.model_apps(&request, &app_packages, working)?
     } else {
         None
     };
-    let run_inference =
-        stage == PreparationStage::All && request.native_engine && !request.speech_models_only;
+    let run_inference = request.native_engine
+        && !request.speech_models_only
+        && (stage == PreparationStage::All
+            || (stage == PreparationStage::Model && app_packages.is_empty()));
     let run_artifacts = stage != PreparationStage::Speech && !request.speech_models_only;
     if run_inference || run_artifacts {
         // Run only in the owned preparation worker after the first UI frame.
