@@ -16,6 +16,8 @@ pub(crate) struct PredictorWorkspace {
     sampler: SamplerScratch,
     decoder: DecoderWorkspace,
     next_raw: Vec<f32>,
+    prefill_in: Vec<f32>,
+    prefill_cache: Vec<LayerKvCache>,
     h_a: Vec<f32>,
     h_b: Vec<f32>,
     normed: Vec<f32>,
@@ -29,9 +31,15 @@ impl PredictorWorkspace {
             layer.v.clear();
             layer.seq_len = 0;
         }
+        for layer in &mut self.prefill_cache {
+            layer.k.clear();
+            layer.v.clear();
+            layer.seq_len = 0;
+        }
         self.sampler.clear();
         self.decoder.clear();
         self.next_raw.clear();
+        self.prefill_in.clear();
         self.h_a.clear();
         self.h_b.clear();
         self.normed.clear();
@@ -56,6 +64,7 @@ impl PredictorWorkspace {
 pub(super) struct Frame<'a>(&'a mut PredictorWorkspace);
 
 impl Frame<'_> {
+    #[cfg(test)]
     pub(super) fn buffers(
         &mut self,
     ) -> (
@@ -73,6 +82,38 @@ impl Frame<'_> {
             &mut self.0.sampler,
             &mut self.0.decoder,
             &mut self.0.next_raw,
+            &mut self.0.h_a,
+            &mut self.0.h_b,
+            &mut self.0.normed,
+            &mut self.0.logits,
+        )
+    }
+
+    #[expect(
+        clippy::type_complexity,
+        reason = "Returns disjoint mutable borrows into request-owned frame buffers without wrapper overhead."
+    )]
+    pub(super) fn all_buffers(
+        &mut self,
+    ) -> (
+        &mut [LayerKvCache],
+        &mut SamplerScratch,
+        &mut DecoderWorkspace,
+        &mut Vec<f32>,
+        &mut Vec<f32>,
+        &mut Vec<LayerKvCache>,
+        &mut Vec<f32>,
+        &mut Vec<f32>,
+        &mut Vec<f32>,
+        &mut Vec<f32>,
+    ) {
+        (
+            &mut self.0.layers,
+            &mut self.0.sampler,
+            &mut self.0.decoder,
+            &mut self.0.next_raw,
+            &mut self.0.prefill_in,
+            &mut self.0.prefill_cache,
             &mut self.0.h_a,
             &mut self.0.h_b,
             &mut self.0.normed,
