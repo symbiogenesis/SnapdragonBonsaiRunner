@@ -196,7 +196,7 @@ fn conv<S: CodecSource + ?Sized>(
     } else {
         None
     };
-    CausalConv1d::from_oc_ic_k(
+    CausalConv1d::from_oc_ic_k_packed_only(
         output, input, kernel, dilation, stride, pad_mode, weight, bias_vec,
     )
 }
@@ -2533,12 +2533,15 @@ fn load_upsample_stage<S: CodecSource + ?Sized>(
     index: usize,
 ) -> io::Result<Upsample> {
     let name = format!("tok_dec.upsample.{index}");
+    let dw_weight = weights.tensor_f32(&format!("{name}.dwconv.weight"), &[7, 1, latent])?;
+    let dw_weight_kc = Some(ConvNeXtBlock::pack_dw_kc(&dw_weight, latent, 7));
     Ok(Upsample {
         conv: trans_conv(weights, &format!("{name}.conv"), latent, latent, 2, 2)?,
         block: ConvNeXtBlock {
             channels: latent,
             kernel: 7,
-            dw_weight: weights.tensor_f32(&format!("{name}.dwconv.weight"), &[7, 1, latent])?,
+            dw_weight,
+            dw_weight_kc,
             dw_bias: weights.tensor_f32(&format!("{name}.dwconv.bias"), &[latent])?,
             norm_w: weights.tensor_f32(&format!("{name}.norm.weight"), &[latent])?,
             norm_b: weights.tensor_f32(&format!("{name}.norm.bias"), &[latent])?,
@@ -3381,10 +3384,17 @@ mod tests {
                 PadMode::Constant,
             )?;
             assert_eq!((layer.kernel, layer.in_c, layer.out_c), (7, 96, 1));
-            assert_eq!(
-                layer.weight,
-                (0_u16..7 * 96).map(f32::from).collect::<Vec<_>>()
-            );
+            assert!(layer.weight.is_empty());
+            let okic = layer.weight_okic.as_deref().unwrap_or(&[]);
+            assert_eq!(okic.len(), 7 * 96);
+            for ic in 0..96 {
+                for k in 0..7 {
+                    assert_eq!(
+                        okic[k * 96 + ic],
+                        f32::from(u16::try_from(ic * 7 + k).unwrap_or(0))
+                    );
+                }
+            }
             assert_eq!(layer.bias, Some(vec![0.25]));
         }
         for shape in [&[7, 1, 96][..], &[3, 224], &[7, 48, 2]] {
@@ -3599,6 +3609,7 @@ mod tests {
                             channels: 2,
                             kernel: 3,
                             dw_weight: vec![0.05; 2 * 3],
+                            dw_weight_kc: None,
                             dw_bias: vec![0.0; 2],
                             norm_w: vec![1.0; 2],
                             norm_b: vec![0.0; 2],
