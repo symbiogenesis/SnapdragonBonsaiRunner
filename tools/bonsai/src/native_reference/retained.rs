@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read as _, Seek as _, SeekFrom, Write as _},
-    path::Path,
+    io::{self, Read as _, Seek as _, SeekFrom, Write as _},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -145,7 +145,7 @@ fn endpoint(endpoint: &str, token: &str, destination: Option<&Path>) -> crate::R
             .create_new(true)
             .open(target)
             .map_err(|error| error.to_string())?;
-        let copied = std::io::copy(
+        let copied = io::copy(
             &mut response.body_mut().as_reader().take(maximum + 1),
             &mut output,
         )
@@ -393,6 +393,101 @@ pub(super) fn replay(root: &Path, comparator: &Path) -> crate::Result<Value> {
     Ok(recomputed)
 }
 
+struct ScratchDir(Option<PathBuf>);
+
+impl ScratchDir {
+    fn create(path: PathBuf) -> crate::Result<Self> {
+        fs::create_dir(&path).map_err(|error| error.to_string())?;
+        Ok(Self(Some(path)))
+    }
+
+    fn cleanup(&mut self) -> crate::Result<()> {
+        if let Some(path) = self.0.take() {
+            remove_dir_all_with_retry(&path)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = remove_dir_all_with_retry(&path);
+        }
+    }
+}
+
+fn is_retryable_cleanup_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
+        || matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
+#[cfg(windows)]
+fn clear_readonly_tree(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if bonsai_artifacts::is_redirect(&metadata) {
+        return;
+    }
+    if metadata.is_dir()
+        && let Ok(entries) = fs::read_dir(path)
+    {
+        for entry in entries.flatten() {
+            clear_readonly_tree(&entry.path());
+        }
+    }
+    if metadata.permissions().readonly() {
+        let mut permissions = metadata.permissions();
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "Windows-only scratch cleanup clears the DOS readonly attribute; this branch never changes Unix permissions."
+        )]
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(path, permissions);
+    }
+}
+
+fn remove_dir_all_with_retry(path: &Path) -> crate::Result<()> {
+    const MAX_ATTEMPTS: usize = 8;
+    for attempt in 0..MAX_ATTEMPTS {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if is_retryable_cleanup_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                #[cfg(windows)]
+                clear_readonly_tree(path);
+                let shift = u32::try_from(attempt.min(4)).unwrap_or(4);
+                std::thread::sleep(Duration::from_millis(20 << shift));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn finalize_audit(
+    output: &Path,
+    mut report: Value,
+    result: crate::Result<()>,
+    mut scratch: Option<ScratchDir>,
+) -> crate::Result<Value> {
+    if let Err(ref error) = result {
+        report["failureClass"] = "native-validation-or-execution".into();
+        report["failureReason"] = error.clone().into();
+    }
+    let write_result = write_json(&output.join("audit.json"), &report);
+    let cleanup_result = if let Some(mut guard) = scratch.take() {
+        guard.cleanup()
+    } else {
+        Ok(())
+    };
+    result?;
+    write_result?;
+    cleanup_result?;
+    Ok(report)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "One failure-retaining operation encloses hosted admission, exact artifact intake, replay and scratch cleanup."
@@ -434,15 +529,14 @@ pub(super) fn audit(request: &Value) -> crate::Result<Value> {
             &output.join("producer.json"),
             &json!({"run":run,"artifact":artifact,"jobs":jobs}),
         )?;
-        let root = std::path::PathBuf::from(
+        let root = PathBuf::from(
             std::env::var_os("RUNNER_TEMP").ok_or("runner temporary directory absent")?,
         )
         .join(format!(
             "ptq1-retained-{}",
             crate::startup_process::unique()
         ));
-        fs::create_dir(&root).map_err(|error| error.to_string())?;
-        scratch = Some(root.clone());
+        scratch = Some(ScratchDir::create(root.clone())?);
         let archive = root.join("evidence.zip");
         let extracted = root.join("extracted");
         report["stage"] = "archive-download".into();
@@ -518,13 +612,63 @@ pub(super) fn audit(request: &Value) -> crate::Result<Value> {
         report["stage"] = "complete".into();
         Ok(())
     })();
-    if let Err(error) = result {
-        report["failureClass"] = "native-validation-or-execution".into();
-        report["failureReason"] = error.into();
+    finalize_audit(&output, report, result, scratch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalize_audit_writes_report_first_cleans_scratch_and_propagates_error() -> crate::Result<()>
+    {
+        let root = std::env::temp_dir().join(format!(
+            "bonsai-retained-finalize-{}",
+            crate::startup_process::unique()
+        ));
+        fs::create_dir(&root).map_err(|error| error.to_string())?;
+        let output = root.join("output");
+        fs::create_dir(&output).map_err(|error| error.to_string())?;
+        let scratch_path = root.join("scratch");
+        let scratch = ScratchDir::create(scratch_path.clone())?;
+        let nested_file = scratch_path.join("evidence.zip");
+        fs::write(&nested_file, b"partial").map_err(|error| error.to_string())?;
+        #[cfg(windows)]
+        {
+            let mut perms = fs::metadata(&nested_file)
+                .map_err(|error| error.to_string())?
+                .permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&nested_file, perms).map_err(|error| error.to_string())?;
+        }
+
+        let report = json!({"schemaVersion": 2, "status": "failed", "stage": "archive-download"});
+        let outcome = finalize_audit(
+            &output,
+            report,
+            Err("simulated archive failure".into()),
+            Some(scratch),
+        );
+        assert_eq!(outcome.err().as_deref(), Some("simulated archive failure"));
+        assert!(!scratch_path.exists());
+
+        let audit_json = read_json(&output.join("audit.json"), 65_536)?;
+        assert_eq!(audit_json["status"], "failed");
+        assert_eq!(audit_json["failureClass"], "native-validation-or-execution");
+        assert_eq!(audit_json["failureReason"], "simulated archive failure");
+
+        // Primary error is not masked even when writing audit.json fails.
+        let non_dir_output = root.join("not-a-dir");
+        fs::write(&non_dir_output, b"file").map_err(|error| error.to_string())?;
+        let masked_check = finalize_audit(
+            &non_dir_output,
+            json!({"status": "failed"}),
+            Err("primary error".into()),
+            None,
+        );
+        assert_eq!(masked_check.err().as_deref(), Some("primary error"));
+
+        remove_dir_all_with_retry(&root)?;
+        Ok(())
     }
-    if let Some(scratch) = scratch {
-        fs::remove_dir_all(scratch).map_err(|error| error.to_string())?;
-    }
-    write_json(&output.join("audit.json"), &report)?;
-    Ok(report)
 }

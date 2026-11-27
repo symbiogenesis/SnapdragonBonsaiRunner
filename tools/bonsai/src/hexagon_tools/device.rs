@@ -228,6 +228,50 @@ pub(super) fn driver(path: &Path, holds: &mut Vec<File>) -> Result<Value> {
     Ok(value)
 }
 
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn create(path: PathBuf) -> Result<Self> {
+        fs::create_dir(&path).map_err(|error| error.to_string())?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if fs::symlink_metadata(&self.0).is_ok_and(|metadata| !is_redirect(&metadata)) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+fn stop_with_bound<E: std::fmt::Display>(
+    mut stop: impl FnMut(Duration) -> std::result::Result<(), E>,
+    max_attempts: usize,
+    per_attempt: Duration,
+    deadline: Duration,
+    backoff: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut last_error = None;
+    for attempt in 0..max_attempts {
+        match stop(per_attempt) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error.to_string());
+                if attempt + 1 >= max_attempts || started.elapsed() >= deadline {
+                    break;
+                }
+                std::thread::sleep(backoff);
+            }
+        }
+    }
+    Err(format!(
+        "Hexagon fixture process teardown failed: {}",
+        last_error.unwrap_or_else(|| "bounded stop retries exhausted".into())
+    ))
+}
+
 #[cfg(windows)]
 #[expect(
     clippy::too_many_arguments,
@@ -248,7 +292,7 @@ fn capture(
     let serial = startup_process::unique();
     let scratch = std::env::temp_dir().join(format!("bonsai-hexagon-capture-{serial}"));
     validate_external_path(&scratch).map_err(|error| error.to_string())?;
-    fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+    let scratch_guard = ScratchDir::create(scratch.clone())?;
     let stdout = scratch.join("stdout");
     let stderr = scratch.join("stderr");
     let system = PathBuf::from(std::env::var_os("SystemRoot").ok_or("SystemRoot unavailable.")?)
@@ -357,13 +401,18 @@ fn capture(
     })();
     // Keep verified input handles alive until teardown is confirmed. A refused
     // termination remains inside the outer supervisor's deadline-owned Job.
-    while process.stop(Duration::from_secs(1)).is_err() {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let _ = fs::remove_file(stdout);
-    let _ = fs::remove_file(stderr);
-    let _ = fs::remove_dir(scratch);
-    result
+    let stop_result = stop_with_bound(
+        |timeout| process.stop(timeout),
+        10,
+        Duration::from_secs(1),
+        Duration::from_secs(10),
+        Duration::from_millis(10),
+    );
+    drop(process);
+    drop(scratch_guard);
+    let output = result?;
+    stop_result?;
+    Ok(output)
 }
 
 fn parsed(text: &str) -> Result<Value> {
@@ -1127,5 +1176,55 @@ mod tests {
         );
         assert!(!file_name("../untrusted.dll"));
         assert!(!file_name("file:stream"));
+    }
+
+    #[test]
+    fn stop_with_bound_caps_retries_and_scratch_drop_cleans_nested_files() -> Result<()> {
+        let mut attempts = 0usize;
+        let err = stop_with_bound(
+            |_| -> std::result::Result<(), &str> {
+                attempts += 1;
+                Err("still running")
+            },
+            3,
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        );
+        assert_eq!(attempts, 3);
+        assert!(
+            err.err()
+                .is_some_and(|message| message.contains("still running"))
+        );
+
+        let mut succeed_attempts = 0usize;
+        stop_with_bound(
+            |_| -> std::result::Result<(), &str> {
+                succeed_attempts += 1;
+                if succeed_attempts < 2 {
+                    Err("busy")
+                } else {
+                    Ok(())
+                }
+            },
+            5,
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )?;
+        assert_eq!(succeed_attempts, 2);
+
+        let scratch = std::env::temp_dir().join(format!(
+            "bonsai-hexagon-scratch-guard-{}",
+            startup_process::unique()
+        ));
+        {
+            let guard = ScratchDir::create(scratch.clone())?;
+            fs::write(guard.0.join("stdout"), b"out").map_err(|error| error.to_string())?;
+            fs::write(guard.0.join("stderr"), b"err").map_err(|error| error.to_string())?;
+            assert!(scratch.exists());
+        }
+        assert!(!scratch.exists());
+        Ok(())
     }
 }
