@@ -15,6 +15,11 @@ $executable = Join-Path $fixture $name
 $manifestPath = Join-Path $fixture 'release-manifest.json'
 $checksumPath = Join-Path $fixture 'SHA256SUMS.txt'
 $bytes = [Text.UTF8Encoding]::new($false).GetBytes('Inert portable asset fixture; never execute.')
+$script:ExecutableSha256 = ''
+function Set-FixtureExecutable([byte[]]$Content) {
+    [IO.File]::WriteAllBytes($executable, $Content)
+    $script:ExecutableSha256 = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
+}
 function New-AssetManifest {
     $files = [ordered]@{
         maintenance = 'bonsai-tools.exe'; core = 'bonsai-broker.exe'; ui = 'bonsai-chat.exe'
@@ -30,14 +35,16 @@ function New-AssetManifest {
         executableSmoke = 'passed-inspect-extract-verify-without-model'; signed = $false
         manifestSha256 = ('b' * 64); builds = $builds
         assets = @(@{ name = $name; bytes = $bytes.Length
-            sha256 = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant() })
+            sha256 = $script:ExecutableSha256 })
     }
 }
 function Write-AssetFixture($Manifest) {
     $Manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
-    $records = @($executable, $manifestPath) | ForEach-Object {
-        '{0}  {1}' -f (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant(), [IO.Path]::GetFileName($_)
-    }
+    $manifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $records = @(
+        ('{0}  {1}' -f $script:ExecutableSha256, [IO.Path]::GetFileName($executable)),
+        ('{0}  {1}' -f $manifestHash, [IO.Path]::GetFileName($manifestPath))
+    )
     [IO.File]::WriteAllLines($checksumPath, $records, [Text.UTF8Encoding]::new($false))
 }
 function Assert-RejectedAssets {
@@ -46,7 +53,7 @@ function Assert-RejectedAssets {
     throw 'An invalid portable release inventory was accepted.'
 }
 try {
-    [IO.File]::WriteAllBytes($executable, $bytes)
+    Set-FixtureExecutable $bytes
     Write-AssetFixture (New-AssetManifest)
     $accepted = Assert-PortableReleaseAssets -AssetDirectory $fixture -Tag $tag -SourceRevision $source
     if ($accepted.distribution -cne 'portable-executable' -or @($accepted.assets).Count -ne 1) { throw 'The valid portable inventory changed.' }
@@ -73,10 +80,10 @@ try {
         $rejected++
     }
     Write-AssetFixture (New-AssetManifest)
-    [IO.File]::WriteAllBytes($executable, [byte[]]@(1, 2, 3))
+    Set-FixtureExecutable ([byte[]]@(1, 2, 3))
     Assert-RejectedAssets
     $rejected++
-    [IO.File]::WriteAllBytes($executable, $bytes)
+    Set-FixtureExecutable $bytes
     Write-AssetFixture (New-AssetManifest)
     Add-Content -LiteralPath $checksumPath -Value (Get-Content -LiteralPath $checksumPath -First 1) -Encoding utf8NoBOM
     Assert-RejectedAssets

@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Release-Common.ps1')
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('SwiftBonsai-Adapter-Controls-' + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($fixture)
-$probePath = Join-Path $fixture 'probe.ps1'
+$probePath = Join-Path $fixture $(if ($IsWindows) { 'probe.cmd' } else { 'probe.ps1' })
 $savedTools = $env:BONSAI_TOOLS_PATH
 $savedRustup = $env:RUSTUP_TOOLCHAIN
 $savedLocation = Get-Location
@@ -22,7 +22,11 @@ $expectedCompiler = '+nightly-2026-11-26-aarch64-pc-windows-msvc'
 function Invoke-AdapterProbe {
     # Keep the outer adapter's actual native stream redirection. Only executable
     # selection is replaced, and the child never executes the supplied Cargo args.
-    & $engine -NoLogo -NoProfile -NonInteractive -File $probePath $probeMode
+    if ($IsWindows) {
+        & cmd.exe /d /c $probePath $probeMode
+    } else {
+        & $engine -NoLogo -NoProfile -NonInteractive -File $probePath $probeMode
+    }
     $global:LASTEXITCODE = $LASTEXITCODE
 }
 function cargo {
@@ -33,7 +37,22 @@ function cargo {
     Invoke-AdapterProbe
 }
 try {
-    @'
+    if ($IsWindows) {
+        @'
+@echo off
+>&2 echo info: fixture native stderr
+if "%~1"=="failure" (
+    echo fixture failure stdout
+    exit /b 7
+)
+if "%~1"=="invalid" (
+    echo invalid fixture stdout
+    exit /b 0
+)
+echo {"value":"fixture reply","items":[1,2]}
+'@ | Set-Content -LiteralPath $probePath -Encoding ascii
+    } else {
+        @'
 param([string]$Mode)
 # This stream-only fixture must not wait for inherited stdin to reach EOF.
 [Console]::Error.WriteLine('info: fixture native stderr')
@@ -47,6 +66,7 @@ if ($Mode -ceq 'invalid') {
 }
 [Console]::Out.WriteLine('{"value":"fixture reply","items":[1,2]}')
 '@ | Set-Content -LiteralPath $probePath -Encoding utf8NoBOM
+    }
     # Match hosted callers that execute in runner.temp with a different default.
     Set-Location -LiteralPath $fixture
     $env:RUSTUP_TOOLCHAIN = 'stable'

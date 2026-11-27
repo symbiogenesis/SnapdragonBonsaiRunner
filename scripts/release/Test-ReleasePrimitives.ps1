@@ -1,4 +1,4 @@
-﻿#Requires -Version 7.6
+#Requires -Version 7.6
 # Model-free controls; never install software or contact a remote service.
 [CmdletBinding()]
 param()
@@ -32,7 +32,7 @@ foreach ($control in @(
     Write-Host "Passed release control: $control"
 }
 Write-Host 'Starting release control: Rust release publication, cleanup, and source build tests'
-& cargo test --locked --manifest-path (Join-Path $repository 'Cargo.toml') -p bonsai-tools --lib -- release_publication_ release_cleanup_ release_package::source::tests::
+& cargo test --locked --manifest-path (Join-Path $repository 'Cargo.toml') -p bonsai-tools --features test-probe --lib -- release_publication_ release_cleanup_ release_package::source::tests::
 if ($LASTEXITCODE -ne 0) { throw "Release control failed: Rust release lib tests (exit code $LASTEXITCODE)." }
 Write-Host 'Passed release control: Rust release publication, cleanup, and source build tests'
 Write-Host 'Starting release control: Test-ReleaseCommandFailures.ps1'

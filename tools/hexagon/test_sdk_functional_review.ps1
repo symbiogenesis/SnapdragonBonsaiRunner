@@ -10,7 +10,16 @@ param([ValidateSet('test_comments_do_not_consume_literal_or_include_contents',
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $target = if ($env:RUNNER_TEMP) { Join-Path $env:RUNNER_TEMP 'Bonsai-Sdk-Reader-Checks' } else { Join-Path ([IO.Path]::GetTempPath()) 'Bonsai-Sdk-Reader-Checks' }
-$arguments = @('test','--locked','--release','--manifest-path',(Join-Path $PSScriptRoot 'sdk-reader/Cargo.toml'),'--target-dir',$target)
+$toolchain = @()
+$toolchainFile = Join-Path $PSScriptRoot '../../rust-toolchain.toml'
+if (Test-Path -LiteralPath $toolchainFile -PathType Leaf) {
+    $match = [regex]::Match([IO.File]::ReadAllText($toolchainFile), '(?m)^\s*channel\s*=\s*"([^"]+)"')
+    if ($match.Success) {
+        $channel = $match.Groups[1].Value
+        $toolchain = @(if ($IsWindows -and [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq 'Arm64') { "+$channel-aarch64-pc-windows-msvc" } else { "+$channel" })
+    }
+}
+$arguments = $toolchain + @('test','--locked','--release','--manifest-path',(Join-Path $PSScriptRoot 'sdk-reader/Cargo.toml'),'--target-dir',$target)
 if ($Test) { $arguments += @("functional::tests::$Test",'--','--exact') } else { $arguments += 'functional::tests::' }
 & cargo @arguments
 exit $LASTEXITCODE
