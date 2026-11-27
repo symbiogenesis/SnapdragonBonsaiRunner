@@ -104,8 +104,8 @@ and device qualification.
 ### Native Markdown parsing
 
 The pure Rust `bonsai-markdown` library pins `markdown-syntax = "=0.7.2"` with
-`default-features = false`. It uses egui's platform-independent text/style types
-without eframe, winit, wgpu or native presentation dependencies. Production
+`default-features = false`. It has no dependency on `egui`, `eframe`, `winit`,
+`wgpu`, or native presentation crates, emitting pure-Rust `BMD1`/`BMD2` wire packets. Production
 parsing runs in a separate offline invocation of the configured headless
 `bonsai-broker` image; the private entry point precedes model, credential and
 network setup. The UI independently validates its output before rendering.

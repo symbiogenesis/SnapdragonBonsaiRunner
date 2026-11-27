@@ -12,7 +12,6 @@ description = "Bounded inert Markdown render packets for the offline native pars
 doctest = false
 
 [dependencies]
-egui = { version = "=0.37.0", default-features = false }
 epaint_default_fonts.workspace = true
 markdown-syntax = { version = "=0.7.2", default-features = false }
 resvg.workspace = true

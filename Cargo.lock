@@ -587,7 +587,6 @@ dependencies = [
 name = "bonsai-markdown"
 version = "0.3.7"
 dependencies = [
- "egui",
  "epaint_default_fonts",
  "markdown-syntax",
  "resvg",
