@@ -200,10 +200,6 @@ impl BackendConnector for Connector {
         &self.policy
     }
 
-    #[expect(
-        clippy::future_not_send,
-        reason = "all fixture state belongs to the deterministic current-thread runtime"
-    )]
     fn connect(&self, _: Instant) -> impl Future<Output = Result<Stream, BackendError>> {
         self.calls.set(self.calls.get() + 1);
         std::future::ready(
