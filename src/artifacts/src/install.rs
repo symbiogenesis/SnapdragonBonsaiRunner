@@ -157,6 +157,29 @@ fn stage_runtime_inner(
     })
 }
 
+fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
+    const MAX_ATTEMPTS: usize = 6;
+    const BASE_DELAY_MS: u64 = 5;
+    let mut attempt = 0_usize;
+    loop {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && attempt + 1 < MAX_ATTEMPTS
+                    && matches!(error.raw_os_error(), Some(5 | 32 | 33 | 145)) =>
+            {
+                let shift = u32::try_from(attempt).unwrap_or(u32::MAX);
+                let delay_ms =
+                    BASE_DELAY_MS.saturating_mul(1_u64.checked_shl(shift).unwrap_or(u64::MAX));
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(160)));
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn cleanup_staging(
     staging: &Path,
     files: &BTreeSet<String>,
@@ -174,7 +197,7 @@ fn cleanup_staging(
     if !installed_files.is_subset(files) || !installed_directories.is_subset(directories) {
         return Err(ArtifactError::Installation);
     }
-    fs::remove_dir_all(staging).map_err(|_| ArtifactError::Installation)
+    remove_dir_all_with_retry(staging).map_err(|_| ArtifactError::Installation)
 }
 
 fn absent(path: &Path) -> Result<(), ArtifactError> {
@@ -228,8 +251,8 @@ fn extract<R: Read + Seek>(
         });
         handles.push(output);
     }
-    if let Some(last) = handles.last() {
-        last.sync_all().map_err(|_| ArtifactError::Installation)?;
+    for handle in &handles {
+        handle.sync_all().map_err(|_| ArtifactError::Installation)?;
     }
     Ok((files, handles))
 }

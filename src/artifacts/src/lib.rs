@@ -14,7 +14,7 @@ use std::{
     fmt,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use zip::ZipArchive;
@@ -553,11 +553,16 @@ pub fn verify_files_bounded_parallel(
 
     let worker_results = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(file_workers - 1);
-        for _ in 0..(file_workers - 1) {
-            handles.push(scope.spawn(&worker_task));
+        for worker_index in 1..file_workers {
+            if let Ok(handle) = std::thread::Builder::new()
+                .name(format!("artifact-verify-{worker_index}"))
+                .spawn_scoped(scope, &worker_task)
+            {
+                handles.push(handle);
+            }
         }
         let current = worker_task();
-        let mut results = Vec::with_capacity(file_workers);
+        let mut results = Vec::with_capacity(handles.len() + 1);
         results.push(current);
         for handle in handles {
             match handle.join() {
@@ -1338,47 +1343,50 @@ fn check_arm64(file: &mut (impl Read + Seek)) -> Result<(), ArtifactError> {
 /// # Errors
 /// Rejects nonabsolute, namespace, ADS, unresolved-variable, Git and reparse paths.
 pub fn validate_external_path(path: &Path) -> Result<(), ArtifactError> {
-    let spelling = path.to_str().ok_or(ArtifactError::Path)?;
-    if !path.is_absolute()
-        || spelling.contains('%')
-        || spelling.contains('\0')
-        || path
-            .components()
-            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
-    {
-        return Err(ArtifactError::Path);
-    }
     #[cfg(windows)]
     {
-        use std::path::Prefix;
-        let Some(Component::Prefix(prefix)) = path.components().next() else {
-            return Err(ArtifactError::Path);
-        };
-        if !matches!(prefix.kind(), Prefix::Disk(_))
-            || spelling.get(2..).is_none_or(|rest| rest.contains(':'))
+        bonsai_windows_credentials::validate_external_path(path).map_err(|_| ArtifactError::Path)
+    }
+    #[cfg(not(windows))]
+    {
+        let spelling = path.to_str().ok_or(ArtifactError::Path)?;
+        if !path.is_absolute()
             || path.parent().is_none()
+            || spelling.contains(['%', '\0', '\\'])
         {
             return Err(ArtifactError::Path);
         }
-    }
-    for ancestor in path.ancestors() {
-        match fs::symlink_metadata(ancestor) {
-            Ok(metadata) => {
-                if is_redirect(&metadata) {
-                    return Err(ArtifactError::Path);
-                }
-                if metadata.is_dir() {
-                    match fs::symlink_metadata(ancestor.join(".git")) {
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        _ => return Err(ArtifactError::Path),
+        let trimmed = spelling.trim_end_matches('/');
+        if trimmed.is_empty()
+            || trimmed[1..].split('/').any(|segment| {
+                segment.is_empty()
+                    || segment == "."
+                    || segment == ".."
+                    || segment.eq_ignore_ascii_case(".git")
+                    || segment.chars().any(char::is_control)
+            })
+        {
+            return Err(ArtifactError::Path);
+        }
+        for ancestor in path.ancestors() {
+            match fs::symlink_metadata(ancestor) {
+                Ok(metadata) => {
+                    if is_redirect(&metadata) {
+                        return Err(ArtifactError::Path);
+                    }
+                    if metadata.is_dir() {
+                        match fs::symlink_metadata(ancestor.join(".git")) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            _ => return Err(ArtifactError::Path),
+                        }
                     }
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(ArtifactError::Path),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(ArtifactError::Path),
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Whether metadata identifies a symbolic link or Windows reparse point.
@@ -1916,5 +1924,20 @@ mod tests {
 
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[test]
+    fn validate_external_path_rejects_git_segments_and_reserved_names() {
+        let temp = std::env::temp_dir();
+        assert!(validate_external_path(&temp.join("valid-leaf")).is_ok());
+        assert_eq!(
+            validate_external_path(&temp.join(".git").join("leaf")),
+            Err(ArtifactError::Path)
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            validate_external_path(&temp.join("COM1.bin")),
+            Err(ArtifactError::Path)
+        );
     }
 }

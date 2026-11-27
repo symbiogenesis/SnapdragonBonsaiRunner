@@ -594,24 +594,29 @@ pub fn verify_multi_rank_lora_gguf(
         let parsed = parse_gguf_header(mapped_bytes, file_len)?;
         let plan = validate_header_and_pairs(&parsed, file_len, max_rank_limit, envelope)?;
         let (sha_result, scan_result) = std::thread::scope(|scope| {
-            let hash_handle = scope.spawn(|| {
-                bonsai_windows_credentials::try_hash_locked_file_mapped(
-                    &file,
-                    file_len,
+            let hash_task = || {
+                bonsai_windows_credentials::hash_mapped_bytes(
+                    mapped_bytes,
                     &mut || Ok(()),
                     |_| ArtifactError::Identity,
                 )
-            });
-            let scan_result = scan_mapped_spans_finite(mapped_bytes, &plan.spans);
-            let hash_result = hash_handle.join().unwrap_or(Err(ArtifactError::Identity));
-            (hash_result, scan_result)
+            };
+            if let Ok(hash_handle) = std::thread::Builder::new()
+                .name("lora-sha256".into())
+                .spawn_scoped(scope, hash_task)
+            {
+                let scan_result = scan_mapped_spans_finite(mapped_bytes, &plan.spans);
+                let hash_result = hash_handle.join().unwrap_or(Err(ArtifactError::Identity));
+                (hash_result, scan_result)
+            } else {
+                let scan_result = scan_mapped_spans_finite(mapped_bytes, &plan.spans);
+                let hash_result = hash_task();
+                (hash_result, scan_result)
+            }
         });
         drop(mapped);
         scan_result?;
-        let sha256 = match sha_result? {
-            Some(digest) => crate::digest_hex(digest),
-            None => hash_locked_file(&mut file, file_len)?,
-        };
+        let sha256 = crate::digest_hex(sha_result?);
         (sha256, plan)
     } else {
         file.seek(SeekFrom::Start(0))

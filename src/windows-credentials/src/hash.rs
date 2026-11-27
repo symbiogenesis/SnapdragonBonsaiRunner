@@ -160,6 +160,21 @@ fn hash_mapped_windows<E>(
     hasher.finish().map_err(map_io_error)
 }
 
+/// Hash an already-mapped immutable byte slice via `PrefetchVirtualMemory` and
+/// `4 MiB` chunked CNG updates, invoking `checkpoint` before each prefetch/update
+/// step.
+///
+/// # Errors
+/// Returns `checkpoint` errors immediately or CNG hashing failures converted by
+/// `map_io_error`.
+pub fn hash_mapped_bytes<E>(
+    bytes: &[u8],
+    checkpoint: &mut impl FnMut() -> Result<(), E>,
+    map_io_error: impl FnMut(io::Error) -> E,
+) -> Result<[u8; 32], E> {
+    hash_mapped_windows(bytes, checkpoint, map_io_error)
+}
+
 /// Hash a read-locked regular file of `expected_bytes` via a read-only section
 /// view, `PrefetchVirtualMemory`, and `4 MiB` chunked CNG updates, invoking
 /// `checkpoint` before mapping and before each prefetch/update step.
@@ -359,11 +374,16 @@ pub fn compute_mapped_chunk_digests_with(
 
     let worker_results = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(worker_count - 1);
-        for _ in 0..(worker_count - 1) {
-            handles.push(scope.spawn(&worker_task));
+        for worker_index in 1..worker_count {
+            if let Ok(handle) = std::thread::Builder::new()
+                .name(format!("cng-hash-{worker_index}"))
+                .spawn_scoped(scope, &worker_task)
+            {
+                handles.push(handle);
+            }
         }
         let current = worker_task();
-        let mut results = Vec::with_capacity(worker_count);
+        let mut results = Vec::with_capacity(handles.len() + 1);
         results.push(current);
         for handle in handles {
             match handle.join() {
@@ -725,6 +745,24 @@ mod tests {
             |e| e,
         );
         assert!(cancelled.is_err());
+
+        let mapped = MappedLockedFile::try_open(
+            &file,
+            u64::try_from(len).map_err(io::Error::other)?,
+        )
+        .ok_or_else(|| io::Error::other("expected mapped locked file"))?;
+        let mut slice_checks = 0_usize;
+        let slice_digest = hash_mapped_bytes(
+            mapped.as_bytes(),
+            &mut || {
+                slice_checks += 1;
+                Ok::<(), io::Error>(())
+            },
+            |e| e,
+        )?;
+        assert_eq!(slice_digest, expected);
+        assert!(slice_checks >= 3);
+        drop(mapped);
 
         drop(file);
         std::fs::remove_file(path)?;
