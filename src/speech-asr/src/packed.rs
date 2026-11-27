@@ -5923,86 +5923,109 @@ mod tests {
     #[test]
     fn packed_q4_k_q6_k_four_row_and_tail_batch_match_scalar_bits() {
         let input = 512_usize;
+        const MAX_ROWS: usize = 24;
+        const MAX_BATCH: usize = 19;
+        let mut q4_max = vec![0_u8; MAX_ROWS * 2 * 144];
+        for (blk_idx, block) in q4_max.chunks_exact_mut(144).enumerate() {
+            block[0..2].copy_from_slice(
+                &(0x2c00_u16 + u16::try_from(blk_idx % 5).unwrap_or(0) * 0x100).to_le_bytes(),
+            );
+            block[2..4].copy_from_slice(
+                &(0x2800_u16 + u16::try_from(blk_idx % 3).unwrap_or(0) * 0x100).to_le_bytes(),
+            );
+            for (i, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = u8::try_from((blk_idx * 7 + i * 5 + 3) % 63).unwrap_or(1);
+            }
+            for (i, byte) in block[16..].iter_mut().enumerate() {
+                *byte = u8::try_from((blk_idx * 17 + i * 11) % 256).unwrap_or(0);
+            }
+        }
+        let mut q6_max = vec![0_u8; MAX_ROWS * 2 * 210];
+        for (blk_idx, block) in q6_max.chunks_exact_mut(210).enumerate() {
+            block[208..210].copy_from_slice(
+                &(0x2c00_u16 + u16::try_from(blk_idx % 4).unwrap_or(0) * 0x100).to_le_bytes(),
+            );
+            for (i, byte) in block[..192].iter_mut().enumerate() {
+                *byte = u8::try_from((blk_idx * 13 + i * 9) % 256).unwrap_or(0);
+            }
+            for (i, byte) in block[192..208].iter_mut().enumerate() {
+                let sc = i8::try_from(((blk_idx * 3 + i * 5) % 31).cast_signed() - 15).unwrap_or(0);
+                *byte = sc.cast_unsigned();
+            }
+        }
+        let full_raw_in: Vec<f32> = (0..MAX_BATCH * input)
+            .map(|i| {
+                if i % 29 == 0 {
+                    -0.0
+                } else {
+                    (f32::from(u16::try_from((i * 7) % 41).unwrap_or(0)) - 20.0) * 0.03125
+                }
+            })
+            .collect();
+        let wm4_max = WeightMatrix {
+            input,
+            output: MAX_ROWS,
+            data: WeightSlice::Q4K(&q4_max),
+        };
+        let wm6_max = WeightMatrix {
+            input,
+            output: MAX_ROWS,
+            data: WeightSlice::Q6K(&q6_max),
+        };
+        let mut full_exp_q4 = Vec::with_capacity(MAX_BATCH * MAX_ROWS);
+        let mut full_exp_q6 = Vec::with_capacity(MAX_BATCH * MAX_ROWS);
+        for t in 0..MAX_BATCH {
+            let row_in = &full_raw_in[t * input..(t + 1) * input];
+            full_exp_q4.extend(scalar_multiply_reference(wm4_max, row_in));
+            full_exp_q6.extend(scalar_multiply_reference(wm6_max, row_in));
+        }
+
+        let mut got = Vec::new();
+        let mut scratch = Vec::new();
         for out_rows in [1_usize, 3, 4, 5, 8, 9, 11, 13, 16, 24] {
-            let mut q4 = vec![0_u8; out_rows * 2 * 144];
-            for (blk_idx, block) in q4.chunks_exact_mut(144).enumerate() {
-                block[0..2].copy_from_slice(
-                    &(0x2c00_u16 + u16::try_from(blk_idx % 5).unwrap_or(0) * 0x100).to_le_bytes(),
-                );
-                block[2..4].copy_from_slice(
-                    &(0x2800_u16 + u16::try_from(blk_idx % 3).unwrap_or(0) * 0x100).to_le_bytes(),
-                );
-                for (i, byte) in block[4..16].iter_mut().enumerate() {
-                    *byte = u8::try_from((blk_idx * 7 + i * 5 + 3) % 63).unwrap_or(1);
-                }
-                for (i, byte) in block[16..].iter_mut().enumerate() {
-                    *byte = u8::try_from((blk_idx * 17 + i * 11) % 256).unwrap_or(0);
-                }
-            }
-            let mut q6 = vec![0_u8; out_rows * 2 * 210];
-            for (blk_idx, block) in q6.chunks_exact_mut(210).enumerate() {
-                block[208..210].copy_from_slice(
-                    &(0x2c00_u16 + u16::try_from(blk_idx % 4).unwrap_or(0) * 0x100).to_le_bytes(),
-                );
-                for (i, byte) in block[..192].iter_mut().enumerate() {
-                    *byte = u8::try_from((blk_idx * 13 + i * 9) % 256).unwrap_or(0);
-                }
-                for (i, byte) in block[192..208].iter_mut().enumerate() {
-                    let sc =
-                        i8::try_from(((blk_idx * 3 + i * 5) % 31).cast_signed() - 15).unwrap_or(0);
-                    *byte = sc.cast_unsigned();
-                }
-            }
             let wm4 = WeightMatrix {
                 input,
                 output: out_rows,
-                data: WeightSlice::Q4K(&q4),
+                data: WeightSlice::Q4K(&q4_max[..out_rows * 2 * 144]),
             };
             let wm6 = WeightMatrix {
                 input,
                 output: out_rows,
-                data: WeightSlice::Q6K(&q6),
+                data: WeightSlice::Q6K(&q6_max[..out_rows * 2 * 210]),
             };
+            let mut single_row = vec![0.0_f32; out_rows];
+            let mut full_single_q4 = Vec::with_capacity(MAX_BATCH * out_rows);
+            let mut full_single_q6 = Vec::with_capacity(MAX_BATCH * out_rows);
+            for t in 0..MAX_BATCH {
+                let row_in = &full_raw_in[t * input..(t + 1) * input];
+                multiply_single_into(wm4, row_in, 1, &mut single_row);
+                full_single_q4.extend(single_row.iter().map(|v| v.to_bits()));
+                multiply_single_into(wm6, row_in, 1, &mut single_row);
+                full_single_q6.extend(single_row.iter().map(|v| v.to_bits()));
+            }
             for batch in [1_usize, 2, 4, 5, 8, 9, 12, 13, 16, 19] {
-                let raw_in: Vec<f32> = (0..batch * input)
-                    .map(|i| {
-                        if i % 29 == 0 {
-                            -0.0
-                        } else {
-                            (f32::from(u16::try_from((i * 7) % 41).unwrap_or(0)) - 20.0) * 0.03125
-                        }
-                    })
-                    .collect();
-                let mut prepared = PreparedBatch::new(&raw_in, batch, input);
-                for (name, wm) in [("q4_k", wm4), ("q6_k", wm6)] {
+                let raw_in = &full_raw_in[..batch * input];
+                let mut prepared = PreparedBatch::new(raw_in, batch, input);
+                for (name, wm, full_exp, full_single_bits) in [
+                    ("q4_k", wm4, &full_exp_q4, &full_single_q4),
+                    ("q6_k", wm6, &full_exp_q6, &full_single_q6),
+                ] {
+                    let single_ref_bits = &full_single_bits[..batch * out_rows];
                     let mut exp_batch = Vec::with_capacity(batch * out_rows);
                     for t in 0..batch {
-                        exp_batch.extend(scalar_multiply_reference(
-                            wm,
-                            &raw_in[t * input..(t + 1) * input],
-                        ));
+                        exp_batch
+                            .extend_from_slice(&full_exp[t * MAX_ROWS..t * MAX_ROWS + out_rows]);
                     }
                     #[cfg(not(all(windows, feature = "rust-qualification")))]
                     let exp_bits: Vec<u32> = exp_batch.iter().map(|v| v.to_bits()).collect();
-                    let mut single_ref_bits = Vec::with_capacity(batch * out_rows);
-                    let mut single_row = vec![0.0_f32; out_rows];
-                    for t in 0..batch {
-                        multiply_single_into(
-                            wm,
-                            &raw_in[t * input..(t + 1) * input],
-                            1,
-                            &mut single_row,
-                        );
-                        single_ref_bits.extend(single_row.iter().map(|v| v.to_bits()));
-                    }
                     let mut prev_bits: Option<Vec<u32>> = None;
                     for workers in [1_usize, 3, 8] {
-                        let mut got = vec![0.0_f32; batch * out_rows];
-                        let mut scratch = Vec::new();
+                        got.resize(batch * out_rows, 0.0_f32);
+                        got.fill(0.0_f32);
                         multiply_batch_prepared_into(
                             wm,
                             &mut prepared,
-                            &raw_in,
+                            raw_in,
                             workers,
                             &mut scratch,
                             &mut got,
@@ -6155,33 +6178,54 @@ mod tests {
                 data: WeightSlice::Q8(&q8_data),
             };
 
-            for batch in [1_usize, 2, 3, 4, 5, 8, 9, 12, 16, 19] {
-                let raw_in: Vec<f32> = (0..batch * input)
-                    .map(|i| {
-                        (f32::from(u16::try_from((i * 11) % 59).unwrap_or(0)) - 29.0) * 0.03125
-                    })
-                    .collect();
-                let mut prepared = PreparedBatch::new(&raw_in, batch, input);
-
-                let mut exp_single = Vec::with_capacity(batch * out_rows);
-                let mut single_buf = vec![0.0_f32; out_rows];
-                for t in 0..batch {
+            const MAX_BATCH: usize = 19;
+            let full_raw_in: Vec<f32> = (0..MAX_BATCH * input)
+                .map(|i| (f32::from(u16::try_from((i * 11) % 59).unwrap_or(0)) - 29.0) * 0.03125)
+                .collect();
+            let mut full_exp_single = Vec::with_capacity(MAX_BATCH * out_rows);
+            let mut single_buf = vec![0.0_f32; out_rows];
+            for t in 0..MAX_BATCH {
+                multiply_single_into(
+                    wm_raw,
+                    &full_raw_in[t * input..(t + 1) * input],
+                    1,
+                    &mut single_buf,
+                );
+                full_exp_single.extend_from_slice(&single_buf);
+            }
+            let full_exp_bits: Vec<u32> = full_exp_single.iter().map(|v| v.to_bits()).collect();
+            for workers in [1_usize, 3, 8] {
+                let mut single_repack = Vec::with_capacity(MAX_BATCH * out_rows);
+                for t in 0..MAX_BATCH {
                     multiply_single_into(
-                        wm_raw,
-                        &raw_in[t * input..(t + 1) * input],
-                        1,
+                        wm_repack,
+                        &full_raw_in[t * input..(t + 1) * input],
+                        workers,
                         &mut single_buf,
                     );
-                    exp_single.extend_from_slice(&single_buf);
+                    single_repack.extend_from_slice(&single_buf);
                 }
-                let exp_bits: Vec<u32> = exp_single.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(
+                    single_repack
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    full_exp_bits,
+                    "repacked GEMV mismatch out={out_rows} workers={workers}"
+                );
+            }
+
+            let mut scratch = Vec::new();
+            for batch in [1_usize, 2, 3, 4, 5, 8, 9, 12, 16, 19] {
+                let raw_in = &full_raw_in[..batch * input];
+                let exp_bits = &full_exp_bits[..batch * out_rows];
+                let mut prepared = PreparedBatch::new(raw_in, batch, input);
 
                 let mut exp_q8 = vec![0.0_f32; batch * out_rows];
-                let mut scratch = Vec::new();
                 multiply_batch_prepared_into(
                     wm_q8,
                     &mut prepared,
-                    &raw_in,
+                    raw_in,
                     1,
                     &mut scratch,
                     &mut exp_q8,
@@ -6189,31 +6233,12 @@ mod tests {
                 let exp_q8_bits: Vec<u32> = exp_q8.iter().map(|v| v.to_bits()).collect();
 
                 for workers in [1_usize, 3, 8] {
-                    let mut single_repack = Vec::with_capacity(batch * out_rows);
-                    for t in 0..batch {
-                        multiply_single_into(
-                            wm_repack,
-                            &raw_in[t * input..(t + 1) * input],
-                            workers,
-                            &mut single_buf,
-                        );
-                        single_repack.extend_from_slice(&single_buf);
-                    }
-                    assert_eq!(
-                        single_repack
-                            .iter()
-                            .map(|v| v.to_bits())
-                            .collect::<Vec<_>>(),
-                        exp_bits,
-                        "repacked GEMV mismatch out={out_rows} batch={batch} workers={workers}"
-                    );
-
                     scratch.resize(out_rows * batch + 16, f32::NAN);
                     let mut batch_repack = vec![f32::NAN; batch * out_rows];
                     multiply_batch_prepared_into(
                         wm_repack,
                         &mut prepared,
-                        &raw_in,
+                        raw_in,
                         workers,
                         &mut scratch,
                         &mut batch_repack,
@@ -6229,7 +6254,7 @@ mod tests {
                     multiply_batch_group_into(
                         &mut [(wm_q8, &mut grp_q8), (wm_repack, &mut grp_repack)],
                         &mut prepared,
-                        &raw_in,
+                        raw_in,
                         workers,
                         &mut scratch,
                     );
@@ -6465,33 +6490,30 @@ mod tests {
                     output,
                     data: WeightSlice::Q8(&q8_data),
                 };
+                const MAX_Q8_BATCH: usize = 17;
+                let full_raw_in: Vec<f32> = (0..MAX_Q8_BATCH * input)
+                    .map(|i| {
+                        if i % 23 == 0 {
+                            -0.0
+                        } else {
+                            (f32::from(u16::try_from((i * 13) % 59).unwrap_or(0)) - 29.0) * 0.03125
+                        }
+                    })
+                    .collect();
+                let mut full_exp_single = Vec::with_capacity(MAX_Q8_BATCH * output);
+                for t in 0..MAX_Q8_BATCH {
+                    #[cfg(all(windows, feature = "rust-qualification"))]
+                    let row_buf =
+                        scalar_q8_x_q8_reference(wm, &full_raw_in[t * input..(t + 1) * input]);
+                    #[cfg(not(all(windows, feature = "rust-qualification")))]
+                    let row_buf =
+                        scalar_multiply_reference(wm, &full_raw_in[t * input..(t + 1) * input]);
+                    full_exp_single.extend_from_slice(&row_buf);
+                }
+                let full_exp_bits: Vec<u32> = full_exp_single.iter().map(|v| v.to_bits()).collect();
                 for batch in [1_usize, 2, 3, 5, 8, 9, 13, 17] {
-                    let raw_in: Vec<f32> = (0..batch * input)
-                        .map(|i| {
-                            if i % 23 == 0 {
-                                -0.0
-                            } else {
-                                (f32::from(u16::try_from((i * 13) % 59).unwrap_or(0)) - 29.0)
-                                    * 0.03125
-                            }
-                        })
-                        .collect();
-                    let mut exp_single = Vec::with_capacity(batch * output);
-                    let mut row_buf = vec![0.0_f32; output];
-                    for t in 0..batch {
-                        #[cfg(all(windows, feature = "rust-qualification"))]
-                        {
-                            row_buf =
-                                scalar_q8_x_q8_reference(wm, &raw_in[t * input..(t + 1) * input]);
-                        }
-                        #[cfg(not(all(windows, feature = "rust-qualification")))]
-                        {
-                            row_buf =
-                                scalar_multiply_reference(wm, &raw_in[t * input..(t + 1) * input]);
-                        }
-                        exp_single.extend_from_slice(&row_buf);
-                    }
-                    let exp_bits: Vec<u32> = exp_single.iter().map(|v| v.to_bits()).collect();
+                    let raw_in = &full_raw_in[..batch * input];
+                    let exp_bits = &full_exp_bits[..batch * output];
                     let mut exp_ch_bits = vec![0_u32; output * batch];
                     for t in 0..batch {
                         for r in 0..output {
@@ -6508,7 +6530,7 @@ mod tests {
                         multiply_batch_prepared_into(
                             wm,
                             &mut prepared,
-                            &raw_in,
+                            raw_in,
                             workers,
                             &mut scratch,
                             &mut batch_out,
@@ -6530,7 +6552,7 @@ mod tests {
                         super::multiply_batch_channel_major_into(
                             wm,
                             &mut prepared,
-                            &raw_in,
+                            raw_in,
                             workers,
                             &mut scratch,
                             &mut ch_out,
@@ -6549,7 +6571,7 @@ mod tests {
                         multiply_batch_group_into(
                             &mut [(wm, &mut grp_a), (wm, &mut grp_b)],
                             &mut prepared,
-                            &raw_in,
+                            raw_in,
                             workers,
                             &mut scratch,
                         );
@@ -6585,25 +6607,27 @@ mod tests {
                     output,
                     data: WeightSlice::Float(&weights_f32),
                 };
+                const MAX_FLOAT_BATCH: usize = 21;
+                let full_raw_in: Vec<f32> = (0..MAX_FLOAT_BATCH * input)
+                    .map(|i| {
+                        if i % 11 == 0 {
+                            -0.0
+                        } else {
+                            (f32::from(u16::try_from((i * 23) % 53).unwrap_or(0)) - 26.0) * 0.0625
+                        }
+                    })
+                    .collect();
+                let mut full_exp = Vec::with_capacity(MAX_FLOAT_BATCH * output);
+                for t in 0..MAX_FLOAT_BATCH {
+                    full_exp.extend(scalar_multiply_reference(
+                        wm,
+                        &full_raw_in[t * input..(t + 1) * input],
+                    ));
+                }
+                let full_exp_bits: Vec<u32> = full_exp.iter().map(|v| v.to_bits()).collect();
                 for batch in [1_usize, 4, 8, 17, 21] {
-                    let raw_in: Vec<f32> = (0..batch * input)
-                        .map(|i| {
-                            if i % 11 == 0 {
-                                -0.0
-                            } else {
-                                (f32::from(u16::try_from((i * 23) % 53).unwrap_or(0)) - 26.0)
-                                    * 0.0625
-                            }
-                        })
-                        .collect();
-                    let mut exp = Vec::with_capacity(batch * output);
-                    for t in 0..batch {
-                        exp.extend(scalar_multiply_reference(
-                            wm,
-                            &raw_in[t * input..(t + 1) * input],
-                        ));
-                    }
-                    let exp_bits: Vec<u32> = exp.iter().map(|v| v.to_bits()).collect();
+                    let raw_in = &full_raw_in[..batch * input];
+                    let exp_bits = &full_exp_bits[..batch * output];
                     let mut exp_ch_bits = vec![0_u32; output * batch];
                     for t in 0..batch {
                         for r in 0..output {
@@ -6620,7 +6644,7 @@ mod tests {
                         multiply_batch_prepared_into(
                             wm,
                             &mut prepared,
-                            &raw_in,
+                            raw_in,
                             workers,
                             &mut scratch,
                             &mut batch_out,
@@ -6636,7 +6660,7 @@ mod tests {
                         super::multiply_batch_channel_major_into(
                             wm,
                             &mut prepared,
-                            &raw_in,
+                            raw_in,
                             workers,
                             &mut scratch,
                             &mut ch_out,
