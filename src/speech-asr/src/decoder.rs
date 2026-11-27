@@ -410,11 +410,41 @@ impl Projection {
             return Err(invalid());
         }
         finite(input)?;
-        for _ in 0..self.output {
+        let polls = if self.output < 4096 {
+            self.output
+        } else {
+            self.output.div_ceil(4096)
+        };
+        for _ in 0..polls {
             check(cancel)?;
         }
         packed::multiply_single_into(self.as_weight_matrix(), input, workers, out);
         finite(out)
+    }
+
+    /// Compute every output row in bounded stack tiles and return the lowest-index finite argmax,
+    /// without materializing a full `[output]` logits buffer.
+    pub(super) fn multiply_argmax_into(
+        &self,
+        input: &[f32],
+        workers: usize,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<u32> {
+        if input.len() != self.input || self.output == 0 {
+            return Err(invalid());
+        }
+        finite(input)?;
+        let polls = if self.output < 4096 {
+            self.output
+        } else {
+            self.output.div_ceil(4096)
+        };
+        for _ in 0..polls {
+            check(cancel)?;
+        }
+        let best = packed::multiply_single_argmax(self.as_weight_matrix(), input, workers)
+            .ok_or_else(invalid)?;
+        u32::try_from(best).map_err(|_| invalid())
     }
 
     /// Compute every output row with bounded workers, allocating only the result vector.
@@ -1445,13 +1475,27 @@ impl Session {
         logits: &mut Vec<f32>,
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<()> {
-        self.step_token_into(id, Some(logits), cancel)
+        self.step_token_into(id, LogitsTarget::Buffer(logits), cancel)
+    }
+
+    /// Decode a vocabulary embedding, fuse LM-head argmax, and publish one position.
+    ///
+    /// # Errors
+    /// Rejects invalid token IDs, allocation faults, or the conditions from [`Self::step_audio`].
+    pub(crate) fn step_argmax(
+        &mut self,
+        id: u32,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<u32> {
+        let mut token = 0_u32;
+        self.step_token_into(id, LogitsTarget::Argmax(&mut token), cancel)?;
+        Ok(token)
     }
 
     fn step_token_into(
         &mut self,
         id: u32,
-        logits: Option<&mut Vec<f32>>,
+        logits: LogitsTarget<'_>,
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<()> {
         check(cancel)?;
@@ -1482,14 +1526,14 @@ impl Session {
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<Vec<f32>> {
         let mut logits = Vec::new();
-        self.advance_into(row, Some(&mut logits), cancel)?;
+        self.advance_into(row, LogitsTarget::Buffer(&mut logits), cancel)?;
         Ok(logits)
     }
 
     fn advance_into(
         &mut self,
         row: &[f32],
-        logits: Option<&mut Vec<f32>>,
+        logits: LogitsTarget<'_>,
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<()> {
         let c = self.model.config;
@@ -1504,7 +1548,7 @@ impl Session {
 
     fn advance_prepared_into(
         &mut self,
-        logits_out: Option<&mut Vec<f32>>,
+        logits_out: LogitsTarget<'_>,
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<()> {
         let model = &self.model;
@@ -1575,11 +1619,21 @@ impl Session {
             c.epsilon,
             &mut ws.single_norm,
         )?;
-        if let Some(logits) = logits_out {
-            ensure_len(logits, model.embedding.output)?;
-            model
-                .embedding
-                .multiply_into(&ws.single_norm, model.decode_threads, logits, cancel)?;
+        let lm_workers = lm_head_workers(model);
+        match logits_out {
+            LogitsTarget::None => {}
+            LogitsTarget::Buffer(logits) => {
+                ensure_len(logits, model.embedding.output)?;
+                model
+                    .embedding
+                    .multiply_into(&ws.single_norm, lm_workers, logits, cancel)?;
+            }
+            LogitsTarget::Argmax(best_token) => {
+                *best_token =
+                    model
+                        .embedding
+                        .multiply_argmax_into(&ws.single_norm, lm_workers, cancel)?;
+            }
         }
         check(cancel)?;
         for state in &mut self.layers {
@@ -1659,12 +1713,56 @@ impl Session {
             &mut guard.session.workspace,
             0,
             PrefillSource::Prompt { prompt, audio },
-            Some(logits),
+            LogitsTarget::Buffer(logits),
             cancel,
         )?;
         guard.session.position = total;
         guard.success = true;
         Ok(())
+    }
+
+    /// Start a fresh prompt and return the final row's greedy argmax token without
+    /// materializing a full `[output]` logits vector.
+    ///
+    /// # Errors
+    /// Rejects non-empty prompts with zero vocabulary, audio geometry, context, or any token/step failure.
+    pub(crate) fn prefill_argmax(
+        &mut self,
+        prompt: &Prompt,
+        audio: &[f32],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<u32> {
+        self.reset();
+        let mut guard = ResetGuard {
+            session: self,
+            success: false,
+        };
+        let total = prompt.ids().len();
+        let model = Arc::clone(&guard.session.model);
+        let c = model.config;
+        let range = prompt.audio_rows();
+        let hidden = c.hidden;
+        if audio.len() != range.len().checked_mul(hidden).ok_or_else(invalid)? || total > c.context
+        {
+            return Err(invalid());
+        }
+        finite(audio)?;
+        if total == 0 {
+            return Err(invalid());
+        }
+        let mut best_token = 0_u32;
+        prefill_rows_inner(
+            &model,
+            &mut guard.session.layers,
+            &mut guard.session.workspace,
+            0,
+            PrefillSource::Prompt { prompt, audio },
+            LogitsTarget::Argmax(&mut best_token),
+            cancel,
+        )?;
+        guard.session.position = total;
+        guard.success = true;
+        Ok(best_token)
     }
 
     /// Incrementally append prompt or control tokens at the current position,
@@ -1700,13 +1798,40 @@ impl Session {
         logits: Option<&mut Vec<f32>>,
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<()> {
+        let target = match logits {
+            Some(buf) => LogitsTarget::Buffer(buf),
+            None => LogitsTarget::None,
+        };
+        self.prefill_tokens_target(ids, target, cancel)
+    }
+
+    /// Incrementally append tokens and return the final row's greedy argmax token.
+    ///
+    /// # Errors
+    /// Rejects empty slices, context overflow, or invalid IDs.
+    pub(crate) fn prefill_tokens_argmax(
+        &mut self,
+        ids: &[u32],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<u32> {
+        let mut best_token = 0_u32;
+        self.prefill_tokens_target(ids, LogitsTarget::Argmax(&mut best_token), cancel)?;
+        Ok(best_token)
+    }
+
+    fn prefill_tokens_target(
+        &mut self,
+        ids: &[u32],
+        logits: LogitsTarget<'_>,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
         check(cancel)?;
         let saved_pos = self.position;
         let model = Arc::clone(&self.model);
         let c = model.config;
         let kv_width = c.kv_heads * c.head_dim;
         let end_pos = saved_pos.checked_add(ids.len()).ok_or_else(invalid)?;
-        if end_pos > c.context || (ids.is_empty() && logits.is_some()) {
+        if end_pos > c.context || (ids.is_empty() && !matches!(logits, LogitsTarget::None)) {
             return Err(invalid());
         }
         if ids.is_empty() {
@@ -1773,12 +1898,26 @@ impl Session {
             &mut guard.session.workspace,
             saved_pos,
             PrefillSource::Audio { audio, rows },
-            None,
+            LogitsTarget::None,
             cancel,
         )?;
         guard.session.position = end_pos;
         guard.success = true;
         Ok(())
+    }
+}
+
+enum LogitsTarget<'a> {
+    None,
+    Buffer(&'a mut Vec<f32>),
+    Argmax(&'a mut u32),
+}
+
+const fn lm_head_workers(model: &Model) -> usize {
+    if model.embedding.output >= 32_768 {
+        model.batch_threads
+    } else {
+        model.decode_threads
     }
 }
 
@@ -1810,7 +1949,7 @@ fn prefill_rows_inner(
     ws: &mut DecoderWorkspace,
     start_pos: usize,
     source: PrefillSource<'_>,
-    logits_out: Option<&mut Vec<f32>>,
+    logits_out: LogitsTarget<'_>,
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<()> {
     let c = model.config;
@@ -1879,7 +2018,7 @@ fn prefill_rows_inner(
     let gqa_group = c.heads / c.kv_heads;
     let last_layer = model.blocks.len() - 1;
     let last_offset = (total - 1) * hidden;
-    let need_logits = logits_out.is_some();
+    let need_logits = !matches!(logits_out, LogitsTarget::None);
     fill_rope_tables(
         &model.inv_freq,
         start_pos,
@@ -2052,11 +2191,19 @@ fn prefill_rows_inner(
         c.epsilon,
         &mut ws.single_norm,
     )?;
-    if let Some(logits) = logits_out {
-        ensure_len(logits, model.embedding.output)?;
-        model
-            .embedding
-            .multiply_into(&ws.single_norm, workers, logits, cancel)?;
+    match logits_out {
+        LogitsTarget::None => {}
+        LogitsTarget::Buffer(logits) => {
+            ensure_len(logits, model.embedding.output)?;
+            model
+                .embedding
+                .multiply_into(&ws.single_norm, workers, logits, cancel)?;
+        }
+        LogitsTarget::Argmax(best_token) => {
+            *best_token = model
+                .embedding
+                .multiply_argmax_into(&ws.single_norm, workers, cancel)?;
+        }
     }
     check(cancel)?;
     Ok(())

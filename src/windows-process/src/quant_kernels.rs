@@ -27,6 +27,37 @@ pub fn dot_q8_0_8rows(caps: Arm64QuantCaps, rows: [&[u8]; 8], act: &[Q8_0ActBloc
     crate::native::quant_q8::dot_q8_0_8rows(caps, rows, act)
 }
 
+/// Computes eight load-validated finite-scale `Q8_0` row dot products using 2-block unrolling
+/// and direct `vld1q_lane_u16` + `vcvt_f32_f16` (`0-ULP` vs `dot_q8_0_row`).
+#[must_use]
+pub fn dot_q8_0_8rows_finite_scales(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    act: &[Q8_0ActBlock],
+) -> [f32; 8] {
+    crate::native::quant_q8::dot_q8_0_8rows_finite_scales(caps, rows, act)
+}
+
+/// Computes `strip_count` contiguous 8-row strips (`strip_count * 8` rows starting at `start_row`)
+/// of load-validated finite-scale `Q8_0` dot products with cross-strip prefetching (`0-ULP` vs `dot_q8_0_row`).
+pub fn dot_q8_0_8rows_finite_scales_strips(
+    caps: Arm64QuantCaps,
+    data: &[u8],
+    start_row: usize,
+    strip_count: usize,
+    act: &[Q8_0ActBlock],
+    out: &mut [f32],
+) {
+    crate::native::quant_q8::dot_q8_0_8rows_finite_scales_strips(
+        caps,
+        data,
+        start_row,
+        strip_count,
+        act,
+        out,
+    );
+}
+
 /// Computes an 8-row by 8-token `Q8_0` tile using `I8MM` (`SMMLA`) or exact `SDOT`/portable fallback.
 #[must_use]
 pub fn gemm_q8_0_8x8(
@@ -654,6 +685,48 @@ mod tests {
                 assert_eq!(d_nat.map(f32::to_bits), d_prt.map(f32::to_bits));
                 for r in 0..8 {
                     assert_eq!(d_nat[r].to_bits(), expected[r][t]);
+                }
+                let df_nat = dot_q8_0_8rows_finite_scales(caps, row_refs, act8_refs[t]);
+                let df_prt = dot_q8_0_8rows_finite_scales(port, row_refs, act8_refs[t]);
+                assert_eq!(df_nat.map(f32::to_bits), expected.map(|row| row[t]));
+                assert_eq!(df_prt.map(f32::to_bits), expected.map(|row| row[t]));
+            }
+
+            if blocks > 0 {
+                let row_bytes = blocks * Q8_0_BLOCK_BYTES;
+                let mut flat_16 = Vec::with_capacity(16 * row_bytes);
+                for s in 0..2 {
+                    for r in 0..8 {
+                        if (r + s) % 2 == 0 {
+                            flat_16.extend_from_slice(&make_edge_q8_0_row(blocks, r + s + 1));
+                        } else {
+                            flat_16.extend_from_slice(&make_q8_0_row(blocks, r + s + 9));
+                        }
+                    }
+                }
+                let mut strip_nat = [f32::NAN; 16];
+                let mut strip_prt = [f32::NAN; 16];
+                dot_q8_0_8rows_finite_scales_strips(
+                    caps,
+                    &flat_16,
+                    0,
+                    2,
+                    act8_refs[0],
+                    &mut strip_nat,
+                );
+                dot_q8_0_8rows_finite_scales_strips(
+                    port,
+                    &flat_16,
+                    0,
+                    2,
+                    act8_refs[0],
+                    &mut strip_prt,
+                );
+                for r in 0..16 {
+                    let row = &flat_16[r * row_bytes..(r + 1) * row_bytes];
+                    let want = dot_q8_0_row(port, row, act8_refs[0]).to_bits();
+                    assert_eq!(strip_nat[r].to_bits(), want);
+                    assert_eq!(strip_prt[r].to_bits(), want);
                 }
             }
 

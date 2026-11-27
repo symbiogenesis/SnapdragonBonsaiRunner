@@ -13,15 +13,15 @@ use bonsai_neon_dot::kquants::{
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{
-    float32x4_t, int8x16_t, int32x4_t, uint8x8_t, uint8x16_t, vaddq_f32, vaddvq_s32, vand_u16,
-    vandq_u8, vandq_u16, vcombine_s8, vcombine_s16, vcvt_f32_f16, vcvt_high_f32_f16, vcvtq_f32_s32,
-    vdotq_s32, vdup_n_s16, vdup_n_u16, vdupq_n_f32, vdupq_n_s8, vdupq_n_s32, vdupq_n_u8,
-    vdupq_n_u16, vfmaq_f32, vget_high_s8, vget_high_u16, vget_low_f16, vget_low_s8, vget_low_s16,
-    vget_low_u16, vld1_u8, vld1_u16, vld1q_f32, vld1q_s8, vld1q_s32, vld1q_u8, vld1q_u16,
-    vmaxv_u16, vmaxvq_u16, vmlal_high_s16, vmlal_s16, vmlaq_s32, vmovl_u8, vmovl_u16, vmulq_f32,
-    vorrq_u8, vpaddq_f32, vpaddq_s32, vreinterpret_f16_u16, vreinterpretq_f16_u16,
-    vreinterpretq_s8_u8, vreinterpretq_s16_u16, vreinterpretq_s32_u32, vshlq_n_u8, vshrq_n_u8,
-    vst1q_f32, vst1q_s8, vst1q_s32, vsubq_s8, vzip1q_f32, vzip2q_f32,
+    float32x4_t, int8x16_t, int32x4_t, uint8x8_t, uint8x16_t, uint16x8_t, vaddq_f32, vaddvq_s32,
+    vand_u16, vandq_u8, vandq_u16, vcombine_s8, vcombine_s16, vcvt_f32_f16, vcvt_high_f32_f16,
+    vcvtq_f32_s32, vdotq_s32, vdup_n_s16, vdup_n_u16, vdupq_n_f32, vdupq_n_s8, vdupq_n_s32,
+    vdupq_n_u8, vdupq_n_u16, vfmaq_f32, vget_high_s8, vget_high_u16, vget_low_f16, vget_low_s8,
+    vget_low_s16, vget_low_u16, vld1_u8, vld1_u16, vld1q_f32, vld1q_lane_u16, vld1q_s8, vld1q_s32,
+    vld1q_u8, vld1q_u16, vmaxv_u16, vmaxvq_u16, vmlal_high_s16, vmlal_s16, vmlaq_s32, vmovl_u8,
+    vmovl_u16, vmulq_f32, vorrq_u8, vpaddq_f32, vpaddq_s32, vreinterpret_f16_u16,
+    vreinterpretq_f16_u16, vreinterpretq_s8_u8, vreinterpretq_s16_u16, vreinterpretq_s32_u32,
+    vshlq_n_u8, vshrq_n_u8, vst1q_f32, vst1q_s8, vst1q_s32, vsubq_s8, vzip1q_f32, vzip2q_f32,
 };
 
 #[inline]
@@ -316,6 +316,231 @@ pub(crate) fn dot_q8_0_8rows(
         return [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]];
     }
     rows.map(|row| dot_q8_0_row(caps, row, act))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_f16_lane<const LANE: i32>(blk: &[u8; 34], vec: uint16x8_t) -> uint16x8_t {
+    // SAFETY: `blk` is a 34-byte Q8_0 block (`>= 2` bytes) and ARM64 `ld1` lane load requires no alignment.
+    unsafe { vld1q_lane_u16::<LANE>(blk.as_ptr().cast::<u16>(), vec) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn q8_0_8rows_finite_scales_block_prod(
+    b: [&[u8; 34]; 8],
+    ab: &Q8_0ActBlock,
+    zero_u16: uint16x8_t,
+    zero_i32: int32x4_t,
+) -> (float32x4_t, float32x4_t) {
+    let mut d_raw = load_f16_lane::<0>(b[0], zero_u16);
+    d_raw = load_f16_lane::<1>(b[1], d_raw);
+    d_raw = load_f16_lane::<2>(b[2], d_raw);
+    d_raw = load_f16_lane::<3>(b[3], d_raw);
+    d_raw = load_f16_lane::<4>(b[4], d_raw);
+    d_raw = load_f16_lane::<5>(b[5], d_raw);
+    d_raw = load_f16_lane::<6>(b[6], d_raw);
+    d_raw = load_f16_lane::<7>(b[7], d_raw);
+    let d_half = vreinterpretq_f16_u16(d_raw);
+    let w_scale_lo = vcvt_f32_f16(vget_low_f16(d_half));
+    let w_scale_hi = vcvt_high_f32_f16(d_half);
+    let act_scale = vdupq_n_f32(ab.d);
+
+    let a_halves = ab.qs.as_chunks::<16>().0;
+    let a0 = load_s8x16(&a_halves[0]);
+    let a1 = load_s8x16(&a_halves[1]);
+
+    let d0 = sdot_q8_block(b[0], a0, a1, zero_i32);
+    let d1 = sdot_q8_block(b[1], a0, a1, zero_i32);
+    let d2 = sdot_q8_block(b[2], a0, a1, zero_i32);
+    let d3 = sdot_q8_block(b[3], a0, a1, zero_i32);
+    let dots_lo = vpaddq_s32(vpaddq_s32(d0, d1), vpaddq_s32(d2, d3));
+
+    let d4 = sdot_q8_block(b[4], a0, a1, zero_i32);
+    let d5 = sdot_q8_block(b[5], a0, a1, zero_i32);
+    let d6 = sdot_q8_block(b[6], a0, a1, zero_i32);
+    let d7 = sdot_q8_block(b[7], a0, a1, zero_i32);
+    let dots_hi = vpaddq_s32(vpaddq_s32(d4, d5), vpaddq_s32(d6, d7));
+
+    let dot_f32_lo = vcvtq_f32_s32(dots_lo);
+    let dot_f32_hi = vcvtq_f32_s32(dots_hi);
+
+    let prod_lo = vmulq_f32(w_scale_lo, vmulq_f32(act_scale, dot_f32_lo));
+    let prod_hi = vmulq_f32(w_scale_hi, vmulq_f32(act_scale, dot_f32_hi));
+    (prod_lo, prod_hi)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon,dotprod")]
+fn dot_q8_0_8rows_finite_scales_inner(
+    r_chunks: [&[[u8; 34]]; 8],
+    next_r_chunks: Option<[&[[u8; 34]]; 8]>,
+    act: &[Q8_0ActBlock],
+) -> [f32; 8] {
+    let blocks = act.len();
+    let mut acc_lo = vdupq_n_f32(0.0_f32);
+    let mut acc_hi = vdupq_n_f32(0.0_f32);
+    let zero_i32 = vdupq_n_s32(0);
+    let zero_u16 = vdupq_n_u16(0);
+
+    let mut idx = 0_usize;
+    while idx + 1 < blocks {
+        if idx + 4 < blocks {
+            for r in &r_chunks {
+                prefetch_l1(r[idx + 4].as_ptr());
+            }
+        } else if let Some(next) = next_r_chunks {
+            let next_idx = if blocks < 4 { 0 } else { idx + 4 - blocks };
+            if next_idx < blocks {
+                for r in &next {
+                    prefetch_l1(r[next_idx].as_ptr());
+                }
+            }
+        }
+        let b_even: [&[u8; 34]; 8] = std::array::from_fn(|r| &r_chunks[r][idx]);
+        let b_odd: [&[u8; 34]; 8] = std::array::from_fn(|r| &r_chunks[r][idx + 1]);
+        let (p0_lo, p0_hi) =
+            q8_0_8rows_finite_scales_block_prod(b_even, &act[idx], zero_u16, zero_i32);
+        let (p1_lo, p1_hi) =
+            q8_0_8rows_finite_scales_block_prod(b_odd, &act[idx + 1], zero_u16, zero_i32);
+        acc_lo = vaddq_f32(acc_lo, p0_lo);
+        acc_hi = vaddq_f32(acc_hi, p0_hi);
+        acc_lo = vaddq_f32(acc_lo, p1_lo);
+        acc_hi = vaddq_f32(acc_hi, p1_hi);
+        idx += 2;
+    }
+    if idx < blocks {
+        if let Some(next) = next_r_chunks
+            && blocks <= 4
+        {
+            for r in &next {
+                prefetch_l1(r[0].as_ptr());
+            }
+        }
+        let b_last: [&[u8; 34]; 8] = std::array::from_fn(|r| &r_chunks[r][idx]);
+        let (p_lo, p_hi) =
+            q8_0_8rows_finite_scales_block_prod(b_last, &act[idx], zero_u16, zero_i32);
+        acc_lo = vaddq_f32(acc_lo, p_lo);
+        acc_hi = vaddq_f32(acc_hi, p_hi);
+    }
+
+    let mut out_lo = [0.0_f32; 4];
+    let mut out_hi = [0.0_f32; 4];
+    store_f32x4(acc_lo, &mut out_lo);
+    store_f32x4(acc_hi, &mut out_hi);
+    [
+        out_lo[0], out_lo[1], out_lo[2], out_lo[3], out_hi[0], out_hi[1], out_hi[2], out_hi[3],
+    ]
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+fn dot_q8_0_8rows_finite_scales_dotprod(rows: [&[u8]; 8], act: &[Q8_0ActBlock]) -> [f32; 8] {
+    let r_chunks: [&[[u8; 34]]; 8] = rows.map(|r| r.as_chunks::<34>().0);
+    dot_q8_0_8rows_finite_scales_inner(r_chunks, None, act)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+fn dot_q8_0_8rows_finite_scales_strips_dotprod(
+    data: &[u8],
+    start_row: usize,
+    strip_count: usize,
+    act: &[Q8_0ActBlock],
+    out: &mut [f32],
+) {
+    let row_bytes = act.len() * Q8_0_BLOCK_BYTES;
+    for strip_idx in 0..strip_count {
+        let base_row = start_row + strip_idx * 8;
+        let r_chunks: [&[[u8; 34]]; 8] = std::array::from_fn(|r| {
+            let off = (base_row + r) * row_bytes;
+            data[off..off + row_bytes].as_chunks::<34>().0
+        });
+        let next_r_chunks = (strip_idx + 1 < strip_count).then(|| {
+            std::array::from_fn(|r| {
+                let off = (base_row + 8 + r) * row_bytes;
+                data[off..off + row_bytes].as_chunks::<34>().0
+            })
+        });
+        let vals = dot_q8_0_8rows_finite_scales_inner(r_chunks, next_r_chunks, act);
+        out[strip_idx * 8..(strip_idx + 1) * 8].copy_from_slice(&vals);
+    }
+}
+
+/// Computes eight load-validated finite-scale `Q8_0` row dot products using 2-block unrolling
+/// and direct `vld1q_lane_u16` + `vcvt_f32_f16` (`0-ULP` vs `dot_q8_0_row`).
+///
+/// Callers must only invoke this on `Q8_0` rows whose `f16` scales were proven finite at load time;
+/// arbitrary unvalidated `f16` inputs should use [`dot_q8_0_8rows`].
+pub(crate) fn dot_q8_0_8rows_finite_scales(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    act: &[Q8_0ActBlock],
+) -> [f32; 8] {
+    if !valid_q8_rows(&rows, act.len()) {
+        return [0.0; 8];
+    }
+    #[cfg(target_arch = "aarch64")]
+    if caps.dotprod && bonsai_neon_dot::has_dotprod() {
+        // SAFETY: `caps.dotprod` and `bonsai_neon_dot::has_dotprod()` verified CPU support for `neon,dotprod`.
+        return unsafe { dot_q8_0_8rows_finite_scales_dotprod(rows, act) };
+    }
+    dot_q8_0_8rows(caps, rows, act)
+}
+
+/// Computes `strip_count` contiguous 8-row strips (`strip_count * 8` rows starting at `start_row`)
+/// of load-validated finite-scale `Q8_0` dot products with cross-strip prefetching (`0-ULP` vs `dot_q8_0_row`).
+pub(crate) fn dot_q8_0_8rows_finite_scales_strips(
+    caps: Arm64QuantCaps,
+    data: &[u8],
+    start_row: usize,
+    strip_count: usize,
+    act: &[Q8_0ActBlock],
+    out: &mut [f32],
+) {
+    if strip_count == 0 {
+        return;
+    }
+    let Some(total_rows) = strip_count.checked_mul(8) else {
+        return;
+    };
+    let Some(end_row) = start_row.checked_add(total_rows) else {
+        return;
+    };
+    let Some(row_bytes) = act.len().checked_mul(Q8_0_BLOCK_BYTES) else {
+        return;
+    };
+    let Some(required_bytes) = end_row.checked_mul(row_bytes) else {
+        return;
+    };
+    if out.len() < total_rows || data.len() < required_bytes {
+        return;
+    }
+    if act.is_empty() {
+        out[..total_rows].fill(0.0);
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if caps.dotprod && bonsai_neon_dot::has_dotprod() {
+        // SAFETY: `caps.dotprod` and `bonsai_neon_dot::has_dotprod()` verified CPU support for `neon,dotprod`,
+        // and all row/byte/output bounds were validated above.
+        unsafe {
+            dot_q8_0_8rows_finite_scales_strips_dotprod(data, start_row, strip_count, act, out);
+        }
+        return;
+    }
+    for strip_idx in 0..strip_count {
+        let base_row = start_row + strip_idx * 8;
+        let rows: [&[u8]; 8] = std::array::from_fn(|r| {
+            let off = (base_row + r) * row_bytes;
+            &data[off..off + row_bytes]
+        });
+        let vals = dot_q8_0_8rows(caps, rows, act);
+        out[strip_idx * 8..(strip_idx + 1) * 8].copy_from_slice(&vals);
+    }
 }
 
 fn gemm_q8_0_8x_dispatch<const TOKENS: usize, const COL_PAIRS: usize>(

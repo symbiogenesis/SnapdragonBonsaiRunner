@@ -1096,16 +1096,38 @@ fn single_rows_quant_arm64(
 ) {
     let width = weights.input;
     match weights.data {
-        WeightSlice::Q8(data) => run_single_rows_quant8(
-            data,
-            start_row,
-            width / 32 * 34,
-            act_q8_0,
-            out,
-            |rows, a| quant_kernels::dot_q8_0_8rows(caps, rows, a),
-            |rows, a| quant_kernels::dot_q8_0_4rows(caps, rows, a),
-            |row, a| quant_kernels::dot_q8_0_row(caps, row, a),
-        ),
+        WeightSlice::Q8(data) => {
+            let row_bytes = width / 32 * 34;
+            let full_strips = out.len() / 8;
+            if full_strips > 0 {
+                quant_kernels::dot_q8_0_8rows_finite_scales_strips(
+                    caps,
+                    data,
+                    start_row,
+                    full_strips,
+                    act_q8_0,
+                    &mut out[..full_strips * 8],
+                );
+            }
+            let processed = full_strips * 8;
+            let mut rem = out.len() - processed;
+            let mut cur_off = processed;
+            if rem >= 4 {
+                let four = quant_kernels::dot_q8_0_4rows(
+                    caps,
+                    four_rows(data, start_row + cur_off, row_bytes),
+                    act_q8_0,
+                );
+                out[cur_off..cur_off + 4].copy_from_slice(&four);
+                cur_off += 4;
+                rem -= 4;
+            }
+            for local_idx in 0..rem {
+                let off = (start_row + cur_off + local_idx) * row_bytes;
+                out[cur_off + local_idx] =
+                    quant_kernels::dot_q8_0_row(caps, &data[off..off + row_bytes], act_q8_0);
+            }
+        }
         WeightSlice::Q4K(data) => run_single_rows_quant(
             data,
             start_row,
@@ -5073,6 +5095,144 @@ pub(super) fn argmax_finite_f32(values: &[f32]) -> Option<usize> {
     dispatch!(level, simd => argmax_finite_f32_simd(simd, values))
 }
 
+#[derive(Clone, Copy)]
+struct ArgmaxSlot {
+    val: f32,
+    idx: usize,
+    finite: bool,
+}
+
+impl ArgmaxSlot {
+    const EMPTY: Self = Self {
+        val: f32::NEG_INFINITY,
+        idx: usize::MAX,
+        finite: true,
+    };
+
+    fn reduce_chunk(&mut self, base_row: usize, values: &[f32]) {
+        if !self.finite {
+            return;
+        }
+        let Some(local_idx) = argmax_finite_f32(values) else {
+            self.finite = false;
+            return;
+        };
+        let val = values[local_idx];
+        let global_idx = base_row + local_idx;
+        if self.idx == usize::MAX || val > self.val || (val == self.val && global_idx < self.idx) {
+            self.val = val;
+            self.idx = global_idx;
+        }
+    }
+}
+
+fn eval_argmax_range(
+    start_row: usize,
+    end_row: usize,
+    eval_chunk: &impl Fn(usize, &mut [f32]),
+) -> ArgmaxSlot {
+    const CHUNK_ROWS: usize = 64;
+    let mut slot = ArgmaxSlot::EMPTY;
+    let mut buf = [0.0_f32; CHUNK_ROWS];
+    let mut row = start_row;
+    while row < end_row {
+        let take = (end_row - row).min(CHUNK_ROWS);
+        let chunk = &mut buf[..take];
+        eval_chunk(row, chunk);
+        slot.reduce_chunk(row, chunk);
+        if !slot.finite {
+            break;
+        }
+        row += take;
+    }
+    slot
+}
+
+fn reduce_argmax_parallel(
+    output: usize,
+    row_align: usize,
+    workers: usize,
+    eval_chunk: &(impl Fn(usize, &mut [f32]) + Sync),
+) -> Option<usize> {
+    if output == 0 {
+        return None;
+    }
+    let groups = output.div_ceil(row_align);
+    let active_workers = workers.clamp(1, crate::threads::MAX_WORKERS).min(groups);
+    if active_workers <= 1 || output < 256 {
+        let slot = eval_argmax_range(0, output, eval_chunk);
+        return (slot.finite && slot.idx != usize::MAX).then_some(slot.idx);
+    }
+    let groups_per_task = groups.div_ceil(active_workers);
+    let rows_per_task = groups_per_task * row_align;
+    let num_tasks = output.div_ceil(rows_per_task);
+    let mut slots = [ArgmaxSlot::EMPTY; crate::threads::MAX_WORKERS];
+    row_workers::run_slice_aligned(
+        &mut slots[..num_tasks],
+        active_workers,
+        1,
+        &|first_task, task_slice| {
+            for (local_idx, slot) in task_slice.iter_mut().enumerate() {
+                let task_idx = first_task + local_idx;
+                let start_row = task_idx * rows_per_task;
+                let end_row = (start_row + rows_per_task).min(output);
+                *slot = eval_argmax_range(start_row, end_row, eval_chunk);
+            }
+        },
+    );
+    let mut best = ArgmaxSlot::EMPTY;
+    for slot in &slots[..num_tasks] {
+        if !slot.finite {
+            return None;
+        }
+        if slot.idx != usize::MAX
+            && (best.idx == usize::MAX
+                || slot.val > best.val
+                || (slot.val == best.val && slot.idx < best.idx))
+        {
+            best.val = slot.val;
+            best.idx = slot.idx;
+        }
+    }
+    (best.idx != usize::MAX).then_some(best.idx)
+}
+
+/// Fused matrix-vector multiplication, finiteness check, and lowest-index argmax
+/// in `64`-row stack tiles across `row_workers`, avoiding a full `[output]` logits allocation.
+pub(super) fn multiply_single_argmax(
+    weights: WeightMatrix<'_>,
+    input: &[f32],
+    workers: usize,
+) -> Option<usize> {
+    if weights.output == 0 || input.len() != weights.input {
+        return None;
+    }
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    if !matches!(weights.data, WeightSlice::Float(_)) {
+        let align = quant_row_align(weights.data);
+        let mut result = None;
+        with_decode_act_buffers(
+            [weights],
+            input,
+            weights.input,
+            workers,
+            |caps, act_q8_0, act_q8_k| {
+                result =
+                    reduce_argmax_parallel(weights.output, align, workers, &|start_row, slice| {
+                        single_rows_quant_arm64(
+                            caps, weights, start_row, act_q8_0, act_q8_k, slice,
+                        );
+                    });
+            },
+        );
+        return result;
+    }
+    let level = simd_level();
+    reduce_argmax_parallel(weights.output, 4, workers, &|start_row, slice| {
+        dispatch!(level, simd => single_rows_simd(simd, weights, start_row, input, slice));
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -6533,5 +6693,75 @@ mod tests {
             4,
             &mut [&mut out0, &mut out1],
         ));
+    }
+
+    #[test]
+    fn multiply_single_argmax_matches_full_logits_and_lowest_index_ties() {
+        let input = 64_usize;
+        for output in [11_usize, 255, 256, 521] {
+            let mut weights_f32 = vec![0.0_f32; output * input];
+            let winner = (output / 3).min(output - 1);
+            let tie = (output * 2 / 3).min(output - 1);
+            for r in 0..output {
+                let val = if r == winner || r == tie {
+                    2.0
+                } else {
+                    (f32::from(u16::try_from(r % 17).unwrap_or(0)) - 8.0) * 0.125
+                };
+                weights_f32[r * input] = val;
+            }
+            let wm_f32 = WeightMatrix {
+                input,
+                output,
+                data: WeightSlice::Float(&weights_f32),
+            };
+            let act: Vec<f32> = (0..input)
+                .map(|i| if i == 0 { 1.0 } else { 0.05 })
+                .collect();
+            let mut logits = vec![0.0_f32; output];
+            multiply_single_into(wm_f32, &act, 4, &mut logits);
+            let expected = super::argmax_finite_f32(&logits);
+            for workers in [1_usize, 3, 8] {
+                assert_eq!(
+                    super::multiply_single_argmax(wm_f32, &act, workers),
+                    expected
+                );
+            }
+
+            // Overflow/nonfinite row must reject even if smaller than winner.
+            let mut bad_f32 = weights_f32;
+            bad_f32[(output - 1) * input] = f32::INFINITY;
+            let wm_bad = WeightMatrix {
+                input,
+                output,
+                data: WeightSlice::Float(&bad_f32),
+            };
+            assert_eq!(super::multiply_single_argmax(wm_bad, &act, 4), None);
+
+            // Q8_0 parallel argmax parity vs multiply_single_into + argmax_finite_f32.
+            let blocks = input / 32;
+            let mut q8_data = vec![0_u8; output * blocks * 34];
+            for (blk_idx, block) in q8_data.chunks_exact_mut(34).enumerate() {
+                block[0..2].copy_from_slice(&0x3555_u16.to_le_bytes());
+                for (q_idx, byte) in block[2..].iter_mut().enumerate() {
+                    let v = i8::try_from(((blk_idx * 13 + q_idx * 7) % 101).cast_signed() - 50)
+                        .unwrap_or(0);
+                    *byte = v.cast_unsigned();
+                }
+            }
+            let wm_q8 = WeightMatrix {
+                input,
+                output,
+                data: WeightSlice::Q8(&q8_data),
+            };
+            multiply_single_into(wm_q8, &act, 4, &mut logits);
+            let expected_q8 = super::argmax_finite_f32(&logits);
+            for workers in [1_usize, 3, 8] {
+                assert_eq!(
+                    super::multiply_single_argmax(wm_q8, &act, workers),
+                    expected_q8
+                );
+            }
+        }
     }
 }

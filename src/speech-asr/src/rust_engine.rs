@@ -215,7 +215,25 @@ impl RustRecognizer {
         pcm: &[f32],
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<String> {
-        self.transcribe_observed(pcm, cancel, &mut |_| Ok(()))
+        self.decoder.reset();
+        let guard = ClearSession(&mut self.decoder);
+        check(cancel)?;
+        let mel = self.frontend.compute_with_scratch(
+            pcm,
+            self.batch_threads,
+            &mut self.frontend_scratch,
+            &mut *cancel,
+        )?;
+        check(cancel)?;
+        let audio = self.encoder.encode(&mel, cancel)?;
+        drop(mel);
+        check(cancel)?;
+        let prompt = self
+            .prompt_tokens
+            .automatic_prompt(audio.rows(), self.context)?;
+        let budget = decode_budget(audio.rows(), prompt.ids().len(), self.context)?;
+        let first_token = guard.0.prefill_argmax(&prompt, audio.values(), cancel)?;
+        decode_greedy_argmax(guard.0, &self.tokenizer, first_token, budget, false, cancel)
     }
 
     /// Recognize with synchronous observations of every numerical boundary.
@@ -305,17 +323,14 @@ impl RustRecognizer {
             self.prompt_tokens
                 .prompt_with_system(&system_tokens, audio.rows(), self.context)?;
         let budget = decode_budget(audio.rows(), prompt.ids().len(), self.context)?;
-        guard
-            .0
-            .prefill_into(&prompt, audio.values(), &mut self.logits_scratch, cancel)?;
-        decode_from_logits(
+        let first_token = guard.0.prefill_argmax(&prompt, audio.values(), cancel)?;
+        decode_greedy_argmax(
             guard.0,
             &self.tokenizer,
-            &mut self.logits_scratch,
+            first_token,
             budget,
             options.trim_repetition_on_stop,
             cancel,
-            &mut |_| Ok(()),
         )
     }
 
@@ -444,19 +459,17 @@ impl LiveCapture<'_> {
             .decoder
             .prefill_audio_chunk(encoded.values(), encoded.rows(), cancel)?;
         let suffix = self.recognizer.prompt_tokens.suffix_ids();
-        self.recognizer.decoder.prefill_tokens_into(
-            &suffix,
-            Some(&mut self.recognizer.logits_scratch),
-            cancel,
-        )?;
-        decode_from_logits(
+        let first_token = self
+            .recognizer
+            .decoder
+            .prefill_tokens_argmax(&suffix, cancel)?;
+        decode_greedy_argmax(
             &mut self.recognizer.decoder,
             &self.recognizer.tokenizer,
-            &mut self.recognizer.logits_scratch,
+            first_token,
             budget,
             false,
             cancel,
-            &mut |_| Ok(()),
         )
     }
 }
@@ -496,6 +509,87 @@ fn decode_audio(
     decode_from_logits(session, tokenizer, logits, budget, false, cancel, observe)
 }
 
+enum StepAction {
+    Continue,
+    Finish(String),
+}
+
+fn finish_stop(
+    tokenizer: &Tokenizer,
+    generated: &[u32],
+    stop: DecodeStop,
+    trim_on_stop: bool,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<String> {
+    let raw = tokenizer.decode(generated)?;
+    let transcript = if trim_on_stop {
+        completed_transcript_with_options(&raw, stop, true)?
+    } else {
+        completed_transcript(&raw, stop)?.to_owned()
+    };
+    check(cancel)?;
+    Ok(transcript)
+}
+
+fn accept_token(
+    tokenizer: &Tokenizer,
+    generated: &mut Vec<u32>,
+    token: u32,
+    trim_on_stop: bool,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<StepAction> {
+    if token == tokenizer.eos() {
+        return finish_stop(
+            tokenizer,
+            generated,
+            DecodeStop::EndOfSequence,
+            trim_on_stop,
+            cancel,
+        )
+        .map(StepAction::Finish);
+    }
+    generated.push(token);
+    if repeating(generated) {
+        if trim_on_stop {
+            return finish_stop(tokenizer, generated, DecodeStop::Repetition, true, cancel)
+                .map(StepAction::Finish);
+        }
+        return Err(invalid());
+    }
+    Ok(StepAction::Continue)
+}
+
+fn decode_greedy_argmax(
+    session: &mut Session,
+    tokenizer: &Tokenizer,
+    mut token: u32,
+    budget: usize,
+    trim_on_stop: bool,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<String> {
+    session.reserve_decode(budget)?;
+    let mut generated = Vec::new();
+    generated
+        .try_reserve_exact(budget)
+        .map_err(io::Error::other)?;
+    for index in 0..budget {
+        check(cancel)?;
+        check(cancel)?;
+        if let StepAction::Finish(transcript) =
+            accept_token(tokenizer, &mut generated, token, trim_on_stop, cancel)?
+        {
+            return Ok(transcript);
+        }
+        if index + 1 < budget {
+            token = session.step_argmax(token, cancel)?;
+        }
+    }
+    if trim_on_stop {
+        return finish_stop(tokenizer, &generated, DecodeStop::TokenLimit, true, cancel);
+    }
+    Err(invalid())
+}
+
 fn decode_from_logits(
     session: &mut Session,
     tokenizer: &Tokenizer,
@@ -520,36 +614,17 @@ fn decode_from_logits(
             state: session,
         })?;
         check(cancel)?;
-        if token == tokenizer.eos() {
-            let raw = tokenizer.decode(&generated)?;
-            let transcript = if trim_on_stop {
-                completed_transcript_with_options(&raw, DecodeStop::EndOfSequence, true)?
-            } else {
-                completed_transcript(&raw, DecodeStop::EndOfSequence)?.to_owned()
-            };
-            check(cancel)?;
+        if let StepAction::Finish(transcript) =
+            accept_token(tokenizer, &mut generated, token, trim_on_stop, cancel)?
+        {
             return Ok(transcript);
-        }
-        generated.push(token);
-        if repeating(&generated) {
-            if trim_on_stop {
-                let raw = tokenizer.decode(&generated)?;
-                let transcript =
-                    completed_transcript_with_options(&raw, DecodeStop::Repetition, true)?;
-                check(cancel)?;
-                return Ok(transcript);
-            }
-            return Err(invalid());
         }
         if index + 1 < budget {
             session.step_into(token, logits, cancel)?;
         }
     }
     if trim_on_stop {
-        let raw = tokenizer.decode(&generated)?;
-        let transcript = completed_transcript_with_options(&raw, DecodeStop::TokenLimit, true)?;
-        check(cancel)?;
-        return Ok(transcript);
+        return finish_stop(tokenizer, &generated, DecodeStop::TokenLimit, true, cancel);
     }
     Err(invalid())
 }
