@@ -770,7 +770,7 @@ mod tests {
             os::windows::process::CommandExt as _,
             process::{Command, Stdio},
         };
-        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
         let directory = std::env::current_dir()?;
         match std::env::var("BONSAI_STARTUP_PROBE").as_deref() {
@@ -792,7 +792,7 @@ mod tests {
                     .stdin(Stdio::null())
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit())
-                    .creation_flags(CREATE_NO_WINDOW)
+                    .creation_flags(CREATE_NO_WINDOW.0)
                     .spawn()?;
                 let status = child.wait()?;
                 return Err(io::Error::other(format!(

@@ -51,8 +51,8 @@ not evidence of a browser frontend.
 | `http`, `httparse` | Complementary typed policy and bounded wire parsing; no general web framework needed. |
 | `subtle` | Constant-time bearer comparison; preserve disabled release debug assertions. |
 | `sha2`, `zip` | Artifact verification and minimal deflate extraction at ZIP 9.5.1; custom extraction policy remains necessary. |
-| `windows-sys` | Selected process/credential/audio/accessibility APIs. Broker pre-bind options use Tokio's `TcpSocket` and the native exclusive-address helper; `socket2` is transitive through Tokio. |
-| `windows`, `windows-future` | Compatible WinRT microphone permission/capture; distinct from windows-sys. Retain future 0.3.2 with windows 0.62.2; 0.100 is incompatible. |
+| `windows-sys` | Selected process/credential APIs in `bonsai-windows-process` and `bonsai-windows-credentials`. Broker pre-bind options use Tokio's `TcpSocket` and the native exclusive-address helper; `socket2` is transitive through Tokio. |
+| `windows`, `windows-future` | Win32, COM, and WinRT APIs in `bonsai-chat` (consolidated off `windows-sys`), including microphone permission/capture, clipboard/shell dialogs, contrast palette, and window placement. Retain `windows-future` 0.3.2 with `windows` 0.62.2; 0.100 is incompatible. |
 | `eframe`, `wgpu` | Native UI, accessibility, clipboard, fallback/system fonts and all three explicit Windows backends. |
 | `markdown-syntax` | Exact `=0.7.2`, default features disabled: dependency-free Markdown AST parsing for native response rendering. No HTML renderer or web frontend. See [Markdown parsing](#native-markdown-parsing) for the reviewed scope and limits. |
 | `resvg` | Exact `=0.50.0`, defaults disabled, `text` feature only (no `svgz`, `raster-images`, `system-fonts` or `memmap-fonts`): dual MIT/Apache-2.0 pure Rust SVG rasterization inside the offline `--markdown-worker` container, using bundled `epaint_default_fonts` with external/data `href` resolvers disabled. |

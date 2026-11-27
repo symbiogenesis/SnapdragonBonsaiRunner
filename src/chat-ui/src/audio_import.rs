@@ -19,7 +19,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use windows_sys::Win32::{
+use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     System::{
         DataExchange::{
@@ -29,7 +29,7 @@ use windows_sys::Win32::{
     },
     UI::{
         Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_INSERT, VK_SHIFT},
-        Shell::{DefSubclassProc, DragQueryFileW, RemoveWindowSubclass, SetWindowSubclass},
+        Shell::{DefSubclassProc, DragQueryFileW, HDROP, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{WM_KEYDOWN, WM_NCDESTROY},
     },
 };
@@ -75,7 +75,7 @@ struct PasteState {
     pending: AtomicBool,
 }
 const fn hwnd(value: isize) -> HWND {
-    std::ptr::without_provenance_mut(value.cast_unsigned())
+    HWND(std::ptr::without_provenance_mut(value.cast_unsigned()))
 }
 
 /// UI-thread hook: winit consumes file-paste keys without emitting an egui event.
@@ -94,7 +94,7 @@ impl PasteHook {
         // callback state remains live at a stable address until subclass removal.
         let installed =
             unsafe { SetWindowSubclass(hwnd(owner), Some(paste_window_proc), cookie, cookie) };
-        if installed == 0 {
+        if !installed.as_bool() {
             return Err(io::Error::last_os_error());
         }
         Ok(Self {
@@ -120,7 +120,7 @@ impl Drop for PasteHook {
             // thread. Destruction clears HWND before this removal is necessary.
             let removed =
                 unsafe { RemoveWindowSubclass(hwnd(owner), Some(paste_window_proc), cookie) };
-            if removed == 0 {
+            if !removed.as_bool() {
                 // A failed removal leaves callback ownership uncertain. Retain
                 // this one small allocation so any later callback stays valid.
                 let _retained = Box::leak(state);
@@ -139,12 +139,12 @@ unsafe extern "system" fn paste_window_proc(
     // SAFETY: The stable boxed state outlives its subclass; callbacks and Drop
     // run on this same window thread, so removal precedes freeing this pointer.
     let state = unsafe { &*std::ptr::with_exposed_provenance::<PasteState>(data) };
-    if message == WM_KEYDOWN && detail & (1 << 30) == 0 {
+    if message == WM_KEYDOWN && detail.0 & (1 << 30) == 0 {
         // SAFETY: GetKeyState only queries process keyboard state.
-        let control = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
+        let control = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
         // SAFETY: GetKeyState borrows no resources or pointers.
-        let shift = unsafe { GetKeyState(i32::from(VK_SHIFT)) } < 0;
-        if ((control && key == usize::from(b'V')) || (shift && key == usize::from(VK_INSERT)))
+        let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
+        if ((control && key.0 == usize::from(b'V')) || (shift && key.0 == usize::from(VK_INSERT.0)))
             && clipboard_has_files()
         {
             state.pending.store(true, Ordering::Release);
@@ -152,14 +152,14 @@ unsafe extern "system" fn paste_window_proc(
     } else if message == WM_NCDESTROY {
         state.owner.store(0, Ordering::Release);
         // SAFETY: Remove the current callback from its live destruction callback.
-        unsafe { RemoveWindowSubclass(hwnd, Some(paste_window_proc), cookie) };
+        let _ = unsafe { RemoveWindowSubclass(hwnd, Some(paste_window_proc), cookie) };
     }
     // SAFETY: Preserve winit's original window procedure and its resource lifetime.
     unsafe { DefSubclassProc(hwnd, message, key, detail) }
 }
 fn clipboard_has_files() -> bool {
     // SAFETY: Standard format availability query returns no borrowed handles.
-    unsafe { IsClipboardFormatAvailable(u32::from(CF_HDROP)) != 0 }
+    unsafe { IsClipboardFormatAvailable(u32::from(CF_HDROP.0)) }.is_ok()
 }
 
 #[derive(Default)]
@@ -324,32 +324,32 @@ struct Clipboard;
 impl Drop for Clipboard {
     fn drop(&mut self) {
         // SAFETY: This guard is constructed only after successful OpenClipboard.
-        unsafe { CloseClipboard() };
+        let _ = unsafe { CloseClipboard() };
     }
 }
 fn clipboard_file() -> Result<Option<PathBuf>, &'static str> {
     // SAFETY: This worker only reads; no owner HWND is required for OpenClipboard.
-    if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+    if unsafe { OpenClipboard(None) }.is_err() {
         return Err("The clipboard is busy. Copy the audio file and paste again.");
     }
     let _clipboard = Clipboard;
     // SAFETY: The clipboard stays open while its HDROP handle is borrowed below.
-    let handle = unsafe { GetClipboardData(u32::from(CF_HDROP)) };
-    if handle.is_null() {
+    let Ok(handle) = (unsafe { GetClipboardData(u32::from(CF_HDROP.0)) }) else {
         return Ok(None);
-    }
+    };
+    let hdrop = HDROP(handle.0);
     // SAFETY: CF_HDROP provides a live HDROP; the sentinel requests its file count.
-    if unsafe { DragQueryFileW(handle, u32::MAX, std::ptr::null_mut(), 0) } != 1 {
+    if unsafe { DragQueryFileW(hdrop, u32::MAX, None) } != 1 {
         return Err("Add one audio file at a time. Your draft was kept.");
     }
     // SAFETY: The clipboard handle remains live while querying its first path.
-    let length = unsafe { DragQueryFileW(handle, 0, std::ptr::null_mut(), 0) };
+    let length = unsafe { DragQueryFileW(hdrop, 0, None) };
     if length == 0 || length >= 32_768 {
         return Err("The copied audio filename is invalid or too long.");
     }
     let mut name = vec![0_u16; usize::try_from(length + 1).map_err(|_| CODEC_FAILURE)?];
     // SAFETY: The name buffer has length+1 writable UTF-16 units; HDROP is live.
-    let copied = unsafe { DragQueryFileW(handle, 0, name.as_mut_ptr(), length + 1) };
+    let copied = unsafe { DragQueryFileW(hdrop, 0, Some(&mut name)) };
     if copied != length {
         return Err("The copied audio filename could not be read.");
     }

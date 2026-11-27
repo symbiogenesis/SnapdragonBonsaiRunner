@@ -115,11 +115,6 @@ impl Drop for Apartment {
 pub(crate) struct CoTaskMemString(PWSTR);
 
 impl CoTaskMemString {
-    /// Wraps a raw `CoTaskMemAlloc`-allocated NUL-terminated UTF-16 string pointer.
-    pub(crate) const fn from_raw(raw: *mut u16) -> Self {
-        Self(PWSTR::from_raw(raw))
-    }
-
     /// Wraps a `PWSTR` returned by a COM/Shell API.
     pub(crate) const fn from_pwstr(raw: PWSTR) -> Self {
         Self(raw)

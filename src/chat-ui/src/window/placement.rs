@@ -8,7 +8,7 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
-use windows_sys::Win32::{
+use windows::Win32::{
     Foundation::{HWND, RECT},
     UI::WindowsAndMessaging::{
         GetWindowPlacement, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWNORMAL, SetWindowPlacement,
@@ -42,14 +42,14 @@ impl Saved {
     fn from_native(native: &WINDOWPLACEMENT) -> Option<Self> {
         // Minimize/close must not replace the last ordinary geometry or turn a
         // maximized window into a restored window on its next launch.
-        if native.showCmd == SW_SHOWMINIMIZED.cast_unsigned() {
+        if native.showCmd == SW_SHOWMINIMIZED.0.cast_unsigned() {
             return None;
         }
         let rect = native.rcNormalPosition;
         let saved = Self {
             version: 1,
             normal: [rect.left, rect.top, rect.right, rect.bottom],
-            maximized: native.showCmd == SW_SHOWMAXIMIZED.cast_unsigned(),
+            maximized: native.showCmd == SW_SHOWMAXIMIZED.0.cast_unsigned(),
         };
         saved.valid().then_some(saved)
     }
@@ -63,6 +63,7 @@ impl Saved {
             } else {
                 SW_SHOWNORMAL
             }
+            .0
             .cast_unsigned(),
             rcNormalPosition: RECT {
                 left,
@@ -114,7 +115,7 @@ impl Placement {
         // SAFETY: eframe lends this live root HWND only on the UI thread; native
         // is a correctly sized local structure. Windows adjusts wholly offscreen
         // placements for current monitors. No handle or pointer escapes the call.
-        if unsafe { SetWindowPlacement(hwnd(handle.hwnd.get()), &raw const native) } == 0 {
+        if unsafe { SetWindowPlacement(hwnd(handle.hwnd.get()), &raw const native) }.is_err() {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -139,7 +140,7 @@ impl Placement {
         };
         // SAFETY: frame lends a live root HWND on this UI thread; native is an
         // initialized, correctly sized writable structure, with no escaping pointer.
-        if unsafe { GetWindowPlacement(hwnd(handle.hwnd.get()), &raw mut native) } == 0 {
+        if unsafe { GetWindowPlacement(hwnd(handle.hwnd.get()), &raw mut native) }.is_err() {
             return Err(io::Error::last_os_error());
         }
         if let Some(saved) = Saved::from_native(&native) {
@@ -155,7 +156,7 @@ impl Placement {
 
 // Integer-to-pointer conversion is confined to the audited native call sites.
 const fn hwnd(value: isize) -> HWND {
-    std::ptr::without_provenance_mut(value.cast_unsigned())
+    HWND(std::ptr::without_provenance_mut(value.cast_unsigned()))
 }
 
 impl State {
@@ -232,7 +233,7 @@ mod tests {
             };
             let mut native = saved.native()?;
             assert_eq!(Saved::from_native(&native), Some(saved));
-            native.showCmd = SW_SHOWMINIMIZED.cast_unsigned();
+            native.showCmd = SW_SHOWMINIMIZED.0.cast_unsigned();
             assert!(Saved::from_native(&native).is_none());
         }
         Ok(())

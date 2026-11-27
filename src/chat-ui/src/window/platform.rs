@@ -1,9 +1,9 @@
 //! Small Windows boundary for system contrast colors and fatal launch errors.
 
-use std::{path::PathBuf, ptr};
+use std::path::PathBuf;
 
 use eframe::egui::{Color32, Shadow, Stroke, Visuals};
-use windows_sys::{
+use windows::{
     Win32::{
         Graphics::Gdi::{
             COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
@@ -11,10 +11,13 @@ use windows_sys::{
         UI::{
             Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
             Shell::{FOLDERID_Fonts, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellExecuteW},
-            WindowsAndMessaging::{SPI_GETHIGHCONTRAST, SW_SHOWNORMAL, SystemParametersInfoW},
+            WindowsAndMessaging::{
+                SPI_GETHIGHCONTRAST, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+                SystemParametersInfoW,
+            },
         },
     },
-    core::w,
+    core::{PCWSTR, w},
 };
 
 #[derive(Clone, Copy)]
@@ -41,11 +44,11 @@ pub(super) fn high_contrast_visuals() -> Option<Visuals> {
         SystemParametersInfoW(
             SPI_GETHIGHCONTRAST,
             contrast.cbSize,
-            (&raw mut contrast).cast(),
-            0,
+            Some((&raw mut contrast).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         )
     };
-    if available == 0 || contrast.dwFlags & HCF_HIGHCONTRASTON == 0 {
+    if available.is_err() || !contrast.dwFlags.contains(HCF_HIGHCONTRASTON) {
         return None;
     }
     // SAFETY: COLOR_WINDOW is a documented system-color index; the call owns no resources.
@@ -126,21 +129,13 @@ fn contrast_visuals(colors: SystemColors) -> Visuals {
     reason = "Read-only Windows Shell known-folder query with RAII CoTaskMemString ownership."
 )]
 pub(super) fn fonts_directory() -> Option<PathBuf> {
-    let mut raw = ptr::null_mut();
-    // SAFETY: FOLDERID_Fonts is a constant GUID reference and raw receives an owned PWSTR.
-    let status = unsafe {
-        SHGetKnownFolderPath(
-            &FOLDERID_Fonts,
-            KF_FLAG_DEFAULT.cast_unsigned(),
-            ptr::null_mut(),
-            &raw mut raw,
-        )
-    };
-    let allocated = crate::com_dialog::CoTaskMemString::from_raw(raw);
-    if status < 0 {
+    // SAFETY: FOLDERID_Fonts is a constant GUID reference and SHGetKnownFolderPath returns an owned PWSTR.
+    let Ok(raw) = (unsafe { SHGetKnownFolderPath(&FOLDERID_Fonts, KF_FLAG_DEFAULT, None) }) else {
         return None;
-    }
-    allocated.into_path_buf().filter(|path| path.is_absolute())
+    };
+    crate::com_dialog::CoTaskMemString::from_pwstr(raw)
+        .into_path_buf()
+        .filter(|path| path.is_absolute())
 }
 
 /// Keep fatal startup failures visible when an egui window cannot be created.
@@ -158,15 +153,15 @@ pub(super) fn open_windows_update() -> bool {
     // ShellExecuteW does not retain any caller pointer after returning.
     let result = unsafe {
         ShellExecuteW(
-            ptr::null_mut(),
+            None,
             w!("open"),
             w!("ms-settings:windowsupdate"),
-            ptr::null(),
-            ptr::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
             SW_SHOWNORMAL,
         )
     };
-    result.addr() > 32
+    result.0.addr() > 32
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 use super::{ModelLifecycle, RichText, State, egui};
 use crate::startup::{SetupActivity, SetupKind, SetupStatus};
 use std::{io, path::PathBuf};
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_DISK_FULL};
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_DISK_FULL};
 
 #[derive(Default)]
 pub(super) struct Setup {
@@ -89,7 +89,7 @@ pub(super) fn failure_message(error: &io::Error) -> &'static str {
         return "Swift's Windows sandbox rejected inherited service credentials. Close Swift and reopen it from a clean app or terminal session. Your draft is safe.";
     }
     if error.kind() == io::ErrorKind::StorageFull
-        || error.raw_os_error() == Some(ERROR_DISK_FULL.cast_signed())
+        || error.raw_os_error() == Some(ERROR_DISK_FULL.0.cast_signed())
         || text.contains("not enough free disk space")
         || text.contains("not enough disk space")
         || text.contains("disk full")
@@ -99,7 +99,7 @@ pub(super) fn failure_message(error: &io::Error) -> &'static str {
     {
         "Setup needs more free storage. Free some space, then select Retry setup. Your draft is safe."
     } else if error.kind() == io::ErrorKind::PermissionDenied
-        || error.raw_os_error() == Some(ERROR_ACCESS_DENIED.cast_signed())
+        || error.raw_os_error() == Some(ERROR_ACCESS_DENIED.0.cast_signed())
         || text.contains("access is denied")
         || text.contains("permissiondenied")
         || text.contains("permission denied")
