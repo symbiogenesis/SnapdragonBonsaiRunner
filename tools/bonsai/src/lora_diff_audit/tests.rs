@@ -345,152 +345,173 @@ fn build_fixture_pair(
 fn local_directory_audit_passes_low_rank_and_rejects_high_rank_or_norm_dominant_fixtures()
 -> crate::Result<()> {
     let scratch = ScratchDir::new("Bonsai-LoraDiffAudit")?;
-    let base_pass = scratch.join("base_pass");
-    let cand_pass = scratch.join("cand_pass");
-    fs::create_dir(&base_pass).map_err(|e| e.to_string())?;
-    fs::create_dir(&cand_pass).map_err(|e| e.to_string())?;
-    build_fixture_pair(&base_pass, &cand_pass, false, false)?;
+    std::thread::scope(|scope| -> crate::Result<()> {
+        let h_pass = scope.spawn(|| -> crate::Result<()> {
+            let base_pass = scratch.join("base_pass");
+            let cand_pass = scratch.join("cand_pass");
+            fs::create_dir(&base_pass).map_err(|e| e.to_string())?;
+            fs::create_dir(&cand_pass).map_err(|e| e.to_string())?;
+            build_fixture_pair(&base_pass, &cand_pass, false, false)?;
 
-    let out_file = scratch.join("pass-receipt.json");
-    let pass_report = run(json!({
-        "schemaVersion": 1,
-        "operation": "audit",
-        "source": {
-            "kind": "local-directories",
-            "candidateDirectory": cand_pass,
-            "baseDirectory": base_pass,
-        },
-        "scope": {
-            "layers": [0, 3],
-            "includeOutputNorm": true,
-            "includeVocab": true,
-            "includeSvd": true,
-            "maxRank": 32,
-            "oversampling": 8,
-            "powerIterations": 2
-        },
-        "controls": {
-            "timeBudgetSeconds": 30,
-            "workers": 2,
-            "httpConcurrency": 1
-        },
-        "outputPath": out_file,
-    }))?;
-    assert_eq!(pass_report["completed"], true);
-    assert_eq!(pass_report["gate1Screen"]["passed"], true);
-    assert_eq!(pass_report["gate1Screen"]["verdict"], "pass-candidate-a");
-    assert!(out_file.is_file());
-    // Refuses overwriting existing outputPath.
-    assert!(
-        run(json!({
-            "schemaVersion": 1,
-            "operation": "plan",
-            "source": { "kind": "pinned-daisyrose" },
-            "outputPath": out_file,
-        }))
-        .is_err()
-    );
+            let out_file = scratch.join("pass-receipt.json");
+            let pass_report = run(json!({
+                "schemaVersion": 1,
+                "operation": "audit",
+                "source": {
+                    "kind": "local-directories",
+                    "candidateDirectory": cand_pass,
+                    "baseDirectory": base_pass,
+                },
+                "scope": {
+                    "layers": [0, 3],
+                    "includeOutputNorm": true,
+                    "includeVocab": true,
+                    "includeSvd": true,
+                    "maxRank": 32,
+                    "oversampling": 8,
+                    "powerIterations": 2
+                },
+                "controls": {
+                    "timeBudgetSeconds": 30,
+                    "workers": 2,
+                    "httpConcurrency": 1
+                },
+                "outputPath": out_file,
+            }))?;
+            assert_eq!(pass_report["completed"], true);
+            assert_eq!(pass_report["gate1Screen"]["passed"], true);
+            assert_eq!(pass_report["gate1Screen"]["verdict"], "pass-candidate-a");
+            assert!(out_file.is_file());
+            // Refuses overwriting existing outputPath.
+            assert!(
+                run(json!({
+                    "schemaVersion": 1,
+                    "operation": "plan",
+                    "source": { "kind": "pinned-daisyrose" },
+                    "outputPath": out_file,
+                }))
+                .is_err()
+            );
+            Ok(())
+        });
 
-    let base_hr = scratch.join("base_hr");
-    let cand_hr = scratch.join("cand_hr");
-    fs::create_dir(&base_hr).map_err(|e| e.to_string())?;
-    fs::create_dir(&cand_hr).map_err(|e| e.to_string())?;
-    build_fixture_pair(&base_hr, &cand_hr, true, false)?;
-    let hr_report = run(json!({
-        "schemaVersion": 1,
-        "operation": "audit",
-        "source": {
-            "kind": "local-directories",
-            "candidateDirectory": cand_hr,
-            "baseDirectory": base_hr,
-        },
-        "scope": {
-            "layers": [0, 3],
-            "includeOutputNorm": true,
-            "includeVocab": false,
-            "includeSvd": true,
-            "maxRank": 32,
-            "oversampling": 8,
-            "powerIterations": 2
+        let h_hr = scope.spawn(|| -> crate::Result<()> {
+            let base_hr = scratch.join("base_hr");
+            let cand_hr = scratch.join("cand_hr");
+            fs::create_dir(&base_hr).map_err(|e| e.to_string())?;
+            fs::create_dir(&cand_hr).map_err(|e| e.to_string())?;
+            build_fixture_pair(&base_hr, &cand_hr, true, false)?;
+            let hr_report = run(json!({
+                "schemaVersion": 1,
+                "operation": "audit",
+                "source": {
+                    "kind": "local-directories",
+                    "candidateDirectory": cand_hr,
+                    "baseDirectory": base_hr,
+                },
+                "scope": {
+                    "layers": [0, 3],
+                    "includeOutputNorm": true,
+                    "includeVocab": false,
+                    "includeSvd": true,
+                    "maxRank": 32,
+                    "oversampling": 8,
+                    "powerIterations": 2
+                }
+            }))?;
+            assert_eq!(hr_report["gate1Screen"]["passed"], false);
+            assert_eq!(hr_report["gate1Screen"]["verdict"], "no-go-high-rank");
+            Ok(())
+        });
+
+        let h_norm = scope.spawn(|| -> crate::Result<()> {
+            let base_norm = scratch.join("base_norm");
+            let cand_norm = scratch.join("cand_norm");
+            fs::create_dir(&base_norm).map_err(|e| e.to_string())?;
+            fs::create_dir(&cand_norm).map_err(|e| e.to_string())?;
+            build_fixture_pair(&base_norm, &cand_norm, false, true)?;
+            let norm_report = run(json!({
+                "schemaVersion": 1,
+                "operation": "audit",
+                "source": {
+                    "kind": "local-directories",
+                    "candidateDirectory": cand_norm,
+                    "baseDirectory": base_norm,
+                },
+                "scope": {
+                    "layers": [0, 3],
+                    "includeOutputNorm": true,
+                    "includeVocab": false,
+                    "includeSvd": true,
+                    "maxRank": 32,
+                    "oversampling": 8,
+                    "powerIterations": 2
+                }
+            }))?;
+            assert_eq!(norm_report["gate1Screen"]["passed"], false);
+            assert_eq!(
+                norm_report["gate1Screen"]["verdict"],
+                "no-go-non-matrix-dominant"
+            );
+            Ok(())
+        });
+
+        let h_nan = scope.spawn(|| -> crate::Result<()> {
+            // Nonfinite BF16 (0x7FC0 NaN) must be rejected.
+            let nan_dir = scratch.join("cand_nan");
+            fs::create_dir(&nan_dir).map_err(|e| e.to_string())?;
+            write_safetensors_dir(
+                &nan_dir,
+                &[(
+                    "model-00001-of-00001.safetensors",
+                    vec![(
+                        "model.language_model.norm.weight",
+                        vec![4],
+                        vec![0xc0, 0x7f, 0, 0, 0, 0, 0, 0],
+                    )],
+                )],
+            )?;
+            let nan_base = scratch.join("base_nan");
+            fs::create_dir(&nan_base).map_err(|e| e.to_string())?;
+            write_safetensors_dir(
+                &nan_base,
+                &[(
+                    "model-00001-of-00001.safetensors",
+                    vec![(
+                        "model.language_model.norm.weight",
+                        vec![4],
+                        vec![0, 0, 0, 0, 0, 0, 0, 0],
+                    )],
+                )],
+            )?;
+            assert!(
+                run(json!({
+                    "schemaVersion": 1,
+                    "operation": "audit",
+                    "source": {
+                        "kind": "local-directories",
+                        "candidateDirectory": nan_dir,
+                        "baseDirectory": nan_base,
+                    },
+                    "scope": {
+                        "layers": [],
+                        "includeOutputNorm": true,
+                        "includeVocab": false,
+                        "includeSvd": false,
+                    }
+                }))
+                .is_err()
+            );
+            Ok(())
+        });
+
+        for handle in [h_pass, h_hr, h_norm, h_nan] {
+            handle
+                .join()
+                .map_err(|_| String::from("Local directory audit thread panicked."))??;
         }
-    }))?;
-    assert_eq!(hr_report["gate1Screen"]["passed"], false);
-    assert_eq!(hr_report["gate1Screen"]["verdict"], "no-go-high-rank");
-
-    let base_norm = scratch.join("base_norm");
-    let cand_norm = scratch.join("cand_norm");
-    fs::create_dir(&base_norm).map_err(|e| e.to_string())?;
-    fs::create_dir(&cand_norm).map_err(|e| e.to_string())?;
-    build_fixture_pair(&base_norm, &cand_norm, false, true)?;
-    let norm_report = run(json!({
-        "schemaVersion": 1,
-        "operation": "audit",
-        "source": {
-            "kind": "local-directories",
-            "candidateDirectory": cand_norm,
-            "baseDirectory": base_norm,
-        },
-        "scope": {
-            "layers": [0, 3],
-            "includeOutputNorm": true,
-            "includeVocab": false,
-            "includeSvd": true,
-            "maxRank": 32,
-            "oversampling": 8,
-            "powerIterations": 2
-        }
-    }))?;
-    assert_eq!(norm_report["gate1Screen"]["passed"], false);
-    assert_eq!(
-        norm_report["gate1Screen"]["verdict"],
-        "no-go-non-matrix-dominant"
-    );
-
-    // Nonfinite BF16 (0x7FC0 NaN) must be rejected.
-    let nan_dir = scratch.join("cand_nan");
-    fs::create_dir(&nan_dir).map_err(|e| e.to_string())?;
-    write_safetensors_dir(
-        &nan_dir,
-        &[(
-            "model-00001-of-00001.safetensors",
-            vec![(
-                "model.language_model.norm.weight",
-                vec![4],
-                vec![0xc0, 0x7f, 0, 0, 0, 0, 0, 0],
-            )],
-        )],
-    )?;
-    let nan_base = scratch.join("base_nan");
-    fs::create_dir(&nan_base).map_err(|e| e.to_string())?;
-    write_safetensors_dir(
-        &nan_base,
-        &[(
-            "model-00001-of-00001.safetensors",
-            vec![(
-                "model.language_model.norm.weight",
-                vec![4],
-                vec![0, 0, 0, 0, 0, 0, 0, 0],
-            )],
-        )],
-    )?;
-    assert!(
-        run(json!({
-            "schemaVersion": 1,
-            "operation": "audit",
-            "source": {
-                "kind": "local-directories",
-                "candidateDirectory": nan_dir,
-                "baseDirectory": nan_base,
-            },
-            "scope": {
-                "layers": [],
-                "includeOutputNorm": true,
-                "includeVocab": false,
-                "includeSvd": false,
-            }
-        }))
-        .is_err()
-    );
+        Ok(())
+    })?;
 
     Ok(())
 }
@@ -930,76 +951,97 @@ fn export_denoised_and_verify_adapter_roundtrip_f32_and_f16() -> crate::Result<(
         ],
     )?;
 
-    for (dtype_str, tol) in [("f32", 1e-4_f64), ("f16", 5e-3_f64)] {
-        let out_gguf = scratch.join(format!("exported-{dtype_str}.gguf"));
-        let req: Request = serde_json::from_value(json!({
-            "schemaVersion": 1,
-            "operation": "export-denoised",
-            "source": {
-                "kind": "local-directories",
-                "candidateDirectory": cand_dir,
-                "baseDirectory": base_dir,
-            },
-            "scope": {
-                "layers": [0, 3],
-                "targetEnvelope": "npu-friendly",
-                "exportDtype": dtype_str,
-                "maxRank": 16,
-                "oversampling": 8,
-                "powerIterations": 2
-            },
-            "controls": {
-                "timeBudgetSeconds": 60,
-                "workers": 2,
-                "httpConcurrency": 1
-            },
-            "outputPath": out_gguf
-        }))
-        .map_err(|e| e.to_string())?;
-        let receipt = run_export_denoised_with_dims(&req, &toy_dims)?;
-        assert_eq!(receipt["published"], true);
-        assert_eq!(receipt["pairCount"], 6);
-        assert_eq!(receipt["verification"]["verified"], true);
-        assert_eq!(receipt["verification"]["preservesHexagonFfnChains"], true);
-        assert_eq!(receipt["verification"]["excludesGroupedSsmOut"], true);
-        assert_eq!(
-            receipt["verification"]["publisherEngineAlphaCompatible"],
-            true
-        );
-        assert_eq!(
-            receipt["verification"]["prismInferenceAlphaCompatible"],
-            true
-        );
+    std::thread::scope(|scope| -> crate::Result<()> {
+        let handles: Vec<_> = [("f32", 1e-4_f64), ("f16", 5e-3_f64)]
+            .into_iter()
+            .map(|(dtype_str, tol)| {
+                let cand_dir = &cand_dir;
+                let base_dir = &base_dir;
+                let toy_dims = &toy_dims;
+                let expected_targets = &expected_targets;
+                let scratch = &scratch;
+                scope.spawn(move || -> crate::Result<()> {
+                    let out_gguf = scratch.join(format!("exported-{dtype_str}.gguf"));
+                    let req: Request = serde_json::from_value(json!({
+                        "schemaVersion": 1,
+                        "operation": "export-denoised",
+                        "source": {
+                            "kind": "local-directories",
+                            "candidateDirectory": cand_dir,
+                            "baseDirectory": base_dir,
+                        },
+                        "scope": {
+                            "layers": [0, 3],
+                            "targetEnvelope": "npu-friendly",
+                            "exportDtype": dtype_str,
+                            "maxRank": 16,
+                            "oversampling": 8,
+                            "powerIterations": 2
+                        },
+                        "controls": {
+                            "timeBudgetSeconds": 60,
+                            "workers": 2,
+                            "httpConcurrency": 1
+                        },
+                        "outputPath": out_gguf
+                    }))
+                    .map_err(|e| e.to_string())?;
+                    let receipt = run_export_denoised_with_dims(&req, toy_dims)?;
+                    assert_eq!(receipt["published"], true);
+                    assert_eq!(receipt["pairCount"], 6);
+                    assert_eq!(receipt["verification"]["verified"], true);
+                    assert_eq!(receipt["verification"]["preservesHexagonFfnChains"], true);
+                    assert_eq!(receipt["verification"]["excludesGroupedSsmOut"], true);
+                    assert_eq!(
+                        receipt["verification"]["publisherEngineAlphaCompatible"],
+                        true
+                    );
+                    assert_eq!(
+                        receipt["verification"]["prismInferenceAlphaCompatible"],
+                        true
+                    );
 
-        let (alpha, tensors) = read_gguf_f32_or_f16_tensors(&out_gguf)?;
-        for target in ["blk.0.ffn_down.weight", "blk.3.attn_output.weight"] {
-            let (rows, cols, expected) = expected_targets
-                .get(target)
-                .ok_or("Missing expected reconstruction.")?;
-            let (a_dims, a_vals) = tensors
-                .get(&format!("{target}.lora_a"))
-                .ok_or("Missing exported lora_a.")?;
-            let (b_dims, b_vals) = tensors
-                .get(&format!("{target}.lora_b"))
-                .ok_or("Missing exported lora_b.")?;
-            let r = a_dims[1];
-            assert_eq!(a_dims[0], *cols);
-            assert_eq!(*b_dims, vec![r, *rows]);
-            let scale = f64::from(alpha) / usize_to_f64(r);
-            let mut actual = vec![0.0_f32; rows * cols];
-            for row in 0..*rows {
-                for col in 0..*cols {
-                    let mut sum = 0.0_f64;
-                    for k in 0..r {
-                        sum += f64::from(b_vals[row * r + k]) * f64::from(a_vals[k * cols + col]);
+                    let (alpha, tensors) = read_gguf_f32_or_f16_tensors(&out_gguf)?;
+                    for target in ["blk.0.ffn_down.weight", "blk.3.attn_output.weight"] {
+                        let (rows, cols, expected) = expected_targets
+                            .get(target)
+                            .ok_or("Missing expected reconstruction.")?;
+                        let (a_dims, a_vals) = tensors
+                            .get(&format!("{target}.lora_a"))
+                            .ok_or("Missing exported lora_a.")?;
+                        let (b_dims, b_vals) = tensors
+                            .get(&format!("{target}.lora_b"))
+                            .ok_or("Missing exported lora_b.")?;
+                        let r = a_dims[1];
+                        assert_eq!(a_dims[0], *cols);
+                        assert_eq!(*b_dims, vec![r, *rows]);
+                        let scale = f64::from(alpha) / usize_to_f64(r);
+                        let mut actual = vec![0.0_f32; rows * cols];
+                        for row in 0..*rows {
+                            for col in 0..*cols {
+                                let mut sum = 0.0_f64;
+                                for k in 0..r {
+                                    sum += f64::from(b_vals[row * r + k])
+                                        * f64::from(a_vals[k * cols + col]);
+                                }
+                                actual[row * cols + col] = f64_to_f32(scale * sum);
+                            }
+                        }
+                        let rel_err =
+                            (frobenius_diff_sq(&actual, expected) / energy_of(expected)).sqrt();
+                        assert!(rel_err < tol, "{target} ({dtype_str}) rel_err={rel_err}");
                     }
-                    actual[row * cols + col] = f64_to_f32(scale * sum);
-                }
-            }
-            let rel_err = (frobenius_diff_sq(&actual, expected) / energy_of(expected)).sqrt();
-            assert!(rel_err < tol, "{target} ({dtype_str}) rel_err={rel_err}");
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| String::from("Export roundtrip thread panicked."))??;
         }
-    }
+        Ok(())
+    })?;
 
     // Reject targetEnvelope: "all" and missing outputPath on export-denoised.
     assert!(
@@ -1214,8 +1256,16 @@ fn generate_test_adapter_is_deterministic_npu_friendly_and_self_verifies() -> cr
             "outputPath": out
         })
     };
-    let res_a = run(req(&out_a))?;
-    let res_b = run(req(&out_b))?;
+    let (res_a, res_b) = std::thread::scope(|scope| -> crate::Result<(Value, Value)> {
+        let h_a = scope.spawn(|| run(req(&out_a)));
+        let h_b = scope.spawn(|| run(req(&out_b)));
+        Ok((
+            h_a.join()
+                .map_err(|_| String::from("Fixture A thread panicked."))??,
+            h_b.join()
+                .map_err(|_| String::from("Fixture B thread panicked."))??,
+        ))
+    })?;
 
     assert_eq!(res_a["published"], true);
     assert_eq!(res_a["status"], "published-and-verified");

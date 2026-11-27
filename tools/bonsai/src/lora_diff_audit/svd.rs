@@ -1709,140 +1709,132 @@ mod tests {
 
     #[test]
     fn shrinkage_modes_cover_gavish_donoho_unshrunk_and_blended() -> crate::Result<()> {
-        for (label, rows, cols, k_req) in [
+        let shapes = [
             ("exact-branch", 40_usize, 48_usize, 48_usize),
             ("randomized-branch", 128_usize, 160_usize, 32_usize),
-        ] {
-            let (mixed, total_energy) = test_spiked_matrix(rows, cols, &[3.2, 2.4, 1.8], 1.0);
+        ];
+        std::thread::scope(|scope| -> crate::Result<()> {
+            let handles: Vec<_> =
+                shapes
+                    .into_iter()
+                    .map(|(label, rows, cols, k_req)| {
+                        scope.spawn(move || -> crate::Result<()> {
+                        let (mixed, total_energy) =
+                            test_spiked_matrix(rows, cols, &[3.2, 2.4, 1.8], 1.0);
+                        let run_mode = |mode: ShrinkageMode, blend: Option<f64>| {
+                            randomized_subspace_denoised_factors_with_mode(
+                                label,
+                                &mixed,
+                                rows,
+                                cols,
+                                k_req,
+                                2,
+                                total_energy,
+                                16,
+                                1.0,
+                                mode,
+                                blend,
+                                2,
+                            )
+                        };
+                        let run_ref = &run_mode;
+                        let (
+                            default_factors,
+                            gd_factors,
+                            unshrunk,
+                            blend_zero,
+                            blend_one,
+                            blend_mid,
+                        ) = std::thread::scope(|inner| -> crate::Result<_> {
+                            let h_def = inner.spawn(|| {
+                                randomized_subspace_denoised_factors(
+                                    label,
+                                    &mixed,
+                                    rows,
+                                    cols,
+                                    k_req,
+                                    2,
+                                    total_energy,
+                                    16,
+                                    1.0,
+                                    2,
+                                )
+                            });
+                            let h_gd = inner
+                                .spawn(move || run_ref(ShrinkageMode::GavishDonoho, None));
+                            let h_un = inner.spawn(move || run_ref(ShrinkageMode::Unshrunk, None));
+                            let h_b0 =
+                                inner.spawn(move || run_ref(ShrinkageMode::Blended, Some(0.0)));
+                            let h_b1 =
+                                inner.spawn(move || run_ref(ShrinkageMode::Blended, Some(1.0)));
+                            let h_bm =
+                                inner.spawn(move || run_ref(ShrinkageMode::Blended, Some(0.35)));
+                            Ok((
+                                h_def.join().map_err(|_| String::from("SVD thread panicked."))??,
+                                h_gd.join().map_err(|_| String::from("SVD thread panicked."))??,
+                                h_un.join().map_err(|_| String::from("SVD thread panicked."))??,
+                                h_b0.join().map_err(|_| String::from("SVD thread panicked."))??,
+                                h_b1.join().map_err(|_| String::from("SVD thread panicked."))??,
+                                h_bm.join().map_err(|_| String::from("SVD thread panicked."))??,
+                            ))
+                        })?;
+                        assert_eq!(default_factors.rank, 3, "{label} should recover 3 spikes");
+                        assert_eq!(gd_factors.rank, default_factors.rank);
+                        for (&a, &b) in default_factors
+                            .shrunk_sigmas
+                            .iter()
+                            .zip(&gd_factors.shrunk_sigmas)
+                        {
+                            assert_eq!(a.to_bits(), b.to_bits(), "{label} default != GavishDonoho");
+                        }
 
-            let default_factors = randomized_subspace_denoised_factors(
-                label,
-                &mixed,
-                rows,
-                cols,
-                k_req,
-                2,
-                total_energy,
-                16,
-                1.0,
-                2,
-            )?;
-            let gd_factors = randomized_subspace_denoised_factors_with_mode(
-                label,
-                &mixed,
-                rows,
-                cols,
-                k_req,
-                2,
-                total_energy,
-                16,
-                1.0,
-                ShrinkageMode::GavishDonoho,
-                None,
-                2,
-            )?;
-            assert_eq!(default_factors.rank, 3, "{label} should recover 3 spikes");
-            assert_eq!(gd_factors.rank, default_factors.rank);
-            for (&a, &b) in default_factors
-                .shrunk_sigmas
-                .iter()
-                .zip(&gd_factors.shrunk_sigmas)
-            {
-                assert_eq!(a.to_bits(), b.to_bits(), "{label} default != GavishDonoho");
-            }
+                        assert_eq!(unshrunk.rank, 3);
+                        assert!(
+                            unshrunk.spectrum.top_singular_values.len() > 3,
+                            "{label} should have bulk singular values rejected by spike threshold"
+                        );
+                        for k in 0..3 {
+                            let raw_sigma = unshrunk.spectrum.top_singular_values[k];
+                            assert_eq!(
+                                unshrunk.shrunk_sigmas[k].to_bits(),
+                                raw_sigma.to_bits(),
+                                "{label} mode {k} should retain exact raw sigma"
+                            );
+                            assert!(unshrunk.shrunk_sigmas[k] > gd_factors.shrunk_sigmas[k]);
+                        }
 
-            let unshrunk = randomized_subspace_denoised_factors_with_mode(
-                label,
-                &mixed,
-                rows,
-                cols,
-                k_req,
-                2,
-                total_energy,
-                16,
-                1.0,
-                ShrinkageMode::Unshrunk,
-                None,
-                2,
-            )?;
-            assert_eq!(unshrunk.rank, 3);
-            assert!(
-                unshrunk.spectrum.top_singular_values.len() > 3,
-                "{label} should have bulk singular values rejected by spike threshold"
-            );
-            for k in 0..3 {
-                let raw_sigma = unshrunk.spectrum.top_singular_values[k];
-                assert_eq!(
-                    unshrunk.shrunk_sigmas[k].to_bits(),
-                    raw_sigma.to_bits(),
-                    "{label} mode {k} should retain exact raw sigma"
-                );
-                assert!(unshrunk.shrunk_sigmas[k] > gd_factors.shrunk_sigmas[k]);
+                        assert_eq!(blend_zero.rank, 3);
+                        assert_eq!(blend_one.rank, 3);
+                        assert_eq!(blend_mid.rank, 3);
+                        for k in 0..3 {
+                            assert!(
+                                (blend_zero.shrunk_sigmas[k] - unshrunk.shrunk_sigmas[k]).abs()
+                                    < 1e-12,
+                                "{label} blend=0 must match unshrunk"
+                            );
+                            assert!(
+                                (blend_one.shrunk_sigmas[k] - gd_factors.shrunk_sigmas[k]).abs()
+                                    < 1e-12,
+                                "{label} blend=1 must match GavishDonoho"
+                            );
+                            let expected = 0.65 * unshrunk.shrunk_sigmas[k]
+                                + 0.35 * gd_factors.shrunk_sigmas[k];
+                            assert!(
+                                (blend_mid.shrunk_sigmas[k] - expected).abs() < 1e-12,
+                                "{label} blend=0.35 mismatch"
+                            );
+                        }
+                        Ok(())
+                    })
+                    })
+                    .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| String::from("SVD shape thread panicked."))??;
             }
-
-            let blend_zero = randomized_subspace_denoised_factors_with_mode(
-                label,
-                &mixed,
-                rows,
-                cols,
-                k_req,
-                2,
-                total_energy,
-                16,
-                1.0,
-                ShrinkageMode::Blended,
-                Some(0.0),
-                2,
-            )?;
-            let blend_one = randomized_subspace_denoised_factors_with_mode(
-                label,
-                &mixed,
-                rows,
-                cols,
-                k_req,
-                2,
-                total_energy,
-                16,
-                1.0,
-                ShrinkageMode::Blended,
-                Some(1.0),
-                2,
-            )?;
-            let blend_mid = randomized_subspace_denoised_factors_with_mode(
-                label,
-                &mixed,
-                rows,
-                cols,
-                k_req,
-                2,
-                total_energy,
-                16,
-                1.0,
-                ShrinkageMode::Blended,
-                Some(0.35),
-                2,
-            )?;
-            assert_eq!(blend_zero.rank, 3);
-            assert_eq!(blend_one.rank, 3);
-            assert_eq!(blend_mid.rank, 3);
-            for k in 0..3 {
-                assert!(
-                    (blend_zero.shrunk_sigmas[k] - unshrunk.shrunk_sigmas[k]).abs() < 1e-12,
-                    "{label} blend=0 must match unshrunk"
-                );
-                assert!(
-                    (blend_one.shrunk_sigmas[k] - gd_factors.shrunk_sigmas[k]).abs() < 1e-12,
-                    "{label} blend=1 must match GavishDonoho"
-                );
-                let expected =
-                    0.65 * unshrunk.shrunk_sigmas[k] + 0.35 * gd_factors.shrunk_sigmas[k];
-                assert!(
-                    (blend_mid.shrunk_sigmas[k] - expected).abs() < 1e-12,
-                    "{label} blend=0.35 mismatch"
-                );
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn write_toy_safetensors_dir(

@@ -8,8 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bonsai_artifacts::RuntimeSpec;
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
-use zip::{ZipWriter, write::SimpleFileOptions};
+use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 #[path = "../support/windows.rs"]
 mod windows;
@@ -17,8 +16,8 @@ use windows::caller_identity;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+fn digest(bytes: &[u8]) -> Result<String> {
+    Ok(hex::encode(bonsai_native_hash::hash_bytes(bytes)?))
 }
 
 fn fixture() -> Result<(PathBuf, RuntimeSpec)> {
@@ -37,13 +36,14 @@ fn fixture() -> Result<(PathBuf, RuntimeSpec)> {
     library[64..70].copy_from_slice(&[b'P', b'E', 0, 0, 0x64, 0xaa]);
     let archive_path = root.join("runtime.zip");
     let mut archive = ZipWriter::new(File::create(&archive_path)?);
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     for (name, bytes) in [
-        ("llama-server.exe", &executable),
+        ("llama-server.exe", &library),
         ("llama-completion.exe", &executable),
         ("ggml.dll", &library),
     ] {
         fs::write(directory.join(name), bytes)?;
-        archive.start_file(name, SimpleFileOptions::default())?;
+        archive.start_file(name, stored)?;
         archive.write_all(bytes)?;
     }
     archive.finish()?;
@@ -52,7 +52,7 @@ fn fixture() -> Result<(PathBuf, RuntimeSpec)> {
         archive_path,
         runtime_directory: directory,
         archive_bytes: u64::try_from(bytes.len())?,
-        archive_sha256: digest(&bytes),
+        archive_sha256: digest(&bytes)?,
     };
     Ok((root, spec))
 }

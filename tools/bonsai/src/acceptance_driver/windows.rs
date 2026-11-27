@@ -651,6 +651,14 @@ mod tests {
         Ok(())
     }
 
+    fn stage_fixture_executable(destination: &Path) -> crate::Result<()> {
+        let current = std::env::current_exe().map_err(|error| error.to_string())?;
+        if fs::hard_link(&current, destination).is_err() {
+            fs::copy(&current, destination).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn native_owner_supervision_removes_credentials_only_from_child() -> crate::Result<()> {
         let root = std::env::temp_dir().join(format!(
@@ -659,11 +667,7 @@ mod tests {
         ));
         fs::create_dir(&root).map_err(|error| error.to_string())?;
         let executable = root.join("native-driver-fixture.exe");
-        fs::copy(
-            std::env::current_exe().map_err(|error| error.to_string())?,
-            &executable,
-        )
-        .map_err(|error| error.to_string())?;
+        stage_fixture_executable(&executable)?;
         let before = std::env::var_os("GH_TOKEN");
         let (now, frequency) = ticks()?;
         let result = supervise(
@@ -694,11 +698,7 @@ mod tests {
         ));
         fs::create_dir(&root).map_err(|error| error.to_string())?;
         let executable = root.join("native-driver-fixture.exe");
-        fs::copy(
-            std::env::current_exe().map_err(|error| error.to_string())?,
-            &executable,
-        )
-        .map_err(|error| error.to_string())?;
+        stage_fixture_executable(&executable)?;
         let (now, frequency) = ticks()?;
         let result = supervise(
             &executable,

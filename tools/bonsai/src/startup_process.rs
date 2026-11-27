@@ -1204,10 +1204,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore]
+    fn compiler_env_probe() -> crate::Result<()> {
+        let env_or = |name: &str| std::env::var(name).map_err(|error| error.to_string());
+        let payload = serde_json::json!({
+            "Value": env_or("BONSAI_STARTUP_UNICODE")?,
+            "Path": env_or("PATH")?,
+            "SystemRoot": env_or("SystemRoot")?,
+            "Local": env_or("LOCALAPPDATA")?,
+            "Roaming": env_or("APPDATA")?,
+        });
+        writeln!(std::io::stdout().lock(), "BONSAI_ENV_JSON={payload}")
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn compiler_overlay_preserves_inherited_profile_and_unicode() -> crate::Result<()> {
         let scratch = std::env::temp_dir().join(format!("Bonsai-Process-Environment-{}", unique()));
         fs::create_dir(&scratch).map_err(|error| error.to_string())?;
-        let executable = resolve(OsStr::new("pwsh.exe"))?;
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         let original_path = std::env::var("PATH").map_err(|error| error.to_string())?;
         let overlay = BTreeMap::from([
             (
@@ -1222,8 +1239,10 @@ mod tests {
         let output = run(
             executable.as_os_str(),
             &[
-                "-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
-                "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); @{Value=$env:BONSAI_STARTUP_UNICODE; Path=$env:PATH; SystemRoot=$env:SystemRoot; Local=$env:LOCALAPPDATA; Roaming=$env:APPDATA} | ConvertTo-Json -Compress".into(),
+                "--exact".into(),
+                "startup_process::tests::compiler_env_probe".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
             ],
             &scratch,
             &overlay,
@@ -1231,16 +1250,15 @@ mod tests {
             &scratch.join("environment.log"),
         )?;
         assert_eq!(output.code, 0, "{}", output.stderr);
+        let json_line = output
+            .stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("BONSAI_ENV_JSON="))
+            .ok_or("Missing compiler environment probe output.")?;
         let actual: serde_json::Value =
-            serde_json::from_str(&output.stdout).map_err(|error| error.to_string())?;
+            serde_json::from_str(json_line).map_err(|error| error.to_string())?;
         assert_eq!(actual["Value"], overlay["BONSAI_STARTUP_UNICODE"]);
-        // PowerShell itself prepends $PSHOME; the complete compiler overlay
-        // remains the inherited suffix rather than changing the parent PATH.
-        assert!(
-            actual["Path"]
-                .as_str()
-                .is_some_and(|path| path.ends_with(&overlay["pAtH"]))
-        );
+        assert_eq!(actual["Path"], overlay["pAtH"]);
         for (field, name) in [
             ("SystemRoot", "SystemRoot"),
             ("Local", "LOCALAPPDATA"),

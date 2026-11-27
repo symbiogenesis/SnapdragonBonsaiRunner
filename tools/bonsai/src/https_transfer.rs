@@ -1190,7 +1190,7 @@ mod tests {
             let started = Instant::now();
             let until = started
                 + if matches!(stop, Stop::Deadline) {
-                    Duration::from_secs(1)
+                    Duration::from_millis(150)
                 } else {
                     Duration::from_secs(5)
                 };

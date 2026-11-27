@@ -117,30 +117,61 @@ fn startup_rejects_invalid_caller_identity_before_build_work()
         std::process::id()
     ));
     fs::create_dir(&scratch)?;
-    let request = scratch.join("request.json");
-    for identity in [
+    let cases: Vec<(String, &'static str, Value)> = [
         json!({"parentProcessId": 1}),
         json!({"parentProcessId": 0, "parentCreationTimeFileTime": 1}),
         json!({"parentProcessId": 1, "parentCreationTimeFileTime": "invalid"}),
-    ] {
-        for command in ["source-build", "chat-launch", "chat-package"] {
-            let mut payload = identity.clone();
-            if command == "chat-package" {
-                payload["operation"] = "launch".into();
-            }
-            fs::write(&request, serde_json::to_vec(&payload)?)?;
-            let output = Command::new(env!("CARGO_BIN_EXE_bonsai-tools"))
-                .args([command, "--request"])
-                .arg(&request)
-                .current_dir(&scratch)
-                .output()?;
-            assert!(!output.status.success());
-            assert_eq!(output.stdout, Vec::<u8>::new());
-            assert!(String::from_utf8_lossy(&output.stderr).contains("startup caller identity"));
+    ]
+    .into_iter()
+    .enumerate()
+    .flat_map(|(i, identity)| {
+        ["source-build", "chat-launch", "chat-package"]
+            .into_iter()
+            .enumerate()
+            .map(move |(j, command)| {
+                let mut payload = identity.clone();
+                if command == "chat-package" {
+                    payload["operation"] = "launch".into();
+                }
+                (format!("request-{i}-{j}.json"), command, payload)
+            })
+    })
+    .collect();
+    std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+        let handles: Vec<_> = cases
+            .into_iter()
+            .map(|(file_name, command, payload)| {
+                let scratch = &scratch;
+                scope.spawn(move || -> Result<(), String> {
+                    let request = scratch.join(file_name);
+                    fs::write(
+                        &request,
+                        serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let output = Command::new(env!("CARGO_BIN_EXE_bonsai-tools"))
+                        .args([command, "--request"])
+                        .arg(&request)
+                        .current_dir(scratch)
+                        .output()
+                        .map_err(|e| e.to_string())?;
+                    assert!(!output.status.success());
+                    assert_eq!(output.stdout, Vec::<u8>::new());
+                    assert!(
+                        String::from_utf8_lossy(&output.stderr).contains("startup caller identity")
+                    );
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| "CLI identity thread panicked.")??;
         }
-    }
-    fs::remove_file(request)?;
-    fs::remove_dir(scratch)?;
+        Ok(())
+    })?;
+    fs::remove_dir_all(scratch)?;
     Ok(())
 }
 
@@ -385,27 +416,42 @@ fn lora_diff_audit_merge_and_edit_dispatch_cleanly_without_network()
     let merged = scratch.join("merged.gguf");
     let edited = scratch.join("edited.gguf");
 
-    for (layer, rank, path) in [(3_u32, 4_usize, &c0), (7_u32, 6_usize, &c1)] {
-        let req = json!({
-            "schemaVersion": 1,
-            "operation": "generate-test-adapter",
-            "scope": {
-                "layers": [layer],
-                "targetEnvelope": "npu-friendly",
-                "exportDtype": "f16",
-                "maxRank": rank
-            },
-            "outputPath": path
-        });
-        let out = Command::new(env!("CARGO_BIN_EXE_bonsai-tools"))
-            .args(["lora-diff-audit", "--json", &req.to_string()])
-            .output()?;
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+        let handles: Vec<_> = [(3_u32, 4_usize, &c0), (7_u32, 6_usize, &c1)]
+            .into_iter()
+            .map(|(layer, rank, path)| {
+                scope.spawn(move || -> Result<(), String> {
+                    let req = json!({
+                        "schemaVersion": 1,
+                        "operation": "generate-test-adapter",
+                        "scope": {
+                            "layers": [layer],
+                            "targetEnvelope": "npu-friendly",
+                            "exportDtype": "f16",
+                            "maxRank": rank
+                        },
+                        "outputPath": path
+                    });
+                    let out = Command::new(env!("CARGO_BIN_EXE_bonsai-tools"))
+                        .args(["lora-diff-audit", "--json", &req.to_string()])
+                        .output()
+                        .map_err(|e| e.to_string())?;
+                    assert!(
+                        out.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| "Adapter generation thread panicked.")??;
+        }
+        Ok(())
+    })?;
 
     let merge_req = json!({
         "schemaVersion": 1,

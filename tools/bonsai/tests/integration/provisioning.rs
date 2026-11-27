@@ -8,12 +8,12 @@ use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
-use zip::{ZipWriter, write::SimpleFileOptions};
+use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-fn invoke(root: &Path, request: &Value) -> Result<Output, Box<dyn std::error::Error>> {
-    let path = root.join("request.json");
+fn invoke(root: &Path, name: &str, request: &Value) -> Result<Output, Box<dyn std::error::Error>> {
+    let path = root.join(name);
     fs::write(&path, serde_json::to_vec(request)?)?;
     Ok(Command::new(env!("CARGO_BIN_EXE_bonsai-tools"))
         .args(["runtime-stage", "--request"])
@@ -37,7 +37,10 @@ fn runtime_stage_cli_rejects_bad_requests_and_returns_offline_receipt() -> TestR
     image[60..64].copy_from_slice(&64_u32.to_le_bytes());
     image[64..70].copy_from_slice(&[b'P', b'E', 0, 0, 0x64, 0xaa]);
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    zip.start_file("llama-server.exe", SimpleFileOptions::default())?;
+    zip.start_file(
+        "llama-server.exe",
+        SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+    )?;
     zip.write_all(&image)?;
     let bytes = zip.finish()?.into_inner();
     fs::write(&archive, &bytes)?;
@@ -47,21 +50,39 @@ fn runtime_stage_cli_rejects_bad_requests_and_returns_offline_receipt() -> TestR
         "runtime": {"archivePath": archive, "runtimeDirectory": destination,
             "archiveBytes": bytes.len(), "archiveSha256": hash},
     });
-    for invalid in [
+    let invalid_cases = [
         json!([1, request["runtime"]]),
         json!({"schemaVersion": 1, "runtime": [archive, destination, bytes.len(), hash]}),
         json!({"schemaVersion": 2, "runtime": request["runtime"]}),
         json!({"schemaVersion": 1, "runtime": request["runtime"], "extra": true}),
         json!({"schemaVersion": 1, "runtime": {"archivePath": archive}}),
-    ] {
-        let output = invoke(&root, &invalid)?;
-        assert!(!output.status.success());
-        assert!(!destination.exists());
-        assert!(!fs::read_dir(&root)?.any(|entry| {
-            entry.is_ok_and(|entry| entry.file_name().to_string_lossy().contains(".staging-"))
-        }));
-    }
-    let output = invoke(&root, &request)?;
+    ];
+    std::thread::scope(|scope| -> TestResult {
+        let handles: Vec<_> = invalid_cases
+            .into_iter()
+            .enumerate()
+            .map(|(index, invalid)| {
+                let root = &root;
+                scope.spawn(move || -> Result<(), String> {
+                    let output = invoke(root, &format!("invalid-{index}.json"), &invalid)
+                        .map_err(|e| e.to_string())?;
+                    assert!(!output.status.success());
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().map_err(|_| -> Box<dyn std::error::Error> {
+                "Runtime stage invalid request thread panicked.".into()
+            })??;
+        }
+        Ok(())
+    })?;
+    assert!(!destination.exists());
+    assert!(!fs::read_dir(&root)?.any(|entry| {
+        entry.is_ok_and(|entry| entry.file_name().to_string_lossy().contains(".staging-"))
+    }));
+    let output = invoke(&root, "request.json", &request)?;
     assert!(
         output.status.success(),
         "{}",
@@ -88,7 +109,7 @@ fn runtime_stage_cli_rejects_bad_requests_and_returns_offline_receipt() -> TestR
     assert_eq!(fs::read(staging.join("llama-server.exe"))?, image);
     assert!(receipt.get("ReportedVersion").is_none());
     fs::write(&destination, b"existing destination")?;
-    let again = invoke(&root, &request)?;
+    let again = invoke(&root, "request-again.json", &request)?;
     assert!(!again.status.success());
     assert_eq!(fs::read(&destination)?, b"existing destination");
     assert_eq!(fs::read(staging.join("llama-server.exe"))?, image);
