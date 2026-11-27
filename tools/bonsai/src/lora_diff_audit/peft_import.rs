@@ -373,16 +373,13 @@ impl PeftDonorIntake {
                 let config_uri = huggingface_resolve_uri(repository, revision, cfg_name);
                 let weights_uri = huggingface_resolve_uri(repository, revision, wt_name);
 
-                let timeout = deadline
-                    .checked_duration_since(Instant::now())
-                    .filter(|d| !d.is_zero())
-                    .ok_or("PEFT import time budget expired before config download.")?;
                 let req_headers = [("Accept-Encoding".to_owned(), "identity".to_owned())];
-                let resp = crate::https_transfer::metadata(
+                let resp = crate::https_transfer::metadata_with_retry(
                     &config_uri,
                     &req_headers,
-                    timeout,
+                    deadline,
                     MAX_PEFT_CONFIG_BYTES,
+                    &mut crate::startup_cancel::checkpoint,
                 )?;
                 if resp.status != 200 {
                     return Err(format!(
@@ -398,7 +395,7 @@ impl PeftDonorIntake {
                     return Err("PEFT adapter config requires identity content encoding.".into());
                 }
 
-                let (prefix, file_bytes) = crate::https_transfer::fetch_range(
+                let (prefix, file_bytes) = crate::https_transfer::fetch_range_with_retry(
                     &weights_uri,
                     0,
                     7,
@@ -421,7 +418,7 @@ impl PeftDonorIntake {
                 {
                     return Err("PEFT safetensors header exceeds bounded size or EOF.".into());
                 }
-                let (raw_hdr, total_after) = crate::https_transfer::fetch_range(
+                let (raw_hdr, total_after) = crate::https_transfer::fetch_range_with_retry(
                     &weights_uri,
                     8,
                     7 + hdr_len,
@@ -542,7 +539,7 @@ fn fetch_single_https_span(
         let take = (byte_len - offset).min(MAX_RANGE_CHUNK_BYTES);
         let start = abs_begin + offset;
         let end_inclusive = start + take - 1;
-        let (bytes, _) = crate::https_transfer::fetch_range(
+        let (bytes, _) = crate::https_transfer::fetch_range_with_retry(
             uri,
             start,
             end_inclusive,

@@ -16,7 +16,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use ureq::{
@@ -183,6 +183,16 @@ fn owned<T: Send>(
     checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
     operation: impl FnOnce(&Agent, &AtomicBool) -> crate::Result<T> + Send,
 ) -> crate::Result<T> {
+    owned_with_abort(agent, until, checkpoint, operation, |_| false)
+}
+
+fn owned_with_abort<T: Send>(
+    agent: Agent,
+    until: Instant,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
+    operation: impl FnOnce(&Agent, &AtomicBool) -> crate::Result<T> + Send,
+    should_abort: impl FnOnce(&T) -> bool,
+) -> crate::Result<T> {
     checkpoint()?;
     remaining(until)?;
     let mut guard = RequestGuard { agent, abort: true };
@@ -222,7 +232,10 @@ fn owned<T: Send>(
         remaining(until)?;
         result
     });
-    guard.abort = result.is_err();
+    guard.abort = match &result {
+        Ok(value) => should_abort(value),
+        Err(_) => true,
+    };
     result
 }
 
@@ -299,13 +312,21 @@ fn read_error(error: &std::io::Error) -> String {
     }
 }
 
-fn get(
+fn format_ureq_error(error: &ureq::Error) -> String {
+    if is_network_offline_error(error) {
+        format!("{OFFLINE_PREFIX} Native HTTPS request failed: {error}")
+    } else {
+        format!("Native HTTPS request failed: {error}")
+    }
+}
+
+fn call_raw(
     agent: &Agent,
     uri: &str,
     headers: &[(String, String)],
     until: Instant,
     redirects: u32,
-) -> crate::Result<http::Response<Body>> {
+) -> crate::Result<Result<http::Response<Body>, ureq::Error>> {
     let mut request = agent
         .get(uri)
         .config()
@@ -315,13 +336,180 @@ fn get(
     for (name, value) in headers {
         request = request.header(name, value);
     }
-    request.call().map_err(|e| {
-        if is_network_offline_error(&e) {
-            format!("{OFFLINE_PREFIX} Native HTTPS request failed: {e}")
-        } else {
-            format!("Native HTTPS request failed: {e}")
+    Ok(request.call())
+}
+
+fn get(
+    agent: &Agent,
+    uri: &str,
+    headers: &[(String, String)],
+    until: Instant,
+    redirects: u32,
+) -> crate::Result<http::Response<Body>> {
+    call_raw(agent, uri, headers, until, redirects)?.map_err(|e| format_ureq_error(&e))
+}
+
+const MAX_HTTP_RETRIES: usize = 4;
+const BASE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+pub(crate) fn is_retryable_http_status(status: u16) -> bool {
+    status == 408 || status == 429 || (500..=599).contains(&status)
+}
+
+pub(crate) fn is_transient_io_error(error: &std::io::Error) -> bool {
+    is_network_offline_io(error)
+        || matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::WouldBlock
+        )
+}
+
+pub(crate) fn is_transient_ureq_error(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed
+        | ureq::Error::ConnectProxyFailed(_)
+        | ureq::Error::Timeout(_) => true,
+        ureq::Error::Io(io_error) => is_transient_io_error(io_error),
+        _ => false,
+    }
+}
+
+fn parse_http_date(value: &str) -> Option<u64> {
+    let words: Vec<_> = value.split_ascii_whitespace().collect();
+    if words.len() != 6 || words[5] != "GMT" {
+        return None;
+    }
+    let day: u64 = words[1].parse().ok()?;
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|month| *month == words[2])?;
+    let year: u64 = words[3].parse().ok()?;
+    let clock: Vec<u64> = words[4]
+        .split(':')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let [hour, minute, second] = clock.as_slice() else {
+        return None;
+    };
+    if !(1970..=9999).contains(&year) || day == 0 || *hour > 23 || *minute > 59 || *second > 59 {
+        return None;
+    }
+    let leap = |year: u64| {
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+    };
+    let months = [
+        31,
+        if leap(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if day > months[month] {
+        return None;
+    }
+    let leaps = |year: u64| year / 4 - year / 100 + year / 400;
+    let days = (year - 1970) * 365 + leaps(year - 1) - leaps(1969)
+        + months[..month].iter().sum::<u64>()
+        + day
+        - 1;
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
+    let trimmed = value.trim();
+    if let Ok(seconds) = trimmed.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let target = parse_http_date(trimmed)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(Duration::from_secs(target.saturating_sub(now)))
+}
+
+pub(crate) enum RetryOutcome<T> {
+    Done(T),
+    Retry {
+        error: String,
+        retry_after: Option<Duration>,
+    },
+    Fatal(String),
+}
+
+fn compute_retry_delay(base: Duration, attempt: usize, retry_after: Option<Duration>) -> Duration {
+    let shift = u32::try_from(attempt.min(5)).unwrap_or(5);
+    let exp = base.saturating_mul(1_u32 << shift);
+    exp.max(retry_after.unwrap_or(Duration::ZERO))
+        .min(MAX_RETRY_DELAY)
+}
+
+pub(crate) fn run_with_retry<T, C: FnMut() -> crate::Result<()> + ?Sized>(
+    until: Instant,
+    checkpoint: &mut C,
+    attempt_fn: impl FnMut(&mut C) -> RetryOutcome<T>,
+) -> crate::Result<T> {
+    run_with_retry_budget(
+        MAX_HTTP_RETRIES,
+        BASE_RETRY_DELAY,
+        until,
+        checkpoint,
+        attempt_fn,
+    )
+}
+
+pub(crate) fn run_with_retry_budget<T, C: FnMut() -> crate::Result<()> + ?Sized>(
+    max_retries: usize,
+    base_delay: Duration,
+    until: Instant,
+    checkpoint: &mut C,
+    mut attempt_fn: impl FnMut(&mut C) -> RetryOutcome<T>,
+) -> crate::Result<T> {
+    for attempt in 0..=max_retries {
+        checkpoint()?;
+        remaining(until)?;
+        match attempt_fn(checkpoint) {
+            RetryOutcome::Done(value) => return Ok(value),
+            RetryOutcome::Fatal(error) => return Err(error),
+            RetryOutcome::Retry { error, retry_after } => {
+                if attempt == max_retries {
+                    return Err(error);
+                }
+                let delay = compute_retry_delay(base_delay, attempt, retry_after);
+                let rem = remaining(until)?;
+                if delay >= rem {
+                    return Err(error);
+                }
+                let wake = Instant::now()
+                    .checked_add(delay)
+                    .ok_or("Invalid HTTPS retry delay.")?;
+                loop {
+                    checkpoint()?;
+                    let rem = remaining(until)?;
+                    let Some(wait) = wake.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    if wait.is_zero() {
+                        break;
+                    }
+                    thread::sleep(wait.min(rem).min(Duration::from_millis(50)));
+                }
+            }
         }
-    })
+    }
+    Err("Native HTTPS retry budget exhausted.".into())
 }
 
 fn response_headers(response: &http::Response<Body>) -> crate::Result<BTreeMap<String, String>> {
@@ -378,22 +566,81 @@ fn metadata_with_redirects(
     cancelled: &AtomicBool,
     redirects: u32,
 ) -> crate::Result<Response> {
-    let mut response = get(agent, uri, headers, until, redirects)?;
+    match metadata_attempt(
+        agent, uri, headers, until, maximum, cancelled, redirects, false,
+    )? {
+        RetryOutcome::Done(response) => Ok(response),
+        RetryOutcome::Retry { error, .. } | RetryOutcome::Fatal(error) => Err(error),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Single metadata attempt shares framing, size-cap and cancellation checks across retried and unretried paths."
+)]
+fn metadata_attempt(
+    agent: &Agent,
+    uri: &str,
+    headers: &[(String, String)],
+    until: Instant,
+    maximum: u64,
+    cancelled: &AtomicBool,
+    redirects: u32,
+    retry_transient_http: bool,
+) -> crate::Result<RetryOutcome<Response>> {
+    let mut response = match call_raw(agent, uri, headers, until, redirects)? {
+        Ok(response) => response,
+        Err(error) => {
+            let message = format_ureq_error(&error);
+            return Ok(if is_transient_ureq_error(&error) {
+                RetryOutcome::Retry {
+                    error: message,
+                    retry_after: None,
+                }
+            } else {
+                RetryOutcome::Fatal(message)
+            });
+        }
+    };
     active(until, cancelled)?;
     let status = response.status().as_u16();
     let headers = response_headers(&response)?;
+    if retry_transient_http && is_retryable_http_status(status) {
+        let retry_after = headers
+            .get("retry-after")
+            .and_then(|value| parse_retry_after(value));
+        return Ok(RetryOutcome::Retry {
+            error: format!("Native HTTPS request returned HTTP {status}."),
+            retry_after,
+        });
+    }
     let mut body = Vec::new();
     // Preserve Retry-After and rate-limit headers without consuming error bodies.
     if status == 200 {
         let declared = content_length(&headers)?;
         if declared.is_some_and(|n| n > maximum) {
-            return Err("Update metadata exceeds its byte limit.".into());
+            return Ok(RetryOutcome::Fatal(
+                "Update metadata exceeds its byte limit.".into(),
+            ));
         }
         let mut reader = response.body_mut().as_reader();
         let mut buffer = [0; 16 * 1024];
         loop {
             active(until, cancelled)?;
-            let count = reader.read(&mut buffer).map_err(|e| read_error(&e))?;
+            let count = match reader.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error) => {
+                    let message = read_error(&error);
+                    return Ok(if is_transient_io_error(&error) {
+                        RetryOutcome::Retry {
+                            error: message,
+                            retry_after: None,
+                        }
+                    } else {
+                        RetryOutcome::Fatal(message)
+                    });
+                }
+            };
             active(until, cancelled)?;
             if count == 0 {
                 break;
@@ -402,23 +649,54 @@ fn metadata_with_redirects(
                 .map_err(|e| e.to_string())?
                 .saturating_add(u64::try_from(count).map_err(|e| e.to_string())?);
             if next > maximum {
-                return Err("Update metadata exceeds its byte limit.".into());
+                return Ok(RetryOutcome::Fatal(
+                    "Update metadata exceeds its byte limit.".into(),
+                ));
             }
             if declared.is_some_and(|expected| next > expected) {
-                return Err("Update metadata length differs from Content-Length.".into());
+                return Ok(RetryOutcome::Fatal(
+                    "Update metadata length differs from Content-Length.".into(),
+                ));
             }
             body.extend_from_slice(&buffer[..count]);
         }
         if let Some(expected) = declared
             && u64::try_from(body.len()).map_err(|e| e.to_string())? != expected
         {
-            return Err("Update metadata response ended before Content-Length.".into());
+            return Ok(RetryOutcome::Retry {
+                error: "Update metadata response ended before Content-Length.".into(),
+                retry_after: None,
+            });
         }
     }
-    Ok(Response {
+    Ok(RetryOutcome::Done(Response {
         status,
         headers,
         body,
+    }))
+}
+
+pub(crate) fn metadata_with_retry(
+    uri: &str,
+    headers: &[(String, String)],
+    until: Instant,
+    maximum: u64,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
+) -> crate::Result<Response> {
+    validate_uri(uri)?;
+    run_with_retry(until, checkpoint, |checkpoint| {
+        match owned_with_abort(
+            agent(),
+            until,
+            checkpoint,
+            |agent, cancelled| {
+                metadata_attempt(agent, uri, headers, until, maximum, cancelled, 3, true)
+            },
+            |outcome| matches!(outcome, RetryOutcome::Retry { .. }),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => RetryOutcome::Fatal(error),
+        }
     })
 }
 
@@ -638,6 +916,7 @@ fn parse_content_range_total(
     Ok(total)
 }
 
+#[cfg(test)]
 fn fetch_range_with(
     agent: &Agent,
     uri: &str,
@@ -647,12 +926,48 @@ fn fetch_range_with(
     until: Instant,
     cancelled: &AtomicBool,
 ) -> crate::Result<(Vec<u8>, u64)> {
+    match fetch_range_attempt(
+        agent,
+        uri,
+        start,
+        end_inclusive,
+        max_bytes,
+        until,
+        cancelled,
+    )? {
+        RetryOutcome::Done(result) => Ok(result),
+        RetryOutcome::Retry { error, .. } | RetryOutcome::Fatal(error) => Err(error),
+    }
+}
+
+fn fetch_range_attempt(
+    agent: &Agent,
+    uri: &str,
+    start: u64,
+    end_inclusive: u64,
+    max_bytes: u64,
+    until: Instant,
+    cancelled: &AtomicBool,
+) -> crate::Result<RetryOutcome<(Vec<u8>, u64)>> {
     let expected_len = range_expected_len(start, end_inclusive, max_bytes)?;
     let headers = [
         ("Accept-Encoding".to_owned(), "identity".to_owned()),
         ("Range".to_owned(), format!("bytes={start}-{end_inclusive}")),
     ];
-    let mut response = get(agent, uri, &headers, until, 10)?;
+    let mut response = match call_raw(agent, uri, &headers, until, 10)? {
+        Ok(response) => response,
+        Err(error) => {
+            let message = format_ureq_error(&error);
+            return Ok(if is_transient_ureq_error(&error) {
+                RetryOutcome::Retry {
+                    error: message,
+                    retry_after: None,
+                }
+            } else {
+                RetryOutcome::Fatal(message)
+            });
+        }
+    };
     active(until, cancelled)?;
     let status = response.status().as_u16();
     let response_headers = response_headers(&response)?;
@@ -660,16 +975,29 @@ fn fetch_range_with(
         .get("content-encoding")
         .is_some_and(|v| !v.eq_ignore_ascii_case("identity"))
     {
-        return Err("Range fetches require identity content encoding.".into());
+        return Ok(RetryOutcome::Fatal(
+            "Range fetches require identity content encoding.".into(),
+        ));
+    }
+    if is_retryable_http_status(status) {
+        let retry_after = response_headers
+            .get("retry-after")
+            .and_then(|value| parse_retry_after(value));
+        return Ok(RetryOutcome::Retry {
+            error: format!("Range fetch expected HTTP 206, received HTTP {status}."),
+            retry_after,
+        });
     }
     if status != 206 {
-        return Err(format!(
+        return Ok(RetryOutcome::Fatal(format!(
             "Range fetch expected HTTP 206, received HTTP {status}."
-        ));
+        )));
     }
     let total = parse_content_range_total(&response_headers, start, end_inclusive)?;
     if content_length(&response_headers)?.is_some_and(|n| n != expected_len) {
-        return Err("Range fetch Content-Length differs from requested slice.".into());
+        return Ok(RetryOutcome::Fatal(
+            "Range fetch Content-Length differs from requested slice.".into(),
+        ));
     }
     let expected_usize = usize::try_from(expected_len).map_err(|e| e.to_string())?;
     let mut body = Vec::new();
@@ -679,7 +1007,20 @@ fn fetch_range_with(
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         active(until, cancelled)?;
-        let count = reader.read(&mut buffer).map_err(|e| read_error(&e))?;
+        let count = match reader.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) => {
+                let message = read_error(&error);
+                return Ok(if is_transient_io_error(&error) {
+                    RetryOutcome::Retry {
+                        error: message,
+                        retry_after: None,
+                    }
+                } else {
+                    RetryOutcome::Fatal(message)
+                });
+            }
+        };
         active(until, cancelled)?;
         if count == 0 {
             break;
@@ -689,19 +1030,25 @@ fn fetch_range_with(
             .checked_add(u64::try_from(count).map_err(|e| e.to_string())?)
             .ok_or("Range response length overflow.")?;
         if next > expected_len {
-            return Err("Range fetch exceeded requested slice length.".into());
+            return Ok(RetryOutcome::Fatal(
+                "Range fetch exceeded requested slice length.".into(),
+            ));
         }
         body.extend_from_slice(&buffer[..count]);
     }
     if u64::try_from(body.len()).map_err(|e| e.to_string())? != expected_len {
-        return Err("Range fetch ended before requested slice length.".into());
+        return Ok(RetryOutcome::Retry {
+            error: "Range fetch ended before requested slice length.".into(),
+            retry_after: None,
+        });
     }
     active(until, cancelled)?;
-    Ok((body, total))
+    Ok(RetryOutcome::Done((body, total)))
 }
 
-/// Fetches an exact bounded byte range (`start..=end_inclusive`) requiring HTTP 206 and `Content-Range`.
-pub(crate) fn fetch_range(
+/// Fetches an exact bounded byte range (`start..=end_inclusive`) with bounded retry on
+/// transient transport errors and HTTP 408/429/5xx, honoring `Retry-After`.
+pub(crate) fn fetch_range_with_retry(
     uri: &str,
     start: u64,
     end_inclusive: u64,
@@ -711,16 +1058,27 @@ pub(crate) fn fetch_range(
 ) -> crate::Result<(Vec<u8>, u64)> {
     validate_uri(uri)?;
     let _ = range_expected_len(start, end_inclusive, max_bytes)?;
-    owned(agent(), until, checkpoint, |agent, cancelled| {
-        fetch_range_with(
-            agent,
-            uri,
-            start,
-            end_inclusive,
-            max_bytes,
+    run_with_retry(until, checkpoint, |checkpoint| {
+        match owned_with_abort(
+            agent(),
             until,
-            cancelled,
-        )
+            checkpoint,
+            |agent, cancelled| {
+                fetch_range_attempt(
+                    agent,
+                    uri,
+                    start,
+                    end_inclusive,
+                    max_bytes,
+                    until,
+                    cancelled,
+                )
+            },
+            |outcome| matches!(outcome, RetryOutcome::Retry { .. }),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => RetryOutcome::Fatal(error),
+        }
     })
 }
 
@@ -1331,5 +1689,156 @@ mod tests {
         assert!(!is_offline_message(
             "GitHub update check failed (HTTP 403). Your installed app is unchanged."
         ));
+    }
+
+    fn sequence_server(
+        responses: Vec<&'static [u8]>,
+    ) -> crate::Result<(String, thread::JoinHandle<crate::Result<Vec<String>>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let uri = format!(
+            "http://{}/artifact",
+            listener.local_addr().map_err(|e| e.to_string())?
+        );
+        let handle = thread::spawn(move || -> crate::Result<Vec<String>> {
+            let mut requests = Vec::with_capacity(responses.len());
+            for payload in responses {
+                let (mut stream, _) = listener.accept().map_err(|e| e.to_string())?;
+                requests.push(request(&mut stream)?);
+                stream.write_all(payload).map_err(|e| e.to_string())?;
+            }
+            Ok(requests)
+        });
+        Ok((uri, handle))
+    }
+
+    #[test]
+    fn retry_after_and_exponential_backoff_are_bounded_and_honored() {
+        assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
+        assert_eq!(parse_retry_after(" 12 "), Some(Duration::from_secs(12)));
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 1970 00:00:01 GMT"),
+            Some(Duration::from_secs(0))
+        );
+        assert_eq!(parse_retry_after("invalid-header"), None);
+
+        assert_eq!(
+            compute_retry_delay(Duration::from_millis(250), 0, None),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            compute_retry_delay(Duration::from_millis(250), 2, None),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            compute_retry_delay(Duration::from_millis(250), 0, Some(Duration::from_secs(5))),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            compute_retry_delay(
+                Duration::from_millis(250),
+                0,
+                Some(Duration::from_secs(120))
+            ),
+            MAX_RETRY_DELAY
+        );
+
+        let mut attempts = 0usize;
+        let err = run_with_retry_budget(
+            3,
+            Duration::from_millis(1),
+            Instant::now() + Duration::from_secs(2),
+            &mut || Ok(()),
+            |_| -> RetryOutcome<()> {
+                attempts += 1;
+                RetryOutcome::Retry {
+                    error: "too many requests".into(),
+                    retry_after: Some(Duration::from_secs(10)),
+                }
+            },
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(err.err().as_deref(), Some("too many requests"));
+
+        let mut fatal_attempts = 0usize;
+        let fatal = run_with_retry_budget(
+            3,
+            Duration::from_millis(1),
+            Instant::now() + Duration::from_secs(2),
+            &mut || Ok(()),
+            |_| -> RetryOutcome<()> {
+                fatal_attempts += 1;
+                RetryOutcome::Fatal("bad status 404".into())
+            },
+        );
+        assert_eq!(fatal_attempts, 1);
+        assert_eq!(fatal.err().as_deref(), Some("bad status 404"));
+    }
+
+    #[test]
+    fn metadata_and_range_retry_transient_http_and_truncation_without_retrying_404()
+    -> crate::Result<()> {
+        let (uri, server) = sequence_server(vec![
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 2-6/20\r\nConnection: close\r\n\r\nwo",
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 2-6/20\r\nConnection: close\r\n\r\nworld",
+        ])?;
+        let until = Instant::now() + Duration::from_secs(10);
+        let (bytes, total) = run_with_retry_budget(
+            4,
+            Duration::from_millis(10),
+            until,
+            &mut || Ok(()),
+            |checkpoint| match owned_with_abort(
+                new_agent(true),
+                until,
+                checkpoint,
+                |agent, cancelled| fetch_range_attempt(agent, &uri, 2, 6, 16, until, cancelled),
+                |outcome| matches!(outcome, RetryOutcome::Retry { .. }),
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => RetryOutcome::Fatal(error),
+            },
+        )?;
+        assert_eq!(bytes, b"world");
+        assert_eq!(total, 20);
+        assert_eq!(
+            server
+                .join()
+                .map_err(|_| "Sequence server panicked.")??
+                .len(),
+            4
+        );
+
+        let (not_found_uri, not_found_server) = sequence_server(vec![
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ])?;
+        let not_found = run_with_retry_budget(
+            4,
+            Duration::from_millis(10),
+            until,
+            &mut || Ok(()),
+            |checkpoint| match owned_with_abort(
+                new_agent(true),
+                until,
+                checkpoint,
+                |agent, cancelled| {
+                    fetch_range_attempt(agent, &not_found_uri, 0, 3, 16, until, cancelled)
+                },
+                |outcome| matches!(outcome, RetryOutcome::Retry { .. }),
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => RetryOutcome::Fatal(error),
+            },
+        );
+        assert!(not_found.is_err());
+        assert_eq!(
+            not_found_server
+                .join()
+                .map_err(|_| "Sequence server panicked.")??
+                .len(),
+            1
+        );
+        Ok(())
     }
 }

@@ -5,7 +5,7 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -517,11 +517,13 @@ impl ShardSource {
             }
             SourceKind::Https { .. } => {
                 let uri = self.shard_uri("model.safetensors.index.json")?;
-                let timeout = deadline
-                    .checked_duration_since(Instant::now())
-                    .filter(|d| !d.is_zero())
-                    .unwrap_or(Duration::from_millis(1));
-                let resp = crate::https_transfer::metadata(&uri, &[], timeout, MAX_INDEX_BYTES)?;
+                let resp = crate::https_transfer::metadata_with_retry(
+                    &uri,
+                    &[],
+                    deadline,
+                    MAX_INDEX_BYTES,
+                    &mut crate::startup_cancel::checkpoint,
+                )?;
                 if resp.status != 200 {
                     return Err(format!(
                         "Safetensors index download returned HTTP {}.",
@@ -568,7 +570,7 @@ impl ShardSource {
             }
             SourceKind::Https { .. } => {
                 let uri = self.shard_uri(shard)?;
-                let (prefix, file_bytes) = crate::https_transfer::fetch_range(
+                let (prefix, file_bytes) = crate::https_transfer::fetch_range_with_retry(
                     &uri,
                     0,
                     7,
@@ -586,7 +588,7 @@ impl ShardSource {
                 {
                     return Err(format!("Safetensors header exceeds bound in '{shard}'."));
                 }
-                let (raw, total_after) = crate::https_transfer::fetch_range(
+                let (raw, total_after) = crate::https_transfer::fetch_range_with_retry(
                     &uri,
                     8,
                     7 + hdr_len,
@@ -668,7 +670,7 @@ impl ShardSource {
                         let take = (byte_len - offset).min(chunk_bytes);
                         let start = abs_begin + offset;
                         let end_inclusive = start + take - 1;
-                        let (bytes, _) = crate::https_transfer::fetch_range(
+                        let (bytes, _) = crate::https_transfer::fetch_range_with_retry(
                             &uri,
                             start,
                             end_inclusive,
@@ -715,7 +717,7 @@ impl ShardSource {
                                 let take = (byte_len - offset).min(chunk_bytes);
                                 let start = abs_begin + offset;
                                 let end_inclusive = start + take - 1;
-                                let fetch = crate::https_transfer::fetch_range(
+                                let fetch = crate::https_transfer::fetch_range_with_retry(
                                     uri_ref,
                                     start,
                                     end_inclusive,

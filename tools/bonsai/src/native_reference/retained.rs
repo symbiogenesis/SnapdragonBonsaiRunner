@@ -7,7 +7,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read as _, Seek as _, SeekFrom, Write as _},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub(super) const REPOSITORY: &str = "symbiogenesis/SwiftBonsai2Runner";
@@ -91,6 +91,22 @@ pub(super) fn redirect(url: &str) -> crate::Result<()> {
     )
 }
 
+fn redact_secret(message: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        message.to_owned()
+    } else {
+        message.replace(secret, "[REDACTED]")
+    }
+}
+
+fn response_retry_after(response: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::https_transfer::parse_retry_after)
+}
+
 fn endpoint(endpoint: &str, token: &str, destination: Option<&Path>) -> crate::Result<Value> {
     let config = ureq::Agent::config_builder()
         .https_only(true)
@@ -105,71 +121,251 @@ fn endpoint(endpoint: &str, token: &str, destination: Option<&Path>) -> crate::R
             .build(),
     );
     let agent = config.build().new_agent();
-    let mut response = agent
-        .get(format!(
-            "https://api.github.com/repos/{REPOSITORY}/{endpoint}"
-        ))
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", "bonsai-retained-reference")
-        .call()
-        .map_err(|error| error.to_string())?;
-    if [301, 302, 303, 307, 308].contains(&response.status().as_u16()) {
-        require(destination.is_some(), "unexpected metadata redirect")?;
-        let target = response
-            .headers()
-            .get("location")
-            .and_then(|h| h.to_str().ok())
-            .ok_or("artifact redirect missing")?
-            .to_owned();
-        redirect(&target)?;
-        // A fresh credential-free request, with automatic redirects disabled.
-        response = agent
-            .get(target)
-            .call()
-            .map_err(|error| error.to_string())?;
-    }
-    require(
-        response.status() == 200,
-        "retained endpoint response differs",
-    )?;
+    let api_url = format!("https://api.github.com/repos/{REPOSITORY}/{endpoint}");
+    let until = Instant::now()
+        .checked_add(Duration::from_secs(120))
+        .ok_or("Invalid retained endpoint timeout.")?;
+    endpoint_with(
+        &agent,
+        &api_url,
+        token,
+        destination,
+        ARCHIVE_BYTES,
+        ARCHIVE_SHA,
+        until,
+        redirect,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Retained endpoint helper binds agent, credentialed API URI, redirect validator and exact archive bounds."
+)]
+fn endpoint_with(
+    agent: &ureq::Agent,
+    api_url: &str,
+    token: &str,
+    destination: Option<&Path>,
+    archive_bytes: u64,
+    archive_sha: &str,
+    until: Instant,
+    validate_redirect: impl Fn(&str) -> crate::Result<()>,
+) -> crate::Result<Value> {
+    use crate::https_transfer::{
+        RetryOutcome, is_retryable_http_status, is_transient_io_error, is_transient_ureq_error,
+        run_with_retry,
+    };
+
     let maximum = if destination.is_some() {
-        ARCHIVE_BYTES
+        archive_bytes
     } else {
         4_194_304
     };
-    if let Some(target) = destination {
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(target)
-            .map_err(|error| error.to_string())?;
-        let copied = io::copy(
-            &mut response.body_mut().as_reader().take(maximum + 1),
-            &mut output,
-        )
-        .map_err(|error| error.to_string())?;
-        output.sync_all().map_err(|error| error.to_string())?;
-        require(
-            copied == maximum && digest(target)? == ARCHIVE_SHA,
-            "archive raw length/hash differs",
-        )?;
-        Ok(Value::Null)
-    } else {
-        let mut raw = Vec::new();
-        response
-            .body_mut()
-            .as_reader()
-            .take(maximum + 1)
-            .read_to_end(&mut raw)
-            .map_err(|error| error.to_string())?;
-        require(
-            u64::try_from(raw.len()).map_err(|error| error.to_string())? <= maximum,
-            "retained response exceeds byte bound",
-        )?;
-        decode(&raw)
-    }
+    let partial_path = destination.map(|target| {
+        target.with_extension(format!("{}.partial", crate::startup_process::unique()))
+    });
+    let mut partial_guard = partial_path
+        .as_ref()
+        .map(|path| crate::fs_guard::TempFileGuard::new(path.clone()));
+    let mut redirect_target: Option<String> = None;
+
+    run_with_retry(until, &mut crate::startup_cancel::checkpoint, |_| {
+        let remaining = match until.checked_duration_since(Instant::now()) {
+            Some(duration) if !duration.is_zero() => duration,
+            _ => {
+                return RetryOutcome::Fatal(
+                    "Native HTTPS operation exceeded its aggregate allowance.".into(),
+                );
+            }
+        };
+        let mut response = if let Some(target) = &redirect_target {
+            match agent
+                .get(target)
+                .config()
+                .timeout_global(Some(remaining))
+                .build()
+                .call()
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let message = redact_secret(&error.to_string(), token);
+                    return if is_transient_ureq_error(&error) {
+                        RetryOutcome::Retry {
+                            error: message,
+                            retry_after: None,
+                        }
+                    } else {
+                        RetryOutcome::Fatal(message)
+                    };
+                }
+            }
+        } else {
+            let initial = match agent
+                .get(api_url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "bonsai-retained-reference")
+                .config()
+                .timeout_global(Some(remaining))
+                .build()
+                .call()
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let message = redact_secret(&error.to_string(), token);
+                    return if is_transient_ureq_error(&error) {
+                        RetryOutcome::Retry {
+                            error: message,
+                            retry_after: None,
+                        }
+                    } else {
+                        RetryOutcome::Fatal(message)
+                    };
+                }
+            };
+            if [301, 302, 303, 307, 308].contains(&initial.status().as_u16()) {
+                if destination.is_none() {
+                    return RetryOutcome::Fatal("unexpected metadata redirect".into());
+                }
+                let target = match initial
+                    .headers()
+                    .get("location")
+                    .and_then(|h| h.to_str().ok())
+                {
+                    Some(location) => location.to_owned(),
+                    None => return RetryOutcome::Fatal("artifact redirect missing".into()),
+                };
+                if let Err(error) = validate_redirect(&target) {
+                    return RetryOutcome::Fatal(redact_secret(&error, token));
+                }
+                redirect_target = Some(target.clone());
+                let remaining = match until.checked_duration_since(Instant::now()) {
+                    Some(duration) if !duration.is_zero() => duration,
+                    _ => {
+                        return RetryOutcome::Fatal(
+                            "Native HTTPS operation exceeded its aggregate allowance.".into(),
+                        );
+                    }
+                };
+                // A fresh credential-free request, with automatic redirects disabled.
+                match agent
+                    .get(&target)
+                    .config()
+                    .timeout_global(Some(remaining))
+                    .build()
+                    .call()
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let message = redact_secret(&error.to_string(), token);
+                        return if is_transient_ureq_error(&error) {
+                            RetryOutcome::Retry {
+                                error: message,
+                                retry_after: None,
+                            }
+                        } else {
+                            RetryOutcome::Fatal(message)
+                        };
+                    }
+                }
+            } else {
+                initial
+            }
+        };
+
+        let status = response.status().as_u16();
+        if is_retryable_http_status(status) {
+            return RetryOutcome::Retry {
+                error: format!("retained endpoint returned HTTP {status}"),
+                retry_after: response_retry_after(&response),
+            };
+        }
+        if status != 200 {
+            return RetryOutcome::Fatal("retained endpoint response differs".into());
+        }
+
+        if let (Some(target), Some(partial)) = (destination, partial_path.as_ref()) {
+            let mut output = match OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(partial)
+            {
+                Ok(file) => file,
+                Err(error) => return RetryOutcome::Fatal(error.to_string()),
+            };
+            let copied = match io::copy(
+                &mut response.body_mut().as_reader().take(maximum + 1),
+                &mut output,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let message = redact_secret(&error.to_string(), token);
+                    return if is_transient_io_error(&error) {
+                        RetryOutcome::Retry {
+                            error: message,
+                            retry_after: None,
+                        }
+                    } else {
+                        RetryOutcome::Fatal(message)
+                    };
+                }
+            };
+            if let Err(error) = output.sync_all() {
+                return RetryOutcome::Fatal(error.to_string());
+            }
+            drop(output);
+            if copied < maximum {
+                return RetryOutcome::Retry {
+                    error: "archive raw length/hash differs".into(),
+                    retry_after: None,
+                };
+            }
+            if copied != maximum {
+                return RetryOutcome::Fatal("archive raw length/hash differs".into());
+            }
+            match digest(partial) {
+                Ok(actual) if actual == archive_sha => {}
+                Ok(_) => return RetryOutcome::Fatal("archive raw length/hash differs".into()),
+                Err(error) => return RetryOutcome::Fatal(error),
+            }
+            if let Err(error) = crate::fs_guard::rename_with_retry(partial, target) {
+                return RetryOutcome::Fatal(error.to_string());
+            }
+            if let Some(guard) = partial_guard.as_mut() {
+                guard.disarm();
+            }
+            RetryOutcome::Done(Value::Null)
+        } else {
+            let mut raw = Vec::new();
+            if let Err(error) = response
+                .body_mut()
+                .as_reader()
+                .take(maximum + 1)
+                .read_to_end(&mut raw)
+            {
+                let message = redact_secret(&error.to_string(), token);
+                return if is_transient_io_error(&error) {
+                    RetryOutcome::Retry {
+                        error: message,
+                        retry_after: None,
+                    }
+                } else {
+                    RetryOutcome::Fatal(message)
+                };
+            }
+            match u64::try_from(raw.len()) {
+                Ok(len) if len <= maximum => {}
+                Ok(_) => return RetryOutcome::Fatal("retained response exceeds byte bound".into()),
+                Err(error) => return RetryOutcome::Fatal(error.to_string()),
+            }
+            match decode(&raw) {
+                Ok(value) => RetryOutcome::Done(value),
+                Err(error) => RetryOutcome::Fatal(error),
+            }
+        }
+    })
 }
 
 fn central(archive: &Path) -> crate::Result<Vec<(String, u64)>> {
@@ -669,6 +865,137 @@ mod tests {
         assert_eq!(masked_check.err().as_deref(), Some("primary error"));
 
         remove_dir_all_with_retry(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_retries_transient_http_strips_redirect_credentials_and_cleans_partials()
+    -> crate::Result<()> {
+        use std::net::TcpListener;
+
+        fn read_http_request(stream: &mut std::net::TcpStream) -> crate::Result<String> {
+            let mut raw = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Ok(String::from_utf8_lossy(&raw).into_owned())
+        }
+
+        let secret = "ghp_secret_token_never_leak";
+        let api_listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let api_addr = api_listener.local_addr().map_err(|e| e.to_string())?;
+        let blob_listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let blob_addr = blob_listener.local_addr().map_err(|e| e.to_string())?;
+
+        let payload = b"retained-archive";
+        let payload_sha = crate::identity::sha256(payload);
+        let payload_len = u64::try_from(payload.len()).map_err(|e| e.to_string())?;
+
+        let redirect_url = format!("http://{blob_addr}/blob.zip");
+        let redirect_response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {redirect_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let ok_blob_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {payload_len}\r\nConnection: close\r\n\r\n{}",
+            std::str::from_utf8(payload).map_err(|e| e.to_string())?
+        );
+
+        let api_thread = std::thread::spawn(move || -> crate::Result<Vec<String>> {
+            let mut seen = Vec::new();
+            for reply in [
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+                "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"ok\":123}".to_owned(),
+                redirect_response,
+            ] {
+                let (mut stream, _) = api_listener.accept().map_err(|e| e.to_string())?;
+                seen.push(read_http_request(&mut stream)?);
+                stream.write_all(reply.as_bytes()).map_err(|e| e.to_string())?;
+            }
+            Ok(seen)
+        });
+        let blob_thread = std::thread::spawn(move || -> crate::Result<Vec<String>> {
+            let mut seen = Vec::new();
+            for reply in [
+                "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nhalf".to_owned(),
+                ok_blob_response,
+            ] {
+                let (mut stream, _) = blob_listener.accept().map_err(|e| e.to_string())?;
+                seen.push(read_http_request(&mut stream)?);
+                stream.write_all(reply.as_bytes()).map_err(|e| e.to_string())?;
+            }
+            Ok(seen)
+        });
+
+        let root = std::env::temp_dir().join(format!(
+            "bonsai-retained-http-{}",
+            crate::startup_process::unique()
+        ));
+        fs::create_dir(&root).map_err(|error| error.to_string())?;
+        let mut _root_guard = crate::fs_guard::TempDirGuard::new(root.clone());
+
+        let agent = ureq::Agent::config_builder()
+            .https_only(false)
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build()
+            .new_agent();
+        let until = Instant::now() + Duration::from_secs(10);
+
+        let metadata = endpoint_with(
+            &agent,
+            &format!("http://{api_addr}/meta"),
+            secret,
+            None,
+            payload_len,
+            &payload_sha,
+            until,
+            |_| Ok(()),
+        )?;
+        assert_eq!(metadata, json!({"ok": 123}));
+
+        let archive_path = root.join("evidence.zip");
+        endpoint_with(
+            &agent,
+            &format!("http://{api_addr}/zip"),
+            secret,
+            Some(&archive_path),
+            payload_len,
+            &payload_sha,
+            until,
+            |_| Ok(()),
+        )?;
+        assert_eq!(fs::read(&archive_path).map_err(|e| e.to_string())?, payload);
+        let partial_count = fs::read_dir(&root)
+            .map_err(|error| error.to_string())?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "partial"))
+            .count();
+        assert_eq!(partial_count, 0);
+
+        let api_requests = api_thread.join().map_err(|_| "API server panicked.")??;
+        assert_eq!(api_requests.len(), 3);
+        assert!(
+            api_requests
+                .iter()
+                .all(|req| req.contains(&format!("Bearer {secret}")))
+        );
+
+        let blob_requests = blob_thread.join().map_err(|_| "Blob server panicked.")??;
+        assert_eq!(blob_requests.len(), 3);
+        assert!(blob_requests.iter().all(
+            |req| !req.to_ascii_lowercase().contains("authorization") && !req.contains(secret)
+        ));
+
+        assert!(!redact_secret(&format!("failed with {secret}"), secret).contains(secret));
         Ok(())
     }
 }
