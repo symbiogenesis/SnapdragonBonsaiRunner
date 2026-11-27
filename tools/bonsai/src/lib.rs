@@ -256,6 +256,7 @@ pub mod ci_report;
 pub mod assets;
 
 mod bounded_input;
+mod fs_guard;
 mod https_transfer;
 mod identity;
 mod native_startup;

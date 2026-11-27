@@ -7,7 +7,7 @@ use std::{
     fs,
     io::Write as _,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
 };
 
 const SWIFT: &str = include_str!("../../../../config/swift-assessment.lock.json");
@@ -98,6 +98,8 @@ struct StatusReport<'a> {
     expected_bytes: Option<u64>,
 }
 
+static STATUS_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
 pub(super) fn status(
     working: &Path,
     stage: &str,
@@ -106,6 +108,9 @@ pub(super) fn status(
     activity: &str,
     artifact: Option<(&Path, u64)>,
 ) -> crate::Result<()> {
+    let _write_guard = STATUS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     external(working)?;
     let path = working.join("chat-setup-progress.json");
     if let Ok(metadata) = fs::symlink_metadata(&path)
@@ -119,6 +124,7 @@ pub(super) fn status(
         ".chat-setup-progress-{}.json",
         crate::startup_process::unique()
     ));
+    let mut temp_guard = crate::fs_guard::TempFileGuard::new(temporary.clone());
     let (artifact_path, expected_bytes) = match artifact {
         Some((artifact_path, expected_bytes)) => (Some(artifact_path), Some(expected_bytes)),
         None => (None, None),
@@ -142,7 +148,10 @@ pub(super) fn status(
         .write_all(&encoded)
         .map_err(|error| format!("Cannot write setup progress: {error}"))?;
     drop(output);
-    fs::rename(&temporary, &path).map_err(|error| format!("Cannot publish setup progress: {error}"))
+    crate::fs_guard::rename_with_retry(&temporary, &path)
+        .map_err(|error| format!("Cannot publish setup progress: {error}"))?;
+    temp_guard.disarm();
+    Ok(())
 }
 
 fn preflight(data: &Path, model: &Model, model_exists: bool) -> crate::Result<()> {
@@ -1107,6 +1116,37 @@ mod tests {
         assert_eq!(with_artifact["SchemaVersion"], 2);
         assert_eq!(with_artifact["ArtifactPath"], json!(cached_file));
         assert_eq!(with_artifact["ExpectedBytes"], 6);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for index in 0..4 {
+                let dir = &working;
+                handles.push(scope.spawn(move || {
+                    status(
+                        dir,
+                        "model",
+                        &format!("Concurrent update {index}"),
+                        "first-run",
+                        "downloading",
+                        None,
+                    )
+                }));
+            }
+            for handle in handles {
+                assert!(handle.join().is_ok_and(|res| res.is_ok()));
+            }
+        });
+        let leftover_temps = fs::read_dir(&working)
+            .map_err(|error| error.to_string())?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".chat-setup-progress-"))
+            })
+            .count();
+        assert_eq!(leftover_temps, 0);
 
         fs::remove_dir_all(working).map_err(|error| error.to_string())
     }

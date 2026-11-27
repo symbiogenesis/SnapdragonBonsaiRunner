@@ -151,15 +151,38 @@ fn model_lock(lock: &Value) -> crate::Result<()> {
     Ok(())
 }
 
-fn working_directory(request: &Request) -> crate::Result<PathBuf> {
-    let path = request.working_directory.clone().unwrap_or_else(|| {
-        std::env::temp_dir().join(format!(
-            "Bonsai-Provision-{}",
-            crate::startup_process::unique()
-        ))
-    });
+struct WorkingDirectory {
+    path: PathBuf,
+    _guard: Option<crate::fs_guard::TempDirGuard>,
+}
+
+impl std::ops::Deref for WorkingDirectory {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+fn working_directory(request: &Request) -> crate::Result<WorkingDirectory> {
+    let (path, guard) = match &request.working_directory {
+        Some(path) => (path.clone(), None),
+        None => {
+            let generated = std::env::temp_dir().join(format!(
+                "Bonsai-Provision-{}",
+                crate::startup_process::unique()
+            ));
+            (
+                generated.clone(),
+                Some(crate::fs_guard::TempDirGuard::new(generated)),
+            )
+        }
+    };
     validate_external_path(&path).map_err(|error| error.to_string())?;
-    Ok(path)
+    Ok(WorkingDirectory {
+        path,
+        _guard: guard,
+    })
 }
 
 fn receive(
@@ -1006,9 +1029,12 @@ pub(crate) fn cleanup_obsolete_inference_downloads(
             continue;
         };
         drop(readable);
-        match fs::remove_file(&path) {
+        match crate::fs_guard::remove_file_with_retry(&path) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if crate::fs_guard::is_windows_sharing_or_access(&error) => {
+                // Best-effort cleanup defers locked/held files instead of aborting active startup.
+                crate::startup_cancel::checkpoint()?;
+            }
             Err(error) => {
                 return Err(format!(
                     "Cannot remove obsolete Prism Inference download at {}: {error}",
@@ -1093,12 +1119,19 @@ pub(crate) fn cleanup_obsolete_inference_installations(
             crate::startup_cancel::checkpoint()?;
             continue;
         }
-        fs::remove_dir_all(&path).map_err(|error| {
-            format!(
-                "Cannot remove obsolete Prism Inference installation at {}: {error}",
-                path.display()
-            )
-        })?;
+        match crate::fs_guard::remove_dir_all_with_retry(&path) {
+            Ok(()) => {}
+            Err(error) if crate::fs_guard::is_windows_sharing_or_access(&error) => {
+                // Best-effort cleanup defers locked/held obsolete installations instead of aborting active startup.
+                crate::startup_cancel::checkpoint()?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Cannot remove obsolete Prism Inference installation at {}: {error}",
+                    path.display()
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1260,9 +1293,11 @@ fn repair_inference(
     // the downloaded archive. Only the fresh expanded staging files are added.
     require_runtime_staging_space(parent, files.iter().map(|file| file.bytes).sum())?;
     let staging = parent.join(format!(".staging-{}", crate::startup_process::unique()));
+    let mut staging_guard = crate::fs_guard::TempDirGuard::new(staging.clone());
     prepare_inference_stage(&lock, &files, &archive, &staging)?;
     observe(RepairActivity::Publishing, None)?;
     let _previous = publish_repaired_runtime(&staging, &destination, &expected)?;
+    staging_guard.disarm();
     observe(RepairActivity::VerifyingExisting, None)?;
     let installed = verify_inference(&lock, &files, &destination)?;
     cleanup_invalid_runtime_directories(&destination, &expected)?;
@@ -1290,6 +1325,7 @@ fn stage_publisher_repair(
     require_runtime_staging_space(parent, runtime_archive_expanded_bytes(&spec.archive_path)?)?;
     let staged = crate::install::run(json!({"schemaVersion":1,"runtime":candidate}))?;
     let staging = Path::new(text(&staged, "StagingDirectory")?);
+    let mut staging_guard = crate::fs_guard::TempDirGuard::new(staging.to_path_buf());
     let expected = staged["RuntimeFiles"]
         .as_array()
         .ok_or("Missing staged runtime inventory.")?
@@ -1302,6 +1338,7 @@ fn stage_publisher_repair(
         })
         .collect::<crate::Result<Vec<_>>>()?;
     let _previous = publish_repaired_runtime(staging, &spec.runtime_directory, &expected)?;
+    staging_guard.disarm();
     // A successful rename is not a verification result. Recheck the published
     // directory against the original locked archive before returning to launch.
     observe(RepairActivity::VerifyingExisting, None)?;
@@ -2458,7 +2495,68 @@ mod tests {
         assert!(!inference.join(old_commit).exists());
         assert!(owner_dir.join("owner.txt").is_file());
 
+        // Read-only obsolete installation is cleaned up instead of failing startup.
+        let ro_commit = "2429a33772089dfd3a50a96c698b9dbe0b36836b";
+        let ro_dir = inference.join(ro_commit).join(target);
+        fs::create_dir_all(&ro_dir).map_err(|error| error.to_string())?;
+        let ro_exe = ro_dir.join("prism-inference.exe");
+        fs::write(&ro_exe, b"exe").map_err(|error| error.to_string())?;
+        #[cfg(windows)]
+        {
+            let mut perms = fs::metadata(&ro_exe)
+                .map_err(|error| error.to_string())?
+                .permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&ro_exe, perms).map_err(|error| error.to_string())?;
+        }
+        cleanup_obsolete_inference_installations(&root, current_commit, target)?;
+        assert!(!inference.join(ro_commit).exists());
+
         fs::remove_dir_all(root).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn working_directory_drops_generated_temp_and_preserves_explicit_dir() -> crate::Result<()> {
+        let explicit = std::env::temp_dir().join(format!(
+            "Bonsai-ExplicitWork-{}",
+            crate::startup_process::unique()
+        ));
+        fs::create_dir(&explicit).map_err(|error| error.to_string())?;
+        let mut _explicit_cleanup = crate::fs_guard::TempDirGuard::new(explicit.clone());
+
+        let base_request = Request {
+            operation: Operation::Inference,
+            data_directory: explicit.clone(),
+            lock_path: None,
+            working_directory: None,
+            verify_only: true,
+            include_capabilities: false,
+            include_help: false,
+            model: "All".into(),
+            tts_quantization: "Q8_0".into(),
+            nariq_variant: None,
+            bonsai25_variant: None,
+        };
+        let generated_path = {
+            let working = working_directory(&base_request)?;
+            fs::create_dir(&*working).map_err(|error| error.to_string())?;
+            fs::write(working.join("scratch.tmp"), b"temp").map_err(|error| error.to_string())?;
+            assert!(working.exists());
+            working.to_path_buf()
+        };
+        assert!(!generated_path.exists());
+
+        let mut explicit_request = base_request;
+        explicit_request.working_directory = Some(explicit.clone());
+        {
+            let working = working_directory(&explicit_request)?;
+            assert_eq!(&*working, explicit.as_path());
+        }
+        assert!(explicit.is_dir());
+        _explicit_cleanup
+            .cleanup()
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     fn build_synthetic_lora_gguf(target_base: &str, rank: u64) -> Vec<u8> {
