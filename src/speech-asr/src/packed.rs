@@ -1007,35 +1007,38 @@ fn with_decode_act_buffers<'a>(
 }
 
 #[cfg(all(windows, feature = "rust-qualification"))]
-fn run_single_rows_q8_0(
-    caps: Arm64QuantCaps,
+#[inline(always)]
+const fn quant_row_align(data: WeightSlice<'_>) -> usize {
+    match data {
+        WeightSlice::Q8(_) | WeightSlice::RepackedQ4K8(_) | WeightSlice::Q6K(_) => 8,
+        WeightSlice::Q4K(_) | WeightSlice::Float(_) => 4,
+    }
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+fn run_single_rows_quant8<A>(
     data: &[u8],
     start_row: usize,
     row_bytes: usize,
-    act: &[Q8_0ActBlock],
+    act: &[A],
     out: &mut [f32],
+    dot8: impl Fn([&[u8]; 8], &[A]) -> [f32; 8],
+    dot4: impl Fn([&[u8]; 4], &[A]) -> [f32; 4],
+    dot1: impl Fn(&[u8], &[A]) -> f32,
 ) {
     let mut processed = 0_usize;
     for dst in out.as_chunks_mut::<8>().0 {
-        *dst = quant_kernels::dot_q8_0_8rows(
-            caps,
-            eight_rows(data, start_row + processed, row_bytes),
-            act,
-        );
+        *dst = dot8(eight_rows(data, start_row + processed, row_bytes), act);
         processed += 8;
     }
     if out[processed..].len() >= 4 {
-        let four = quant_kernels::dot_q8_0_4rows(
-            caps,
-            four_rows(data, start_row + processed, row_bytes),
-            act,
-        );
+        let four = dot4(four_rows(data, start_row + processed, row_bytes), act);
         out[processed..processed + 4].copy_from_slice(&four);
         processed += 4;
     }
     for (local_idx, dst) in out[processed..].iter_mut().enumerate() {
         let off = (start_row + processed + local_idx) * row_bytes;
-        *dst = quant_kernels::dot_q8_0_row(caps, &data[off..off + row_bytes], act);
+        *dst = dot1(&data[off..off + row_bytes], act);
     }
 }
 
@@ -1050,9 +1053,16 @@ fn single_rows_quant_arm64(
 ) {
     let width = weights.input;
     match weights.data {
-        WeightSlice::Q8(data) => {
-            run_single_rows_q8_0(caps, data, start_row, width / 32 * 34, act_q8_0, out);
-        }
+        WeightSlice::Q8(data) => run_single_rows_quant8(
+            data,
+            start_row,
+            width / 32 * 34,
+            act_q8_0,
+            out,
+            |rows, a| quant_kernels::dot_q8_0_8rows(caps, rows, a),
+            |rows, a| quant_kernels::dot_q8_0_4rows(caps, rows, a),
+            |row, a| quant_kernels::dot_q8_0_row(caps, row, a),
+        ),
         WeightSlice::Q4K(data) => run_single_rows_quant(
             data,
             start_row,
@@ -1065,12 +1075,13 @@ fn single_rows_quant_arm64(
         WeightSlice::RepackedQ4K8(data) => {
             run_single_rows_repacked_q4_k(caps, data, width, start_row, act_q8_k, out);
         }
-        WeightSlice::Q6K(data) => run_single_rows_quant(
+        WeightSlice::Q6K(data) => run_single_rows_quant8(
             data,
             start_row,
             width / 256 * 210,
             act_q8_k,
             out,
+            |rows, a| quant_kernels::dot_q6_k_8rows(caps, rows, a),
             |rows, a| quant_kernels::dot_q6_k_4rows(caps, rows, a),
             |row, a| quant_kernels::dot_q6_k_row(caps, row, a),
         ),
@@ -1087,14 +1098,7 @@ pub(super) fn multiply_single_into(
 ) {
     #[cfg(all(windows, feature = "rust-qualification"))]
     if !matches!(weights.data, WeightSlice::Float(_)) {
-        let align = if matches!(
-            weights.data,
-            WeightSlice::Q8(_) | WeightSlice::RepackedQ4K8(_)
-        ) {
-            8
-        } else {
-            4
-        };
+        let align = quant_row_align(weights.data);
         with_decode_act_buffers(
             [weights],
             input,
@@ -1137,14 +1141,11 @@ fn run_single_group_with_acts(
     }
 
     #[cfg(all(windows, feature = "rust-qualification"))]
-    let row_align = if targets
+    let row_align = targets
         .iter()
-        .any(|(w, _)| matches!(w.data, WeightSlice::Q8(_) | WeightSlice::RepackedQ4K8(_)))
-    {
-        8_usize
-    } else {
-        4_usize
-    };
+        .map(|(w, _)| quant_row_align(w.data))
+        .max()
+        .unwrap_or(4);
     #[cfg(not(all(windows, feature = "rust-qualification")))]
     let row_align = 4_usize;
 
@@ -2352,52 +2353,57 @@ fn run_batch_rows_quant<A>(
 #[cfg(all(windows, feature = "rust-qualification"))]
 #[expect(
     clippy::too_many_arguments,
-    reason = "8-row Q8_0 I8MM GEMM kernel driver handles 8x8/8x4/8x2/8x1 tiles and <8-row tails."
+    reason = "8-row I8MM GEMM kernel driver handles 8x8/8x4/8x2/8x1 tiles and <8-row tails."
 )]
-fn run_batch_rows_q8_0(
-    caps: Arm64QuantCaps,
+fn run_batch_rows_quant8<A>(
     data: &[u8],
     start_row: usize,
     row_bytes: usize,
     blocks: usize,
     batch: usize,
-    act: &[Q8_0ActBlock],
+    act: &[A],
     transposed_slice: &mut [f32],
+    gemm8x8: impl Fn([&[u8]; 8], [&[A]; 8]) -> [[f32; 8]; 8],
+    gemm8x4: impl Fn([&[u8]; 8], [&[A]; 4]) -> [[f32; 4]; 8],
+    gemm8x2: impl Fn([&[u8]; 8], [&[A]; 2]) -> [[f32; 2]; 8],
+    dot8: impl Fn([&[u8]; 8], &[A]) -> [f32; 8],
+    gemm4x2: impl Fn([&[u8]; 4], &[A], &[A]) -> [[f32; 2]; 4],
+    dot4: impl Fn([&[u8]; 4], &[A]) -> [f32; 4],
+    dot1: impl Fn(&[u8], &[A]) -> f32,
 ) {
     let mut processed = 0_usize;
     for chunk in transposed_slice.chunks_exact_mut(8 * batch) {
         let row_slices = eight_rows(data, start_row + processed, row_bytes);
         let mut t = 0_usize;
         while t + 8 <= batch {
-            let acts: [&[Q8_0ActBlock]; 8] =
+            let acts: [&[A]; 8] =
                 std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
-            let tile = quant_kernels::gemm_q8_0_8x8(caps, row_slices, acts);
+            let tile = gemm8x8(row_slices, acts);
             for (r, row_vals) in tile.iter().enumerate() {
                 chunk[r * batch + t..r * batch + t + 8].copy_from_slice(row_vals);
             }
             t += 8;
         }
         if t + 4 <= batch {
-            let acts: [&[Q8_0ActBlock]; 4] =
+            let acts: [&[A]; 4] =
                 std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
-            let tile = quant_kernels::gemm_q8_0_8x4(caps, row_slices, acts);
+            let tile = gemm8x4(row_slices, acts);
             for (r, row_vals) in tile.iter().enumerate() {
                 chunk[r * batch + t..r * batch + t + 4].copy_from_slice(row_vals);
             }
             t += 4;
         }
         if t + 2 <= batch {
-            let acts: [&[Q8_0ActBlock]; 2] =
+            let acts: [&[A]; 2] =
                 std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
-            let tile = quant_kernels::gemm_q8_0_8x2(caps, row_slices, acts);
+            let tile = gemm8x2(row_slices, acts);
             for (r, row_vals) in tile.iter().enumerate() {
                 chunk[r * batch + t..r * batch + t + 2].copy_from_slice(row_vals);
             }
             t += 2;
         }
         if t < batch {
-            let col =
-                quant_kernels::dot_q8_0_8rows(caps, row_slices, &act[t * blocks..(t + 1) * blocks]);
+            let col = dot8(row_slices, &act[t * blocks..(t + 1) * blocks]);
             for (r, &v) in col.iter().enumerate() {
                 chunk[r * batch + t] = v;
             }
@@ -2413,9 +2419,9 @@ fn run_batch_rows_q8_0(
             batch,
             act,
             &mut transposed_slice[processed * batch..],
-            |r, a, b| quant_kernels::gemm_q8_0_4x2(caps, r, a, b),
-            |r, a| quant_kernels::dot_q8_0_4rows(caps, r, a),
-            |r, a| quant_kernels::dot_q8_0_row(caps, r, a),
+            gemm4x2,
+            dot4,
+            dot1,
         );
     }
 }
@@ -2441,7 +2447,27 @@ fn run_batch_rows_repacked_q4_k(
         let strip = &data[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
         let take = (8 - lane).min(rows_here - row_idx);
         let mut t = 0_usize;
-        while t + 1 < batch {
+        while t + 8 <= batch {
+            let acts: [&[Q8_KActBlock]; 8] =
+                std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
+            let tile = quant_kernels::gemm_q4_k_repacked8_8x8(caps, strip, acts);
+            for local_r in 0..take {
+                let dst = &mut transposed_slice[(row_idx + local_r) * batch + t..];
+                dst[..8].copy_from_slice(&tile[lane + local_r]);
+            }
+            t += 8;
+        }
+        if t + 4 <= batch {
+            let acts: [&[Q8_KActBlock]; 4] =
+                std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
+            let tile = quant_kernels::gemm_q4_k_repacked8_8x4(caps, strip, acts);
+            for local_r in 0..take {
+                let dst = &mut transposed_slice[(row_idx + local_r) * batch + t..];
+                dst[..4].copy_from_slice(&tile[lane + local_r]);
+            }
+            t += 4;
+        }
+        if t + 2 <= batch {
             let tile = quant_kernels::gemm_q4_k_repacked8_8x2(
                 caps,
                 strip,
@@ -2480,8 +2506,7 @@ fn batch_rows_quant_arm64(
     match weights.data {
         WeightSlice::Q8(data) => {
             let blocks = width / 32;
-            run_batch_rows_q8_0(
-                caps,
+            run_batch_rows_quant8(
                 data,
                 start_row,
                 blocks * 34,
@@ -2489,6 +2514,13 @@ fn batch_rows_quant_arm64(
                 batch,
                 act_q8_0,
                 transposed_slice,
+                |r, a| quant_kernels::gemm_q8_0_8x8(caps, r, a),
+                |r, a| quant_kernels::gemm_q8_0_8x4(caps, r, a),
+                |r, a| quant_kernels::gemm_q8_0_8x2(caps, r, a),
+                |r, a| quant_kernels::dot_q8_0_8rows(caps, r, a),
+                |r, a, b| quant_kernels::gemm_q8_0_4x2(caps, r, a, b),
+                |r, a| quant_kernels::dot_q8_0_4rows(caps, r, a),
+                |r, a| quant_kernels::dot_q8_0_row(caps, r, a),
             );
         }
         WeightSlice::Q4K(data) => {
@@ -2519,7 +2551,7 @@ fn batch_rows_quant_arm64(
         }
         WeightSlice::Q6K(data) => {
             let blocks = width / 256;
-            run_batch_rows_quant(
+            run_batch_rows_quant8(
                 data,
                 start_row,
                 blocks * 210,
@@ -2527,6 +2559,10 @@ fn batch_rows_quant_arm64(
                 batch,
                 act_q8_k,
                 transposed_slice,
+                |r, a| quant_kernels::gemm_q6_k_8x8(caps, r, a),
+                |r, a| quant_kernels::gemm_q6_k_8x4(caps, r, a),
+                |r, a| quant_kernels::gemm_q6_k_8x2(caps, r, a),
+                |r, a| quant_kernels::dot_q6_k_8rows(caps, r, a),
                 |r, a, b| quant_kernels::gemm_q6_k_4x2(caps, r, a, b),
                 |r, a| quant_kernels::dot_q6_k_4rows(caps, r, a),
                 |r, a| quant_kernels::dot_q6_k_row(caps, r, a),
@@ -2636,14 +2672,7 @@ pub(super) fn multiply_batch_prepared_into(
             transposed_scratch.resize(needed, 0.0);
         }
         let transposed = &mut transposed_scratch[..needed];
-        let row_align = if matches!(
-            weights.data,
-            WeightSlice::Q8(_) | WeightSlice::RepackedQ4K8(_)
-        ) {
-            8
-        } else {
-            4
-        };
+        let row_align = quant_row_align(weights.data);
         row_workers::run_aligned(
             transposed,
             workers,
@@ -2715,14 +2744,7 @@ pub(super) fn multiply_batch_channel_major_into(
             weights.input,
             workers,
         );
-        let row_align = if matches!(
-            weights.data,
-            WeightSlice::Q8(_) | WeightSlice::RepackedQ4K8(_)
-        ) {
-            8
-        } else {
-            4
-        };
+        let row_align = quant_row_align(weights.data);
         row_workers::run_aligned(out, workers, row_align * batch, &|elem_off, slice| {
             let start_row = elem_off / batch;
             batch_rows_quant_arm64(
@@ -2836,14 +2858,11 @@ pub(super) fn multiply_batch_group_into(
                 prepared.input,
                 workers,
             );
-            let row_align = if matrices[..count]
+            let row_align = matrices[..count]
                 .iter()
-                .any(|w| matches!(w.data, WeightSlice::Q8(_) | WeightSlice::RepackedQ4K8(_)))
-            {
-                8_usize
-            } else {
-                4_usize
-            };
+                .map(|w| quant_row_align(w.data))
+                .max()
+                .unwrap_or(4);
             let mut offsets = [0_usize; 4];
             let mut padded_rows = 0_usize;
             for (idx, w) in matrices[..count].iter().enumerate() {
@@ -4749,7 +4768,7 @@ mod tests {
     #[test]
     fn packed_q4_k_q6_k_four_row_and_tail_batch_match_scalar_bits() {
         let input = 512_usize;
-        for out_rows in [1_usize, 3, 4, 5, 9, 11] {
+        for out_rows in [1_usize, 3, 4, 5, 8, 9, 11, 13, 16, 24] {
             let mut q4 = vec![0_u8; out_rows * 2 * 144];
             for (blk_idx, block) in q4.chunks_exact_mut(144).enumerate() {
                 block[0..2].copy_from_slice(
@@ -4789,7 +4808,7 @@ mod tests {
                 output: out_rows,
                 data: WeightSlice::Q6K(&q6),
             };
-            for batch in [1_usize, 2, 4, 5, 8, 9, 13] {
+            for batch in [1_usize, 2, 4, 5, 8, 9, 12, 13, 16, 19] {
                 let raw_in: Vec<f32> = (0..batch * input)
                     .map(|i| {
                         if i % 29 == 0 {
@@ -4981,7 +5000,7 @@ mod tests {
                 data: WeightSlice::Q8(&q8_data),
             };
 
-            for batch in [1_usize, 2, 3, 4, 5, 9] {
+            for batch in [1_usize, 2, 3, 4, 5, 8, 9, 12, 16, 19] {
                 let raw_in: Vec<f32> = (0..batch * input)
                     .map(|i| {
                         (f32::from(u16::try_from((i * 11) % 59).unwrap_or(0)) - 29.0) * 0.03125
