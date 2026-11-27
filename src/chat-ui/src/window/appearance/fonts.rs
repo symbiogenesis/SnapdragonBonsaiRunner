@@ -81,6 +81,12 @@ pub(super) fn configure(ctx: &egui::Context) {
 }
 
 #[cfg(test)]
+pub(super) fn base_fonts() -> egui::FontDefinitions {
+    prepare();
+    FONTS.clone()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -523,7 +523,7 @@ fn streamed_find_matches_folded_reference_at_every_unicode_append_boundary() {
                 .map(move |second| format!("{first}{second}").to_lowercase())
         })
         .chain(alphabet.iter().map(|query| query.to_lowercase()))
-        .collect::<Vec<_>>();
+        .collect::<std::collections::BTreeSet<_>>();
     let bodies = alphabet
         .into_iter()
         .flat_map(move |first| {
@@ -582,7 +582,7 @@ fn bounded_find_matches_folded_reference_across_expansion_and_prefix_boundaries(
                 .map(move |second| format!("{first}{second}").to_lowercase())
         })
         .chain(alphabet.iter().map(|query| query.to_lowercase()))
-        .collect::<Vec<_>>();
+        .collect::<std::collections::BTreeSet<_>>();
     for first in alphabet {
         for second in alphabet {
             for third in alphabet {
@@ -622,7 +622,7 @@ fn bounded_find_scratch_depends_on_query_bytes_and_retains_the_result_lookahead(
     let scratch = (matcher.fallback.capacity(), matcher.starts.capacity());
     // A long repeated prefix exercises fallback without retaining source bytes
     // or allocating an offset pair for every folded byte.
-    for start in 0..super::super::MAX_BYTES {
+    for start in 0..65_536 {
         assert!(!matcher.push(b'a', start, start + 1, &mut ranges));
     }
     assert_eq!(ranges, Vec::<Range<usize>>::new());

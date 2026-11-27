@@ -16,6 +16,11 @@ pub(super) fn configure_fonts(ctx: &egui::Context) {
     fonts::configure(ctx);
 }
 
+#[cfg(test)]
+pub(super) fn base_fonts() -> egui::FontDefinitions {
+    fonts::base_fonts()
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Theme {
@@ -148,6 +153,16 @@ pub(super) fn text_size(ctx: &egui::Context) -> f32 {
 
 pub(super) fn configure(ctx: &egui::Context) {
     configure_fonts(ctx);
+    configure_style(ctx);
+}
+
+#[cfg(test)]
+pub(super) fn configure_with_fonts(ctx: &egui::Context, fonts: egui::FontDefinitions) {
+    ctx.set_fonts(fonts);
+    configure_style(ctx);
+}
+
+fn configure_style(ctx: &egui::Context) {
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
         let mut style = (*ctx.style_of(theme)).clone();
         style

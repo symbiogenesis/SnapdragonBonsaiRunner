@@ -2230,20 +2230,94 @@ fn configure(ctx: &egui::Context) {
 }
 
 #[cfg(test)]
-fn test_font_provider() -> std::sync::Arc<egui_system_font_provider::SystemFontProvider> {
+struct CachedTestFontProvider {
+    inner: egui_system_font_provider::SystemFontProvider,
+    cache: std::sync::RwLock<
+        std::collections::HashMap<(char, egui::FontFamily), Option<egui::epaint::text::FontInsert>>,
+    >,
+}
+
+#[cfg(test)]
+impl egui::epaint::text::FontProvider for CachedTestFontProvider {
+    fn font_for(
+        &self,
+        request: &egui::epaint::text::FallbackRequest<'_>,
+    ) -> Option<egui::epaint::text::FontInsert> {
+        let base_char = request.cluster.chars().next()?;
+        let key = (base_char, request.family.clone());
+        {
+            let guard = self
+                .cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = guard.get(&key) {
+                return cached.clone();
+            }
+        }
+        let resolved = self.inner.font_for(request);
+        let mut guard = self
+            .cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.entry(key).or_insert_with(|| resolved.clone()).clone()
+    }
+}
+
+#[cfg(test)]
+fn test_font_provider() -> std::sync::Arc<CachedTestFontProvider> {
     use std::sync::{Arc, LazyLock};
 
-    // Enumerate the same installed fonts once. Each harness still owns its
-    // context, font atlas, styles and layout caches.
-    static PROVIDER: LazyLock<Arc<egui_system_font_provider::SystemFontProvider>> =
-        LazyLock::new(|| Arc::new(egui_system_font_provider::SystemFontProvider::new()));
+    // Enumerate and cache installed fallback fonts once across harnesses so parallel
+    // tests never serialize on SystemFontProvider's internal Mutex.
+    static PROVIDER: LazyLock<Arc<CachedTestFontProvider>> = LazyLock::new(|| {
+        Arc::new(CachedTestFontProvider {
+            inner: egui_system_font_provider::SystemFontProvider::new(),
+            cache: std::sync::RwLock::new(std::collections::HashMap::new()),
+        })
+    });
     Arc::clone(&PROVIDER)
 }
 
 #[cfg(test)]
+fn test_font_definitions() -> egui::FontDefinitions {
+    use egui::epaint::text::{FallbackRequest, FontPriority, FontProvider as _};
+    use std::sync::{Arc, LazyLock};
+
+    static TEST_FONTS: LazyLock<egui::FontDefinitions> = LazyLock::new(|| {
+        let mut fonts = appearance::base_fonts();
+        let provider = test_font_provider();
+        for ch in ['🌱', '界'] {
+            let mut buf = [0_u8; 4];
+            let cluster = ch.encode_utf8(&mut buf);
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                if let Some(insert) = provider.font_for(&FallbackRequest {
+                    cluster,
+                    family: &family,
+                }) {
+                    fonts
+                        .font_data
+                        .entry(insert.name.clone())
+                        .or_insert_with(|| Arc::new(insert.data));
+                    for target in insert.families {
+                        let list = fonts.families.entry(target.family).or_default();
+                        if !list.iter().any(|name| name == &insert.name) {
+                            match target.priority {
+                                FontPriority::Highest => list.insert(0, insert.name.clone()),
+                                FontPriority::Lowest => list.push(insert.name.clone()),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fonts
+    });
+    TEST_FONTS.clone()
+}
+
+#[cfg(test)]
 fn configure_test_context(ctx: &egui::Context) {
-    appearance::prepare_fonts();
-    configure(ctx);
+    appearance::configure_with_fonts(ctx, test_font_definitions());
     ctx.add_font_provider(test_font_provider());
 }
 

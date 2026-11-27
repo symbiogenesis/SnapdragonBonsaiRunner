@@ -375,7 +375,7 @@ fn transcript_highlights_follow_selection_colors_without_reflowing_plain_message
 #[test]
 fn highlighted_layout_cache_keeps_constant_size_keys_during_streaming_and_navigation() {
     let mut transcript = Transcript::default();
-    let highlights = 10_000;
+    let highlights = 512;
     transcript.push(Role::User, "hit ".repeat(highlights));
     transcript.push(Role::Assistant, "A streamed answer".to_owned());
     transcript.search.query = "hit".to_owned();

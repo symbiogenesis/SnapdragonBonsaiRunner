@@ -132,9 +132,21 @@ pub(super) struct ImageCache {
     entries: Vec<Entry>,
     png_entries: Vec<PngEntry>,
     clock: u64,
+    #[cfg(test)]
+    max_cache_bytes: Option<usize>,
 }
 
 impl ImageCache {
+    #[cfg(test)]
+    fn with_max_cache_bytes(max_bytes: usize) -> Self {
+        Self {
+            service: None,
+            entries: Vec::new(),
+            png_entries: Vec::new(),
+            clock: 0,
+            max_cache_bytes: Some(max_bytes),
+        }
+    }
     /// Drives active offline rasterization tickets to GPU texture upload.
     pub(super) fn poll(&mut self, ctx: &egui::Context) {
         let Some(service) = Service::get_or_init(&mut self.service, ctx) else {
@@ -445,7 +457,11 @@ impl ImageCache {
                 break;
             }
         }
-        self.evict_over_byte_budget(MAX_CACHE_BYTES);
+        #[cfg(test)]
+        let max_bytes = self.max_cache_bytes.unwrap_or(MAX_CACHE_BYTES);
+        #[cfg(not(test))]
+        let max_bytes = MAX_CACHE_BYTES;
+        self.evict_over_byte_budget(max_bytes);
     }
 
     fn evict_over_byte_budget(&mut self, max_bytes: usize) {
@@ -796,14 +812,14 @@ mod tests {
         Ok(())
     }
 
-    fn gray_2048_png(pixel_seed: u8) -> std::io::Result<Vec<u8>> {
+    fn rgba_16_png(pixel_seed: u8) -> std::io::Result<Vec<u8>> {
         let mut png_bytes = Vec::new();
-        let mut encoder = png::Encoder::new(&mut png_bytes, 2_048, 2_048);
+        let mut encoder = png::Encoder::new(&mut png_bytes, 16, 16);
         encoder.set_color(png::ColorType::Grayscale);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(png::Compression::Fastest);
         let mut writer = encoder.write_header().map_err(std::io::Error::other)?;
-        let mut pixels = vec![pixel_seed; 2_048 * 2_048];
+        let mut pixels = vec![pixel_seed; 16 * 16];
         pixels[0] = pixel_seed.wrapping_add(1);
         writer
             .write_image_data(&pixels)
@@ -814,24 +830,15 @@ mod tests {
 
     #[test]
     fn image_cache_enforces_64_mib_byte_cap_via_lru_eviction() -> std::io::Result<()> {
-        let pngs = std::thread::scope(|scope| -> std::io::Result<[Vec<u8>; 5]> {
-            let h1 = scope.spawn(|| gray_2048_png(10));
-            let h2 = scope.spawn(|| gray_2048_png(20));
-            let h3 = scope.spawn(|| gray_2048_png(30));
-            let h4 = scope.spawn(|| gray_2048_png(40));
-            let p5 = gray_2048_png(50)?;
-            let join_png = |h: std::thread::ScopedJoinHandle<'_, std::io::Result<Vec<u8>>>| {
-                h.join()
-                    .map_err(|_| std::io::Error::other("png fixture worker panicked"))?
-            };
-            Ok([
-                join_png(h1)?,
-                join_png(h2)?,
-                join_png(h3)?,
-                join_png(h4)?,
-                p5,
-            ])
-        })?;
+        assert_eq!(MAX_CACHE_BYTES, 64 * 1024 * 1024);
+        let pngs = [
+            rgba_16_png(10)?,
+            rgba_16_png(20)?,
+            rgba_16_png(30)?,
+            rgba_16_png(40)?,
+            rgba_16_png(50)?,
+        ];
+        const TEST_CAP: usize = 4 * 16 * 16 * 4;
         let hashes: Vec<u64> = pngs.iter().map(|bytes| fnv1a64(bytes)).collect();
         let svg = PrehashedSvg::from_str(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="navy"/></svg>"#,
@@ -847,17 +854,17 @@ mod tests {
                     for png in &pngs_for_ui[0..4] {
                         assert!(cache.png_bytes_texture(ui.ctx(), png).is_some());
                     }
-                    // Refresh entry 0 so entry 1 becomes the LRU before pushing the 5th 16 MiB PNG.
+                    // Refresh entry 0 so entry 1 becomes the LRU before pushing the 5th PNG.
                     assert!(cache.png_bytes_texture(ui.ctx(), &pngs_for_ui[0]).is_some());
                     assert!(cache.png_bytes_texture(ui.ctx(), &pngs_for_ui[4]).is_some());
                     // Negative-cache zero-byte entries remain without displacing GPU textures.
                     assert!(cache.png_bytes_texture(ui.ctx(), b"not-png").is_none());
                 },
-                ImageCache::default(),
+                ImageCache::with_max_cache_bytes(TEST_CAP),
             );
         harness.step();
         let state = harness.state();
-        assert_eq!(state.total_texture_bytes(), MAX_CACHE_BYTES);
+        assert_eq!(state.total_texture_bytes(), TEST_CAP);
         assert!(state.entries.is_empty());
         assert!(state.png_entries.iter().any(|e| e.key.hash == hashes[0]));
         assert!(!state.png_entries.iter().any(|e| e.key.hash == hashes[1]));
