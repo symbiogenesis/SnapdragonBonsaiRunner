@@ -38,18 +38,25 @@ const POLL: Duration = Duration::from_millis(25);
 const STARTUP_LIMIT: Duration = Duration::from_secs(10);
 const REQUEST_LIMIT: Duration = Duration::from_secs(2);
 const CLEANUP_LIMIT: Duration = Duration::from_secs(5);
+const MAX_WORKER_RESTARTS: usize = 2;
 
 static SLOT: WorkerSlot = WorkerSlot::new();
 
-/// Session-local identity for a bounded parse or raster request; zero is an immediate failure.
+/// Session-local identity for a bounded parse or raster request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Ticket(u64);
 
-impl Ticket {
-    /// Whether admission allocated a live request identity.
-    pub(crate) const fn admitted(self) -> bool {
-        self.0 != 0
-    }
+/// Outcome of attempting to admit a bounded parse or raster request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Admission {
+    /// Request was queued with a live request identity.
+    Admitted(Ticket),
+    /// Queue is temporarily full; caller may retry on a later frame.
+    Busy,
+    /// Input exceeded static size or dimension bounds and must not be retried.
+    InvalidInput,
+    /// Worker session or sandbox slot is permanently unavailable.
+    Unavailable,
 }
 
 /// Untrusted transport bytes still require the caller's independent typed validation.
@@ -133,6 +140,21 @@ impl Shared {
         }
         drop(state);
         self.request_repaint();
+    }
+
+    fn fail_ticket(&self, ticket: Ticket) {
+        let mut state = self.state();
+        let mut updated = false;
+        if let Some(status) = state.results.get_mut(&ticket)
+            && matches!(status, Status::Pending)
+        {
+            *status = Status::Failed;
+            updated = true;
+        }
+        drop(state);
+        if updated {
+            self.request_repaint();
+        }
     }
 
     fn pending(&self, ticket: Ticket) -> bool {
@@ -327,21 +349,21 @@ impl Service {
     }
 
     /// Admits a bounded Markdown parse request without blocking the event loop.
-    pub(crate) fn request(&self, source: Arc<str>) -> Ticket {
+    pub(crate) fn request(&self, source: Arc<str>) -> Admission {
         if source.len() > MAX_SOURCE_BYTES {
-            return Ticket(0);
+            return Admission::InvalidInput;
         }
         self.admit(RequestKind::Markdown(source))
     }
 
     /// Admits a bounded offline SVG rasterization request without blocking the event loop.
-    pub(crate) fn request_raster(&self, svg: Arc<str>, max_width: u32, max_height: u32) -> Ticket {
+    pub(crate) fn request_raster(&self, svg: Arc<str>, max_width: u32, max_height: u32) -> Admission {
         if svg.is_empty()
             || svg.len() > MAX_SVG_BYTES
             || !(1..=MAX_RASTER_DIMENSION).contains(&max_width)
             || !(1..=MAX_RASTER_DIMENSION).contains(&max_height)
         {
-            return Ticket(0);
+            return Admission::InvalidInput;
         }
         self.admit(RequestKind::Rasterize {
             max_width,
@@ -350,26 +372,39 @@ impl Service {
         })
     }
 
-    fn admit(&self, kind: RequestKind) -> Ticket {
-        if self.shared.cancelled.load(Ordering::Acquire) {
-            return Ticket(0);
+    fn admit(&self, kind: RequestKind) -> Admission {
+        if self.shared.cancelled.load(Ordering::Acquire) || SLOT.is_closed() {
+            return Admission::Unavailable;
         }
         let mut state = self.shared.state();
-        if state.failed || state.results.len() >= MAX_REQUESTS {
-            return Ticket(0);
+        if state.failed {
+            return Admission::Unavailable;
+        }
+        if state.results.len() >= MAX_REQUESTS {
+            return Admission::Busy;
         }
         let Some(next) = state.next.checked_add(1) else {
-            return Ticket(0);
+            return Admission::Unavailable;
         };
         state.next = next;
         let ticket = Ticket(next);
         state.results.insert(ticket, Status::Pending);
-        if self.requests.try_send(Request { ticket, kind }).is_err() {
-            state.results.remove(&ticket);
-            return Ticket(0);
+        match self.requests.try_send(Request { ticket, kind }) {
+            Ok(()) => {
+                drop(state);
+                Admission::Admitted(ticket)
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                state.results.remove(&ticket);
+                Admission::Busy
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                state.results.remove(&ticket);
+                drop(state);
+                self.shared.fail();
+                Admission::Unavailable
+            }
         }
-        drop(state);
-        ticket
     }
 
     /// Polls a result without waiting; absent or released identities fail closed.
@@ -413,15 +448,24 @@ impl Drop for Service {
     }
 }
 
+struct SuperviseGuard<'a>(&'a Shared);
+
+impl Drop for SuperviseGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fail();
+    }
+}
+
 fn finish_prepared_cleanup(
     mut prepared: ownership::Prepared,
     reader: Option<JoinHandle<()>>,
     need_quarantine: bool,
     shared: &Shared,
-) {
+) -> bool {
     if need_quarantine {
         ownership::quarantine(prepared, reader);
         shared.cleanup_failed.store(true, Ordering::Release);
+        false
     } else {
         if let Some(reader) = reader {
             let _joined = reader.join();
@@ -429,8 +473,25 @@ fn finish_prepared_cleanup(
         if prepared.cleanup().is_err() {
             shared.cleanup_failed.store(true, Ordering::Release);
             SLOT.close_admission();
+            false
+        } else {
+            true
         }
     }
+}
+
+const fn can_restart_worker(
+    protocol_error: bool,
+    cleanup_ok: bool,
+    cancelled: bool,
+    slot_closed: bool,
+    restarts: usize,
+) -> bool {
+    !protocol_error
+        && cleanup_ok
+        && !cancelled
+        && !slot_closed
+        && restarts < MAX_WORKER_RESTARTS
 }
 
 fn next_request(
@@ -452,84 +513,127 @@ fn next_request(
 }
 
 fn supervise(shared: &Shared, requests: &Receiver<Request>, image: &Path) {
-    let first = next_request(shared, requests, true);
+    let _panic_guard = SuperviseGuard(shared);
+    let mut first = next_request(shared, requests, true);
     if shared.cancelled.load(Ordering::Acquire)
         || (first.is_none() && !shared.warmup.load(Ordering::Acquire))
     {
         return;
     }
     let Ok(_active) = SLOT.acquire() else {
-        shared.fail();
         return;
     };
-    let startup = Instant::now() + STARTUP_LIMIT;
-    let Ok(prepared) = ownership::Prepared::new(image) else {
-        shared.fail();
-        return;
-    };
-    let (process, input, output) = match OwnedProcess::start_sandboxed_piped_minimal(
-        &prepared.specification,
-        &prepared.policy,
-    ) {
-        Ok(started) => started,
-        Err(error) => {
-            finish_prepared_cleanup(
-                prepared,
-                None,
-                bonsai_windows_process::process_start_cleanup_unconfirmed(&error),
-                shared,
-            );
-            shared.fail();
-            return;
+    let mut restarts = 0_usize;
+    let mut pending_retry: Option<Request> = None;
+    loop {
+        let initial = if restarts == 0 {
+            first.take()
+        } else if let Some(queued) = pending_retry.take() {
+            Some(queued)
+        } else {
+            let Some(next) = next_request(shared, requests, false) else {
+                break;
+            };
+            Some(next)
+        };
+        if shared.cancelled.load(Ordering::Acquire) {
+            break;
         }
-    };
-    let (commands, commands_rx) = mpsc::sync_channel(1);
-    let (events_tx, events) = mpsc::sync_channel(1);
-    let reader = thread::Builder::new()
-        .name("bonsai-markdown-pipe".to_owned())
-        .spawn(move || protocol::exchange(input, output, &commands_rx, &events_tx));
-    let Ok(reader) = reader else {
-        shared.fail();
-        finish_prepared_cleanup(prepared, None, process.stop(CLEANUP_LIMIT).is_err(), shared);
-        return;
-    };
-    let ready = await_event(shared, &process, &events, startup)
-        .is_some_and(|event| matches!(event, protocol::Event::Ready));
-    if ready {
-        shared.ready();
-        let mut request = first.or_else(|| next_request(shared, requests, false));
-        while let Some(current) = request {
-            if !shared.cancelled.load(Ordering::Acquire) && shared.pending(current.ticket) {
-                let ticket = current.ticket;
-                if commands.try_send(current).is_err() {
-                    break;
-                }
-                let deadline = Instant::now() + REQUEST_LIMIT;
-                let Some(protocol::Event::Response(actual, bytes)) =
-                    await_event(shared, &process, &events, deadline)
-                else {
-                    break;
-                };
-                if actual != ticket {
-                    break;
-                }
-                shared.complete(ticket, bytes);
+        let startup = Instant::now() + STARTUP_LIMIT;
+        let Ok(prepared) = ownership::Prepared::new(image) else {
+            break;
+        };
+        let (process, input, output) = match OwnedProcess::start_sandboxed_piped_minimal(
+            &prepared.specification,
+            &prepared.policy,
+        ) {
+            Ok(started) => started,
+            Err(error) => {
+                let _ = finish_prepared_cleanup(
+                    prepared,
+                    None,
+                    bonsai_windows_process::process_start_cleanup_unconfirmed(&error),
+                    shared,
+                );
+                break;
             }
-            request = next_request(shared, requests, false);
+        };
+        let (commands, commands_rx) = mpsc::sync_channel(1);
+        let (events_tx, events) = mpsc::sync_channel(1);
+        let reader = thread::Builder::new()
+            .name("bonsai-markdown-pipe".to_owned())
+            .spawn(move || protocol::exchange(input, output, &commands_rx, &events_tx));
+        let Ok(reader) = reader else {
+            let _ = finish_prepared_cleanup(prepared, None, process.stop(CLEANUP_LIMIT).is_err(), shared);
+            break;
+        };
+        let startup_event = await_event(shared, &process, &events, startup);
+        let ready = matches!(startup_event, Some(protocol::Event::Ready));
+        let mut protocol_error = startup_event.is_some() && !ready;
+        if ready {
+            shared.ready();
+            let mut request = initial.or_else(|| next_request(shared, requests, false));
+            while let Some(current) = request {
+                if !shared.cancelled.load(Ordering::Acquire) && shared.pending(current.ticket) {
+                    let ticket = current.ticket;
+                    if let Err(error) = commands.try_send(current) {
+                        let unsent = match error {
+                            mpsc::TrySendError::Full(unsent)
+                            | mpsc::TrySendError::Disconnected(unsent) => unsent,
+                        };
+                        if restarts < MAX_WORKER_RESTARTS {
+                            pending_retry = Some(unsent);
+                        } else {
+                            shared.fail_ticket(ticket);
+                        }
+                        break;
+                    }
+                    let deadline = Instant::now() + REQUEST_LIMIT;
+                    match await_event(shared, &process, &events, deadline) {
+                        Some(protocol::Event::Response(actual, bytes)) if actual == ticket => {
+                            shared.complete(ticket, bytes);
+                        }
+                        Some(protocol::Event::Response(_, _) | protocol::Event::Ready) => {
+                            protocol_error = true;
+                            shared.fail_ticket(ticket);
+                            break;
+                        }
+                        None => {
+                            shared.fail_ticket(ticket);
+                            break;
+                        }
+                    }
+                }
+                request = next_request(shared, requests, false);
+            }
+        } else if let Some(unserved) = initial {
+            shared.fail_ticket(unserved.ticket);
         }
+        // Release channel waiters before terminating the exact process: a hostile
+        // worker may have stalled either a pipe read or a pipe write.
+        drop(commands);
+        drop(events);
+        let cleanup = Instant::now() + CLEANUP_LIMIT;
+        let stopped = process.stop(CLEANUP_LIMIT).is_ok();
+        while stopped && !reader.is_finished() && Instant::now() < cleanup {
+            thread::sleep(POLL.min(cleanup.saturating_duration_since(Instant::now())));
+        }
+        let quarantine = !stopped || !reader.is_finished();
+        let cleanup_ok = finish_prepared_cleanup(prepared, Some(reader), quarantine, shared);
+        if !can_restart_worker(
+            protocol_error,
+            cleanup_ok,
+            shared.cancelled.load(Ordering::Acquire),
+            SLOT.is_closed(),
+            restarts,
+        ) {
+            break;
+        }
+        restarts += 1;
     }
-    shared.fail();
-    // Release channel waiters before terminating the exact process: a hostile
-    // worker may have stalled either a pipe read or a pipe write.
-    drop(commands);
-    drop(events);
-    let cleanup = Instant::now() + CLEANUP_LIMIT;
-    let stopped = process.stop(CLEANUP_LIMIT).is_ok();
-    while stopped && !reader.is_finished() && Instant::now() < cleanup {
-        thread::sleep(POLL.min(cleanup.saturating_duration_since(Instant::now())));
+    if let Some(unserved) = pending_retry {
+        shared.fail_ticket(unserved.ticket);
     }
-    let quarantine = !stopped || !reader.is_finished();
-    finish_prepared_cleanup(prepared, Some(reader), quarantine, shared);
 }
 
 fn await_event(
@@ -563,8 +667,9 @@ mod tests {
         assert!(service.warm_up());
         assert!(pending.try_recv().is_err());
         let source: Arc<str> = Arc::from("**A restored answer**");
-        let ticket = service.request(Arc::clone(&source));
-        assert!(ticket.admitted());
+        let Admission::Admitted(ticket) = service.request(Arc::clone(&source)) else {
+            return Err(io::Error::other("Expected admitted markdown request"));
+        };
         assert!(next_request(&service.shared, &pending, true).is_none());
         let request = next_request(&service.shared, &pending, false)
             .ok_or_else(|| io::Error::other("Warmup consumed the queued source"))?;
@@ -610,20 +715,29 @@ mod tests {
             requests,
             worker: Mutex::new(None),
         };
+        assert_eq!(
+            service.request(Arc::from("x".repeat(MAX_SOURCE_BYTES + 1))),
+            Admission::InvalidInput
+        );
+        assert!(!service.unavailable());
         for _ in 0..MAX_REQUESTS {
-            assert!(service.request(Arc::from("界")).admitted());
+            assert!(matches!(
+                service.request(Arc::from("界")),
+                Admission::Admitted(_)
+            ));
         }
-        assert!(!service.request(Arc::from("busy")).admitted());
+        assert_eq!(service.request(Arc::from("busy")), Admission::Busy);
         assert!(!service.unavailable());
         let released = pending.try_recv().map_err(io::Error::other)?;
         service.release(released.ticket);
-        let ticket = service.request(Arc::from("available"));
-        assert!(ticket.admitted());
+        let Admission::Admitted(ticket) = service.request(Arc::from("available")) else {
+            return Err(io::Error::other("Expected admitted request after release"));
+        };
         service.reject();
         service.shared.complete(ticket, b"late response".to_vec());
         assert!(matches!(service.poll(ticket), Status::Failed));
         assert!(service.unavailable());
-        assert!(!service.request(Arc::from("closed")).admitted());
+        assert_eq!(service.request(Arc::from("closed")), Admission::Unavailable);
         Ok(())
     }
 
@@ -634,26 +748,33 @@ mod tests {
         let svg: Arc<str> = Arc::from(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>"#,
         );
-        assert!(!service.request_raster(Arc::from(""), 64, 64).admitted());
-        assert!(
-            !service
-                .request_raster(Arc::from("x".repeat(MAX_SVG_BYTES + 1)), 64, 64)
-                .admitted()
+        assert_eq!(
+            service.request_raster(Arc::from(""), 64, 64),
+            Admission::InvalidInput
         );
-        assert!(!service.request_raster(Arc::clone(&svg), 0, 64).admitted());
-        assert!(!service.request_raster(Arc::clone(&svg), 64, 0).admitted());
-        assert!(
-            !service
-                .request_raster(Arc::clone(&svg), MAX_RASTER_DIMENSION + 1, 64)
-                .admitted()
+        assert_eq!(
+            service.request_raster(Arc::from("x".repeat(MAX_SVG_BYTES + 1)), 64, 64),
+            Admission::InvalidInput
         );
-        assert!(
-            !service
-                .request_raster(Arc::clone(&svg), 64, MAX_RASTER_DIMENSION + 1)
-                .admitted()
+        assert_eq!(
+            service.request_raster(Arc::clone(&svg), 0, 64),
+            Admission::InvalidInput
         );
-        let ticket = service.request_raster(Arc::clone(&svg), 128, 64);
-        assert!(ticket.admitted());
+        assert_eq!(
+            service.request_raster(Arc::clone(&svg), 64, 0),
+            Admission::InvalidInput
+        );
+        assert_eq!(
+            service.request_raster(Arc::clone(&svg), MAX_RASTER_DIMENSION + 1, 64),
+            Admission::InvalidInput
+        );
+        assert_eq!(
+            service.request_raster(Arc::clone(&svg), 64, MAX_RASTER_DIMENSION + 1),
+            Admission::InvalidInput
+        );
+        let Admission::Admitted(ticket) = service.request_raster(Arc::clone(&svg), 128, 64) else {
+            return Err(io::Error::other("Expected admitted SVG raster request"));
+        };
         let request = pending.try_recv().map_err(io::Error::other)?;
         assert_eq!(request.ticket, ticket);
         assert!(matches!(
@@ -664,6 +785,71 @@ mod tests {
                 ref svg,
             } if svg.starts_with("<svg")
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn disconnected_worker_and_supervise_panic_guard_fail_pending_tickets() -> io::Result<()> {
+        let context = egui::Context::default();
+        let (service, pending) = Service::inert(&context);
+        let Admission::Admitted(ticket) = service.request(Arc::from("pending")) else {
+            return Err(io::Error::other("Expected admitted request"));
+        };
+        drop(pending);
+        assert_eq!(
+            service.request(Arc::from("after disconnect")),
+            Admission::Unavailable
+        );
+        assert!(service.unavailable());
+        assert!(matches!(service.poll(ticket), Status::Failed));
+
+        let shared = Arc::new(Shared::default());
+        let panic_shared = Arc::clone(&shared);
+        let panicking = thread::Builder::new()
+            .name("bonsai-markdown-panic-guard-test".to_owned())
+            .spawn(move || {
+                let _guard = SuperviseGuard(&panic_shared);
+                std::panic::resume_unwind(Box::new("simulated supervisor panic"));
+            })?;
+        assert!(panicking.join().is_err());
+        assert!(shared.state().failed);
+        Ok(())
+    }
+
+    #[test]
+    fn single_ticket_failure_and_bounded_restart_policy_keep_healthy_session_alive() -> io::Result<()> {
+        let context = egui::Context::default();
+        let (service, _pending) = Service::inert(&context);
+        let Admission::Admitted(first) = service.request(Arc::from("bad")) else {
+            return Err(io::Error::other("Expected admitted first request"));
+        };
+        let Admission::Admitted(second) = service.request(Arc::from("good")) else {
+            return Err(io::Error::other("Expected admitted second request"));
+        };
+        service.shared.fail_ticket(first);
+        assert!(matches!(service.poll(first), Status::Failed));
+        assert!(matches!(service.poll(second), Status::Pending));
+        assert!(!service.unavailable());
+
+        assert!(can_restart_worker(false, true, false, false, 0));
+        assert!(can_restart_worker(
+            false,
+            true,
+            false,
+            false,
+            MAX_WORKER_RESTARTS - 1
+        ));
+        assert!(!can_restart_worker(
+            false,
+            true,
+            false,
+            false,
+            MAX_WORKER_RESTARTS
+        ));
+        assert!(!can_restart_worker(true, true, false, false, 0));
+        assert!(!can_restart_worker(false, false, false, false, 0));
+        assert!(!can_restart_worker(false, true, true, false, 0));
+        assert!(!can_restart_worker(false, true, false, true, 0));
         Ok(())
     }
 }

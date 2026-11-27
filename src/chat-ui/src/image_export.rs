@@ -16,7 +16,7 @@ use std::{
 use eframe::egui;
 
 use crate::{
-    markdown_service::{self, Service, Status, Ticket},
+    markdown_service::{self, Admission, Service, Status, Ticket},
     window::atomic_file,
 };
 
@@ -154,15 +154,22 @@ impl Export {
         };
         match raster {
             PendingRaster::Retry { service, svg } => {
-                let ticket =
-                    service.request_raster(Arc::clone(&svg), EXPORT_RASTER_DIM, EXPORT_RASTER_DIM);
-                if ticket.admitted() {
-                    self.raster = Some(PendingRaster::Ticket(service, ticket));
-                } else if service.unavailable() {
-                    let _sent = tx.try_send(Err(RASTER_FAILED));
-                    drop(self.raster_tx.take());
-                } else {
-                    self.raster = Some(PendingRaster::Retry { service, svg });
+                match service.request_raster(Arc::clone(&svg), EXPORT_RASTER_DIM, EXPORT_RASTER_DIM)
+                {
+                    Admission::Admitted(ticket) => {
+                        self.raster = Some(PendingRaster::Ticket(service, ticket));
+                    }
+                    Admission::InvalidInput => {
+                        let _sent = tx.try_send(Err(UNRENDERABLE_IMAGE));
+                        drop(self.raster_tx.take());
+                    }
+                    Admission::Unavailable => {
+                        let _sent = tx.try_send(Err(RASTER_FAILED));
+                        drop(self.raster_tx.take());
+                    }
+                    Admission::Busy => {
+                        self.raster = Some(PendingRaster::Retry { service, svg });
+                    }
                 }
             }
             PendingRaster::Ticket(service, ticket) => match service.poll(ticket) {
@@ -219,17 +226,20 @@ fn prepare_raster(
     raster_tx: &SyncSender<Result<Arc<[u8]>, &'static str>>,
 ) -> Option<PendingRaster> {
     if let Some(service) = Service::get(ctx) {
-        let ticket = service.request_raster(Arc::clone(svg), EXPORT_RASTER_DIM, EXPORT_RASTER_DIM);
-        if ticket.admitted() {
-            Some(PendingRaster::Ticket(service, ticket))
-        } else if service.unavailable() {
-            let _sent = raster_tx.try_send(Err(RASTER_FAILED));
-            None
-        } else {
-            Some(PendingRaster::Retry {
+        match service.request_raster(Arc::clone(svg), EXPORT_RASTER_DIM, EXPORT_RASTER_DIM) {
+            Admission::Admitted(ticket) => Some(PendingRaster::Ticket(service, ticket)),
+            Admission::InvalidInput => {
+                let _sent = raster_tx.try_send(Err(UNRENDERABLE_IMAGE));
+                None
+            }
+            Admission::Unavailable => {
+                let _sent = raster_tx.try_send(Err(RASTER_FAILED));
+                None
+            }
+            Admission::Busy => Some(PendingRaster::Retry {
                 service,
                 svg: Arc::clone(svg),
-            })
+            }),
         }
     } else {
         #[cfg(test)]

@@ -175,7 +175,7 @@ impl Pending {
         if !self.asynchronous_fixture {
             return self.refresh_fixture(ui, revision, source);
         }
-        use crate::markdown_service::{Service, Status};
+        use crate::markdown_service::{Admission, Service, Status};
         let mut changed = false;
         if let Some(service) = &self.service {
             let failed = service.cleanup_failed();
@@ -251,21 +251,24 @@ impl Pending {
                 return changed;
             }
             let request_source: Arc<str> = Arc::from(source);
-            let ticket = service.request(Arc::clone(&request_source));
-            if ticket.admitted() {
-                self.ticket = Some(ticket);
-                self.ticket_source = Some(request_source);
-                self.request_dirty = false;
-                self.last_dispatch = Some(now);
-                self.dispatched_len = source.len();
-            } else if service.unavailable() {
-                self.failed = true;
-                self.request_dirty = false;
-                changed = true;
-            } else {
-                // Backpressure is temporary. Retry admission on an upcoming frame
-                // without retaining an extra source clone or restarting a failed worker.
-                ui.ctx().request_repaint_after(Duration::from_millis(25));
+            match service.request(Arc::clone(&request_source)) {
+                Admission::Admitted(ticket) => {
+                    self.ticket = Some(ticket);
+                    self.ticket_source = Some(request_source);
+                    self.request_dirty = false;
+                    self.last_dispatch = Some(now);
+                    self.dispatched_len = source.len();
+                }
+                Admission::InvalidInput | Admission::Unavailable => {
+                    self.failed = true;
+                    self.request_dirty = false;
+                    changed = true;
+                }
+                Admission::Busy => {
+                    // Backpressure is temporary. Retry admission on an upcoming frame
+                    // without retaining an extra source clone or restarting a failed worker.
+                    ui.ctx().request_repaint_after(Duration::from_millis(25));
+                }
             }
         }
         changed

@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use super::egui;
-use crate::markdown_service::{self, MAX_RASTER_DIMENSION, Service, Status, Ticket};
+use crate::markdown_service::{self, Admission, MAX_RASTER_DIMENSION, Service, Status, Ticket};
 use base64ct::{Base64, Encoding as _};
 use std::{io::Cursor, sync::Arc, time::Duration};
 
@@ -289,31 +289,45 @@ impl ImageCache {
             return RasterSlot::Loading { fallback };
         }
 
-        let ticket = service.request_raster(Arc::clone(&svg.svg), max_width, max_height);
-        if ticket.admitted() {
-            self.entries.push(Entry {
-                key,
-                svg: svg.clone(),
-                last_used: stamp,
-                bytes: 0,
-                state: SlotState::Pending(ticket),
-            });
-            ctx.request_repaint_after(REPAINT_INTERVAL);
-            RasterSlot::Loading { fallback }
-        } else if service.unavailable() {
-            self.entries.push(Entry {
-                key,
-                svg: svg.clone(),
-                last_used: stamp,
-                bytes: 0,
-                state: SlotState::Failed,
-            });
-            self.evict_finished();
-            RasterSlot::FallbackSource
-        } else {
-            // Worker queue temporarily full; retry on an upcoming frame.
-            ctx.request_repaint_after(Duration::from_millis(25));
-            RasterSlot::Loading { fallback }
+        match service.request_raster(Arc::clone(&svg.svg), max_width, max_height) {
+            Admission::Admitted(ticket) => {
+                self.entries.push(Entry {
+                    key,
+                    svg: svg.clone(),
+                    last_used: stamp,
+                    bytes: 0,
+                    state: SlotState::Pending(ticket),
+                });
+                ctx.request_repaint_after(REPAINT_INTERVAL);
+                RasterSlot::Loading { fallback }
+            }
+            Admission::InvalidInput => {
+                self.entries.push(Entry {
+                    key,
+                    svg: svg.clone(),
+                    last_used: stamp,
+                    bytes: 0,
+                    state: SlotState::Unrenderable,
+                });
+                self.evict_finished();
+                RasterSlot::FallbackSource
+            }
+            Admission::Unavailable => {
+                self.entries.push(Entry {
+                    key,
+                    svg: svg.clone(),
+                    last_used: stamp,
+                    bytes: 0,
+                    state: SlotState::Failed,
+                });
+                self.evict_finished();
+                RasterSlot::FallbackSource
+            }
+            Admission::Busy => {
+                // Worker queue temporarily full; retry on an upcoming frame.
+                ctx.request_repaint_after(Duration::from_millis(25));
+                RasterSlot::Loading { fallback }
+            }
         }
     }
 
@@ -873,5 +887,25 @@ mod tests {
         assert!(state.png_entries.iter().any(|e| e.key.hash == hashes[4]));
         assert!(state.png_entries.iter().any(|e| e.bytes == 0));
         Ok(())
+    }
+
+    #[test]
+    fn invalid_svg_admission_immediately_falls_back_without_spinning() {
+        let empty = PrehashedSvg::from_str("");
+        let mut harness = Harness::builder()
+            .with_size([160.0, 120.0])
+            .with_context_setup(super::super::configure)
+            .build_ui_state(
+                move |ui, cache: &mut ImageCache| {
+                    let _ = Service::fixture(ui.ctx());
+                    let slot = cache.get_or_request(ui.ctx(), &empty, egui::vec2(64.0, 64.0));
+                    assert!(matches!(slot, RasterSlot::FallbackSource));
+                },
+                ImageCache::default(),
+            );
+        harness.step();
+        let state = harness.state();
+        assert!(!state.has_pending());
+        assert!(state.is_rejected(&PrehashedSvg::from_str("")));
     }
 }
