@@ -21,7 +21,7 @@ use core::arch::aarch64::{
     vmaxv_u16, vmaxvq_u16, vmlal_high_s16, vmlal_s16, vmlaq_s32, vmovl_u8, vmovl_u16, vmulq_f32,
     vorrq_u8, vpaddq_f32, vpaddq_s32, vreinterpret_f16_u16, vreinterpretq_f16_u16,
     vreinterpretq_s8_u8, vreinterpretq_s16_u16, vreinterpretq_s32_u32, vshlq_n_u8, vshrq_n_u8,
-    vst1q_f32, vst1q_s32, vsubq_s8, vzip1q_f32, vzip2q_f32,
+    vst1q_f32, vst1q_s8, vst1q_s32, vsubq_s8, vzip1q_f32, vzip2q_f32,
 };
 
 #[inline]
@@ -53,6 +53,13 @@ fn load_u8x16(bytes: &[u8; 16]) -> uint8x16_t {
 fn load_s8x16(bytes: &[i8; 16]) -> int8x16_t {
     // SAFETY: `bytes` is a valid 16-byte array reference and `vld1q_s8` requires no alignment.
     unsafe { vld1q_s8(bytes.as_ptr()) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn store_s8x16(vec: int8x16_t, out: &mut [i8; 16]) {
+    // SAFETY: `out` is a valid mutable 16-byte array reference and `vst1q_s8` requires no alignment.
+    unsafe { vst1q_s8(out.as_mut_ptr(), vec) };
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -354,6 +361,330 @@ pub(crate) fn gemm_q8_0_8x2(
     acts: [&[Q8_0ActBlock]; 2],
 ) -> [[f32; 2]; 8] {
     gemm_q8_0_8x_dispatch::<2, 1>(caps, rows, acts)
+}
+
+/// Pre-interleaved 8-token `Q8_0` activation panel for `I8MM` (`SMMLA`) GEMM.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Q8_0ActPanel8 {
+    /// Paired token activation scales `[d0, d1, d0, d1]` for each column pair `0..4`.
+    pub d_pairs: [[f32; 4]; 4],
+    /// Pre-interleaved signed activation bytes `[half][col_pair][lo_hi][16]` for `SMMLA`.
+    pub qs: [[[[i8; 16]; 2]; 4]; 2],
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[target_feature(enable = "neon")]
+fn pack_q8_0_act_panels8_neon(
+    acts: &[Q8_0ActBlock],
+    blocks: usize,
+    panel_count: usize,
+    panels: &mut [Q8_0ActPanel8],
+) {
+    for p in 0..panel_count {
+        let panel_dst = &mut panels[p * blocks..(p + 1) * blocks];
+        let tok_base = p * 8;
+        for (k, dst) in panel_dst.iter_mut().enumerate() {
+            for cp in 0..4 {
+                let a_even = &acts[(tok_base + cp * 2) * blocks + k];
+                let a_odd = &acts[(tok_base + cp * 2 + 1) * blocks + k];
+                dst.d_pairs[cp] = [a_even.d, a_odd.d, a_even.d, a_odd.d];
+                let e_halves = a_even.qs.as_chunks::<16>().0;
+                let o_halves = a_odd.qs.as_chunks::<16>().0;
+                for half in 0..2 {
+                    let e = load_s8x16(&e_halves[half]);
+                    let o = load_s8x16(&o_halves[half]);
+                    store_s8x16(
+                        vcombine_s8(vget_low_s8(e), vget_low_s8(o)),
+                        &mut dst.qs[half][cp][0],
+                    );
+                    store_s8x16(
+                        vcombine_s8(vget_high_s8(e), vget_high_s8(o)),
+                        &mut dst.qs[half][cp][1],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+fn pack_q8_0_act_panels8_portable(
+    acts: &[Q8_0ActBlock],
+    blocks: usize,
+    panel_count: usize,
+    panels: &mut [Q8_0ActPanel8],
+) {
+    for p in 0..panel_count {
+        let panel_dst = &mut panels[p * blocks..(p + 1) * blocks];
+        let tok_base = p * 8;
+        for (k, dst) in panel_dst.iter_mut().enumerate() {
+            for cp in 0..4 {
+                let a_even = &acts[(tok_base + cp * 2) * blocks + k];
+                let a_odd = &acts[(tok_base + cp * 2 + 1) * blocks + k];
+                dst.d_pairs[cp] = [a_even.d, a_odd.d, a_even.d, a_odd.d];
+                for half in 0..2 {
+                    let h = half * 16;
+                    dst.qs[half][cp][0][0..8].copy_from_slice(&a_even.qs[h..h + 8]);
+                    dst.qs[half][cp][0][8..16].copy_from_slice(&a_odd.qs[h..h + 8]);
+                    dst.qs[half][cp][1][0..8].copy_from_slice(&a_even.qs[h + 8..h + 16]);
+                    dst.qs[half][cp][1][8..16].copy_from_slice(&a_odd.qs[h + 8..h + 16]);
+                }
+            }
+        }
+    }
+}
+
+/// Pre-packs `panel_count * 8` tokens of `Q8_0ActBlock`s (`acts`) into `Q8_0ActPanel8`s
+/// laid out as `[panel_idx * blocks + k]`.
+pub(crate) fn pack_q8_0_act_panels8(
+    acts: &[Q8_0ActBlock],
+    blocks: usize,
+    panel_count: usize,
+    panels: &mut [Q8_0ActPanel8],
+) {
+    if blocks == 0 || panel_count == 0 {
+        return;
+    }
+    let Some(min_acts) = panel_count
+        .checked_mul(8)
+        .and_then(|t| t.checked_mul(blocks))
+    else {
+        return;
+    };
+    let Some(needed_panels) = panel_count.checked_mul(blocks) else {
+        return;
+    };
+    if acts.len() < min_acts || panels.len() < needed_panels {
+        return;
+    }
+    let panels = &mut panels[..needed_panels];
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        // SAFETY: Baseline NEON is enabled by target configuration and slice bounds were checked above.
+        unsafe { pack_q8_0_act_panels8_neon(acts, blocks, panel_count, panels) };
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
+        pack_q8_0_act_panels8_portable(acts, blocks, panel_count, panels);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct UnpackedQ8WeightBlock {
+    d_w_pairs: [[f32; 4]; 4],
+    qs: [[[[i8; 16]; 2]; 2]; 4],
+}
+
+#[cfg(target_arch = "aarch64")]
+impl UnpackedQ8WeightBlock {
+    const ZERO: Self = Self {
+        d_w_pairs: [[0.0; 4]; 4],
+        qs: [[[[0; 16]; 2]; 2]; 4],
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,i8mm")]
+fn gemm_q8_0_8x_panels_i8mm(
+    rows: [&[u8]; 8],
+    panels: &[Q8_0ActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_rows: &mut [f32],
+    row_stride: usize,
+) {
+    const K_TILE: usize = 32;
+    const T_PANEL: usize = 8;
+
+    let r_chunks: [&[[u8; 34]]; 8] = rows.map(|r| r.as_chunks::<34>().0);
+    // 32 * 320 B = 10 KiB L1D-resident weight tile + 2 KiB accumulator buffer.
+    let mut w_tile = [UnpackedQ8WeightBlock::ZERO; K_TILE];
+    let mut acc_buf = [[[[0.0_f32; 4]; 4]; 4]; T_PANEL];
+
+    for p_base in (0..panel_count).step_by(T_PANEL) {
+        let p_len = (panel_count - p_base).min(T_PANEL);
+        for slot in &mut acc_buf[..p_len] {
+            *slot = [[[0.0_f32; 4]; 4]; 4];
+        }
+        for k_base in (0..blocks).step_by(K_TILE) {
+            let k_len = (blocks - k_base).min(K_TILE);
+            for (k_local, wb) in w_tile[..k_len].iter_mut().enumerate() {
+                let idx = k_base + k_local;
+                if idx + 2 < blocks {
+                    for r in &r_chunks {
+                        prefetch_l1(r[idx + 2].as_ptr());
+                    }
+                }
+                let blks: [&[u8; 34]; 8] = std::array::from_fn(|r| &r_chunks[r][idx]);
+                let d_bits: [u16; 8] = blks.map(|b| u16::from_le_bytes([b[0], b[1]]));
+                let [ws_lo_arr, ws_hi_arr] = bonsai_neon_dot::widen_f16_eight(&d_bits);
+                let ws_lo = load_f32x4(&ws_lo_arr);
+                let ws_hi = load_f32x4(&ws_hi_arr);
+                store_f32x4(vzip1q_f32(ws_lo, ws_lo), &mut wb.d_w_pairs[0]);
+                store_f32x4(vzip2q_f32(ws_lo, ws_lo), &mut wb.d_w_pairs[1]);
+                store_f32x4(vzip1q_f32(ws_hi, ws_hi), &mut wb.d_w_pairs[2]);
+                store_f32x4(vzip2q_f32(ws_hi, ws_hi), &mut wb.d_w_pairs[3]);
+
+                for rp in 0..4 {
+                    let halves0 = blks[rp * 2][2..34].as_chunks::<16>().0;
+                    let halves1 = blks[rp * 2 + 1][2..34].as_chunks::<16>().0;
+                    for half in 0..2 {
+                        let w_even = vreinterpretq_s8_u8(load_u8x16(&halves0[half]));
+                        let w_odd = vreinterpretq_s8_u8(load_u8x16(&halves1[half]));
+                        store_s8x16(
+                            vcombine_s8(vget_low_s8(w_even), vget_low_s8(w_odd)),
+                            &mut wb.qs[rp][half][0],
+                        );
+                        store_s8x16(
+                            vcombine_s8(vget_high_s8(w_even), vget_high_s8(w_odd)),
+                            &mut wb.qs[rp][half][1],
+                        );
+                    }
+                }
+            }
+
+            for (p_local, p_acc) in acc_buf[..p_len].iter_mut().enumerate() {
+                let p_idx = p_base + p_local;
+                let p_panels = &panels[p_idx * blocks + k_base..p_idx * blocks + k_base + k_len];
+                let mut acc: [[float32x4_t; 4]; 4] =
+                    std::array::from_fn(|rp| std::array::from_fn(|cp| load_f32x4(&p_acc[rp][cp])));
+                for (wb, ap) in w_tile[..k_len].iter().zip(p_panels.iter()) {
+                    let d_act = [
+                        load_f32x4(&ap.d_pairs[0]),
+                        load_f32x4(&ap.d_pairs[1]),
+                        load_f32x4(&ap.d_pairs[2]),
+                        load_f32x4(&ap.d_pairs[3]),
+                    ];
+                    for rp in 0..4 {
+                        let mut c_rp = [vdupq_n_s32(0); 4];
+                        for half in 0..2 {
+                            let w_lo = load_s8x16(&wb.qs[rp][half][0]);
+                            let w_hi = load_s8x16(&wb.qs[rp][half][1]);
+                            for cp in 0..4 {
+                                let a_lo = load_s8x16(&ap.qs[half][cp][0]);
+                                let a_hi = load_s8x16(&ap.qs[half][cp][1]);
+                                c_rp[cp] = smmla_s32(smmla_s32(c_rp[cp], w_lo, a_lo), w_hi, a_hi);
+                            }
+                        }
+                        let d_w_v = load_f32x4(&wb.d_w_pairs[rp]);
+                        for cp in 0..4 {
+                            let dot_f32 = vcvtq_f32_s32(c_rp[cp]);
+                            let prod = vmulq_f32(d_w_v, vmulq_f32(d_act[cp], dot_f32));
+                            acc[rp][cp] = vaddq_f32(acc[rp][cp], prod);
+                        }
+                    }
+                }
+                for (rp, pair_acc) in acc.iter().enumerate() {
+                    for (cp, &vec) in pair_acc.iter().enumerate() {
+                        store_f32x4(vec, &mut p_acc[rp][cp]);
+                    }
+                }
+            }
+        }
+
+        for (p_local, p_acc) in acc_buf[..p_len].iter().enumerate() {
+            let t_off = (p_base + p_local) * 8;
+            for (rp, pair_acc) in p_acc.iter().enumerate() {
+                let r0 = rp * 2;
+                let r1 = rp * 2 + 1;
+                for (cp, tile) in pair_acc.iter().enumerate() {
+                    let c0 = cp * 2;
+                    let c1 = cp * 2 + 1;
+                    out_rows[r0 * row_stride + t_off + c0] = tile[0];
+                    out_rows[r0 * row_stride + t_off + c1] = tile[1];
+                    out_rows[r1 * row_stride + t_off + c0] = tile[2];
+                    out_rows[r1 * row_stride + t_off + c1] = tile[3];
+                }
+            }
+        }
+    }
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token `Q8_0` GEMM over pre-packed `Q8_0ActPanel8`s
+/// with K-blocked L1D weight tiles (`I8MM` `SMMLA`, or exact `SDOT`/portable fallback).
+pub(crate) fn gemm_q8_0_8x_panels(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    panels: &[Q8_0ActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_rows: &mut [f32],
+    row_stride: usize,
+) {
+    if panel_count == 0 {
+        return;
+    }
+    let Some(tokens) = panel_count.checked_mul(8) else {
+        return;
+    };
+    let Some(expected_panels) = panel_count.checked_mul(blocks) else {
+        return;
+    };
+    let Some(min_out) = row_stride
+        .checked_mul(7)
+        .and_then(|v| v.checked_add(tokens))
+    else {
+        return;
+    };
+    if row_stride < tokens
+        || out_rows.len() < min_out
+        || panels.len() != expected_panels
+        || !valid_q8_rows(&rows, blocks)
+    {
+        return;
+    }
+    if blocks == 0 {
+        for r in 0..8 {
+            out_rows[r * row_stride..r * row_stride + tokens].fill(0.0);
+        }
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if caps.i8mm && bonsai_neon_dot::has_i8mm() {
+        // SAFETY: `caps.i8mm` and `bonsai_neon_dot::has_i8mm()` verified CPU support for `neon,i8mm`,
+        // and all slice lengths and row strides were validated above.
+        unsafe {
+            gemm_q8_0_8x_panels_i8mm(rows, panels, panel_count, blocks, out_rows, row_stride);
+        }
+        return;
+    }
+
+    let mut unpacked = vec![Q8_0ActBlock::default(); 8 * blocks];
+    for p in 0..panel_count {
+        let p_slice = &panels[p * blocks..(p + 1) * blocks];
+        for (k, ap) in p_slice.iter().enumerate() {
+            for cp in 0..4 {
+                let t_even = cp * 2;
+                let t_odd = cp * 2 + 1;
+                {
+                    let dst_even = &mut unpacked[t_even * blocks + k];
+                    dst_even.d = ap.d_pairs[cp][0];
+                    for half in 0..2 {
+                        let h = half * 16;
+                        dst_even.qs[h..h + 8].copy_from_slice(&ap.qs[half][cp][0][0..8]);
+                        dst_even.qs[h + 8..h + 16].copy_from_slice(&ap.qs[half][cp][1][0..8]);
+                    }
+                }
+                let dst_odd = &mut unpacked[t_odd * blocks + k];
+                dst_odd.d = ap.d_pairs[cp][1];
+                for half in 0..2 {
+                    let h = half * 16;
+                    dst_odd.qs[h..h + 8].copy_from_slice(&ap.qs[half][cp][0][8..16]);
+                    dst_odd.qs[h + 8..h + 16].copy_from_slice(&ap.qs[half][cp][1][8..16]);
+                }
+            }
+        }
+        let t_off = p * 8;
+        for t in 0..8 {
+            let col = dot_q8_0_8rows(caps, rows, &unpacked[t * blocks..(t + 1) * blocks]);
+            for (r, &val) in col.iter().enumerate() {
+                out_rows[r * row_stride + t_off + t] = val;
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]

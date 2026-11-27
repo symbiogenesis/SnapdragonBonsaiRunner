@@ -121,15 +121,15 @@ fn non_windows_chunk_len(worker_count: usize, total_len: usize, alignment: usize
 }
 
 /// Execute `compute_slice(offset, chunk)` over `alignment`-aligned contiguous
-/// slices of `out`, falling back to serial execution on single-worker, small,
-/// nested, or unspawnable pools.
-pub(super) fn run_aligned<F>(
-    out: &mut [f32],
+/// slices of `out` for arbitrary `Send` element types, falling back to serial
+/// execution on single-worker, small, nested, or unspawnable pools.
+pub(super) fn run_slice_aligned<T: Send, F>(
+    out: &mut [T],
     worker_count: usize,
     alignment: usize,
     compute_slice: &F,
 ) where
-    F: Fn(usize, &mut [f32]) + Sync,
+    F: Fn(usize, &mut [T]) + Sync,
 {
     #[cfg(windows)]
     {
@@ -139,11 +139,11 @@ pub(super) fn run_aligned<F>(
             out.len(),
             eff_align,
             |pool, active_workers| {
-                let run = |offset: usize, slice: &mut [f32]| {
+                let run = |offset: usize, slice: &mut [T]| {
                     let _guard = WorkerFlagGuard::enter();
                     compute_slice(offset, slice);
                 };
-                pool.run_aligned(out, active_workers, eff_align, &run);
+                pool.run_slice_aligned(out, active_workers, eff_align, &run);
             },
         );
         if done.is_none() {
@@ -171,6 +171,20 @@ pub(super) fn run_aligned<F>(
             compute_slice(first_index * chunk_len, first_slice);
         });
     }
+}
+
+/// Execute `compute_slice(offset, chunk)` over `alignment`-aligned contiguous
+/// slices of `out`, falling back to serial execution on single-worker, small,
+/// nested, or unspawnable pools.
+pub(super) fn run_aligned<F>(
+    out: &mut [f32],
+    worker_count: usize,
+    alignment: usize,
+    compute_slice: &F,
+) where
+    F: Fn(usize, &mut [f32]) + Sync,
+{
+    run_slice_aligned(out, worker_count, alignment, compute_slice);
 }
 
 /// Fallible counterpart to [`run_aligned`], joining every task and returning

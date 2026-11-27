@@ -1,6 +1,7 @@
 //! Safe public boundary for ARM64 `SDOT` / `I8MM` / `FCVTL` / `FCVTN` quantized
 //! kernels with runtime CPU feature detection and exact portable fallbacks.
 
+pub use crate::native::quant_q8::Q8_0ActPanel8;
 pub use bonsai_neon_dot::kquants::{
     Arm64QuantCaps, Q4_K_BLOCK_BYTES, Q4_K_REPACK8_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES,
     Q8_0_BLOCK_ELEMENTS, Q8_0ActBlock, Q8_KActBlock, QK_K, dot_q4_k_4rows, dot_q4_k_row,
@@ -54,6 +55,39 @@ pub fn gemm_q8_0_8x2(
     acts: [&[Q8_0ActBlock]; 2],
 ) -> [[f32; 2]; 8] {
     crate::native::quant_q8::gemm_q8_0_8x2(caps, rows, acts)
+}
+
+/// Pre-packs `panel_count * 8` tokens of `Q8_0ActBlock`s (`acts`) into `Q8_0ActPanel8`s
+/// laid out as `[panel_idx * blocks + k]`.
+pub fn pack_q8_0_act_panels8(
+    acts: &[Q8_0ActBlock],
+    blocks: usize,
+    panel_count: usize,
+    panels: &mut [Q8_0ActPanel8],
+) {
+    crate::native::quant_q8::pack_q8_0_act_panels8(acts, blocks, panel_count, panels);
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token `Q8_0` GEMM over pre-packed `Q8_0ActPanel8`s
+/// with K-blocked L1D weight tiles (`I8MM` `SMMLA`, or exact `SDOT`/portable fallback).
+pub fn gemm_q8_0_8x_panels(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    panels: &[Q8_0ActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_rows: &mut [f32],
+    row_stride: usize,
+) {
+    crate::native::quant_q8::gemm_q8_0_8x_panels(
+        caps,
+        rows,
+        panels,
+        panel_count,
+        blocks,
+        out_rows,
+        row_stride,
+    );
 }
 
 /// Computes an 8-row by 8-token repacked `Q4_K` strip GEMM tile using `I8MM` (`SMMLA`) or exact fallback.
@@ -1050,5 +1084,79 @@ mod tests {
         );
         assert_eq!(untouched0.map(f32::to_bits), [7.0_f32.to_bits(); 2]);
         assert_eq!(untouched1.map(f32::to_bits), [9.0_f32.to_bits(); 1]);
+    }
+
+    #[test]
+    fn q8_0_act_panels8_and_k_blocked_gemm_match_row_bit_exact() {
+        let caps = Arm64QuantCaps::detect();
+        let port = Arm64QuantCaps::portable();
+
+        // Exercise K_TILE=32 and T_PANEL=8 boundaries across blocks and panel_count.
+        for blocks in [0_usize, 1, 2, 31, 32, 33, 65] {
+            let rows_vec: Vec<Vec<u8>> = (0..8)
+                .map(|r| {
+                    if r % 2 == 0 {
+                        make_edge_q8_0_row(blocks, r + 3)
+                    } else {
+                        make_q8_0_row(blocks, r + 11)
+                    }
+                })
+                .collect();
+            let row_refs: [&[u8]; 8] = std::array::from_fn(|r| rows_vec[r].as_slice());
+
+            for panel_count in [0_usize, 1, 2, 8, 9] {
+                let tokens = panel_count * 8;
+                let mut flat_acts = Vec::with_capacity(tokens * blocks);
+                for t in 0..tokens {
+                    flat_acts.extend(make_edge_q8_0_act(blocks, t));
+                }
+                let mut panels = vec![Q8_0ActPanel8::default(); panel_count * blocks];
+                pack_q8_0_act_panels8(&flat_acts, blocks, panel_count, &mut panels);
+
+                let stride = tokens + 3;
+                let mut out_nat = vec![f32::NAN; 8 * stride];
+                let mut out_prt = vec![f32::NAN; 8 * stride];
+                gemm_q8_0_8x_panels(
+                    caps,
+                    row_refs,
+                    &panels,
+                    panel_count,
+                    blocks,
+                    &mut out_nat,
+                    stride,
+                );
+                gemm_q8_0_8x_panels(
+                    port,
+                    row_refs,
+                    &panels,
+                    panel_count,
+                    blocks,
+                    &mut out_prt,
+                    stride,
+                );
+
+                for r in 0..8 {
+                    for t in 0..tokens {
+                        let expected = dot_q8_0_row(
+                            port,
+                            row_refs[r],
+                            &flat_acts[t * blocks..(t + 1) * blocks],
+                        )
+                        .to_bits();
+                        let idx = r * stride + t;
+                        assert_eq!(
+                            out_nat[idx].to_bits(),
+                            expected,
+                            "nat mismatch blocks={blocks} panels={panel_count} r={r} t={t}"
+                        );
+                        assert_eq!(
+                            out_prt[idx].to_bits(),
+                            expected,
+                            "prt mismatch blocks={blocks} panels={panel_count} r={r} t={t}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
