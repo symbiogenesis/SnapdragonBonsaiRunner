@@ -110,6 +110,21 @@ impl RowWorkerPool {
         self.0.run_aligned(out, active_workers, alignment, compute);
     }
 
+    /// Partition `out` across up to `active_workers` along `alignment`-element boundaries
+    /// for arbitrary `Send` element types.
+    pub fn run_slice_aligned<T: Send, F>(
+        &self,
+        out: &mut [T],
+        active_workers: usize,
+        alignment: usize,
+        compute: &F,
+    ) where
+        F: Fn(usize, &mut [T]) + Sync,
+    {
+        self.0
+            .run_slice_aligned(out, active_workers, alignment, compute);
+    }
+
     /// Fallible counterpart to [`Self::run_aligned`], joining every chunk and returning
     /// the smallest-`offset` error deterministically when any slice fails.
     ///
@@ -2505,6 +2520,24 @@ mod storage_budget_tests {
             Ok(())
         });
         assert_eq!(err.err().map(|e| e.to_string()), Some("fail-8".to_owned()));
+
+        #[derive(Debug, Default, PartialEq, Eq)]
+        struct Item {
+            index: usize,
+            label: String,
+        }
+        let mut items: Vec<Item> = (0..19).map(|_| Item::default()).collect();
+        pool.run_slice_aligned(&mut items, 4, 3, &|offset, slice| {
+            for (i, item) in slice.iter_mut().enumerate() {
+                let g = offset + i;
+                item.index = g;
+                item.label = format!("item-{g}");
+            }
+        });
+        for (idx, item) in items.iter().enumerate() {
+            assert_eq!(item.index, idx);
+            assert_eq!(item.label, format!("item-{idx}"));
+        }
         Ok(())
     }
 }

@@ -10,7 +10,7 @@
     reason = "This module audits native handle thread safety independently of broad Clippy category defaults."
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
@@ -186,56 +186,69 @@ fn validate_policy(spec: &ProcessSpec, policy: &SandboxPolicy) -> io::Result<Vec
             "native sandbox requires 1..128 explicit read-only grants",
         ));
     }
-    validate_local_path(&policy.writable_directory)?;
-    if !policy.writable_directory.is_dir()
-        || !same_path(&spec.working_directory, &policy.writable_directory)?
-    {
+    let mut checked_ancestors = HashSet::new();
+    let writable_meta =
+        validate_local_path_cached(&policy.writable_directory, &mut checked_ancestors)?;
+    let writable_ancestors_u16 = encode_ancestors_utf16(&policy.writable_directory)?;
+    let writable_u16 = writable_ancestors_u16
+        .first()
+        .ok_or_else(|| invalid("sandbox working directory must be its existing private scratch"))?;
+    let working_u16 = encode_utf16_path(&spec.working_directory)?;
+    if !writable_meta.is_dir() || !same_utf16_path(&working_u16, writable_u16)? {
         return Err(invalid(
             "sandbox working directory must be its existing private scratch",
         ));
     }
+    let mut scratch = Vec::with_capacity(260);
     for output in [&spec.stdout, &spec.stderr] {
-        if within(output, &policy.writable_directory)? {
+        if within_utf16_root(output, writable_u16, &mut scratch)? {
             return Err(invalid(
                 "sandbox evidence must remain outside worker scratch",
             ));
         }
     }
-    let mut readonly = runtime_paths()?;
+    let os_runtime = runtime_paths_cached(&mut checked_ancestors)?;
+    let mut readonly: Vec<String> = os_runtime.iter().map(|(text, _)| text.clone()).collect();
+    let user_profile_ancestors = std::env::var_os("USERPROFILE")
+        .map(|profile| encode_ancestors_utf16(Path::new(&profile)))
+        .transpose()?;
+    let executable_u16 = encode_utf16_path(&spec.executable)?;
+    let mut executable_granted = false;
+    let mut path_u16 = Vec::with_capacity(260);
     for path in &policy.readonly_paths {
-        validate_local_path(path)?;
-        if !path.is_file() {
+        let leaf_meta = validate_local_path_cached(path, &mut checked_ancestors)?;
+        if !leaf_meta.is_file() {
             return Err(invalid(
                 "sandbox read-only grants must name exact existing files",
             ));
         }
-        if within(path, &policy.writable_directory)? || within(&policy.writable_directory, path)? {
+        encode_utf16_into(path, &mut path_u16)?;
+        if within_utf16_root(path, writable_u16, &mut scratch)?
+            || within_encoded_ancestors(&path_u16, &writable_ancestors_u16)?
+        {
             return Err(invalid(
                 "sandbox read-only and writable grants must not overlap",
             ));
         }
-        if let Some(profile) = std::env::var_os("USERPROFILE")
-            && within(Path::new(&profile), path)?
+        if let Some(ref profile_ancestors) = user_profile_ancestors
+            && within_encoded_ancestors(&path_u16, profile_ancestors)?
         {
             return Err(invalid(
                 "sandbox cannot grant an entire user profile or its ancestors",
             ));
         }
-        readonly.push(path_text(path)?);
-    }
-    let mut executable_granted = false;
-    for path in &policy.readonly_paths {
-        if same_path(&spec.executable, path)? {
+        if same_utf16_path(&executable_u16, &path_u16)? {
             executable_granted = true;
         }
+        readonly.push(path_text(path)?);
     }
     if !executable_granted {
         return Err(invalid(
             "sandbox executable requires an explicit read-only grant",
         ));
     }
-    for path in &readonly {
-        if within(&policy.writable_directory, Path::new(path))? {
+    for (_, os_dir_u16) in &os_runtime {
+        if within_encoded_ancestors(os_dir_u16, &writable_ancestors_u16)? {
             return Err(invalid(
                 "sandbox scratch cannot overlap an OS runtime grant",
             ));
@@ -247,6 +260,14 @@ fn validate_policy(spec: &ProcessSpec, policy: &SandboxPolicy) -> io::Result<Vec
 }
 
 fn validate_local_path(path: &Path) -> io::Result<()> {
+    let mut checked = HashSet::new();
+    validate_local_path_cached(path, &mut checked).map(|_| ())
+}
+
+fn validate_local_path_cached(
+    path: &Path,
+    checked_ancestors: &mut HashSet<PathBuf>,
+) -> io::Result<std::fs::Metadata> {
     validate_path(path)?;
     if !matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)))
         || path.file_name().is_none()
@@ -258,13 +279,21 @@ fn validate_local_path(path: &Path) -> io::Result<()> {
             "sandbox grants require non-root local paths without streams",
         ));
     }
-    for ancestor in path.ancestors() {
+    let leaf_meta = std::fs::symlink_metadata(path)?;
+    if leaf_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(invalid("sandbox paths must not contain reparse points"));
+    }
+    for ancestor in path.ancestors().skip(1) {
+        if checked_ancestors.contains(ancestor) {
+            break;
+        }
         let metadata = std::fs::symlink_metadata(ancestor)?;
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(invalid("sandbox paths must not contain reparse points"));
         }
+        checked_ancestors.insert(ancestor.to_path_buf());
     }
-    Ok(())
+    Ok(leaf_meta)
 }
 
 fn path_text(path: &Path) -> io::Result<String> {
@@ -273,16 +302,47 @@ fn path_text(path: &Path) -> io::Result<String> {
         .ok_or_else(|| invalid("sandbox paths must be Unicode"))
 }
 
-fn same_path(left: &Path, right: &Path) -> io::Result<bool> {
-    let left: Vec<u16> = left.as_os_str().encode_wide().collect();
-    let right: Vec<u16> = right.as_os_str().encode_wide().collect();
-    super::compare_ordinal_ignore_case(&left, &right, "sandbox path is too long")
+fn encode_utf16_path(path: &Path) -> io::Result<Vec<u16>> {
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    i32::try_from(units.len()).map_err(|_| invalid("sandbox path is too long"))?;
+    Ok(units)
+}
+
+fn encode_utf16_into(path: &Path, buf: &mut Vec<u16>) -> io::Result<()> {
+    buf.clear();
+    buf.extend(path.as_os_str().encode_wide());
+    i32::try_from(buf.len()).map_err(|_| invalid("sandbox path is too long"))?;
+    Ok(())
+}
+
+fn same_utf16_path(left: &[u16], right: &[u16]) -> io::Result<bool> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    if left == right {
+        return Ok(true);
+    }
+    super::compare_ordinal_ignore_case(left, right, "sandbox path is too long")
         .map(|ordering| ordering.is_eq())
 }
 
-fn within(path: &Path, root: &Path) -> io::Result<bool> {
+fn encode_ancestors_utf16(path: &Path) -> io::Result<Vec<Vec<u16>>> {
+    path.ancestors().map(encode_utf16_path).collect()
+}
+
+fn within_utf16_root(path: &Path, root_u16: &[u16], scratch: &mut Vec<u16>) -> io::Result<bool> {
     for ancestor in path.ancestors() {
-        if same_path(ancestor, root)? {
+        encode_utf16_into(ancestor, scratch)?;
+        if same_utf16_path(scratch, root_u16)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn within_encoded_ancestors(target_u16: &[u16], ancestors_u16: &[Vec<u16>]) -> io::Result<bool> {
+    for ancestor_u16 in ancestors_u16 {
+        if same_utf16_path(ancestor_u16, target_u16)? {
             return Ok(true);
         }
     }
@@ -298,14 +358,31 @@ fn windows_directory() -> io::Result<PathBuf> {
     Ok(windows)
 }
 
-fn runtime_paths() -> io::Result<Vec<String>> {
-    let windows = windows_directory()?;
+fn windows_directory_cached(checked_ancestors: &mut HashSet<PathBuf>) -> io::Result<PathBuf> {
+    let windows = super::query_system_dir("Windows directory length overflow", |buf, cap| {
+        // SAFETY: Caller provides writable UTF-16 buffer of `cap` elements.
+        unsafe { GetWindowsDirectoryW(buf, cap) }
+    })?;
+    let meta = validate_local_path_cached(&windows, checked_ancestors)?;
+    if meta.is_dir() {
+        checked_ancestors.insert(windows.clone());
+    }
+    Ok(windows)
+}
+
+fn runtime_paths_cached(checked_ancestors: &mut HashSet<PathBuf>) -> io::Result<Vec<(String, Vec<u16>)>> {
+    let windows = windows_directory_cached(checked_ancestors)?;
     let mut paths = Vec::new();
     for name in ["System32", "WinSxS", "SysWOW64"] {
         let path = windows.join(name);
-        if path.is_dir() {
-            validate_local_path(&path)?;
-            paths.push(path_text(&path)?);
+        match validate_local_path_cached(&path, checked_ancestors) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+            Ok(meta) => {
+                if meta.is_dir() {
+                    paths.push((path_text(&path)?, encode_utf16_path(&path)?));
+                }
+            }
         }
     }
     if paths.is_empty() {
@@ -530,6 +607,30 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(!specification.stdout.exists());
         assert!(!specification.stderr.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cached_utf16_containment_checks_handle_case_ancestry_and_overlap() -> io::Result<()> {
+        let a_u16 = encode_utf16_path(Path::new("C:\\Alpha\\Beta"))?;
+        let b_u16 = encode_utf16_path(Path::new("c:\\alpha\\beta"))?;
+        let c_u16 = encode_utf16_path(Path::new("C:\\Alpha\\Beta\\Gamma"))?;
+        assert!(same_utf16_path(&a_u16, &b_u16)?);
+        assert!(!same_utf16_path(&a_u16, &c_u16)?);
+
+        let anc_u16 = encode_ancestors_utf16(Path::new("C:\\Alpha\\Beta\\Gamma"))?;
+        assert!(within_encoded_ancestors(&b_u16, &anc_u16)?);
+        let mut scratch = Vec::new();
+        assert!(within_utf16_root(
+            Path::new("C:\\alpha\\beta\\file.bin"),
+            &a_u16,
+            &mut scratch
+        )?);
+        assert!(!within_utf16_root(
+            Path::new("C:\\alpha\\other\\file.bin"),
+            &a_u16,
+            &mut scratch
+        )?);
         Ok(())
     }
 }

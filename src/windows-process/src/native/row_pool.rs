@@ -22,7 +22,8 @@ fn wait_unpoisoned<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<
 const MAX_POOL_WORKERS: usize = 32;
 const SPIN_ITERATIONS: usize = 4096;
 const GEN_SHIFT: u32 = 8;
-const SLOT_MASK: usize = (1 << GEN_SHIFT) - 1;
+const DIRECT_FLAG: usize = 1 << (GEN_SHIFT - 1);
+const SLOT_MASK: usize = DIRECT_FLAG - 1;
 const GEN_MASK: usize = usize::MAX >> GEN_SHIFT;
 
 #[repr(align(64))]
@@ -35,7 +36,7 @@ thread_local! {
 #[derive(Clone, Copy)]
 struct ChunkDesc {
     offset: usize,
-    ptr: *mut f32,
+    ptr: *mut u8,
     len: usize,
 }
 
@@ -49,7 +50,7 @@ impl Default for ChunkDesc {
     }
 }
 
-type DispatchFn = unsafe fn(*const (), usize, &mut [f32]);
+type DispatchFn = unsafe fn(*const (), usize, *mut u8, usize);
 
 #[derive(Clone, Copy)]
 struct TaskPtr {
@@ -59,7 +60,7 @@ struct TaskPtr {
 
 impl Default for TaskPtr {
     fn default() -> Self {
-        unsafe fn noop(_: *const (), _: usize, _: &mut [f32]) {}
+        unsafe fn noop(_: *const (), _: usize, _: *mut u8, _: usize) {}
         Self {
             call: noop,
             env: std::ptr::null(),
@@ -67,14 +68,18 @@ impl Default for TaskPtr {
     }
 }
 
-unsafe fn call_closure<F: Fn(usize, &mut [f32]) + Sync>(
+unsafe fn call_closure<T: Send, F: Fn(usize, &mut [T]) + Sync>(
     env: *const (),
     offset: usize,
-    slice: &mut [f32],
+    ptr: *mut u8,
+    len: usize,
 ) {
     // SAFETY: `env` points to the caller-owned `F` which remains live until
     // `ScopeGuard::drop` confirms `workers_remaining == 0`.
     let func = unsafe { &*env.cast::<F>() };
+    // SAFETY: `ptr..ptr + len` is a valid, properly aligned, disjoint mutable
+    // sub-slice of `&mut [T]` held live through `ScopeGuard::drop`.
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<T>(), len) };
     func(offset, slice);
 }
 
@@ -133,13 +138,19 @@ impl Shared {
         }
     }
 
-    fn try_claim_slot_for_gen(&self, gen_id: usize) -> bool {
+    fn try_claim_slot_for_gen(&self, gen_id: usize) -> ClaimedWork {
         let mut state = self.dispatch_state.0.load(Ordering::Acquire);
         loop {
             let state_gen = state >> GEN_SHIFT;
+            if state_gen != gen_id {
+                return ClaimedWork::None;
+            }
+            if (state & DIRECT_FLAG) != 0 {
+                return ClaimedWork::Direct;
+            }
             let remaining = state & SLOT_MASK;
-            if state_gen != gen_id || remaining == 0 {
-                return false;
+            if remaining == 0 {
+                return ClaimedWork::None;
             }
             let next = (gen_id << GEN_SHIFT) | (remaining - 1);
             match self.dispatch_state.0.compare_exchange_weak(
@@ -148,10 +159,23 @@ impl Shared {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(_) => return ClaimedWork::Dynamic,
                 Err(actual) => state = actual,
             }
         }
+    }
+
+    #[inline]
+    fn run_chunk(&self, task: TaskPtr, idx: usize) {
+        // SAFETY: `idx < num_chunks <= MAX_POOL_WORKERS`, initialized before the
+        // generation bump, and exclusively claimed by this thread for the generation.
+        let desc = unsafe { *self.chunks[idx].get() };
+        if desc.len == 0 {
+            return;
+        }
+        // SAFETY: `task.call` was paired with `&F` (`task.env`) and `desc.ptr..desc.ptr + desc.len`
+        // from `&mut [T]`, kept live and immutable across all workers for the active scope.
+        unsafe { (task.call)(task.env, desc.offset, desc.ptr, desc.len) };
     }
 
     fn drain_chunks(&self, task: TaskPtr) {
@@ -161,23 +185,19 @@ impl Shared {
             if idx >= count {
                 break;
             }
-            // SAFETY: `idx < count <= MAX_POOL_WORKERS`, initialized before the
-            // generation bump, and exclusively claimed by this thread via `fetch_add`.
-            let desc = unsafe { *self.chunks[idx].get() };
-            if desc.len == 0 {
-                continue;
-            }
-            // SAFETY: `desc.ptr..desc.ptr + desc.len` is a valid disjoint mutable
-            // chunk from the caller's slice held live through `ScopeGuard::drop`.
-            let slice = unsafe { std::slice::from_raw_parts_mut(desc.ptr, desc.len) };
-            // SAFETY: `task.call` was paired with `&F` (`task.env`), kept live
-            // and immutable across all workers for the active scope.
-            unsafe { (task.call)(task.env, desc.offset, slice) };
+            self.run_chunk(task, idx);
         }
     }
 }
 
-fn worker_loop(shared: &Shared) {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ClaimedWork {
+    None,
+    Direct,
+    Dynamic,
+}
+
+fn worker_loop(shared: &Shared, worker_id: usize) {
     IN_ROW_POOL.with(|flag| flag.set(true));
     let mut last_gen = 0_usize;
     loop {
@@ -214,14 +234,17 @@ fn worker_loop(shared: &Shared) {
             }
         }
         last_gen = current_gen;
-        if !shared.try_claim_slot_for_gen(current_gen) {
+        let claim = shared.try_claim_slot_for_gen(current_gen);
+        if claim == ClaimedWork::None {
             continue;
         }
         // SAFETY: `task` was published prior to incrementing `generation` and
         // stays valid until `workers_remaining` drops to zero below.
         let task = unsafe { *shared.task.get() };
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            shared.drain_chunks(task);
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| match claim {
+            ClaimedWork::Direct => shared.run_chunk(task, worker_id),
+            ClaimedWork::Dynamic => shared.drain_chunks(task),
+            ClaimedWork::None => {}
         }));
         if let Err(payload) = result {
             let mut panic_guard = lock_unpoisoned(&shared.panic_slot);
@@ -300,7 +323,7 @@ impl NativeRowWorkerPool {
             let worker_shared = Arc::clone(&shared);
             let handle = std::thread::Builder::new()
                 .name(format!("{name_prefix}-{idx}"))
-                .spawn(move || worker_loop(&worker_shared))?;
+                .spawn(move || worker_loop(&worker_shared, idx))?;
             pool.workers.push(handle);
         }
         Ok(pool)
@@ -318,6 +341,18 @@ impl NativeRowWorkerPool {
         compute: &F,
     ) where
         F: Fn(usize, &mut [f32]) + Sync,
+    {
+        self.run_slice_aligned(out, active_workers, alignment, compute);
+    }
+
+    pub(crate) fn run_slice_aligned<T: Send, F>(
+        &self,
+        out: &mut [T],
+        active_workers: usize,
+        alignment: usize,
+        compute: &F,
+    ) where
+        F: Fn(usize, &mut [T]) + Sync,
     {
         if out.is_empty() {
             return;
@@ -343,7 +378,7 @@ impl NativeRowWorkerPool {
             unsafe {
                 *self.shared.chunks[chunk_count].get() = ChunkDesc {
                     offset,
-                    ptr: sub.as_mut_ptr(),
+                    ptr: sub.as_mut_ptr().cast::<u8>(),
                     len: sub.len(),
                 };
             }
@@ -358,6 +393,7 @@ impl NativeRowWorkerPool {
         });
 
         let active_bg = chunk_count.saturating_sub(1).min(bg_count);
+        let direct = active_bg == bg_count && chunk_count == active;
         let next_gen = match self
             .shared
             .generation
@@ -370,17 +406,22 @@ impl NativeRowWorkerPool {
             g => g,
         };
         let task = TaskPtr {
-            call: call_closure::<F>,
+            call: call_closure::<T, F>,
             env: (&raw const *compute).cast::<()>(),
         };
         // SAFETY: Previous generation completed (`workers_remaining == 0`).
         unsafe { *self.shared.task.get() = task };
         self.shared.num_chunks.store(chunk_count, Ordering::Release);
-        self.shared.next_chunk.0.store(0, Ordering::Release);
+        let dispatch_word = if direct {
+            (next_gen << GEN_SHIFT) | DIRECT_FLAG
+        } else {
+            self.shared.next_chunk.0.store(0, Ordering::Release);
+            (next_gen << GEN_SHIFT) | active_bg
+        };
         self.shared
             .dispatch_state
             .0
-            .store((next_gen << GEN_SHIFT) | active_bg, Ordering::Release);
+            .store(dispatch_word, Ordering::Release);
         self.shared
             .workers_remaining
             .0
@@ -405,7 +446,11 @@ impl NativeRowWorkerPool {
             }
         }
 
-        self.shared.drain_chunks(task);
+        if direct {
+            self.shared.run_chunk(task, 0);
+        } else {
+            self.shared.drain_chunks(task);
+        }
     }
 
     pub(crate) fn try_run_aligned<F>(
@@ -534,6 +579,63 @@ mod tests {
                 val.to_bits(),
                 u16::try_from(idx).map_or(0.0, f32::from).to_bits()
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_dispatch_runs_without_next_chunk_fetch_and_supports_run_slice_aligned() -> io::Result<()>
+    {
+        use std::collections::HashSet;
+
+        let pool = NativeRowWorkerPool::new(4, "test-direct-row")?;
+        let coordinator_id = std::thread::current().id();
+        let mut out = vec![0_u64; 32];
+
+        // Full-team aligned workload: active == worker_count == chunk_count (4).
+        // Marker 0xDEAD_BEEF in next_chunk must remain untouched because direct-dispatch
+        // bypasses CAS and next_chunk.fetch_add.
+        pool.shared.next_chunk.0.store(0xDEAD_BEEF, Ordering::Release);
+        let chunk_threads: Mutex<Vec<(usize, std::thread::ThreadId)>> = Mutex::new(Vec::new());
+        pool.run_slice_aligned(&mut out, 4, 8, &|offset, slice| {
+            lock_unpoisoned(&chunk_threads).push((offset, std::thread::current().id()));
+            for (i, slot) in slice.iter_mut().enumerate() {
+                *slot = u64::try_from(offset + i).unwrap_or(0) * 3 + 1;
+            }
+        });
+        assert_eq!(pool.shared.next_chunk.0.load(Ordering::Acquire), 0xDEAD_BEEF);
+        assert_ne!(
+            pool.shared.dispatch_state.0.load(Ordering::Acquire) & DIRECT_FLAG,
+            0
+        );
+        let recorded = lock_unpoisoned(&chunk_threads);
+        assert_eq!(recorded.len(), 4);
+        assert!(
+            recorded
+                .iter()
+                .any(|(offset, tid)| *offset == 0 && *tid == coordinator_id)
+        );
+        let unique_threads: HashSet<_> = recorded.iter().map(|(_, tid)| *tid).collect();
+        assert_eq!(unique_threads.len(), 4);
+        drop(recorded);
+        for (idx, &val) in out.iter().enumerate() {
+            assert_eq!(val, u64::try_from(idx).unwrap_or(0) * 3 + 1);
+        }
+
+        // Partial-team wake uses CAS + next_chunk path and clears DIRECT_FLAG.
+        let mut partial = vec![0_u64; 16];
+        pool.run_slice_aligned(&mut partial, 2, 4, &|offset, slice| {
+            for (i, slot) in slice.iter_mut().enumerate() {
+                *slot = u64::try_from(offset + i).unwrap_or(0) + 100;
+            }
+        });
+        assert_eq!(
+            pool.shared.dispatch_state.0.load(Ordering::Acquire) & DIRECT_FLAG,
+            0
+        );
+        assert!(pool.shared.next_chunk.0.load(Ordering::Acquire) >= 2);
+        for (idx, &val) in partial.iter().enumerate() {
+            assert_eq!(val, u64::try_from(idx).unwrap_or(0) + 100);
         }
         Ok(())
     }
