@@ -555,9 +555,13 @@ bonsai-ci rust-check --root $PWD --package bonsai-broker --target (Join-Path $sc
 
 Choose a relevant named Rust regression, such as
 `cli::tests::bounded_input_rejects_nonobjects_truncation_and_overflow`, with
-`cargo test --locked --release --package bonsai-tools --lib NAME -- --exact` and external
+`cargo test --locked --package bonsai-tools --lib NAME -- --exact` and external
 target/working
-directories. `--full-tests` is reserved for main-branch GitHub Actions; benchmarks
+directories. Local inner-loop checks omit `--release` so `[profile.dev]` and
+`[profile.test]` share tuned incremental dependencies (`opt-level = 1`,
+`debug = "line-tables-only"`, `opt-level = 2` / `debug = 0` deps), reserving
+`--release` for CI and production builds. `--full-tests` is reserved for
+main-branch GitHub Actions; benchmarks
 are always CI-only.
 
 For native deadline and process-tree ownership, `bonsai-ci rust-check` accepts

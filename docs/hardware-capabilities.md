@@ -365,9 +365,9 @@ untimed checks are allowed.
 From an external temp working directory, use absolute checkout/build paths:
 
 ```text
-cargo test --manifest-path <repo>/Cargo.toml --target-dir <temp>/target --locked --offline --release -p bonsai-tools --lib host_capabilities::tests
-cargo test --manifest-path <repo>/Cargo.toml --target-dir <temp>/target --locked --offline --release -p bonsai-tools --lib doctor::tests
-cargo test --manifest-path <repo>/Cargo.toml --target-dir <temp>/target --locked --offline --release -p bonsai-cpu-policy hardware::tests
+cargo test --manifest-path <repo>/Cargo.toml --target-dir <temp>/target --locked --offline -p bonsai-tools --lib host_capabilities::tests
+cargo test --manifest-path <repo>/Cargo.toml --target-dir <temp>/target --locked --offline -p bonsai-tools --lib doctor::tests
+cargo test --manifest-path <repo>/Cargo.toml --target-dir <temp>/target --locked --offline -p bonsai-cpu-policy hardware::tests
 ```
 
 Coverage: malformed/missing probes, emulation, failed/empty inventories, memory units/overflow,
