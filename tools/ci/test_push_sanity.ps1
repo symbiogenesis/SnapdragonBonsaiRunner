@@ -74,9 +74,17 @@ foreach ($entry in @(@{Receipt='push-checker.json';Image='bonsai-ci.exe'},@{Rece
     $head = (& git -C $repository rev-parse HEAD).Trim()
     $identities = @{}
     foreach ($selection in @(@{Name = 'checker'; Inputs = $checkerInputs }, @{Name = 'recovery'; Inputs = $recoveryInputs })) {
-        # Resolve one object at a time, independently of the batched adapter.
-        $objects = @($selection.Inputs | ForEach-Object { (& git -C $repository rev-parse --verify ('{0}:{1}' -f $head, $_)).Trim() })
+        # Resolve objects via cat-file, independently of the rev-parse adapter.
+        $batchInput = ($selection.Inputs | ForEach-Object { '{0}:{1}' -f $head, $_ }) -join "`n"
+        $objects = @($batchInput | & git -C $repository cat-file --batch-check='%(objectname)' | ForEach-Object { $_.Trim() })
+        if ($LASTEXITCODE -ne 0 -or $objects.Count -ne $selection.Inputs.Count -or @($objects | Where-Object { $_ -cnotmatch '^[0-9a-f]{40,64}$' }).Count -gt 0) {
+            throw 'Cannot resolve recovery template git objects.'
+        }
         $identities[$selection.Name] = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($objects -join "`n")))).ToLowerInvariant()
+    }
+    Write-CiFixture $repository 'unrelated-source.txt' 'Uncommitted poison must not reach recovery.'
+    if ($WithPreparation) {
+        Write-CiFixture $repository 'tools/ci/prepare_push_helpers.ps1' "throw 'Uncommitted preparation helper must never execute.'"
     }
     $template = @{ Scratch = $scratch; Repo = $repository; Head = $head; Identities = $identities }
     $script:PushTemplateCache[$key] = $template
@@ -99,8 +107,7 @@ function Invoke-PushRecoveryFixture([string]$CheckerState, [string]$RecoveryStat
     $scratch = New-CiScratch 'bonsai-push-recovery-'
     try {
         $template = Get-PushRecoveryTemplate ($PreparationState -cne 'none')
-        $repository = Join-Path $scratch 'repository'
-        Copy-CiTree $template.Repo $repository
+        $repository = $template.Repo
         $head = $template.Head
         $identities = $template.Identities
         $target = if ($CheckerState -ceq 'absent-target') { Join-Path $scratch 'absent/cache/target' } else { Join-Path $scratch 'target' }
@@ -134,8 +141,6 @@ function Invoke-PushRecoveryFixture([string]$CheckerState, [string]$RecoveryStat
         } else {
             Assert-Ci (-not (Test-Path -LiteralPath $target)) 'Absent recovery target already exists.'
         }
-        Write-CiFixture $repository 'unrelated-source.txt' 'Uncommitted poison must not reach recovery.'
-        if ($PreparationState -cne 'none') { Write-CiFixture $repository 'tools/ci/prepare_push_helpers.ps1' "throw 'Uncommitted preparation helper must never execute.'" }
         $gitPath = (Get-Command git -CommandType Application | Select-Object -First 1).Source
         try {
             Invoke-RedirectedStdin "refs/heads/main $head refs/heads/main $head`n" {
@@ -157,7 +162,7 @@ function Invoke-PushRecoveryFixture([string]$CheckerState, [string]$RecoveryStat
                         }
                         Assert-Ci (-not ($args -ccontains '--')) 'Recovery selected a partial policy archive.'
                         $archive = @($args | Where-Object { $_.StartsWith('--output=', [StringComparison]::Ordinal) })[0].Substring(9)
-                        $unpacked = Join-Path (Split-Path $repository -Parent) 'unpacked'
+                        $unpacked = Join-Path $scratch 'unpacked'
                         [IO.Compression.ZipFile]::ExtractToDirectory($archive, $unpacked, $true)
                         Assert-CiEqual ([IO.File]::ReadAllText((Join-Path $unpacked 'unrelated-source.txt'))) 'Committed full-source input.'
                         Assert-Ci (Test-Path -LiteralPath (Join-Path $unpacked 'Cargo.toml')) 'Recovery omitted committed build inputs.'
@@ -230,8 +235,12 @@ $cases = [ordered]@{
             & git -C $repository -c user.name=Fixture -c user.email=fixture@example.invalid -c core.hooksPath= -c commit.gpgsign=false commit --quiet -m fixture
             if ($LASTEXITCODE) { throw 'Cannot commit policy archive fixture.' }
             $head = (& git -C $repository rev-parse HEAD).Trim()
-            # Compute the legacy ordered identity independently, one input at a time.
-            $objects = @($inputs | ForEach-Object { (& git -C $repository rev-parse --verify ('{0}:{1}' -f $head, $_)).Trim() })
+            # Resolve objects via cat-file, independently of the rev-parse adapter.
+            $batchInput = ($inputs | ForEach-Object { '{0}:{1}' -f $head, $_ }) -join "`n"
+            $objects = @($batchInput | & git -C $repository cat-file --batch-check='%(objectname)' | ForEach-Object { $_.Trim() })
+            if ($LASTEXITCODE -ne 0 -or $objects.Count -ne $inputs.Count -or @($objects | Where-Object { $_ -cnotmatch '^[0-9a-f]{40,64}$' }).Count -gt 0) {
+                throw 'Cannot resolve policy archive fixture git objects.'
+            }
             $sourceId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($objects -join "`n")))).ToLowerInvariant()
             $binary = Join-Path $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe'
             Write-CiFixture $target 'aarch64-pc-windows-msvc/debug/bonsai-ci.exe' 'Inert checker; archive interception must stop before execution.'
@@ -245,7 +254,7 @@ $cases = [ordered]@{
                     if ($LASTEXITCODE) { throw 'Fixture Git command failed.' }
                     if ($args -ccontains 'archive') {
                         $archive = @($args | Where-Object { $_.StartsWith('--output=', [StringComparison]::Ordinal) })[0].Substring(9)
-                        $unpacked = Join-Path (Split-Path $repository -Parent) 'unpacked'
+                        $unpacked = Join-Path $scratch 'unpacked'
                         [IO.Compression.ZipFile]::ExtractToDirectory($archive, $unpacked, $true)
                         $expected = @('check_push_snapshot.ps1', 'check_owned_languages.ps1', 'check_powershell_syntax.ps1', 'check_workflow_startup.ps1', 'check_workflow_syntax.ps1', 'native_ci_cache.ps1', 'test_device_concurrency.ps1', 'test_foundation_handoff.ps1', 'test_native_ci_cache.ps1', 'test_rust_toolchain.ps1', 'test_tools_cache_inputs.ps1', 'test_source_checks.ps1', 'test_support.ps1')
                         $actual = @(Get-ChildItem -LiteralPath $unpacked -File -Recurse | ForEach-Object { [IO.Path]::GetRelativePath($unpacked, $_.FullName).Replace('\', '/') })

@@ -5,22 +5,6 @@ $repository = if ($CandidateRoot) { (Resolve-Path -LiteralPath $CandidateRoot).P
 $selector = Join-Path $repository 'tools/ci/select_source_checks.ps1'
 $script:SourceTemplate = $null
 
-function Copy-CiTree([string]$Source, [string]$Destination) {
-    $stack = [Collections.Generic.Stack[string[]]]::new()
-    $stack.Push(@($Source, $Destination))
-    while ($stack.Count -gt 0) {
-        $pair = $stack.Pop()
-        $src = $pair[0]; $dst = $pair[1]
-        [void][IO.Directory]::CreateDirectory($dst)
-        foreach ($file in [IO.Directory]::GetFiles($src)) {
-            [IO.File]::Copy($file, (Join-Path $dst ([IO.Path]::GetFileName($file))), $true)
-        }
-        foreach ($dir in [IO.Directory]::GetDirectories($src)) {
-            $stack.Push(@($dir, (Join-Path $dst ([IO.Path]::GetFileName($dir)))))
-        }
-    }
-}
-
 function Get-SourceTemplate {
     if ($null -ne $script:SourceTemplate) { return $script:SourceTemplate }
     $scratch = New-CiScratch 'bonsai-source-template-'
@@ -39,9 +23,49 @@ function Get-SourceTemplate {
         if ($LASTEXITCODE -ne 0) { throw 'Cannot commit selector empty fixture.' }
         $emptyHead = (& git rev-parse HEAD).Trim()
         & git checkout --quiet $base
-        $script:SourceTemplate = @{ Scratch = $scratch; Repo = $repo; Base = $base; EmptyHead = $emptyHead }
+        $script:SourceTemplate = @{ Scratch = $scratch; Repo = $repo; Base = $base; EmptyHead = $emptyHead; CommitCache = @{}; NextRefId = 0 }
         return $script:SourceTemplate
     } finally { Pop-Location }
+}
+
+function New-SourceFixtureCommit($Template, [string]$Parent, [string[]]$Paths) {
+    $cacheKey = "$Parent|" + (($Paths | Sort-Object) -join "`0")
+    if ($Template.CommitCache.ContainsKey($cacheKey)) { return $Template.CommitCache[$cacheKey] }
+    $Template.NextRefId++
+    $ref = "refs/heads/fixture-$($Template.NextRefId)"
+    $sb = [Text.StringBuilder]::new()
+    [void]$sb.Append("commit $ref`n")
+    [void]$sb.Append("committer Fixture <fixture@example.invalid> 1700000000 +0000`n")
+    [void]$sb.Append("data 6`nchange`n")
+    [void]$sb.Append("from $Parent`n")
+    foreach ($path in $Paths) {
+        $normalized = $path.Replace('\', '/')
+        [void]$sb.Append("M 100644 inline $normalized`n")
+        [void]$sb.Append("data 7`nchanged`n")
+    }
+    [void]$sb.Append("done`n")
+    $start = [Diagnostics.ProcessStartInfo]::new('git')
+    $start.WorkingDirectory = $Template.Repo
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardError = $true
+    foreach ($arg in @('fast-import', '--quiet')) { $start.ArgumentList.Add($arg) }
+    $process = [Diagnostics.Process]::Start($start)
+    try {
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($sb.ToString())
+        $process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+        $process.StandardInput.Close()
+        $process.WaitForExit()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) { throw "Cannot fast-import selector fixture commit: $stderr" }
+    } finally { $process.Dispose() }
+    $looseRef = Join-Path $Template.Repo ('.git/' + $ref)
+    $sha = if ([IO.File]::Exists($looseRef)) { [IO.File]::ReadAllText($looseRef).Trim() } else { (& git -C $Template.Repo rev-parse $ref).Trim() }
+    if ($sha -cnotmatch '^[0-9a-fA-F]{40}$') { throw "Unexpected selector fixture commit SHA: $sha" }
+    $Template.CommitCache[$cacheKey] = $sha
+    return $sha
 }
 
 function Invoke-SourceSelection([string]$Event, [string]$Ref, [string[]]$Paths = @(), [string]$Range = 'valid') {
@@ -49,37 +73,22 @@ function Invoke-SourceSelection([string]$Event, [string]$Ref, [string[]]$Paths =
     $scratch = New-CiScratch 'bonsai-source-selection-'
     $names = @('EVENT_NAME', 'EVENT_REF', 'BASE_SHA', 'HEAD_SHA', 'GITHUB_OUTPUT', 'GITHUB_STEP_SUMMARY')
     $original = @{}; foreach ($name in $names) { $original[$name] = [Environment]::GetEnvironmentVariable($name) }
-    $needsRepoCopy = ($Range -cin @('valid', 'diverged') -and ($Paths.Count -gt 0 -or $Range -ceq 'diverged'))
-    $workRepo = if ($needsRepoCopy) {
-        $copied = Join-Path $scratch 'repository'
-        Copy-CiTree $template.Repo $copied
-        $copied
-    } else {
-        $template.Repo
-    }
-    Push-Location $workRepo
+    $needsCommit = ($Range -cin @('valid', 'diverged') -and ($Paths.Count -gt 0 -or $Range -ceq 'diverged'))
+    Push-Location $template.Repo
     try {
         $base = $template.Base
-        $head = $template.EmptyHead
-        if ($needsRepoCopy) {
-            foreach ($path in $Paths) { Write-CiFixture $workRepo $path 'changed' }
-            & git add --all
-            & git -c user.name=Fixture -c user.email=fixture@example.invalid -c core.hooksPath= -c commit.gpgsign=false commit --quiet --allow-empty -m change
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot commit selector fixture change.' }
-            $head = (& git rev-parse HEAD).Trim()
+        $head = if ($needsCommit) {
+            New-SourceFixtureCommit $template $template.Base $Paths
+        } else {
+            $template.EmptyHead
         }
-        $env:EVENT_NAME = $Event; $env:EVENT_REF = $Ref; $env:BASE_SHA = $base; $env:HEAD_SHA = $head
-        if ($Range -ceq 'invalid') { $env:BASE_SHA = '0' * 40 }
-        elseif ($Range -ceq 'missing') { $env:BASE_SHA = 'f' * 40 }
+        if ($Range -ceq 'invalid') { $base = '0' * 40 }
+        elseif ($Range -ceq 'missing') { $base = 'f' * 40 }
         elseif ($Range -ceq 'diverged') {
             # A base-only source edit must not contaminate a docs-only PR diff.
-            & git checkout --quiet --detach $base
-            Write-CiFixture $workRepo 'src/base-only.rs' 'base branch change'
-            & git add --all
-            & git -c user.name=Fixture -c user.email=fixture@example.invalid -c core.hooksPath= -c commit.gpgsign=false commit --quiet -m base-change
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot commit diverged selector baseline.' }
-            $env:BASE_SHA = (& git rev-parse HEAD).Trim()
+            $base = New-SourceFixtureCommit $template $template.Base @('src/base-only.rs')
         }
+        $env:EVENT_NAME = $Event; $env:EVENT_REF = $Ref; $env:BASE_SHA = $base; $env:HEAD_SHA = $head
         $env:GITHUB_OUTPUT = Join-Path $scratch 'output'; $env:GITHUB_STEP_SUMMARY = Join-Path $scratch 'summary'
         & $selector
         $summary = [IO.File]::ReadAllText($env:GITHUB_STEP_SUMMARY)
