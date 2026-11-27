@@ -47,16 +47,32 @@ pub fn pcm16_pause_boundary(
     let mut quietest = energy;
     let mut loudest = energy;
     let mut boundary = first + half;
-    for index in first + window..samples {
-        energy -= sample_energy(pcm[index - window]);
-        energy += sample_energy(pcm[index]);
-        let start = index + 1 - window;
-        if (start - first).is_multiple_of(step) || index + 1 == samples {
-            loudest = loudest.max(energy);
-            if energy <= quietest {
-                quietest = energy;
-                boundary = start + half;
-            }
+    let total_advance = samples - (first + window);
+    let full_steps = total_advance / step;
+    let mut pos = first + window;
+    for _ in 0..full_steps {
+        for index in pos..pos + step {
+            energy -= sample_energy(pcm[index - window]);
+            energy += sample_energy(pcm[index]);
+        }
+        pos += step;
+        let start = pos - window;
+        loudest = loudest.max(energy);
+        if energy <= quietest {
+            quietest = energy;
+            boundary = start + half;
+        }
+    }
+    if pos < samples {
+        for index in pos..samples {
+            energy -= sample_energy(pcm[index - window]);
+            energy += sample_energy(pcm[index]);
+        }
+        let start = samples - window;
+        loudest = loudest.max(energy);
+        if energy <= quietest {
+            quietest = energy;
+            boundary = start + half;
         }
     }
     let absolute_limit = u64::try_from(window).ok()?.checked_mul(256 * 256)?;
@@ -110,7 +126,11 @@ pub fn pcm16_pause_boundary_adaptive(
     }
 
     let mut frame_buf = [0_i16; 960];
-    let mut statuses = Vec::with_capacity(frame_count);
+    let mut best_cut = None;
+    let mut seen_speech = false;
+    let mut silence_run_start: Option<usize> = None;
+    let mut last_status = crate::vad::VadFrameStatus::Silence;
+
     for frame_idx in 0..frame_count {
         let start = frame_idx * frame_len;
         for (dst, &bytes) in frame_buf[..frame_len]
@@ -119,38 +139,32 @@ pub fn pcm16_pause_boundary_adaptive(
         {
             *dst = i16::from_le_bytes(bytes);
         }
-        statuses.push(
-            vad.process_frame(&frame_buf[..frame_len])
-                .unwrap_or(crate::vad::VadFrameStatus::Silence),
-        );
-    }
-
-    if statuses.last() == Some(&crate::vad::VadFrameStatus::Silence) {
-        return Some(samples);
-    }
-
-    let mut best_cut = None;
-    let mut idx = 0;
-    let mut seen_speech = false;
-    while idx < statuses.len() {
-        if statuses[idx] != crate::vad::VadFrameStatus::Silence {
-            if statuses[idx] == crate::vad::VadFrameStatus::Speech {
+        let status = vad
+            .process_frame(&frame_buf[..frame_len])
+            .unwrap_or(crate::vad::VadFrameStatus::Silence);
+        last_status = status;
+        if status == crate::vad::VadFrameStatus::Silence {
+            if silence_run_start.is_none() {
+                silence_run_start = Some(frame_idx);
+            }
+        } else {
+            if let Some(run_start) = silence_run_start.take() {
+                let run_len = frame_idx - run_start;
+                if seen_speech && run_len >= 2 {
+                    let mid = ((run_start + frame_idx) * frame_len) / 2;
+                    if mid >= minimum_samples && mid <= samples - frame_len {
+                        best_cut = Some(mid);
+                    }
+                }
+            }
+            if status == crate::vad::VadFrameStatus::Speech {
                 seen_speech = true;
             }
-            idx += 1;
-            continue;
         }
-        let run_start = idx;
-        while idx < statuses.len() && statuses[idx] == crate::vad::VadFrameStatus::Silence {
-            idx += 1;
-        }
-        let run_len = idx - run_start;
-        if seen_speech && run_len >= 2 && idx < statuses.len() {
-            let mid = ((run_start + idx) * frame_len) / 2;
-            if mid >= minimum_samples && mid <= samples - frame_len {
-                best_cut = Some(mid);
-            }
-        }
+    }
+
+    if last_status == crate::vad::VadFrameStatus::Silence {
+        return Some(samples);
     }
 
     Some(best_cut.unwrap_or(samples))

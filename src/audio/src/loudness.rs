@@ -1,7 +1,7 @@
 //! ITU-R BS.1770-4 / EBU R128 loudness, EBU Tech 3342 LRA, 4x true-peak metering,
 //! and attested loudness-matched listening copies.
 
-use crate::{WavError, decode_pcm16le_into, mono_pcm16_data_checked, mono_pcm16_wav_bytes};
+use crate::{WavError, decode_pcm16le_into, mono_pcm16_data_checked};
 use std::{error::Error, fmt};
 
 /// Minimum sample rate admitted by the K-weighting bilinear filter design.
@@ -270,15 +270,56 @@ fn kaiser_sinc_phase_taps(mu: f64) -> [f64; TRUE_PEAK_PHASE_TAPS] {
     taps
 }
 
+struct TruePeakKernel {
+    phases: [[f64; TRUE_PEAK_PHASE_TAPS]; 3],
+    l1_bound: f64,
+}
+
+static TRUE_PEAK_KERNEL: std::sync::OnceLock<TruePeakKernel> = std::sync::OnceLock::new();
+
+fn true_peak_kernel() -> &'static TruePeakKernel {
+    TRUE_PEAK_KERNEL.get_or_init(|| {
+        let phases = [
+            kaiser_sinc_phase_taps(0.25),
+            kaiser_sinc_phase_taps(0.50),
+            kaiser_sinc_phase_taps(0.75),
+        ];
+        let max_l1 = phases
+            .iter()
+            .map(|taps| taps.iter().map(|c| c.abs()).sum::<f64>())
+            .fold(0.0_f64, f64::max);
+        TruePeakKernel {
+            phases,
+            l1_bound: max_l1 * (1.0 + 1.0e-12),
+        }
+    })
+}
+
+fn slice_max_abs_f32(slice: &[f32]) -> f32 {
+    let mut m0 = 0.0_f32;
+    let mut m1 = 0.0_f32;
+    let mut m2 = 0.0_f32;
+    let mut m3 = 0.0_f32;
+    let (chunks, tail) = slice.as_chunks::<4>();
+    for c in chunks {
+        m0 = m0.max(c[0].abs());
+        m1 = m1.max(c[1].abs());
+        m2 = m2.max(c[2].abs());
+        m3 = m3.max(c[3].abs());
+    }
+    let mut peak = m0.max(m1).max(m2).max(m3);
+    for &v in tail {
+        peak = peak.max(v.abs());
+    }
+    peak
+}
+
 fn measure_true_peak_linear(samples: &[f32], sample_peak: f64) -> f64 {
     if sample_peak <= 0.0 || samples.is_empty() {
         return 0.0;
     }
-    let phases = [
-        kaiser_sinc_phase_taps(0.25),
-        kaiser_sinc_phase_taps(0.50),
-        kaiser_sinc_phase_taps(0.75),
-    ];
+    let kernel = true_peak_kernel();
+    let phases = &kernel.phases;
     let mut true_peak = sample_peak;
     let len = samples.len();
     let half_before = TRUE_PEAK_HALF_TAPS - 1;
@@ -288,7 +329,7 @@ fn measure_true_peak_linear(samples: &[f32], sample_peak: f64) -> f64 {
     let interior_end = len.saturating_sub(half_after);
 
     let eval_boundary = |center: isize, true_peak: &mut f64| {
-        for taps in &phases {
+        for taps in phases {
             let mut acc = 0.0_f64;
             for (k, &coeff) in taps.iter().enumerate() {
                 let offset =
@@ -314,18 +355,29 @@ fn measure_true_peak_linear(samples: &[f32], sample_peak: f64) -> f64 {
         eval_boundary(center, &mut true_peak);
     }
 
-    for center in interior_start..interior_end {
-        let window = &samples[center - half_before..=center + half_after];
-        for taps in &phases {
-            let mut acc = 0.0_f64;
-            for (&sample, &coeff) in window.iter().zip(taps.iter()) {
-                acc += f64::from(sample) * coeff;
-            }
-            let mag = acc.abs();
-            if mag > true_peak {
-                true_peak = mag;
+    const BLOCK_CENTERS: usize = 64;
+    let mut block_start = interior_start;
+    while block_start < interior_end {
+        let block_end = (block_start + BLOCK_CENTERS).min(interior_end);
+        let support = &samples[block_start - half_before..block_end + half_after];
+        let block_max = slice_max_abs_f32(support);
+        if f64::from(block_max) * kernel.l1_bound > true_peak {
+            let [p0, p1, p2] = phases;
+            for center in block_start..block_end {
+                let window = &samples[center - half_before..=center + half_after];
+                let mut acc0 = 0.0_f64;
+                let mut acc1 = 0.0_f64;
+                let mut acc2 = 0.0_f64;
+                for k in 0..TRUE_PEAK_PHASE_TAPS {
+                    let s = f64::from(window[k]);
+                    acc0 += s * p0[k];
+                    acc1 += s * p1[k];
+                    acc2 += s * p2[k];
+                }
+                true_peak = true_peak.max(acc0.abs()).max(acc1.abs()).max(acc2.abs());
             }
         }
+        block_start = block_end;
     }
 
     let tail_start = isize::try_from(interior_end.max(interior_start)).unwrap_or(0);
@@ -731,19 +783,40 @@ pub fn build_loudness_matched_listening_wav(
         return Err(LoudnessError::InvalidTruePeakCeiling);
     }
 
-    let mut scaled = Vec::new();
-    scaled
-        .try_reserve_exact(samples.len())
+    let header = crate::mono_pcm16_header(sample_rate, samples.len())
+        .ok_or(WavError::InvalidSamples)?;
+    let pcm_bytes = samples
+        .len()
+        .checked_mul(2)
+        .ok_or(WavError::BufferTooSmall)?;
+    let total_bytes = header
+        .len()
+        .checked_add(pcm_bytes)
+        .ok_or(WavError::BufferTooSmall)?;
+    let mut wav_bytes = Vec::new();
+    wav_bytes
+        .try_reserve_exact(total_bytes)
         .map_err(|_| LoudnessError::AllocationFailed)?;
-    for &sample in samples {
+    wav_bytes.extend_from_slice(&header);
+    let encode_scaled = |sample: f32| -> Result<[u8; 2], LoudnessError> {
         let boosted = f64::from(sample) * linear_gain;
         if !boosted.is_finite() {
             return Err(LoudnessError::InvalidTruePeakCeiling);
         }
-        scaled.push(clamp_unit_f64_to_f32(boosted));
+        let clamped = clamp_unit_f64_to_f32(boosted);
+        Ok(crate::encode_pcm16le_sample(clamped).to_le_bytes())
+    };
+    let (chunks, tail) = samples.as_chunks::<8>();
+    for c in chunks {
+        let mut block = [0_u8; 16];
+        for (dst, &sample) in block.as_chunks_mut::<2>().0.iter_mut().zip(c.iter()) {
+            *dst = encode_scaled(sample)?;
+        }
+        wav_bytes.extend_from_slice(&block);
     }
-
-    let wav_bytes = mono_pcm16_wav_bytes(&scaled, sample_rate, scaled.len())?;
+    for &sample in tail {
+        wav_bytes.extend_from_slice(&encode_scaled(sample)?);
+    }
     Ok(LoudnessMatchedListeningWav {
         observation,
         wav_bytes,
@@ -858,6 +931,65 @@ mod tests {
             "expected ~+3.01 dBTP inter-sample peak, got {true_peak}"
         );
         Ok(())
+    }
+
+    fn naive_true_peak_linear_ref(samples: &[f32], sample_peak: f64) -> f64 {
+        if sample_peak <= 0.0 || samples.is_empty() {
+            return 0.0;
+        }
+        let phases = [
+            super::kaiser_sinc_phase_taps(0.25),
+            super::kaiser_sinc_phase_taps(0.50),
+            super::kaiser_sinc_phase_taps(0.75),
+        ];
+        let mut true_peak = sample_peak;
+        let half_before = super::TRUE_PEAK_HALF_TAPS - 1;
+        let half_after = super::TRUE_PEAK_HALF_TAPS;
+        let start = -isize::try_from(half_after).unwrap_or(6);
+        let end = isize::try_from(samples.len() + half_before).unwrap_or(0);
+        for center in start..=end {
+            for taps in &phases {
+                let mut acc = 0.0_f64;
+                for (k, &coeff) in taps.iter().enumerate() {
+                    let offset =
+                        isize::try_from(k).unwrap_or(0) - isize::try_from(half_before).unwrap_or(5);
+                    let idx = center + offset;
+                    if idx >= 0
+                        && let Ok(u) = usize::try_from(idx)
+                        && let Some(&sample) = samples.get(u)
+                    {
+                        acc += f64::from(sample) * coeff;
+                    }
+                }
+                let mag = acc.abs();
+                if mag > true_peak {
+                    true_peak = mag;
+                }
+            }
+        }
+        true_peak
+    }
+
+    #[test]
+    fn true_peak_block_skip_matches_naive_full_fir_exact_bits() {
+        let mut samples = vec![0.0_f32; 512];
+        for (i, slot) in samples.iter_mut().enumerate() {
+            *slot = if (64..140).contains(&i) {
+                if i % 4 < 2 { 0.85 } else { -0.85 }
+            } else if (200..310).contains(&i) {
+                0.01 * f32::from(i8::try_from(i % 17).unwrap_or(0) - 8)
+            } else if (400..440).contains(&i) {
+                0.92 * if i % 2 == 0 { 1.0 } else { -1.0 }
+            } else {
+                0.0
+            };
+        }
+        let sample_peak = samples
+            .iter()
+            .fold(0.0_f64, |acc, &s| acc.max(f64::from(s.abs())));
+        let actual = super::measure_true_peak_linear(&samples, sample_peak);
+        let expected = naive_true_peak_linear_ref(&samples, sample_peak);
+        assert_eq!(actual.to_bits(), expected.to_bits());
     }
 
     #[test]

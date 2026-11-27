@@ -58,6 +58,7 @@ pub struct VoiceActivityDetector {
     hangover_limit: usize,
     hp_alpha: f32,
     lp_alphas: [f32; 4],
+    lp_betas: [f32; 4],
     hp_prev_in: f32,
     hp_prev_out: f32,
     lp_states: [f32; 4],
@@ -90,6 +91,12 @@ impl VoiceActivityDetector {
             pole_alpha(1_000.0, fs),
             pole_alpha(nyquist_cap, fs),
         ];
+        let lp_betas = [
+            1.0 - lp_alphas[0],
+            1.0 - lp_alphas[1],
+            1.0 - lp_alphas[2],
+            1.0 - lp_alphas[3],
+        ];
 
         Some(Self {
             frame_samples,
@@ -97,6 +104,7 @@ impl VoiceActivityDetector {
             hangover_limit: config.hangover_frames,
             hp_alpha,
             lp_alphas,
+            lp_betas,
             hp_prev_in: 0.0,
             hp_prev_out: 0.0,
             lp_states: [0.0; 4],
@@ -130,36 +138,45 @@ impl VoiceActivityDetector {
             return None;
         }
 
-        let mut band_sum_sq = [0.0_f32; 4];
+        let [mut bs0, mut bs1, mut bs2, mut bs3] = [0.0_f32; 4];
         let mut total_sq = 0.0_f32;
         let mut zero_crossings = 0_usize;
-        let mut prev_sign_pos = self.hp_prev_out >= 0.0;
+        let hp_alpha = self.hp_alpha;
+        let mut hp_prev_in = self.hp_prev_in;
+        let mut hp_prev_out = self.hp_prev_out;
+        let mut prev_sign_pos = hp_prev_out >= 0.0;
+        let [a0, a1, a2, a3] = self.lp_alphas;
+        let [b0_beta, b1_beta, b2_beta, b3_beta] = self.lp_betas;
+        let [mut lp0, mut lp1, mut lp2, mut lp3] = self.lp_states;
 
         for &sample in frame {
             let x = f32::from(sample) * PCM16_INV_SCALE;
-            let hp = (x - self.hp_prev_in) + self.hp_alpha * self.hp_prev_out;
-            self.hp_prev_in = x;
-            self.hp_prev_out = hp;
+            let hp = (x - hp_prev_in) + hp_alpha * hp_prev_out;
+            hp_prev_in = x;
+            hp_prev_out = hp;
             total_sq += hp * hp;
 
             let sign_pos = hp >= 0.0;
-            if sign_pos != prev_sign_pos && hp.abs() > 1.0e-5 {
-                zero_crossings += 1;
-            }
+            zero_crossings += usize::from((sign_pos != prev_sign_pos) & (hp.abs() > 1.0e-5));
             prev_sign_pos = sign_pos;
 
-            for (state, alpha) in self.lp_states.iter_mut().zip(self.lp_alphas) {
-                *state = alpha * (*state) + (1.0 - alpha) * hp;
-            }
-            let b0 = self.lp_states[0];
-            let b1 = self.lp_states[1] - self.lp_states[0];
-            let b2 = self.lp_states[2] - self.lp_states[1];
-            let b3 = self.lp_states[3] - self.lp_states[2];
-            band_sum_sq[0] += b0 * b0;
-            band_sum_sq[1] += b1 * b1;
-            band_sum_sq[2] += b2 * b2;
-            band_sum_sq[3] += b3 * b3;
+            lp0 = a0 * lp0 + b0_beta * hp;
+            lp1 = a1 * lp1 + b1_beta * hp;
+            lp2 = a2 * lp2 + b2_beta * hp;
+            lp3 = a3 * lp3 + b3_beta * hp;
+            let b0 = lp0;
+            let b1 = lp1 - lp0;
+            let b2 = lp2 - lp1;
+            let b3 = lp3 - lp2;
+            bs0 += b0 * b0;
+            bs1 += b1 * b1;
+            bs2 += b2 * b2;
+            bs3 += b3 * b3;
         }
+        self.hp_prev_in = hp_prev_in;
+        self.hp_prev_out = hp_prev_out;
+        self.lp_states = [lp0, lp1, lp2, lp3];
+        let band_sum_sq = [bs0, bs1, bs2, bs3];
 
         let inv_n = 1.0 / u32_to_f32(u32::try_from(frame.len()).unwrap_or(1));
         let band_energies = band_sum_sq.map(|e| (e * inv_n).max(MIN_BAND_FLOOR));

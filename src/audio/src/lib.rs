@@ -89,8 +89,28 @@ impl Error for WavError {}
 #[must_use]
 pub fn finite_sample_count(samples: &[f32], previous: usize, maximum: usize) -> Option<usize> {
     let total = previous.checked_add(samples.len())?;
-    (!samples.is_empty() && total <= maximum && samples.iter().all(|sample| sample.is_finite()))
-        .then_some(total)
+    if samples.is_empty() || total > maximum {
+        return None;
+    }
+    let (chunks, tail) = samples.as_chunks::<8>();
+    for c in chunks {
+        if !(c[0].is_finite()
+            & c[1].is_finite()
+            & c[2].is_finite()
+            & c[3].is_finite()
+            & c[4].is_finite()
+            & c[5].is_finite()
+            & c[6].is_finite()
+            & c[7].is_finite())
+        {
+            return None;
+        }
+    }
+    if tail.iter().all(|sample| sample.is_finite()) {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 fn validate_canonical_pcm16_fmt(
@@ -306,8 +326,17 @@ pub fn mono_pcm16_wav_bytes(
     wave.try_reserve_exact(total_bytes)
         .map_err(|_| WavError::AllocationFailed)?;
     wave.extend_from_slice(&header);
-    wave.resize(total_bytes, 0);
-    encode_pcm16le_into(samples, &mut wave[44..])?;
+    let (chunks, tail) = samples.as_chunks::<8>();
+    for c in chunks {
+        let mut block = [0_u8; 16];
+        for (dst, &sample) in block.as_chunks_mut::<2>().0.iter_mut().zip(c.iter()) {
+            *dst = encode_pcm16le_sample(sample).to_le_bytes();
+        }
+        wave.extend_from_slice(&block);
+    }
+    for &sample in tail {
+        wave.extend_from_slice(&encode_pcm16le_sample(sample).to_le_bytes());
+    }
     Ok(wave)
 }
 
@@ -330,13 +359,26 @@ pub fn decode_pcm16le_into<'a>(
     samples
         .try_reserve_exact(pairs.len())
         .map_err(|_| WavError::AllocationFailed)?;
-    samples.extend(
-        pairs
-            .iter()
-            // 1.0 / 32_768.0 is exact binary 2^-15, preserving bit-for-bit equality
-            // with division by 32_768.0 across every i16 sample without FP division.
-            .map(|&sample| f32::from(i16::from_le_bytes(sample)) * (1.0 / 32_768.0)),
-    );
+    // 1.0 / 32_768.0 is exact binary 2^-15, preserving bit-for-bit equality
+    // with division by 32_768.0 across every i16 sample without FP division.
+    let scale = 1.0 / 32_768.0;
+    let (chunks, tail) = pairs.as_chunks::<8>();
+    for c in chunks {
+        let decoded = [
+            f32::from(i16::from_le_bytes(c[0])) * scale,
+            f32::from(i16::from_le_bytes(c[1])) * scale,
+            f32::from(i16::from_le_bytes(c[2])) * scale,
+            f32::from(i16::from_le_bytes(c[3])) * scale,
+            f32::from(i16::from_le_bytes(c[4])) * scale,
+            f32::from(i16::from_le_bytes(c[5])) * scale,
+            f32::from(i16::from_le_bytes(c[6])) * scale,
+            f32::from(i16::from_le_bytes(c[7])) * scale,
+        ];
+        samples.extend_from_slice(&decoded);
+    }
+    for &sample in tail {
+        samples.push(f32::from(i16::from_le_bytes(sample)) * scale);
+    }
     Ok(samples)
 }
 
@@ -361,8 +403,17 @@ pub fn encode_pcm16le_into<'a>(samples: &[f32], bytes: &'a mut [u8]) -> Result<&
         .checked_mul(2)
         .ok_or(WavError::BufferTooSmall)?;
     let target = bytes.get_mut(..byte_len).ok_or(WavError::BufferTooSmall)?;
-    for (sample, slot) in samples.iter().zip(target.as_chunks_mut::<2>().0) {
-        *slot = encode_pcm16le_sample(*sample).to_le_bytes();
+    let (sample_chunks, sample_tail) = samples.as_chunks::<8>();
+    let (dst_chunks, dst_tail) = target.as_chunks_mut::<16>();
+    for (s, d) in sample_chunks.iter().zip(dst_chunks.iter_mut()) {
+        let mut idx = 0_usize;
+        for slot in d.as_chunks_mut::<2>().0 {
+            *slot = encode_pcm16le_sample(s[idx]).to_le_bytes();
+            idx += 1;
+        }
+    }
+    for (&sample, slot) in sample_tail.iter().zip(dst_tail.as_chunks_mut::<2>().0) {
+        *slot = encode_pcm16le_sample(sample).to_le_bytes();
     }
     Ok(target)
 }
