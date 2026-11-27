@@ -12,12 +12,12 @@ const MAX_RASTER_REQUEST_BYTES: usize = 8 + super::svg::MAX_SVG_BYTES;
 const MAX_RASTER_OUTPUT_BYTES: usize =
     super::svg::RASTER_HEADER_BYTES + super::svg::MAX_RASTER_PIXELS * 4;
 
-enum RequestKind {
-    Markdown(String),
+enum RequestKind<'a> {
+    Markdown(&'a str),
     Rasterize {
         max_width: u32,
         max_height: u32,
-        svg: String,
+        svg: &'a str,
     },
 }
 
@@ -50,7 +50,10 @@ fn write_frame(
     output.flush()
 }
 
-fn read_frame(input: &mut impl Read) -> io::Result<(u64, RequestKind)> {
+fn read_frame<'a>(
+    input: &mut impl Read,
+    scratch: &'a mut Vec<u8>,
+) -> io::Result<(u64, RequestKind<'a>)> {
     let mut header = [0; HEADER_BYTES];
     input.read_exact(&mut header)?;
     let Some((magic, rest)) = header.split_first_chunk::<8>() else {
@@ -80,13 +83,14 @@ fn read_frame(input: &mut impl Read) -> io::Result<(u64, RequestKind)> {
     if length > limit || (is_raster && length < 8) {
         return Err(io::Error::other("Oversized Markdown frame"));
     }
-    let mut bytes = vec![0; length];
-    input.read_exact(&mut bytes)?;
+    scratch.clear();
+    scratch.resize(length, 0);
+    input.read_exact(scratch)?;
     if is_markdown {
-        let source = String::from_utf8(bytes).map_err(io::Error::other)?;
+        let source = std::str::from_utf8(scratch).map_err(io::Error::other)?;
         Ok((ticket, RequestKind::Markdown(source)))
     } else {
-        let Some((dimensions, svg_bytes)) = bytes.split_first_chunk::<8>() else {
+        let Some((dimensions, svg_bytes)) = scratch.split_first_chunk::<8>() else {
             return Err(io::Error::other("Invalid SVG raster frame"));
         };
         let Some((width_bytes, rest)) = dimensions.split_first_chunk::<4>() else {
@@ -97,9 +101,7 @@ fn read_frame(input: &mut impl Read) -> io::Result<(u64, RequestKind)> {
         };
         let max_width = u32::from_le_bytes(*width_bytes);
         let max_height = u32::from_le_bytes(*height_bytes);
-        let svg = std::str::from_utf8(svg_bytes)
-            .map_err(io::Error::other)?
-            .to_owned();
+        let svg = std::str::from_utf8(svg_bytes).map_err(io::Error::other)?;
         Ok((
             ticket,
             RequestKind::Rasterize {
@@ -121,29 +123,34 @@ fn read_frame(input: &mut impl Read) -> io::Result<(u64, RequestKind)> {
 /// Rejects invalid identity, zero request tickets, oversized or truncated frames,
 /// invalid UTF-8, oversized results and failed pipe reads, writes or flushes.
 pub fn serve(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
-    let mut scratch = Vec::with_capacity(HEADER_BYTES);
-    write_frame(output, 0, &[], &mut scratch)?;
+    let mut read_scratch = Vec::new();
+    let mut write_scratch = Vec::with_capacity(HEADER_BYTES);
+    write_frame(output, 0, &[], &mut write_scratch)?;
     loop {
-        let (ticket, request) = read_frame(input)?;
+        let (ticket, request) = read_frame(input, &mut read_scratch)?;
         match request {
             RequestKind::Markdown(source) => {
-                let rendered = super::parse(&source);
+                let rendered = super::parse(source);
                 if rendered.len() > MAX_OUTPUT_BYTES {
                     return Err(io::Error::other("Oversized Markdown result"));
                 }
-                write_frame(output, ticket, &rendered, &mut scratch)?;
+                write_frame(output, ticket, &rendered, &mut write_scratch)?;
             }
             RequestKind::Rasterize {
                 max_width,
                 max_height,
                 svg,
             } => {
-                let raster = super::svg::rasterize(&svg, max_width, max_height);
+                let raster = super::svg::rasterize(svg, max_width, max_height);
                 if raster.len() > MAX_RASTER_OUTPUT_BYTES {
                     return Err(io::Error::other("Oversized SVG raster result"));
                 }
-                write_frame(output, ticket, &raster, &mut scratch)?;
+                write_frame(output, ticket, &raster, &mut write_scratch)?;
             }
+        }
+        read_scratch.clear();
+        if read_scratch.capacity() > SCRATCH_LIMIT_BYTES {
+            read_scratch.shrink_to(SCRATCH_LIMIT_BYTES);
         }
     }
 }

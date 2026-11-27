@@ -79,6 +79,47 @@ fn persistent_worker_preserves_unicode_packet_and_request_identity() -> io::Resu
 }
 
 #[test]
+fn persistent_worker_reuses_and_bounds_frame_scratch_across_large_and_small_frames()
+-> io::Result<()> {
+    let small = b"small **frame**";
+    let large = "x".repeat(96 * 1024);
+    let mut requests = frame(1, small)?;
+    requests.extend(frame(2, large.as_bytes())?);
+    requests.extend(frame(3, small)?);
+    let mut output = Vec::new();
+    assert_eq!(
+        serve(&mut Cursor::new(requests), &mut output)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::UnexpectedEof)
+    );
+    let expected_small = parse("small **frame**");
+    let expected_large = parse(&large);
+    let mut cursor = Cursor::new(output);
+    let expected_payloads: Vec<(u64, &[u8])> = vec![
+        (0, &[]),
+        (1, &expected_small),
+        (2, &expected_large),
+        (3, &expected_small),
+    ];
+    for (ticket, payload) in expected_payloads {
+        let mut header = [0; 20];
+        cursor.read_exact(&mut header)?;
+        assert_eq!(&header[..8], b"BSMR0001");
+        assert_eq!(&header[8..16], &ticket.to_le_bytes());
+        let len = u32::from_le_bytes(header[16..].try_into().map_err(io::Error::other)?);
+        assert_eq!(
+            usize::try_from(len).map_err(io::Error::other)?,
+            payload.len()
+        );
+        let mut actual = vec![0; payload.len()];
+        cursor.read_exact(&mut actual)?;
+        assert_eq!(actual, payload);
+    }
+    Ok(())
+}
+
+#[test]
 fn worker_rejects_invalid_frames_before_emitting_any_rendered_response() -> io::Result<()> {
     let mut bad_magic = frame(1, b"text")?;
     bad_magic[0] = b'X';
@@ -677,10 +718,14 @@ fn svg_parse_tree_cache_reuses_valid_trees_and_evicts_lru_after_four() -> io::Re
     let svg3 = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"#333\"/></svg>";
     let svg4 = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"#444\"/></svg>";
     let svg5 = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"#555\"/></svg>";
+    let svg6 = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"#666\"/></svg>";
+    let svg7 = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"#777\"/></svg>";
+    let svg8 = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"#888\"/></svg>";
+    let svg9 = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"#999\"/></svg>";
     let invalid = "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
 
     let results = svg::parse_tree_cache_for_test_roundtrip(&[
-        svg1, svg1, svg2, svg3, svg4, svg2, svg5, invalid, svg2, svg1,
+        svg1, svg1, svg2, svg3, svg4, svg5, svg6, svg7, svg8, svg2, invalid, svg9, svg3, svg2, svg1,
     ]);
     let t1_first = results[0]
         .as_ref()
@@ -693,20 +738,28 @@ fn svg_parse_tree_cache_reuses_valid_trees_and_evicts_lru_after_four() -> io::Re
     let t2_first = results[2]
         .as_ref()
         .ok_or_else(|| io::Error::other("svg2 valid"))?;
-    let t2_promoted = results[5]
+    let t3_first = results[3]
+        .as_ref()
+        .ok_or_else(|| io::Error::other("svg3 valid"))?;
+    let t2_promoted = results[9]
         .as_ref()
         .ok_or_else(|| io::Error::other("svg2 promoted"))?;
     assert!(Arc::ptr_eq(t2_first, t2_promoted));
 
-    assert!(results[6].is_some());
-    assert!(results[7].is_none());
+    assert!(results[10].is_none());
+    assert!(results[11].is_some());
 
-    let t2_retained = results[8]
+    let t3_retained = results[12]
+        .as_ref()
+        .ok_or_else(|| io::Error::other("svg3 retained"))?;
+    assert!(Arc::ptr_eq(t3_first, t3_retained));
+
+    let t2_retained = results[13]
         .as_ref()
         .ok_or_else(|| io::Error::other("svg2 retained"))?;
     assert!(Arc::ptr_eq(t2_first, t2_retained));
 
-    let t1_re_parsed = results[9]
+    let t1_re_parsed = results[14]
         .as_ref()
         .ok_or_else(|| io::Error::other("svg1 re-parsed"))?;
     assert!(!Arc::ptr_eq(t1_first, t1_re_parsed));

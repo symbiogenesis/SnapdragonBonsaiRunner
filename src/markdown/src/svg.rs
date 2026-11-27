@@ -23,7 +23,7 @@ pub const MAX_RASTER_PIXELS: usize = 4_194_304;
 pub(crate) const RASTER_MAGIC: &[u8; 4] = b"BMG1";
 /// Byte length of the raster header (`BMG1` + `ok:u8` + `width:u32` + `height:u32`).
 pub(crate) const RASTER_HEADER_BYTES: usize = 13;
-const PARSE_TREE_CACHE_CAPACITY: usize = 4;
+const PARSE_TREE_CACHE_CAPACITY: usize = MAX_SVG_IMAGES;
 
 struct EmbeddedFonts {
     database: Arc<resvg::usvg::fontdb::Database>,
