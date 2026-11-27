@@ -9,9 +9,10 @@
     reason = "Non-fused multiply and add preserve exact left-to-right scalar f32 bit parity."
 )]
 
+use bonsai_windows_process::quant_kernels;
 #[cfg(all(windows, feature = "rust-qualification"))]
 use bonsai_windows_process::quant_kernels::{
-    self, Arm64QuantCaps, Q8_0ActBlock, Q8_0ActPanel8, Q8_KActBlock, Q8_KActPanel8,
+    Arm64QuantCaps, Q8_0ActBlock, Q8_0ActPanel8, Q8_KActBlock, Q8_KActPanel8, RowMajorBand,
 };
 use std::sync::OnceLock;
 
@@ -3156,7 +3157,437 @@ fn add_bias_and_check_finite_simd<S: Simd>(
     all_finite
 }
 
-/// Bit-exact matrix multiplication for a pre-transposed batch `[batch, input]`
+#[cfg(all(windows, feature = "rust-qualification"))]
+fn aligned_band_cols(output: usize, workers: usize, align: usize) -> Vec<usize> {
+    if output == 0 {
+        return Vec::new();
+    }
+    let eff_align = align.max(1);
+    let groups = output.div_ceil(eff_align);
+    let active = workers
+        .clamp(1, crate::threads::MAX_WORKERS)
+        .min(groups.max(1));
+    let base_groups = groups / active;
+    let rem_groups = groups % active;
+    let mut cols = Vec::with_capacity(active);
+    let mut assigned = 0_usize;
+    for idx in 0..active {
+        let count = base_groups + usize::from(idx < rem_groups);
+        let take = count.saturating_mul(eff_align).min(output - assigned);
+        if take > 0 {
+            cols.push(take);
+            assigned += take;
+        }
+    }
+    cols
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Executes quantized 8-row/4-row/1-row GEMMs directly into a disjoint RowMajorBand with optional fused bias."
+)]
+fn run_band_8row_quant<A>(
+    data: &[u8],
+    row_bytes: usize,
+    blocks: usize,
+    batch: usize,
+    bias: Option<&[f32]>,
+    act: &[A],
+    panel_count: usize,
+    band: &mut RowMajorBand<'_>,
+    mut gemm_panels_into_band: impl FnMut(
+        [&[u8]; 8],
+        &mut RowMajorBand<'_>,
+        usize,
+        Option<[f32; 8]>,
+    ) -> bool,
+    gemm8x8: impl Fn([&[u8]; 8], [&[A]; 8]) -> [[f32; 8]; 8],
+    gemm8x4: impl Fn([&[u8]; 8], [&[A]; 4]) -> [[f32; 4]; 8],
+    gemm8x2: impl Fn([&[u8]; 8], [&[A]; 2]) -> [[f32; 2]; 8],
+    dot8: impl Fn([&[u8]; 8], &[A]) -> [f32; 8],
+    gemm4x2: impl Fn([&[u8]; 4], &[A], &[A]) -> [[f32; 2]; 4],
+    dot4: impl Fn([&[u8]; 4], &[A]) -> [f32; 4],
+    dot1: impl Fn(&[u8], &[A]) -> f32,
+) -> bool {
+    let start_row = band.col_start();
+    let rows_here = band.col_len();
+    let mut local_col = 0_usize;
+    let mut all_finite = true;
+    while local_col + 8 <= rows_here {
+        let abs_row = start_row + local_col;
+        let row_slices = eight_rows(data, abs_row, row_bytes);
+        let b8 = bias.map(|b| std::array::from_fn(|r| b[abs_row + r]));
+        let b_slice = b8.as_ref().map(|a| a.as_slice());
+        let mut t = 0_usize;
+        if panel_count > 0 {
+            if !gemm_panels_into_band(row_slices, band, local_col, b8) {
+                all_finite = false;
+            }
+            t = panel_count * 8;
+        } else {
+            while t + 8 <= batch {
+                let acts: [&[A]; 8] =
+                    std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
+                let tile = gemm8x8(row_slices, acts);
+                for k in 0..8 {
+                    let col: [f32; 8] = std::array::from_fn(|r| tile[r][k]);
+                    if !band.write_token_slice_biased(t + k, local_col, &col, b_slice) {
+                        all_finite = false;
+                    }
+                }
+                t += 8;
+            }
+        }
+        if t + 4 <= batch {
+            let acts: [&[A]; 4] =
+                std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
+            let tile = gemm8x4(row_slices, acts);
+            for k in 0..4 {
+                let col: [f32; 8] = std::array::from_fn(|r| tile[r][k]);
+                if !band.write_token_slice_biased(t + k, local_col, &col, b_slice) {
+                    all_finite = false;
+                }
+            }
+            t += 4;
+        }
+        if t + 2 <= batch {
+            let acts: [&[A]; 2] =
+                std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
+            let tile = gemm8x2(row_slices, acts);
+            for k in 0..2 {
+                let col: [f32; 8] = std::array::from_fn(|r| tile[r][k]);
+                if !band.write_token_slice_biased(t + k, local_col, &col, b_slice) {
+                    all_finite = false;
+                }
+            }
+            t += 2;
+        }
+        if t < batch {
+            let col = dot8(row_slices, &act[t * blocks..(t + 1) * blocks]);
+            if !band.write_token_slice_biased(t, local_col, &col, b_slice) {
+                all_finite = false;
+            }
+        }
+        local_col += 8;
+    }
+    while local_col + 4 <= rows_here {
+        let abs_row = start_row + local_col;
+        let row_slices = four_rows(data, abs_row, row_bytes);
+        let b4: Option<[f32; 4]> = bias.map(|b| std::array::from_fn(|r| b[abs_row + r]));
+        let b_slice = b4.as_ref().map(|a| a.as_slice());
+        let mut t = 0_usize;
+        while t + 1 < batch {
+            let res = gemm4x2(
+                row_slices,
+                &act[t * blocks..(t + 1) * blocks],
+                &act[(t + 1) * blocks..(t + 2) * blocks],
+            );
+            let c0: [f32; 4] = std::array::from_fn(|r| res[r][0]);
+            let c1: [f32; 4] = std::array::from_fn(|r| res[r][1]);
+            if !band.write_token_slice_biased(t, local_col, &c0, b_slice) {
+                all_finite = false;
+            }
+            if !band.write_token_slice_biased(t + 1, local_col, &c1, b_slice) {
+                all_finite = false;
+            }
+            t += 2;
+        }
+        if t < batch {
+            let col = dot4(row_slices, &act[t * blocks..(t + 1) * blocks]);
+            if !band.write_token_slice_biased(t, local_col, &col, b_slice) {
+                all_finite = false;
+            }
+        }
+        local_col += 4;
+    }
+    while local_col < rows_here {
+        let abs_row = start_row + local_col;
+        let w_row = &data[abs_row * row_bytes..(abs_row + 1) * row_bytes];
+        let b1 = bias.map(|b| [b[abs_row]]);
+        let b_slice = b1.as_ref().map(|a| a.as_slice());
+        for t in 0..batch {
+            let val = dot1(w_row, &act[t * blocks..(t + 1) * blocks]);
+            if !band.write_token_slice_biased(t, local_col, &[val], b_slice) {
+                all_finite = false;
+            }
+        }
+        local_col += 1;
+    }
+    all_finite
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Executes quantized GEMM directly into a disjoint RowMajorBand with fused bias and finiteness check."
+)]
+fn run_band_quant_arm64(
+    caps: Arm64QuantCaps,
+    weights: WeightMatrix<'_>,
+    batch: usize,
+    bias: Option<&[f32]>,
+    act_q8_0: &[Q8_0ActBlock],
+    act_q8_0_panels8: &[Q8_0ActPanel8],
+    q8_0_panel_count: usize,
+    act_q8_k: &[Q8_KActBlock],
+    act_q8_k_panels8: &[Q8_KActPanel8],
+    q8_k_panel_count: usize,
+    band: &mut RowMajorBand<'_>,
+) -> bool {
+    let width = weights.input;
+    match weights.data {
+        WeightSlice::Q8(data) => {
+            let blocks = width / 32;
+            let panels = if q8_0_panel_count > 0 {
+                &act_q8_0_panels8[..q8_0_panel_count * blocks]
+            } else {
+                &[]
+            };
+            run_band_8row_quant(
+                data,
+                blocks * 34,
+                blocks,
+                batch,
+                bias,
+                act_q8_0,
+                q8_0_panel_count,
+                band,
+                |r, b, local_col, b8| {
+                    quant_kernels::gemm_q8_0_8x_panels_into_band::<false>(
+                        caps,
+                        r,
+                        panels,
+                        q8_0_panel_count,
+                        blocks,
+                        b,
+                        local_col,
+                        b8,
+                    )
+                },
+                |r, a| quant_kernels::gemm_q8_0_8x8(caps, r, a),
+                |r, a| quant_kernels::gemm_q8_0_8x4(caps, r, a),
+                |r, a| quant_kernels::gemm_q8_0_8x2(caps, r, a),
+                |r, a| quant_kernels::dot_q8_0_8rows(caps, r, a),
+                |r, a, b| quant_kernels::gemm_q8_0_4x2(caps, r, a, b),
+                |r, a| quant_kernels::dot_q8_0_4rows(caps, r, a),
+                |r, a| quant_kernels::dot_q8_0_row(caps, r, a),
+            )
+        }
+        WeightSlice::Q4K(data) => {
+            let blocks = width / 256;
+            let row_bytes = blocks * 144;
+            let start_row = band.col_start();
+            let rows_here = band.col_len();
+            let mut local_col = 0_usize;
+            let mut all_finite = true;
+            while local_col + 4 <= rows_here {
+                let abs_row = start_row + local_col;
+                let row_slices = four_rows(data, abs_row, row_bytes);
+                let b4: Option<[f32; 4]> = bias.map(|b| std::array::from_fn(|r| b[abs_row + r]));
+                let b_slice = b4.as_ref().map(|a| a.as_slice());
+                let mut t = 0_usize;
+                while t + 1 < batch {
+                    let res = quant_kernels::gemm_q4_k_4x2(
+                        caps,
+                        row_slices,
+                        &act_q8_k[t * blocks..(t + 1) * blocks],
+                        &act_q8_k[(t + 1) * blocks..(t + 2) * blocks],
+                    );
+                    let c0: [f32; 4] = std::array::from_fn(|r| res[r][0]);
+                    let c1: [f32; 4] = std::array::from_fn(|r| res[r][1]);
+                    if !band.write_token_slice_biased(t, local_col, &c0, b_slice) {
+                        all_finite = false;
+                    }
+                    if !band.write_token_slice_biased(t + 1, local_col, &c1, b_slice) {
+                        all_finite = false;
+                    }
+                    t += 2;
+                }
+                if t < batch {
+                    let col = quant_kernels::dot_q4_k_4rows(
+                        caps,
+                        row_slices,
+                        &act_q8_k[t * blocks..(t + 1) * blocks],
+                    );
+                    if !band.write_token_slice_biased(t, local_col, &col, b_slice) {
+                        all_finite = false;
+                    }
+                }
+                local_col += 4;
+            }
+            while local_col < rows_here {
+                let abs_row = start_row + local_col;
+                let w_row = &data[abs_row * row_bytes..(abs_row + 1) * row_bytes];
+                let b1 = bias.map(|b| [b[abs_row]]);
+                let b_slice = b1.as_ref().map(|a| a.as_slice());
+                for t in 0..batch {
+                    let val = quant_kernels::dot_q4_k_row(
+                        caps,
+                        w_row,
+                        &act_q8_k[t * blocks..(t + 1) * blocks],
+                    );
+                    if !band.write_token_slice_biased(t, local_col, &[val], b_slice) {
+                        all_finite = false;
+                    }
+                }
+                local_col += 1;
+            }
+            all_finite
+        }
+        WeightSlice::RepackedQ4K8(data) => {
+            let blocks = width / quant_kernels::QK_K;
+            let strip_bytes = blocks * quant_kernels::Q4_K_REPACK8_BLOCK_BYTES;
+            let start_row = band.col_start();
+            let rows_here = band.col_len();
+            let panels = if q8_k_panel_count > 0 {
+                &act_q8_k_panels8[..q8_k_panel_count * blocks]
+            } else {
+                &[]
+            };
+            let mut local_col = 0_usize;
+            let mut all_finite = true;
+            while local_col < rows_here {
+                let abs_row = start_row + local_col;
+                let strip_idx = abs_row / 8;
+                let lane = abs_row % 8;
+                let strip = &data[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
+                let take = (8 - lane).min(rows_here - local_col);
+                let b_slice = bias.map(|b| &b[abs_row..abs_row + take]);
+                let mut t = 0_usize;
+                if q8_k_panel_count > 0 && lane == 0 && take == 8 {
+                    let b8: Option<[f32; 8]> = b_slice.map(|bs| std::array::from_fn(|r| bs[r]));
+                    if !quant_kernels::gemm_q4_k_repacked8_8x_panels_into_band::<false>(
+                        caps,
+                        strip,
+                        panels,
+                        q8_k_panel_count,
+                        blocks,
+                        band,
+                        local_col,
+                        b8,
+                    ) {
+                        all_finite = false;
+                    }
+                    t = q8_k_panel_count * 8;
+                } else {
+                    while t + 8 <= batch {
+                        let acts: [&[Q8_KActBlock]; 8] = std::array::from_fn(|k| {
+                            &act_q8_k[(t + k) * blocks..(t + k + 1) * blocks]
+                        });
+                        let tile = quant_kernels::gemm_q4_k_repacked8_8x8(caps, strip, acts);
+                        for k in 0..8 {
+                            let mut col = [0.0_f32; 8];
+                            for r in 0..take {
+                                col[r] = tile[lane + r][k];
+                            }
+                            if !band.write_token_slice_biased(
+                                t + k,
+                                local_col,
+                                &col[..take],
+                                b_slice,
+                            ) {
+                                all_finite = false;
+                            }
+                        }
+                        t += 8;
+                    }
+                }
+                if t + 4 <= batch {
+                    let acts: [&[Q8_KActBlock]; 4] =
+                        std::array::from_fn(|k| &act_q8_k[(t + k) * blocks..(t + k + 1) * blocks]);
+                    let tile = quant_kernels::gemm_q4_k_repacked8_8x4(caps, strip, acts);
+                    for k in 0..4 {
+                        let mut col = [0.0_f32; 8];
+                        for r in 0..take {
+                            col[r] = tile[lane + r][k];
+                        }
+                        if !band.write_token_slice_biased(t + k, local_col, &col[..take], b_slice) {
+                            all_finite = false;
+                        }
+                    }
+                    t += 4;
+                }
+                if t + 2 <= batch {
+                    let tile = quant_kernels::gemm_q4_k_repacked8_8x2(
+                        caps,
+                        strip,
+                        &act_q8_k[t * blocks..(t + 1) * blocks],
+                        &act_q8_k[(t + 1) * blocks..(t + 2) * blocks],
+                    );
+                    for k in 0..2 {
+                        let mut col = [0.0_f32; 8];
+                        for r in 0..take {
+                            col[r] = tile[lane + r][k];
+                        }
+                        if !band.write_token_slice_biased(t + k, local_col, &col[..take], b_slice) {
+                            all_finite = false;
+                        }
+                    }
+                    t += 2;
+                }
+                if t < batch {
+                    let col = quant_kernels::dot_q4_k_repacked8(
+                        caps,
+                        strip,
+                        &act_q8_k[t * blocks..(t + 1) * blocks],
+                    );
+                    if !band.write_token_slice_biased(
+                        t,
+                        local_col,
+                        &col[lane..lane + take],
+                        b_slice,
+                    ) {
+                        all_finite = false;
+                    }
+                }
+                local_col += take;
+            }
+            all_finite
+        }
+        WeightSlice::Q6K(data) => {
+            let blocks = width / 256;
+            let panels = if q8_k_panel_count > 0 {
+                &act_q8_k_panels8[..q8_k_panel_count * blocks]
+            } else {
+                &[]
+            };
+            run_band_8row_quant(
+                data,
+                blocks * 210,
+                blocks,
+                batch,
+                bias,
+                act_q8_k,
+                q8_k_panel_count,
+                band,
+                |r, b, local_col, b8| {
+                    quant_kernels::gemm_q6_k_8x_panels_into_band::<false>(
+                        caps,
+                        r,
+                        panels,
+                        q8_k_panel_count,
+                        blocks,
+                        b,
+                        local_col,
+                        b8,
+                    )
+                },
+                |r, a| quant_kernels::gemm_q6_k_8x8(caps, r, a),
+                |r, a| quant_kernels::gemm_q6_k_8x4(caps, r, a),
+                |r, a| quant_kernels::gemm_q6_k_8x2(caps, r, a),
+                |r, a| quant_kernels::dot_q6_k_8rows(caps, r, a),
+                |r, a, b| quant_kernels::gemm_q6_k_4x2(caps, r, a, b),
+                |r, a| quant_kernels::dot_q6_k_4rows(caps, r, a),
+                |r, a| quant_kernels::dot_q6_k_row(caps, r, a),
+            )
+        }
+        WeightSlice::Float(_) => true,
+    }
+}
+
+/// Matrix multiplication for a pre-transposed batch `[batch, input]` into `[batch, output]`
+/// using `4x8` / `4x4` SIMD tiles (or ARM64 `I8MM`/`SDOT` kernels) and `row_workers`,
 /// with optional fused bias and in-register finiteness check, returning `false` on non-finite output.
 pub(super) fn multiply_batch_prepared_biased_into(
     weights: WeightMatrix<'_>,
@@ -3187,34 +3618,37 @@ pub(super) fn multiply_batch_prepared_biased_into(
             weights.input,
             workers,
         );
-        let needed = output * batch;
-        if transposed_scratch.len() < needed {
-            transposed_scratch.resize(needed, 0.0);
-        }
-        let transposed = &mut transposed_scratch[..needed];
         let row_align = quant_row_align(weights.data);
-        row_workers::run_aligned(
-            transposed,
-            workers,
-            row_align * batch,
-            &|elem_off, slice| {
-                let start_row = elem_off / batch;
-                batch_rows_quant_arm64(
-                    caps,
-                    weights,
-                    start_row,
-                    batch,
-                    &prepared.act_q8_0,
-                    &prepared.act_q8_0_panels8,
-                    prepared.q8_0_panel_count,
-                    &prepared.act_q8_k,
-                    &prepared.act_q8_k_panels8,
-                    prepared.q8_k_panel_count,
-                    slice,
-                );
-            },
-        );
-        return scatter_transposed_to_batch(transposed, batch, output, batch, workers, bias, out);
+        let band_cols = aligned_band_cols(output, workers, row_align);
+        if let Some(mut bands) =
+            quant_kernels::split_row_major_bands(out, batch, output, &band_cols)
+        {
+            let all_finite = std::sync::atomic::AtomicBool::new(true);
+            let active_workers = workers
+                .clamp(1, crate::threads::MAX_WORKERS)
+                .min(bands.len().max(1));
+            row_workers::run_slice_aligned(&mut bands, active_workers, 1, &|_, worker_bands| {
+                for band in worker_bands {
+                    if !run_band_quant_arm64(
+                        caps,
+                        weights,
+                        batch,
+                        bias,
+                        &prepared.act_q8_0,
+                        &prepared.act_q8_0_panels8,
+                        prepared.q8_0_panel_count,
+                        &prepared.act_q8_k,
+                        &prepared.act_q8_k_panels8,
+                        prepared.q8_k_panel_count,
+                        band,
+                    ) {
+                        all_finite.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+            return all_finite.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        return false;
     }
 
     prepared.ensure_quads(raw_input, workers);
@@ -3521,64 +3955,66 @@ pub(super) fn multiply_batch_group_biased_into(
                 .map(|w| quant_row_align(w.data))
                 .max()
                 .unwrap_or(4);
-            let mut offsets = [0_usize; 4];
-            let mut padded_rows = 0_usize;
-            for (idx, w) in matrices[..count].iter().enumerate() {
-                offsets[idx] = padded_rows;
-                padded_rows += w.output.next_multiple_of(row_align);
+            struct GroupBandTask<'a> {
+                weights: WeightMatrix<'a>,
+                bias: Option<&'a [f32]>,
+                band: RowMajorBand<'a>,
             }
-            let needed = padded_rows * batch;
-            if transposed_scratch.len() < needed {
-                transposed_scratch.resize(needed, 0.0);
+            let total_rows: usize = matrices[..count].iter().map(|w| w.output).sum();
+            let total_groups = total_rows.div_ceil(row_align);
+            let target_workers = workers
+                .clamp(1, crate::threads::MAX_WORKERS)
+                .min(total_groups.max(1));
+            let mut tasks = Vec::with_capacity(target_workers.saturating_mul(count));
+            for (idx, (_, bias_opt, out)) in targets.iter_mut().enumerate() {
+                let w = matrices[idx];
+                if w.output == 0 {
+                    continue;
+                }
+                let share = (target_workers * w.output)
+                    .div_ceil(total_rows.max(1))
+                    .max(1);
+                let cols = aligned_band_cols(w.output, share, row_align);
+                let Some(bands) =
+                    quant_kernels::split_row_major_bands(*out, batch, w.output, &cols)
+                else {
+                    return false;
+                };
+                for band in bands {
+                    tasks.push(GroupBandTask {
+                        weights: w,
+                        bias: *bias_opt,
+                        band,
+                    });
+                }
             }
-            let transposed = &mut transposed_scratch[..needed];
-            row_workers::run_aligned(
-                transposed,
-                workers,
-                row_align * batch,
-                &|elem_off, slice| {
-                    let start_row_global = elem_off / batch;
-                    let end_row_global = start_row_global + slice.len() / batch;
-                    for (idx, w) in matrices[..count].iter().enumerate() {
-                        let t_start = offsets[idx];
-                        let t_end = t_start + w.output;
-                        let lo = start_row_global.max(t_start);
-                        let hi = end_row_global.min(t_end);
-                        if lo >= hi {
-                            continue;
-                        }
-                        let slice_lo = (lo - start_row_global) * batch;
-                        let slice_hi = (hi - start_row_global) * batch;
-                        batch_rows_quant_arm64(
-                            caps,
-                            *w,
-                            lo - t_start,
-                            batch,
-                            &prepared.act_q8_0,
-                            &prepared.act_q8_0_panels8,
-                            prepared.q8_0_panel_count,
-                            &prepared.act_q8_k,
-                            &prepared.act_q8_k_panels8,
-                            prepared.q8_k_panel_count,
-                            &mut slice[slice_lo..slice_hi],
-                        );
+            if tasks.is_empty() {
+                return true;
+            }
+            let all_finite = std::sync::atomic::AtomicBool::new(true);
+            let active_workers = workers
+                .clamp(1, crate::threads::MAX_WORKERS)
+                .min(tasks.len());
+            row_workers::run_slice_aligned(&mut tasks, active_workers, 1, &|_, worker_tasks| {
+                for task in worker_tasks {
+                    if !run_band_quant_arm64(
+                        caps,
+                        task.weights,
+                        batch,
+                        task.bias,
+                        &prepared.act_q8_0,
+                        &prepared.act_q8_0_panels8,
+                        prepared.q8_0_panel_count,
+                        &prepared.act_q8_k,
+                        &prepared.act_q8_k_panels8,
+                        prepared.q8_k_panel_count,
+                        &mut task.band,
+                    ) {
+                        all_finite.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
-                },
-            );
-            let mut outs: [&mut [f32]; 4] = [&mut [], &mut [], &mut [], &mut []];
-            for (idx, (_, _, out)) in targets.iter_mut().enumerate() {
-                outs[idx] = *out;
-            }
-            return scatter_group_to_batch(
-                transposed,
-                &offsets[..count],
-                batch,
-                &outputs[..count],
-                &biases[..count],
-                batch,
-                workers,
-                &mut outs[..count],
-            );
+                }
+            });
+            return all_finite.load(std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -4137,6 +4573,18 @@ fn softmax_scores_simd<S: Simd>(
     Ok(())
 }
 
+#[cfg(test)]
+pub(super) fn softmax_scores_test_ref(
+    scores: &mut [f32],
+    invalid: fn() -> std::io::Error,
+) -> std::io::Result<()> {
+    let level = simd_level();
+    dispatch!(level, simd => {
+        let max = max_finite_simd(simd, scores);
+        softmax_scores_simd(simd, scores, max, invalid)
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Shared single-head attention kernel reuses caller score/output storage without allocating."
@@ -4418,64 +4866,31 @@ fn weighted_value_accum_4_tile_simd<S: Simd, const N: usize>(
     }
 }
 
-#[inline(always)]
-fn dot_row_tile_simd<S: Simd, const N: usize>(
-    simd: S,
-    q_tile: [&[f32]; N],
-    k: &[f32],
-    head_dim: usize,
-    divisor: f32,
-) -> [f32; N] {
-    let mut dots = [0.0_f32; N];
-    let chunks = head_dim / 4;
-    for chunk_idx in 0..chunks {
-        let base = chunk_idx * 4;
-        let kv = f32x4::from_slice(simd, &k[base..base + 4]);
-        for g in 0..N {
-            let prod: [f32; 4] = (f32x4::from_slice(simd, &q_tile[g][base..base + 4]) * kv).into();
-            dots[g] += prod[0];
-            dots[g] += prod[1];
-            dots[g] += prod[2];
-            dots[g] += prod[3];
-        }
+#[inline]
+fn dot_row_fma_scalar(q: &[f32], k: &[f32], divisor: f32) -> f32 {
+    let mut acc = 0.0_f32;
+    for (&qv, &kv) in q.iter().zip(k) {
+        acc = qv.mul_add(kv, acc);
     }
-    for d in (chunks * 4)..head_dim {
-        let kv = k[d];
-        for g in 0..N {
-            dots[g] += q_tile[g][d] * kv;
-        }
-    }
-    for dot in &mut dots {
-        *dot /= divisor;
-    }
-    dots
+    acc / divisor
 }
 
-#[inline(always)]
-fn weighted_value_accum_tile_simd<S: Simd, const N: usize>(
-    simd: S,
-    out_tile: [&mut [f32]; N],
-    value: &[f32],
-    weights: [f32; N],
-    head_dim: usize,
-) {
-    let wv: [f32x4<S>; N] = std::array::from_fn(|g| f32x4::splat(simd, weights[g]));
-    let chunks = head_dim / 4;
-    for chunk_idx in 0..chunks {
-        let base = chunk_idx * 4;
-        let vv = f32x4::from_slice(simd, &value[base..base + 4]);
-        for g in 0..N {
-            let dst = &mut out_tile[g][base..base + 4];
-            let ov = f32x4::from_slice(simd, dst);
-            (ov + wv[g] * vv).store_slice(dst);
-        }
+#[inline]
+fn axpy_row_fma_scalar(out: &mut [f32], v: &[f32], weight: f32) {
+    for (dst, &vv) in out.iter_mut().zip(v) {
+        *dst = weight.mul_add(vv, *dst);
     }
-    for d in (chunks * 4)..head_dim {
-        let vv = value[d];
-        for g in 0..N {
-            out_tile[g][d] += weights[g] * vv;
-        }
+}
+
+#[inline]
+fn dot_pair_f32_fma_scalar(q0: &[f32], q1: &[f32], k: &[f32]) -> (f32, f32) {
+    let mut d0 = 0.0_f32;
+    let mut d1 = 0.0_f32;
+    for ((&kv, &a), &b) in k.iter().zip(q0).zip(q1) {
+        d0 = a.mul_add(kv, d0);
+        d1 = b.mul_add(kv, d1);
     }
+    (d0, d1)
 }
 
 #[expect(
@@ -4506,16 +4921,24 @@ fn attend_q_tile_head_simd<S: Simd, const N: usize>(
             &keys[(r + 2) * hidden + offset..(r + 2) * hidden + offset + head_dim],
             &keys[(r + 3) * hidden + offset..(r + 3) * hidden + offset + head_dim],
         ];
-        let res = dot_4keys_tile_simd(simd, q_tile, k_refs, head_dim, divisor);
-        for g in 0..N {
-            scores[g * win_len + r..g * win_len + r + 4].copy_from_slice(&res[g]);
+        if N == 4 {
+            let q4 = [q_tile[0], q_tile[1], q_tile[2], q_tile[3]];
+            let res = quant_kernels::dot_4x4_f32_fma(q4, k_refs, divisor);
+            for g in 0..4 {
+                scores[g * win_len + r..g * win_len + r + 4].copy_from_slice(&res[g]);
+            }
+        } else {
+            for g in 0..N {
+                for (ki, k_ref) in k_refs.iter().enumerate() {
+                    scores[g * win_len + r + ki] = dot_row_fma_scalar(q_tile[g], k_ref, divisor);
+                }
+            }
         }
     }
     for r in (full_quads * 4)..win_len {
         let k = &keys[r * hidden + offset..r * hidden + offset + head_dim];
-        let res = dot_row_tile_simd(simd, q_tile, k, head_dim, divisor);
         for g in 0..N {
-            scores[g * win_len + r] = res[g];
+            scores[g * win_len + r] = dot_row_fma_scalar(q_tile[g], k, divisor);
         }
     }
     if !ensure_finite_simd(simd, &scores[..N * win_len]) {
@@ -4531,34 +4954,32 @@ fn attend_q_tile_head_simd<S: Simd, const N: usize>(
     }
     for quad in 0..full_quads {
         let r = quad * 4;
-        let weights: [[f32; 4]; N] = std::array::from_fn(|g| {
-            let s = &scores[g * win_len + r..g * win_len + r + 4];
-            [s[0], s[1], s[2], s[3]]
-        });
         let v_refs = [
             &values[r * hidden + offset..r * hidden + offset + head_dim],
             &values[(r + 1) * hidden + offset..(r + 1) * hidden + offset + head_dim],
             &values[(r + 2) * hidden + offset..(r + 2) * hidden + offset + head_dim],
             &values[(r + 3) * hidden + offset..(r + 3) * hidden + offset + head_dim],
         ];
-        weighted_value_accum_4_tile_simd(
-            simd,
-            out_tile.each_mut().map(|s| &mut **s),
-            v_refs,
-            weights,
-            head_dim,
-        );
+        if let [o0, o1, o2, o3] = out_tile.as_mut_slice() {
+            let weights: [[f32; 4]; 4] = std::array::from_fn(|g| {
+                let s = &scores[g * win_len + r..g * win_len + r + 4];
+                [s[0], s[1], s[2], s[3]]
+            });
+            quant_kernels::axpy_4x4_f32_fma(&mut [o0, o1, o2, o3], v_refs, weights);
+        } else {
+            for g in 0..N {
+                let s = &scores[g * win_len + r..g * win_len + r + 4];
+                for (ki, v_ref) in v_refs.iter().enumerate() {
+                    axpy_row_fma_scalar(out_tile[g], v_ref, s[ki]);
+                }
+            }
+        }
     }
     for r in (full_quads * 4)..win_len {
-        let weights: [f32; N] = std::array::from_fn(|g| scores[g * win_len + r]);
         let v = &values[r * hidden + offset..r * hidden + offset + head_dim];
-        weighted_value_accum_tile_simd(
-            simd,
-            out_tile.each_mut().map(|s| &mut **s),
-            v,
-            weights,
-            head_dim,
-        );
+        for g in 0..N {
+            axpy_row_fma_scalar(out_tile[g], v, scores[g * win_len + r]);
+        }
     }
     Ok(())
 }
@@ -5013,21 +5434,98 @@ pub(super) fn attend_kv_group_f16(
     out_group: &mut [f32],
     invalid: fn() -> std::io::Error,
 ) -> std::io::Result<()> {
-    attend_kv_group_impl(
-        q_group,
-        keys,
-        values,
-        history_rows,
-        row_width,
-        offset,
-        head_dim,
-        gqa_group,
-        divisor,
-        current_kv,
-        scores,
-        out_group,
-        invalid,
-    )
+    if gqa_group >= 2 && gqa_group.is_multiple_of(2) {
+        let total_rows = history_rows
+            .checked_add(usize::from(current_kv.is_some()))
+            .ok_or_else(invalid)?;
+        let group_elems = gqa_group.checked_mul(head_dim).ok_or_else(invalid)?;
+        let scores_elems = gqa_group.checked_mul(total_rows).ok_or_else(invalid)?;
+        if head_dim == 0
+            || head_dim > 256
+            || q_group.len() != group_elems
+            || out_group.len() != group_elems
+            || scores.len() != scores_elems
+            || current_kv.is_some_and(|(k, v)| k.len() != head_dim || v.len() != head_dim)
+        {
+            return Err(invalid());
+        }
+        let level = simd_level();
+        dispatch!(level, simd => {
+            for row in 0..history_rows {
+                let start = row * row_width + offset;
+                let k_row = &keys[start..start + head_dim];
+                let mut g_base = 0_usize;
+                while g_base < gqa_group {
+                    let q0 = &q_group[g_base * head_dim..(g_base + 1) * head_dim];
+                    let q1 = &q_group[(g_base + 1) * head_dim..(g_base + 2) * head_dim];
+                    let (d0, d1) = quant_kernels::dot_f16_pair_f32_finite(q0, q1, k_row);
+                    scores[g_base * total_rows + row] = d0 / divisor;
+                    scores[(g_base + 1) * total_rows + row] = d1 / divisor;
+                    g_base += 2;
+                }
+            }
+            if let Some((k, _)) = current_kv {
+                let mut g_base = 0_usize;
+                while g_base < gqa_group {
+                    let q0 = &q_group[g_base * head_dim..(g_base + 1) * head_dim];
+                    let q1 = &q_group[(g_base + 1) * head_dim..(g_base + 2) * head_dim];
+                    let (d0, d1) = dot_pair_f32_fma_scalar(q0, q1, k);
+                    scores[g_base * total_rows + history_rows] = d0 / divisor;
+                    scores[(g_base + 1) * total_rows + history_rows] = d1 / divisor;
+                    g_base += 2;
+                }
+            }
+            if !ensure_finite_simd(simd, scores) {
+                return Err(invalid());
+            }
+            for g in 0..gqa_group {
+                let head_scores = &mut scores[g * total_rows..(g + 1) * total_rows];
+                let max = max_finite_simd(simd, head_scores);
+                softmax_scores_simd(simd, head_scores, max, invalid)?;
+            }
+            out_group.fill(0.0);
+            for row in 0..history_rows {
+                let start = row * row_width + offset;
+                let v_row = &values[start..start + head_dim];
+                let mut g_base = 0_usize;
+                while g_base < gqa_group {
+                    let w0 = scores[g_base * total_rows + row];
+                    let w1 = scores[(g_base + 1) * total_rows + row];
+                    let (o0, o1) =
+                        out_group[g_base * head_dim..(g_base + 2) * head_dim].split_at_mut(head_dim);
+                    quant_kernels::axpy_f16_pair_f32_finite(w0, w1, v_row, o0, o1);
+                    g_base += 2;
+                }
+            }
+            if let Some((_, v)) = current_kv {
+                for g in 0..gqa_group {
+                    let w = scores[g * total_rows + history_rows];
+                    let out_head = &mut out_group[g * head_dim..(g + 1) * head_dim];
+                    axpy_row_fma_scalar(out_head, v, w);
+                }
+            }
+            if !ensure_finite_simd(simd, out_group) {
+                return Err(invalid());
+            }
+            Ok(())
+        })
+    } else {
+        attend_kv_group_impl(
+            q_group,
+            keys,
+            values,
+            history_rows,
+            row_width,
+            offset,
+            head_dim,
+            gqa_group,
+            divisor,
+            current_kv,
+            scores,
+            out_group,
+            invalid,
+        )
+    }
 }
 
 #[expect(
@@ -5067,7 +5565,7 @@ fn attend_kv_group_2pos_f32_simd<S: Simd>(
             let qa1 = &q_group_a[(g_base + 1) * head_dim..(g_base + 2) * head_dim];
             let qb0 = &q_group_b[g_base * head_dim..(g_base + 1) * head_dim];
             let qb1 = &q_group_b[(g_base + 1) * head_dim..(g_base + 2) * head_dim];
-            let res = dot_4keys_tile_simd(simd, [qa0, qa1, qb0, qb1], k_refs, head_dim, divisor);
+            let res = quant_kernels::dot_4x4_f32_fma([qa0, qa1, qb0, qb1], k_refs, divisor);
             scores_a[g_base * len_a + r..g_base * len_a + r + 4].copy_from_slice(&res[0]);
             scores_a[(g_base + 1) * len_a + r..(g_base + 1) * len_a + r + 4]
                 .copy_from_slice(&res[1]);
@@ -5079,48 +5577,26 @@ fn attend_kv_group_2pos_f32_simd<S: Simd>(
         if g_base < gqa_group {
             let qa0 = &q_group_a[g_base * head_dim..(g_base + 1) * head_dim];
             let qb0 = &q_group_b[g_base * head_dim..(g_base + 1) * head_dim];
-            let res = dot_4keys_tile_simd(simd, [qa0, qb0], k_refs, head_dim, divisor);
-            scores_a[g_base * len_a + r..g_base * len_a + r + 4].copy_from_slice(&res[0]);
-            scores_b[g_base * len_b + r..g_base * len_b + r + 4].copy_from_slice(&res[1]);
+            for (ki, k_ref) in k_refs.iter().enumerate() {
+                scores_a[g_base * len_a + r + ki] = dot_row_fma_scalar(qa0, k_ref, divisor);
+                scores_b[g_base * len_b + r + ki] = dot_row_fma_scalar(qb0, k_ref, divisor);
+            }
         }
     }
     for row in (shared_quads * 4)..len_a {
         let k = &keys_hm[row * head_dim..(row + 1) * head_dim];
-        let mut g_base = 0_usize;
-        while g_base + 1 < gqa_group {
-            let qa0 = &q_group_a[g_base * head_dim..(g_base + 1) * head_dim];
-            let qa1 = &q_group_a[(g_base + 1) * head_dim..(g_base + 2) * head_dim];
-            let qb0 = &q_group_b[g_base * head_dim..(g_base + 1) * head_dim];
-            let qb1 = &q_group_b[(g_base + 1) * head_dim..(g_base + 2) * head_dim];
-            let res = dot_row_tile_simd(simd, [qa0, qa1, qb0, qb1], k, head_dim, divisor);
-            scores_a[g_base * len_a + row] = res[0];
-            scores_a[(g_base + 1) * len_a + row] = res[1];
-            scores_b[g_base * len_b + row] = res[2];
-            scores_b[(g_base + 1) * len_b + row] = res[3];
-            g_base += 2;
-        }
-        if g_base < gqa_group {
-            let qa0 = &q_group_a[g_base * head_dim..(g_base + 1) * head_dim];
-            let qb0 = &q_group_b[g_base * head_dim..(g_base + 1) * head_dim];
-            let res = dot_row_tile_simd(simd, [qa0, qb0], k, head_dim, divisor);
-            scores_a[g_base * len_a + row] = res[0];
-            scores_b[g_base * len_b + row] = res[1];
+        for g in 0..gqa_group {
+            let qa = &q_group_a[g * head_dim..(g + 1) * head_dim];
+            let qb = &q_group_b[g * head_dim..(g + 1) * head_dim];
+            scores_a[g * len_a + row] = dot_row_fma_scalar(qa, k, divisor);
+            scores_b[g * len_b + row] = dot_row_fma_scalar(qb, k, divisor);
         }
     }
     {
         let k_last = &keys_hm[len_a * head_dim..(len_a + 1) * head_dim];
-        let mut g_base = 0_usize;
-        while g_base + 1 < gqa_group {
-            let qb0 = &q_group_b[g_base * head_dim..(g_base + 1) * head_dim];
-            let qb1 = &q_group_b[(g_base + 1) * head_dim..(g_base + 2) * head_dim];
-            let res = dot_row_tile_simd(simd, [qb0, qb1], k_last, head_dim, divisor);
-            scores_b[g_base * len_b + len_a] = res[0];
-            scores_b[(g_base + 1) * len_b + len_a] = res[1];
-            g_base += 2;
-        }
-        if g_base < gqa_group {
-            let qb0 = &q_group_b[g_base * head_dim..(g_base + 1) * head_dim];
-            scores_b[g_base * len_b + len_a] = dot_row_simd(simd, qb0, k_last, divisor);
+        for g in 0..gqa_group {
+            let qb = &q_group_b[g * head_dim..(g + 1) * head_dim];
+            scores_b[g * len_b + len_a] = dot_row_fma_scalar(qb, k_last, divisor);
         }
     }
 
@@ -5160,9 +5636,8 @@ fn attend_kv_group_2pos_f32_simd<S: Simd>(
                 out_group_a[g_base * head_dim..(g_base + 2) * head_dim].split_at_mut(head_dim);
             let (ob0, ob1) =
                 out_group_b[g_base * head_dim..(g_base + 2) * head_dim].split_at_mut(head_dim);
-            weighted_value_accum_4_tile_simd(
-                simd,
-                [oa0, oa1, ob0, ob1],
+            quant_kernels::axpy_4x4_f32_fma(
+                &mut [oa0, oa1, ob0, ob1],
                 v_refs,
                 [
                     weights_a(g_base),
@@ -5170,80 +5645,34 @@ fn attend_kv_group_2pos_f32_simd<S: Simd>(
                     weights_b(g_base),
                     weights_b(g_base + 1),
                 ],
-                head_dim,
             );
             g_base += 2;
         }
         if g_base < gqa_group {
             let oa0 = &mut out_group_a[g_base * head_dim..(g_base + 1) * head_dim];
             let ob0 = &mut out_group_b[g_base * head_dim..(g_base + 1) * head_dim];
-            weighted_value_accum_4_tile_simd(
-                simd,
-                [oa0, ob0],
-                v_refs,
-                [weights_a(g_base), weights_b(g_base)],
-                head_dim,
-            );
+            let wa = weights_a(g_base);
+            let wb = weights_b(g_base);
+            for (ki, v_ref) in v_refs.iter().enumerate() {
+                axpy_row_fma_scalar(oa0, v_ref, wa[ki]);
+                axpy_row_fma_scalar(ob0, v_ref, wb[ki]);
+            }
         }
     }
     for row in (shared_quads * 4)..len_a {
         let v = &values_hm[row * head_dim..(row + 1) * head_dim];
-        let mut g_base = 0_usize;
-        while g_base + 1 < gqa_group {
-            let (oa0, oa1) =
-                out_group_a[g_base * head_dim..(g_base + 2) * head_dim].split_at_mut(head_dim);
-            let (ob0, ob1) =
-                out_group_b[g_base * head_dim..(g_base + 2) * head_dim].split_at_mut(head_dim);
-            weighted_value_accum_tile_simd(
-                simd,
-                [oa0, oa1, ob0, ob1],
-                v,
-                [
-                    scores_a[g_base * len_a + row],
-                    scores_a[(g_base + 1) * len_a + row],
-                    scores_b[g_base * len_b + row],
-                    scores_b[(g_base + 1) * len_b + row],
-                ],
-                head_dim,
-            );
-            g_base += 2;
-        }
-        if g_base < gqa_group {
-            let oa0 = &mut out_group_a[g_base * head_dim..(g_base + 1) * head_dim];
-            let ob0 = &mut out_group_b[g_base * head_dim..(g_base + 1) * head_dim];
-            weighted_value_accum_tile_simd(
-                simd,
-                [oa0, ob0],
-                v,
-                [
-                    scores_a[g_base * len_a + row],
-                    scores_b[g_base * len_b + row],
-                ],
-                head_dim,
-            );
+        for g in 0..gqa_group {
+            let oa = &mut out_group_a[g * head_dim..(g + 1) * head_dim];
+            let ob = &mut out_group_b[g * head_dim..(g + 1) * head_dim];
+            axpy_row_fma_scalar(oa, v, scores_a[g * len_a + row]);
+            axpy_row_fma_scalar(ob, v, scores_b[g * len_b + row]);
         }
     }
     {
         let v_last = &values_hm[len_a * head_dim..(len_a + 1) * head_dim];
-        let mut g_base = 0_usize;
-        while g_base + 1 < gqa_group {
-            let (ob0, ob1) =
-                out_group_b[g_base * head_dim..(g_base + 2) * head_dim].split_at_mut(head_dim);
-            weighted_value_accum_tile_simd(
-                simd,
-                [ob0, ob1],
-                v_last,
-                [
-                    scores_b[g_base * len_b + len_a],
-                    scores_b[(g_base + 1) * len_b + len_a],
-                ],
-                head_dim,
-            );
-            g_base += 2;
-        }
-        if g_base < gqa_group {
-            let ob0 = &mut out_group_b[g_base * head_dim..(g_base + 1) * head_dim];
-            weighted_value_accum_simd(simd, ob0, v_last, scores_b[g_base * len_b + len_a]);
+        for g in 0..gqa_group {
+            let ob = &mut out_group_b[g * head_dim..(g + 1) * head_dim];
+            axpy_row_fma_scalar(ob, v_last, scores_b[g * len_b + len_a]);
         }
     }
 
@@ -6901,15 +7330,60 @@ mod tests {
                         &mut got_b,
                         inv,
                     )?;
+                    // Exact 0-ULP parity against scalar sequential mul_add FMA reference, plus
+                    // <= 1e-5 max abs diff against non-FMA single-position attend_kv_group_f32.
+                    let mut fma_a = vec![0.0_f32; group_elems];
+                    let mut fma_b = vec![0.0_f32; group_elems];
+                    let attend_pos_fma =
+                        |q_grp: &[f32], len: usize, out_grp: &mut [f32]| -> io::Result<()> {
+                            for g in 0..gqa_group {
+                                let q_h = &q_grp[g * head_dim..(g + 1) * head_dim];
+                                let mut sc = vec![0.0_f32; len];
+                                for row in 0..len {
+                                    sc[row] = super::dot_row_fma_scalar(
+                                        q_h,
+                                        &keys_hm[row * head_dim..(row + 1) * head_dim],
+                                        divisor,
+                                    );
+                                }
+                                super::softmax_scores_test_ref(&mut sc, inv)?;
+                                let out_h = &mut out_grp[g * head_dim..(g + 1) * head_dim];
+                                out_h.fill(0.0);
+                                for row in 0..len {
+                                    super::axpy_row_fma_scalar(
+                                        out_h,
+                                        &values_hm[row * head_dim..(row + 1) * head_dim],
+                                        sc[row],
+                                    );
+                                }
+                            }
+                            Ok(())
+                        };
+                    attend_pos_fma(&q_a, len_a, &mut fma_a)?;
+                    attend_pos_fma(&q_b, len_b, &mut fma_b)?;
                     assert_eq!(
                         got_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        exp_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        "2pos A mismatch gqa={gqa_group} dim={head_dim} len_a={len_a}"
+                        fma_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "2pos A scalar-FMA mismatch gqa={gqa_group} dim={head_dim} len_a={len_a}"
                     );
                     assert_eq!(
                         got_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        exp_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        "2pos B mismatch gqa={gqa_group} dim={head_dim} len_a={len_a}"
+                        fma_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "2pos B scalar-FMA mismatch gqa={gqa_group} dim={head_dim} len_a={len_a}"
+                    );
+                    let max_diff_a = got_a
+                        .iter()
+                        .zip(&exp_a)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0_f32, f32::max);
+                    let max_diff_b = got_b
+                        .iter()
+                        .zip(&exp_b)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0_f32, f32::max);
+                    assert!(
+                        max_diff_a <= 1e-5 && max_diff_b <= 1e-5,
+                        "2pos non-FMA drift exceeded 1e-5: a={max_diff_a} b={max_diff_b}"
                     );
                 }
             }

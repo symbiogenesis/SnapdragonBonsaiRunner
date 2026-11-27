@@ -798,10 +798,44 @@ fn rust_asr_encoder_simd_norm_bias_and_tiled_attention_parity_and_nonfinite() ->
                     &mut got_out,
                     super::invalid,
                 )?;
+                let mut fma_out = vec![0.0_f32; tile_rows * hidden];
+                for r in 0..tile_rows {
+                    for head in 0..heads {
+                        let off = head * head_dim;
+                        let q_h = &q_rows[r * hidden + off..r * hidden + off + head_dim];
+                        let mut sc = vec![0.0_f32; win_len];
+                        for kr in 0..win_len {
+                            let k_h = &keys[kr * hidden + off..kr * hidden + off + head_dim];
+                            let mut acc = 0.0_f32;
+                            for (&qv, &kv) in q_h.iter().zip(k_h) {
+                                acc = qv.mul_add(kv, acc);
+                            }
+                            sc[kr] = acc / divisor;
+                        }
+                        crate::packed::softmax_scores_test_ref(&mut sc, super::invalid)?;
+                        let out_h = &mut fma_out[r * hidden + off..r * hidden + off + head_dim];
+                        for vr in 0..win_len {
+                            let v_h = &values[vr * hidden + off..vr * hidden + off + head_dim];
+                            let w = sc[vr];
+                            for (dst, &vv) in out_h.iter_mut().zip(v_h) {
+                                *dst = w.mul_add(vv, *dst);
+                            }
+                        }
+                    }
+                }
                 assert_eq!(
                     got_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    exp_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    "tiled attention mismatch heads={heads} dim={head_dim} win={win_len} tile={tile_rows}"
+                    fma_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "tiled attention scalar-FMA mismatch heads={heads} dim={head_dim} win={win_len} tile={tile_rows}"
+                );
+                let max_diff = got_out
+                    .iter()
+                    .zip(&exp_out)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    max_diff <= 1e-5,
+                    "tiled attention non-FMA drift exceeded 1e-5: {max_diff}"
                 );
             }
         }

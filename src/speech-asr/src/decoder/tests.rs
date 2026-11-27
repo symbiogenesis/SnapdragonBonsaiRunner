@@ -404,6 +404,9 @@ fn rust_asr_decoder_batched_prefill_and_parallel_decode_match_step_by_step_bits(
         };
     }
 
+    let mut serial_prefill_sess = serial_model.session();
+    let serial_prefill_logits = serial_prefill_sess.prefill(&prompt, &audio, &mut || false)?;
+
     let mut parallel_sess = parallel_model.session();
     let parallel_logits = parallel_sess.prefill(&prompt, &audio, &mut || false)?;
     parallel_sess.reserve_decode(3)?;
@@ -414,9 +417,23 @@ fn rust_asr_decoder_batched_prefill_and_parallel_decode_match_step_by_step_bits(
         })
         .collect::<io::Result<Vec<_>>>()?;
     assert_eq!(parallel_sess.position(), serial_sess.position());
-    for (got, want) in parallel_logits.iter().zip(&expected_logits) {
-        assert_eq!(got.to_bits(), want.to_bits(), "prefill logit mismatch");
+    assert_eq!(parallel_sess.position(), serial_prefill_sess.position());
+    for (got, want) in parallel_logits.iter().zip(&serial_prefill_logits) {
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "prefill worker-count mismatch"
+        );
     }
+    let max_prefill_diff = parallel_logits
+        .iter()
+        .zip(&expected_logits)
+        .map(|(got, want)| (got - want).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_prefill_diff <= 1e-5,
+        "prefill vs step logit drift exceeded 1e-5: {max_prefill_diff}"
+    );
     for layer in 0..2 {
         let (pk, pv) = cache_vecs(parallel_sess.cache(layer))
             .ok_or_else(|| io::Error::other("missing parallel layer"))?;

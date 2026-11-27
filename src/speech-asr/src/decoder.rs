@@ -2382,52 +2382,60 @@ fn prefill_causal_attention_hm(
 
     let active_workers = workers.clamp(1, threads::MAX_WORKERS).min(total_tasks);
     if active_workers > 1 && total_tasks >= 2 {
-        let mut attn_slots = Vec::new();
-        attn_slots
-            .try_reserve_exact(total * c.kv_heads)
-            .map_err(io::Error::other)?;
-        for chunk in batch_attn.chunks_exact_mut(group_width) {
-            attn_slots.push(std::sync::Mutex::new(chunk));
+        struct WorkerBucket<'a> {
+            tasks: Vec<(usize, &'a mut [f32])>,
+            result: io::Result<()>,
         }
-        let next_task = std::sync::atomic::AtomicUsize::new(0);
-        let mut task_tokens = [0.0_f32; threads::MAX_WORKERS];
-        row_workers::try_run_aligned(
-            &mut task_tokens[..active_workers],
-            active_workers,
-            1,
-            &|_, _| {
-                with_score_scratch(score_needed, |scores| {
-                    loop {
-                        let task_id = next_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if task_id >= total_tasks {
-                            break;
-                        }
-                        let kv_head = task_id / num_pairs;
-                        let pair_idx = task_id % num_pairs;
-                        let t_lo = pair_idx;
-                        let t_hi = num_row_tiles - 1 - pair_idx;
-                        for tile_idx in [Some(t_lo), (t_hi != t_lo).then_some(t_hi)]
-                            .into_iter()
-                            .flatten()
-                        {
-                            let r0 = tile_idx * 2;
-                            let mut out_a = attn_slots[r0 * c.kv_heads + kv_head]
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if r0 + 1 < total {
-                                let mut out_b = attn_slots[(r0 + 1) * c.kv_heads + kv_head]
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                run_tile(kv_head, tile_idx, scores, &mut out_a, Some(&mut out_b))?;
-                            } else {
-                                run_tile(kv_head, tile_idx, scores, &mut out_a, None)?;
+        let mut buckets: Vec<WorkerBucket<'_>> = (0..active_workers)
+            .map(|_| WorkerBucket {
+                tasks: Vec::with_capacity(num_row_tiles.div_ceil(active_workers) + 1),
+                result: Ok(()),
+            })
+            .collect();
+        let mut tile_chunks: Vec<Option<&mut [f32]>> =
+            batch_attn.chunks_mut(2 * q_width).map(Some).collect();
+        for pair_idx in 0..num_pairs {
+            let bucket = &mut buckets[pair_idx % active_workers];
+            let t_lo = pair_idx;
+            let t_hi = num_row_tiles - 1 - pair_idx;
+            if let Some(chunk) = tile_chunks[t_lo].take() {
+                bucket.tasks.push((t_lo, chunk));
+            }
+            if t_hi != t_lo
+                && let Some(chunk) = tile_chunks[t_hi].take()
+            {
+                bucket.tasks.push((t_hi, chunk));
+            }
+        }
+        row_workers::run_slice_aligned(&mut buckets, active_workers, 1, &|_, slice| {
+            for bucket in slice {
+                bucket.result = with_score_scratch(score_needed, |scores| {
+                    for (tile_idx, rows_chunk) in &mut bucket.tasks {
+                        let r0 = *tile_idx * 2;
+                        if r0 + 1 < total {
+                            let (row_a, row_b) = rows_chunk.split_at_mut(q_width);
+                            for (kv_head, (out_a, out_b)) in row_a
+                                .chunks_exact_mut(group_width)
+                                .zip(row_b.chunks_exact_mut(group_width))
+                                .enumerate()
+                            {
+                                run_tile(kv_head, *tile_idx, scores, out_a, Some(out_b))?;
+                            }
+                        } else {
+                            for (kv_head, out_a) in
+                                rows_chunk.chunks_exact_mut(group_width).enumerate()
+                            {
+                                run_tile(kv_head, *tile_idx, scores, out_a, None)?;
                             }
                         }
                     }
                     Ok(())
-                })
-            },
-        )?;
+                });
+            }
+        });
+        for bucket in buckets {
+            bucket.result?;
+        }
         return Ok(());
     }
 
@@ -3259,20 +3267,120 @@ mod gqa_attention_tests {
                                     4,
                                     &mut || false,
                                 )?;
-                                let expected_bits: Vec<u32> =
-                                    expected.iter().map(|v| v.to_bits()).collect();
                                 let seq_bits: Vec<u32> =
                                     seq_grouped.iter().map(|v| v.to_bits()).collect();
                                 let par_bits: Vec<u32> =
                                     par_grouped.iter().map(|v| v.to_bits()).collect();
                                 assert_eq!(
-                                    seq_bits, expected_bits,
-                                    "seq mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
+                                    par_bits, seq_bits,
+                                    "worker invariance mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
                                 );
-                                assert_eq!(
-                                    par_bits, expected_bits,
-                                    "par mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
-                                );
+                                if matches!(precision, CachePrecision::F16)
+                                    && gqa_ratio.is_multiple_of(2)
+                                {
+                                    // Direct F16 pair kernels use ARM64 FMA + 2-acc pair reduction:
+                                    // assert 0-ULP vs scalar FMA reference and <= 1e-5 vs non-FMA.
+                                    let (k_f16, v_f16) = match &state.data {
+                                        LayerKv::F16(pair) => (&pair.keys, &pair.values),
+                                        LayerKv::F32(_) => {
+                                            return Err(io::Error::other("expected F16 cache"));
+                                        }
+                                    };
+                                    let mut fma_expected = zeros(c.heads * c.head_dim)?;
+                                    for kv_head in 0..c.kv_heads {
+                                        let offset = kv_head * c.head_dim;
+                                        let q_group = &query[kv_head * gqa_ratio * c.head_dim
+                                            ..(kv_head + 1) * gqa_ratio * c.head_dim];
+                                        let total_rows = position + 1;
+                                        let mut g_scores = vec![0.0_f32; gqa_ratio * total_rows];
+                                        for row in 0..position {
+                                            let start = row * kv_width + offset;
+                                            let k_row = &k_f16[start..start + c.head_dim];
+                                            let mut gb = 0_usize;
+                                            while gb < gqa_ratio {
+                                                let q0 = &q_group
+                                                    [gb * c.head_dim..(gb + 1) * c.head_dim];
+                                                let q1 = &q_group
+                                                    [(gb + 1) * c.head_dim..(gb + 2) * c.head_dim];
+                                                let (d0, d1) =
+                                                    bonsai_windows_process::quant_kernels::dot_f16_pair_f32(
+                                                        q0, q1, k_row,
+                                                    );
+                                                g_scores[gb * total_rows + row] = d0 / divisor;
+                                                g_scores[(gb + 1) * total_rows + row] =
+                                                    d1 / divisor;
+                                                gb += 2;
+                                            }
+                                        }
+                                        let ck = &cur_k[offset..offset + c.head_dim];
+                                        for g in 0..gqa_ratio {
+                                            let qh = &q_group[g * c.head_dim..(g + 1) * c.head_dim];
+                                            let mut dot = 0.0_f32;
+                                            for (&qv, &kv) in qh.iter().zip(ck) {
+                                                dot = qv.mul_add(kv, dot);
+                                            }
+                                            g_scores[g * total_rows + position] = dot / divisor;
+                                        }
+                                        for g in 0..gqa_ratio {
+                                            let hs = &mut g_scores
+                                                [g * total_rows..(g + 1) * total_rows];
+                                            packed::softmax_scores_test_ref(hs, super::invalid)?;
+                                        }
+                                        let out_group = &mut fma_expected[kv_head * gqa_ratio * c.head_dim
+                                            ..(kv_head + 1) * gqa_ratio * c.head_dim];
+                                        for row in 0..position {
+                                            let start = row * kv_width + offset;
+                                            let v_row = &v_f16[start..start + c.head_dim];
+                                            let mut gb = 0_usize;
+                                            while gb < gqa_ratio {
+                                                let w0 = g_scores[gb * total_rows + row];
+                                                let w1 = g_scores[(gb + 1) * total_rows + row];
+                                                let (o0, o1) = out_group
+                                                    [gb * c.head_dim..(gb + 2) * c.head_dim]
+                                                    .split_at_mut(c.head_dim);
+                                                bonsai_windows_process::quant_kernels::axpy_f16_pair_f32(
+                                                    w0, w1, v_row, o0, o1,
+                                                );
+                                                gb += 2;
+                                            }
+                                        }
+                                        let cv = &cur_v[offset..offset + c.head_dim];
+                                        for g in 0..gqa_ratio {
+                                            let w = g_scores[g * total_rows + position];
+                                            let oh = &mut out_group
+                                                [g * c.head_dim..(g + 1) * c.head_dim];
+                                            for (dst, &vv) in oh.iter_mut().zip(cv) {
+                                                *dst = w.mul_add(vv, *dst);
+                                            }
+                                        }
+                                    }
+                                    let fma_bits: Vec<u32> =
+                                        fma_expected.iter().map(|v| v.to_bits()).collect();
+                                    assert_eq!(
+                                        seq_bits, fma_bits,
+                                        "F16 scalar-FMA mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
+                                    );
+                                    let max_diff = seq_grouped
+                                        .iter()
+                                        .zip(&expected)
+                                        .map(|(a, b)| (a - b).abs())
+                                        .fold(0.0_f32, f32::max);
+                                    assert!(
+                                        max_diff <= 1e-5,
+                                        "F16 non-FMA drift exceeded 1e-5: {max_diff}"
+                                    );
+                                } else {
+                                    let expected_bits: Vec<u32> =
+                                        expected.iter().map(|v| v.to_bits()).collect();
+                                    assert_eq!(
+                                        seq_bits, expected_bits,
+                                        "seq mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
+                                    );
+                                    assert_eq!(
+                                        par_bits, expected_bits,
+                                        "par mismatch gqa={gqa_ratio} pos={position} dim={head_dim}"
+                                    );
+                                }
                             }
                         }
                         Ok(())
