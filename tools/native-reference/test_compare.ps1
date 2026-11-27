@@ -74,7 +74,7 @@ $tests=[ordered]@{
         Write-ControlFixture 'auto' 1 0
         foreach($capture in @(@{adapterLoaded=$true;adapterScale=0},@{adapterLoaded=$false;adapterScale=0})){Assert-Rejected {Assert-NativeRustControls $scratch $capture 'auto' 1}}
         foreach($field in 'model_sha256','adapter_sha256','target_pairs','scale_bits','input_token'){
-            Write-ControlFixture 'auto' 1 0;$path=Join-Path $scratch 'stdout.txt';$records=@([IO.File]::ReadAllLines($path)|ForEach-Object{ConvertFrom-ReferenceJson ([Text.Encoding]::UTF8.GetBytes($_))})
+            Write-ControlFixture 'auto' 1 0;$path=Join-Path $scratch 'stdout.txt';$records=@([IO.File]::ReadAllLines($path)|ForEach-Object{ConvertFrom-Json -InputObject $_ -AsHashtable})
             $index=if($field -ceq 'input_token'){2}else{1};$records[$index][$field]=if($field -ceq 'target_pairs'){128}elseif($field -ceq 'input_token'){198}else{'substituted'}
             Write-ControlRecords $records;Assert-Rejected {Assert-NativeRustControls $scratch @{adapterLoaded=$true;adapterScale=1.3} 'auto' 1}
         }
@@ -87,7 +87,7 @@ $tests=[ordered]@{
     }
 }
 function Write-ControlRecords($Records){$lines=@($Records|ForEach-Object{ConvertTo-Json -InputObject $_ -Compress -Depth 8});[IO.File]::WriteAllLines((Join-Path $scratch 'stdout.txt'),$lines,[Text.UTF8Encoding]::new($false))}
-function Read-ControlRecords{return ,@([IO.File]::ReadAllLines((Join-Path $scratch 'stdout.txt'))|ForEach-Object{ConvertFrom-ReferenceJson ([Text.Encoding]::UTF8.GetBytes($_))})}
+function Read-ControlRecords{return ,@([IO.File]::ReadAllLines((Join-Path $scratch 'stdout.txt'))|ForEach-Object{ConvertFrom-Json -InputObject $_ -AsHashtable})}
 function Write-ControlFixture([string]$Backend,$Workers,$Operations){Write-ControlRecords @(@{event='weights-loaded';model_sha256=$script:NativeModel;weight_representation='current-repacked-PTQ1_0'},@{event='rank-one-adapter-loaded';model_sha256=$script:NativeModel;adapter_sha256=$script:NativeAdapter;target_pairs=129;scale_bits='3fa66666'},@{event='forward-step';position=0;input_token=248045;backend_requested=$Backend;row_workers=$Workers;parallel_row_operations=$Operations})}
 try {
     $selected=if($Name.Count -gt 0){@($Name|ForEach-Object{($_ -split '\.')[-1]})}elseif($env:GITHUB_ACTIONS -ceq 'true'){@($tests.Keys)}else{throw 'Select a named focused regression locally; complete tests are CI-only.'}

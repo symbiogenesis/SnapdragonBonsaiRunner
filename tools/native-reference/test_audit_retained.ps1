@@ -9,7 +9,14 @@ function New-ProducerFixture{
     $jobs=@{total_count=2;jobs=@('prepare','numerics'|ForEach-Object{@{name=$_;status='completed';conclusion='success';run_id=$script:RetainedRun;head_sha=$script:RetainedRevision;labels=@("ptq1-numerics-$script:RetainedRun")}})}
     return @($run,$artifact,$jobs)
 }
-function New-ExpectedRecord([string]$Name='safe.json',[byte[]]$Data=([Text.Encoding]::UTF8.GetBytes('{}'))){return @{path=$Name;bytes=$Data.Length;sha256=(Get-ReferenceDigest $Data)}}
+$script:EmptyJsonDigest=$null
+function New-ExpectedRecord([string]$Name='safe.json',[byte[]]$Data=([Text.Encoding]::UTF8.GetBytes('{}'))){
+    $digest=if($Data.Length -eq 2 -and $Data[0] -eq 123 -and $Data[1] -eq 125){
+        if($null -eq $script:EmptyJsonDigest){$script:EmptyJsonDigest=Get-ReferenceDigest $Data}
+        $script:EmptyJsonDigest
+    }else{Get-ReferenceDigest $Data}
+    return @{path=$Name;bytes=$Data.Length;sha256=$digest}
+}
 function Invoke-ExtractionFixture($Entries,$Expected){
     $lane=Join-Path $scratch ([guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($lane);$path=Join-Path $lane 'test.zip';$zip=[IO.Compression.ZipFile]::Open($path,[IO.Compression.ZipArchiveMode]::Create)
     try{foreach($item in $Entries){$entry=$zip.CreateEntry($item.name);$entry.ExternalAttributes=[int]($item.mode -shl 16);$output=$entry.Open();try{$output.Write([byte[]]$item.data)}finally{$output.Dispose()}}}finally{$zip.Dispose()}
