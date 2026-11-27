@@ -457,8 +457,7 @@ fn scatter_transposed_to_time_first(
     }
 }
 
-const CONV_F_TILE: usize = 32;
-const CONV_IC_TILE: usize = 128;
+const CONV_F_TILE: usize = 60;
 
 #[inline]
 fn gemm_16oc_ic_tiled(
@@ -469,22 +468,14 @@ fn gemm_16oc_ic_tiled(
     in_c: usize,
     acc_tile: &mut [[f32; 16]],
 ) {
-    let mut x_rows: [&[f32]; CONV_F_TILE] = [&[]; CONV_F_TILE];
-    for ic_base in (0..in_c).step_by(CONV_IC_TILE) {
-        let ic_end = (ic_base + CONV_IC_TILE).min(in_c);
-        let ic_len = ic_end - ic_base;
-        let w_tile = &w_blk[ic_base * 16..ic_end * 16];
-        for df in 0..f_len {
-            let off = (first_row + df) * in_c + ic_base;
-            x_rows[df] = &input[off..off + ic_len];
-        }
-        conv_kernels::gemm_f32_fma_16oc_frames(
-            w_tile,
-            &x_rows[..f_len],
-            ic_len,
-            &mut acc_tile[..f_len],
-        );
-    }
+    conv_kernels::gemm_f32_fma_16oc_strided(
+        w_blk,
+        &input[first_row * in_c..],
+        in_c,
+        in_c,
+        f_len,
+        acc_tile,
+    );
 }
 
 #[inline]
@@ -502,26 +493,17 @@ fn conv1d_16oc_tile_acc(
     ),
     acc_tile: &mut [[f32; 16]],
 ) {
-    let mut x_rows: [&[f32]; CONV_F_TILE] = [&[]; CONV_F_TILE];
-    for k in 0..kernel {
-        let w_k = &w_blk[k * in_c * 16..(k + 1) * in_c * 16];
-        let tap_shift = k * dilation;
-        for ic_base in (0..in_c).step_by(CONV_IC_TILE) {
-            let ic_end = (ic_base + CONV_IC_TILE).min(in_c);
-            let ic_len = ic_end - ic_base;
-            let w_tile = &w_k[ic_base * 16..ic_end * 16];
-            for df in 0..f_len {
-                let off = ((first_frame + f_start + df) * stride + tap_shift) * in_c + ic_base;
-                x_rows[df] = &ext[off..off + ic_len];
-            }
-            conv_kernels::gemm_f32_fma_16oc_frames(
-                w_tile,
-                &x_rows[..f_len],
-                ic_len,
-                &mut acc_tile[..f_len],
-            );
-        }
-    }
+    let ext_base = (first_frame + f_start) * stride * in_c;
+    conv_kernels::conv1d_f32_fma_16oc_strided(
+        w_blk,
+        &ext[ext_base..],
+        in_c,
+        kernel,
+        stride,
+        dilation,
+        f_len,
+        acc_tile,
+    );
 }
 
 #[expect(
@@ -666,6 +648,127 @@ fn conv1d_unpacked_row_frames_acc<const F: usize>(
     clippy::inline_always,
     reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
 )]
+#[inline(always)]
+fn bias_vec_16<S: Simd>(
+    simd: S,
+    bias_rows: Option<&[f32]>,
+    oc_base: usize,
+) -> Option<[f32x4<S>; 4]> {
+    bias_rows.map(|b| {
+        [
+            f32x4::from_slice(simd, &b[oc_base..oc_base + 4]),
+            f32x4::from_slice(simd, &b[oc_base + 4..oc_base + 8]),
+            f32x4::from_slice(simd, &b[oc_base + 8..oc_base + 12]),
+            f32x4::from_slice(simd, &b[oc_base + 12..oc_base + 16]),
+        ]
+    })
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn conv1d_16oc_f_tile_time_first_simd<S: Simd>(
+    simd: S,
+    w_blk: &[f32],
+    bias_vec: Option<[f32x4<S>; 4]>,
+    residual: Option<&[f32]>,
+    ext: &[f32],
+    (first_frame, f_start, f_len, stride, in_c, kernel, dilation, num_rows, oc_base): (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ),
+    out: &mut [f32],
+) {
+    let mut acc_tile = [[0.0_f32; 16]; CONV_F_TILE];
+    conv1d_16oc_tile_acc(
+        w_blk,
+        ext,
+        (first_frame, f_start, f_len, stride, in_c, kernel, dilation),
+        &mut acc_tile[..f_len],
+    );
+    store_16oc_time_first(
+        simd,
+        &acc_tile[..f_len],
+        bias_vec,
+        residual,
+        f_start,
+        num_rows,
+        oc_base,
+        out,
+    );
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn conv1d_tail_oc_f_range_time_first_simd<S: Simd>(
+    simd: S,
+    w_blk: &[f32],
+    bias_rows: Option<&[f32]>,
+    residual: Option<&[f32]>,
+    ext: &[f32],
+    (first_frame, f_start, f_end, stride, in_c, kernel, dilation, num_rows, oc_base, lane_w): (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ),
+    out: &mut [f32],
+) {
+    let mut f = f_start;
+    while f + 4 <= f_end {
+        let acc = conv1d_tail_oc_frames_acc::<S, 4>(
+            simd,
+            w_blk,
+            ext,
+            (first_frame, f, stride, in_c, kernel, dilation, lane_w),
+        );
+        for (df, acc_row) in acc.iter().enumerate() {
+            let dst_off = (f + df) * num_rows + oc_base;
+            for lane in 0..lane_w {
+                let with_bias = acc_row[lane] + bias_rows.map_or(0.0_f32, |b| b[oc_base + lane]);
+                out[dst_off + lane] = residual.map_or(with_bias, |r| with_bias + r[dst_off + lane]);
+            }
+        }
+        f += 4;
+    }
+    while f < f_end {
+        let [acc_row] = conv1d_tail_oc_frames_acc::<S, 1>(
+            simd,
+            w_blk,
+            ext,
+            (first_frame, f, stride, in_c, kernel, dilation, lane_w),
+        );
+        let dst_off = f * num_rows + oc_base;
+        for lane in 0..lane_w {
+            let with_bias = acc_row[lane] + bias_rows.map_or(0.0_f32, |b| b[oc_base + lane]);
+            out[dst_off + lane] = residual.map_or(with_bias, |r| with_bias + r[dst_off + lane]);
+        }
+        f += 1;
+    }
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
 #[expect(
     clippy::too_many_arguments,
     reason = "Explicit tiled convolution arguments avoid an extra wrapper struct in the SIMD inner loop."
@@ -723,77 +826,112 @@ fn conv1d_oc_outer_time_first_simd<S: Simd>(
     }
 
     let oc_blocks = num_rows.div_ceil(16);
+    if num_frames.saturating_mul(in_c).saturating_mul(4) > 48 * 1024 {
+        for f_start in (0..num_frames).step_by(CONV_F_TILE) {
+            let f_len = (num_frames - f_start).min(CONV_F_TILE);
+            for oc_blk in 0..oc_blocks {
+                let oc_base = oc_blk * 16;
+                let lane_w = 16.min(num_rows - oc_base);
+                let w_blk = &w_packed[oc_base * k_in_c..(oc_base + lane_w) * k_in_c];
+                if lane_w == 16 {
+                    let bias_vec = bias_vec_16(simd, bias_rows, oc_base);
+                    conv1d_16oc_f_tile_time_first_simd(
+                        simd,
+                        w_blk,
+                        bias_vec,
+                        residual,
+                        ext,
+                        (
+                            first_frame,
+                            f_start,
+                            f_len,
+                            stride,
+                            in_c,
+                            kernel,
+                            dilation,
+                            num_rows,
+                            oc_base,
+                        ),
+                        out,
+                    );
+                } else {
+                    conv1d_tail_oc_f_range_time_first_simd(
+                        simd,
+                        w_blk,
+                        bias_rows,
+                        residual,
+                        ext,
+                        (
+                            first_frame,
+                            f_start,
+                            f_start + f_len,
+                            stride,
+                            in_c,
+                            kernel,
+                            dilation,
+                            num_rows,
+                            oc_base,
+                            lane_w,
+                        ),
+                        out,
+                    );
+                }
+            }
+        }
+        return;
+    }
+
     for oc_blk in 0..oc_blocks {
         let oc_base = oc_blk * 16;
         let lane_w = 16.min(num_rows - oc_base);
         let w_blk = &w_packed[oc_base * k_in_c..(oc_base + lane_w) * k_in_c];
         if lane_w == 16 {
-            let bias_vec = bias_rows.map(|b| {
-                [
-                    f32x4::from_slice(simd, &b[oc_base..oc_base + 4]),
-                    f32x4::from_slice(simd, &b[oc_base + 4..oc_base + 8]),
-                    f32x4::from_slice(simd, &b[oc_base + 8..oc_base + 12]),
-                    f32x4::from_slice(simd, &b[oc_base + 12..oc_base + 16]),
-                ]
-            });
+            let bias_vec = bias_vec_16(simd, bias_rows, oc_base);
             for f_start in (0..num_frames).step_by(CONV_F_TILE) {
                 let f_len = (num_frames - f_start).min(CONV_F_TILE);
-                let mut acc_tile = [[0.0_f32; 16]; CONV_F_TILE];
-                conv1d_16oc_tile_acc(
-                    w_blk,
-                    ext,
-                    (first_frame, f_start, f_len, stride, in_c, kernel, dilation),
-                    &mut acc_tile[..f_len],
-                );
-                store_16oc_time_first(
+                conv1d_16oc_f_tile_time_first_simd(
                     simd,
-                    &acc_tile[..f_len],
+                    w_blk,
                     bias_vec,
                     residual,
-                    f_start,
-                    num_rows,
-                    oc_base,
+                    ext,
+                    (
+                        first_frame,
+                        f_start,
+                        f_len,
+                        stride,
+                        in_c,
+                        kernel,
+                        dilation,
+                        num_rows,
+                        oc_base,
+                    ),
                     out,
                 );
             }
         } else {
             for f_start in (0..num_frames).step_by(f_tile) {
                 let f_end = (f_start + f_tile).min(num_frames);
-                let mut f = f_start;
-                while f + 4 <= f_end {
-                    let acc = conv1d_tail_oc_frames_acc::<S, 4>(
-                        simd,
-                        w_blk,
-                        ext,
-                        (first_frame, f, stride, in_c, kernel, dilation, lane_w),
-                    );
-                    for (df, acc_row) in acc.iter().enumerate() {
-                        let dst_off = (f + df) * num_rows + oc_base;
-                        for lane in 0..lane_w {
-                            let with_bias =
-                                acc_row[lane] + bias_rows.map_or(0.0_f32, |b| b[oc_base + lane]);
-                            out[dst_off + lane] =
-                                residual.map_or(with_bias, |r| with_bias + r[dst_off + lane]);
-                        }
-                    }
-                    f += 4;
-                }
-                while f < f_end {
-                    let [acc_row] = conv1d_tail_oc_frames_acc::<S, 1>(
-                        simd,
-                        w_blk,
-                        ext,
-                        (first_frame, f, stride, in_c, kernel, dilation, lane_w),
-                    );
-                    let dst_off = f * num_rows + oc_base;
-                    for lane in 0..lane_w {
-                        let with_bias =
-                            acc_row[lane] + bias_rows.map_or(0.0_f32, |b| b[oc_base + lane]);
-                        out[dst_off + lane] =
-                            residual.map_or(with_bias, |r| with_bias + r[dst_off + lane]);
-                    }
-                    f += 1;
-                }
+                conv1d_tail_oc_f_range_time_first_simd(
+                    simd,
+                    w_blk,
+                    bias_rows,
+                    residual,
+                    ext,
+                    (
+                        first_frame,
+                        f_start,
+                        f_end,
+                        stride,
+                        in_c,
+                        kernel,
+                        dilation,
+                        num_rows,
+                        oc_base,
+                        lane_w,
+                    ),
+                    out,
+                );
             }
         }
     }
