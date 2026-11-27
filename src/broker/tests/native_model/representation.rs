@@ -1182,13 +1182,10 @@ fn native_representation_invalid_transport_and_sse_wait_for_cleanup_and_keep_rec
             );
             assert_eq!(saved["passed"], false);
         }
-        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = reservation.local_addr().unwrap().port();
-        drop(reservation);
         let mut report = json!({"passed":false,"samples":[{}]});
         assert!(
             record_response(
-                port,
+                0,
                 "fixture",
                 &evidence,
                 tokio::time::Instant::now() + STOP_WAIT + Duration::from_secs(5),

@@ -398,7 +398,7 @@ fn serve_probe(stream: &mut BlockingStream, key: &str) -> io::Result<()> {
 #[test]
 #[ignore = "subprocess entry point; invoked only as an owned holder child"]
 fn synthetic_pipe_holder_probe() -> io::Result<()> {
-    std::thread::sleep(Duration::from_secs(30));
+    std::thread::park();
     Ok(())
 }
 

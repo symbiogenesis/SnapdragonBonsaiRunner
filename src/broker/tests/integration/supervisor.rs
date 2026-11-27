@@ -468,44 +468,27 @@ fn backend_failures_before_response_report_counting_or_generation_stage() {
 
 #[test]
 fn backend_failure_diagnostics_preserve_stage_and_redact_private_values() {
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Command, Stdio};
 
     // Direct writes to stderr bypass libtest's capture. Replay only the named,
     // already bounded in-memory fixture in a child; no environment mutation or
     // recursive invocation of this test is needed.
-    struct Replay(Option<Child>);
-
-    impl Drop for Replay {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.0.take() {
-                let _killed = child.kill();
-                let _joined = child.wait();
-            }
-        }
-    }
-
-    let mut replay = Replay(Some(
-        Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "supervisor::backend_failures_before_response_report_counting_or_generation_stage",
-                "--nocapture",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    ));
-    let until = std::time::Instant::now() + Duration::from_secs(10);
-    while replay.0.as_mut().unwrap().try_wait().unwrap().is_none() {
-        assert!(
-            std::time::Instant::now() < until,
-            "Diagnostic replay timed out."
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    let output = replay.0.take().unwrap().wait_with_output().unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "supervisor::backend_failures_before_response_report_counting_or_generation_stage",
+            "--nocapture",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
     assert!(output.status.success(), "{output:?}");
     let stderr = String::from_utf8(output.stderr).unwrap();
     let observed = stderr

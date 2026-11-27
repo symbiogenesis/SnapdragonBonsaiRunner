@@ -46,6 +46,7 @@ fn owner_shutdown_arguments_preserve_launch_selection_and_reject_ambiguous_stora
 fn current_runtime() -> io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .start_paused(true)
         .build()
 }
 

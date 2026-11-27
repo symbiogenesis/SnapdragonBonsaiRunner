@@ -14,7 +14,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::{JoinHandle, spawn_local},
-    time::{Instant, timeout},
+    time::Instant,
 };
 
 use crate::support::{
@@ -139,10 +139,10 @@ fn burst_limit_rejects_authenticated_headers_before_body_or_backend_and_refills(
         // Authentication still wins after exhaustion rather than returning a
         // rate response for a caller with an invalid credential.
         assert_eq!(burst_probe(&service, false, false).await.0, "");
+        tokio::task::yield_now().await;
         assert!(
-            timeout(Duration::from_millis(1), backend.accept())
+            std::future::poll_fn(|cx| std::task::Poll::Ready(backend.poll_accept(cx).is_pending()))
                 .await
-                .is_err()
         );
         // No socket work is pending; advance only the refill clock, then
         // restore real time before the next loopback exchange.
@@ -282,10 +282,10 @@ fn control_token_rejection_never_contacts_backend_and_keeps_service_ready() {
             body,
             r#"{"error":{"code":"input_control_tokens_rejected"}}"#
         );
+        tokio::task::yield_now().await;
         assert!(
-            timeout(Duration::from_millis(1), backend.accept())
+            std::future::poll_fn(|cx| std::task::Poll::Ready(backend.poll_accept(cx).is_pending()))
                 .await
-                .is_err()
         );
         let backend_work = spawn_local(async move {
             let counted = count(&backend).await;
@@ -387,10 +387,10 @@ fn policy_rejections_report_fixed_errors_and_keep_service_usable() {
                 )))
             );
         }
+        tokio::task::yield_now().await;
         assert!(
-            timeout(Duration::from_millis(1), backend.accept())
+            std::future::poll_fn(|cx| std::task::Poll::Ready(backend.poll_accept(cx).is_pending()))
                 .await
-                .is_err()
         );
         let worker = Arc::clone(&service);
         let serving = spawn_local(async move { worker.accept().await.unwrap().serve().await });
@@ -511,10 +511,12 @@ fn queued_socket_expires_without_reading_a_request_or_connecting_backend() {
             tokio::time::resume();
             let mut byte = [0];
             assert_eq!(queued_client.read(&mut byte).await.unwrap(), 0);
+            tokio::task::yield_now().await;
             assert!(
-                timeout(Duration::from_millis(1), backend.accept())
-                    .await
-                    .is_err()
+                std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(backend.poll_accept(cx).is_pending())
+                })
+                .await
             );
             service.close();
             assert_eq!(
@@ -634,10 +636,10 @@ fn expired_connector_deadline_never_connects() {
             connector.connect(Instant::now()).await,
             Err(BackendError::Deadline)
         ));
+        tokio::task::yield_now().await;
         assert!(
-            timeout(Duration::from_millis(1), backend.accept())
+            std::future::poll_fn(|cx| std::task::Poll::Ready(backend.poll_accept(cx).is_pending()))
                 .await
-                .is_err()
         );
     });
 }
@@ -677,10 +679,10 @@ fn queued_client_disconnect_aborts_before_slot_without_closing_gate() {
             Err(ServiceError::Request(ServeError::ClientAbandoned))
         );
         // Gate remains open and the backend never receives a connection for the abandoned queue entry.
+        tokio::task::yield_now().await;
         assert!(
-            timeout(Duration::from_millis(1), backend.accept())
+            std::future::poll_fn(|cx| std::task::Poll::Ready(backend.poll_accept(cx).is_pending()))
                 .await
-                .is_err()
         );
 
         service.close();

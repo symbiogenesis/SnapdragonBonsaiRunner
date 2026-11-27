@@ -2232,15 +2232,9 @@ fn refine_backend_startup_error(
 }
 
 fn wait_briefly_for_exit(process: &OwnedProcess, error: LaunchError) -> io::Result<Option<u32>> {
-    let mut status = process.try_wait();
+    let status = process.try_wait();
     if error == LaunchError::Backend && matches!(status, Ok(None)) {
-        for _ in 0..10 {
-            std::thread::sleep(Duration::from_millis(5));
-            status = process.try_wait();
-            if !matches!(status, Ok(None)) {
-                break;
-            }
-        }
+        return process.wait_for_exit(Duration::from_millis(50));
     }
     status
 }

@@ -1671,9 +1671,7 @@ mod tests {
             // wait_server_ready stays pending until KIND_SERVER_READY is sent after attestation.
             assert!(
                 matches!(
-                    backend
-                        .wait_server_ready(Instant::now() + Duration::from_millis(1))
-                        .await,
+                    backend.wait_server_ready(Instant::now()).await,
                     Err(BackendError::Deadline)
                 ),
                 "wait_server_ready completed before KIND_SERVER_READY"

@@ -283,10 +283,12 @@ mod transport {
                         ReceiveError::Policy(Rejection::ChatSchema)
                     )))
                 );
+                tokio::task::yield_now().await;
                 assert!(
-                    timeout(Duration::from_millis(1), backend.accept())
-                        .await
-                        .is_err()
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(backend.poll_accept(cx).is_pending())
+                    })
+                    .await
                 );
                 let worker = Arc::clone(&service);
                 let serving =
