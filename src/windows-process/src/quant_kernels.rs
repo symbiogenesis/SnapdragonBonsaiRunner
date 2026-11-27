@@ -1,7 +1,7 @@
 //! Safe public boundary for ARM64 `SDOT` / `I8MM` / `FCVTL` / `FCVTN` quantized
 //! kernels with runtime CPU feature detection and exact portable fallbacks.
 
-pub use crate::native::quant_q8::Q8_0ActPanel8;
+pub use crate::native::quant_q8::{Q8_0ActPanel8, Q8_KActPanel8};
 pub use bonsai_neon_dot::kquants::{
     Arm64QuantCaps, Q4_K_BLOCK_BYTES, Q4_K_REPACK8_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES,
     Q8_0_BLOCK_ELEMENTS, Q8_0ActBlock, Q8_KActBlock, QK_K, dot_q4_k_4rows, dot_q4_k_row,
@@ -19,6 +19,26 @@ pub use bonsai_ternary::{checked_float_to_half, float_to_half, unpack_q4_k_scale
 #[must_use]
 pub fn dot_q4_k_repacked8(caps: Arm64QuantCaps, strip: &[u8], act: &[Q8_KActBlock]) -> [f32; 8] {
     crate::native::quant_q8::dot_q4_k_repacked8(caps, strip, act)
+}
+
+/// Computes `strip_count` contiguous 8-row repacked `Q4_K` strips starting at `start_strip`
+/// for load-validated finite scales with cross-strip prefetching (`0-ULP` vs `dot_q4_k_row`).
+pub fn dot_q4_k_repacked8_finite_scales_strips(
+    caps: Arm64QuantCaps,
+    data: &[u8],
+    start_strip: usize,
+    strip_count: usize,
+    act: &[Q8_KActBlock],
+    out: &mut [f32],
+) {
+    crate::native::quant_q8::dot_q4_k_repacked8_finite_scales_strips(
+        caps,
+        data,
+        start_strip,
+        strip_count,
+        act,
+        out,
+    );
 }
 
 /// Computes eight `Q8_0` row dot products while sharing activations per block (`0-ULP` vs `dot_q8_0_row`).
@@ -141,6 +161,39 @@ pub fn gemm_q4_k_repacked8_8x4(
     crate::native::quant_q8::gemm_q4_k_repacked8_8x4(caps, strip, acts)
 }
 
+/// Pre-packs `panel_count * 8` tokens of `Q8_KActBlock`s (`acts`) into `Q8_KActPanel8`s
+/// laid out as `[panel_idx * blocks + k]`.
+pub fn pack_q8_k_act_panels8(
+    acts: &[Q8_KActBlock],
+    blocks: usize,
+    panel_count: usize,
+    panels: &mut [Q8_KActPanel8],
+) {
+    crate::native::quant_q8::pack_q8_k_act_panels8(acts, blocks, panel_count, panels);
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token repacked `Q4_K` strip GEMM over pre-packed
+/// `Q8_KActPanel8`s with K-blocked L1D weight tiles (`I8MM` `SMMLA`, or exact `SDOT`/portable fallback).
+pub fn gemm_q4_k_repacked8_8x_panels(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    panels: &[Q8_KActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_rows: &mut [f32],
+    row_stride: usize,
+) {
+    crate::native::quant_q8::gemm_q4_k_repacked8_8x_panels(
+        caps,
+        strip,
+        panels,
+        panel_count,
+        blocks,
+        out_rows,
+        row_stride,
+    );
+}
+
 /// Computes eight `Q6_K` row dot products while sharing activations per superblock (`0-ULP` vs `dot_q6_k_row`).
 #[must_use]
 pub fn dot_q6_k_8rows(caps: Arm64QuantCaps, rows: [&[u8]; 8], act: &[Q8_KActBlock]) -> [f32; 8] {
@@ -175,6 +228,28 @@ pub fn gemm_q6_k_8x2(
     acts: [&[Q8_KActBlock]; 2],
 ) -> [[f32; 2]; 8] {
     crate::native::quant_q8::gemm_q6_k_8x2(caps, rows, acts)
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token `Q6_K` GEMM over pre-packed `Q8_KActPanel8`s
+/// with K-blocked L1D weight tiles (`I8MM` `SMMLA`, or exact `SDOT`/portable fallback).
+pub fn gemm_q6_k_8x_panels(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    panels: &[Q8_KActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_rows: &mut [f32],
+    row_stride: usize,
+) {
+    crate::native::quant_q8::gemm_q6_k_8x_panels(
+        caps,
+        rows,
+        panels,
+        panel_count,
+        blocks,
+        out_rows,
+        row_stride,
+    );
 }
 
 /// Computes `(dot(q0, k), dot(q1, k))` from a shared `binary16` key vector `k_f16`
@@ -1283,6 +1358,227 @@ mod tests {
                     acc_prt[r].map(f32::to_bits),
                     "k_len={k_len} r={r}"
                 );
+            }
+        }
+    }
+
+    fn make_edge_q4_k_row(blocks: usize, seed: usize) -> Vec<u8> {
+        const SCALE_BITS: [u16; 10] = [
+            0x3C01, // 1 + 2^-10
+            0xBC03, // -(1 + 3*2^-10)
+            0x0001, // smallest positive subnormal f16
+            0x8001, // smallest negative subnormal f16
+            0x0000, // +0.0
+            0x8000, // -0.0
+            0x3555, // ~0.33325
+            0xB557, // ~-0.33374
+            0x4213, // ~3.037
+            0xC215, // ~-3.041
+        ];
+        let mut bytes = Vec::with_capacity(blocks * Q4_K_BLOCK_BYTES);
+        for b in 0..blocks {
+            let d_bits = SCALE_BITS[(seed * 3 + b * 5) % SCALE_BITS.len()];
+            let dmin_bits = SCALE_BITS[(seed * 7 + b * 2 + 1) % SCALE_BITS.len()];
+            bytes.extend_from_slice(&d_bits.to_le_bytes());
+            bytes.extend_from_slice(&dmin_bits.to_le_bytes());
+            for i in 0..12 {
+                bytes.push(u8::try_from((seed * 19 + b * 31 + i * 47) % 251).unwrap_or(0));
+            }
+            for i in 0..128 {
+                bytes.push(u8::try_from((seed * 29 + b * 17 + i * 41) % 256).unwrap_or(0));
+            }
+        }
+        bytes
+    }
+
+    fn make_edge_q6_k_row(blocks: usize, seed: usize) -> Vec<u8> {
+        const SCALE_BITS: [u16; 8] = [
+            0x3C01, 0xBC03, 0x0001, 0x8001, 0x0000, 0x8000, 0x3555, 0xB557,
+        ];
+        let mut bytes = Vec::with_capacity(blocks * Q6_K_BLOCK_BYTES);
+        for b in 0..blocks {
+            for i in 0..128 {
+                bytes.push(u8::try_from((seed * 23 + b * 11 + i * 43) % 256).unwrap_or(0));
+            }
+            for i in 0..64 {
+                bytes.push(u8::try_from((seed * 19 + b * 7 + i * 53) % 256).unwrap_or(0));
+            }
+            for i in 0..16 {
+                let s = i8::try_from(
+                    isize::try_from((seed * 13 + b * 5 + i * 17) % 255).unwrap_or(0) - 127,
+                )
+                .unwrap_or(1);
+                bytes.push(s.cast_unsigned());
+            }
+            let d_bits = SCALE_BITS[(seed * 5 + b * 3) % SCALE_BITS.len()];
+            bytes.extend_from_slice(&d_bits.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn q4_k_repacked8_finite_scales_strips_matches_row_across_caps_bit_exact() {
+        let det = Arm64QuantCaps::detect();
+        let modes = [
+            ("portable", Arm64QuantCaps::portable()),
+            (
+                "dotprod",
+                Arm64QuantCaps {
+                    dotprod: det.dotprod,
+                    i8mm: false,
+                },
+            ),
+            ("i8mm", det),
+        ];
+
+        for blocks in [0_usize, 1, 2, 3, 5] {
+            let in_dim = blocks * QK_K;
+            let q4_rows: Vec<Vec<u8>> = (0..24)
+                .map(|r| {
+                    if r % 2 == 0 {
+                        make_edge_q4_k_row(blocks, r + 1)
+                    } else {
+                        make_q4_k_row(blocks, r + 7)
+                    }
+                })
+                .collect();
+            let flat_q4: Vec<u8> = q4_rows.iter().flat_map(|r| r.iter().copied()).collect();
+            let repacked = if blocks == 0 {
+                Vec::new()
+            } else {
+                repack_q4_k_8rows(&flat_q4, in_dim, 24).unwrap_or_default()
+            };
+            assert_eq!(repacked.len(), 3 * blocks * Q4_K_REPACK8_BLOCK_BYTES);
+
+            let act = make_edge_q8_k_act(blocks, 2);
+            for &(mode_name, caps) in &modes {
+                let mut out = vec![f32::NAN; 16];
+                dot_q4_k_repacked8_finite_scales_strips(caps, &repacked, 1, 2, &act, &mut out);
+                for r in 0..16 {
+                    let expected = dot_q4_k_row(Arm64QuantCaps::portable(), &q4_rows[8 + r], &act);
+                    assert_eq!(
+                        out[r].to_bits(),
+                        expected.to_bits(),
+                        "mode={mode_name} blocks={blocks} r={r}"
+                    );
+                }
+            }
+        }
+
+        // Edge cases: strip_count == 0 or mismatched buffer lengths leave out untouched.
+        let valid = vec![0_u8; 2 * Q4_K_REPACK8_BLOCK_BYTES];
+        let act = make_edge_q8_k_act(2, 0);
+        let mut untouched = [7.0_f32; 8];
+        dot_q4_k_repacked8_finite_scales_strips(det, &valid, 0, 0, &act, &mut untouched);
+        assert_eq!(untouched.map(f32::to_bits), [7.0_f32.to_bits(); 8]);
+        dot_q4_k_repacked8_finite_scales_strips(
+            det,
+            &valid[..valid.len() - 1],
+            0,
+            1,
+            &act,
+            &mut untouched,
+        );
+        assert_eq!(untouched.map(f32::to_bits), [7.0_f32.to_bits(); 8]);
+    }
+
+    #[test]
+    fn q8_k_act_panels8_and_k_blocked_gemm_match_row_across_caps_bit_exact() {
+        let det = Arm64QuantCaps::detect();
+        let port = Arm64QuantCaps::portable();
+        let modes = [
+            ("portable", port),
+            (
+                "dotprod",
+                Arm64QuantCaps {
+                    dotprod: det.dotprod,
+                    i8mm: false,
+                },
+            ),
+            ("i8mm", det),
+        ];
+
+        // Exercise K_TILE=4 and T_PANEL=8 boundaries across blocks and panel_count.
+        for blocks in [0_usize, 1, 2, 3, 4, 5, 9] {
+            let in_dim = blocks * QK_K;
+            let q4_rows: Vec<Vec<u8>> = (0..8)
+                .map(|r| {
+                    if r % 2 == 0 {
+                        make_edge_q4_k_row(blocks, r + 3)
+                    } else {
+                        make_q4_k_row(blocks, r + 11)
+                    }
+                })
+                .collect();
+            let flat_q4: Vec<u8> = q4_rows.iter().flat_map(|r| r.iter().copied()).collect();
+            let repacked = if blocks == 0 {
+                Vec::new()
+            } else {
+                repack_q4_k_8rows(&flat_q4, in_dim, 8).unwrap_or_default()
+            };
+
+            let q6_rows: Vec<Vec<u8>> = (0..8)
+                .map(|r| {
+                    if r % 2 == 0 {
+                        make_edge_q6_k_row(blocks, r + 5)
+                    } else {
+                        make_q6_k_row(blocks, r + 13)
+                    }
+                })
+                .collect();
+            let q6_refs: [&[u8]; 8] = std::array::from_fn(|r| q6_rows[r].as_slice());
+
+            for panel_count in [0_usize, 1, 2, 8, 9] {
+                let tokens = panel_count * 8;
+                let mut flat_acts = Vec::with_capacity(tokens * blocks);
+                for t in 0..tokens {
+                    flat_acts.extend(make_edge_q8_k_act(blocks, t));
+                }
+                let mut panels = vec![Q8_KActPanel8::default(); panel_count * blocks];
+                pack_q8_k_act_panels8(&flat_acts, blocks, panel_count, &mut panels);
+
+                let stride = tokens + 3;
+                for &(mode_name, caps) in &modes {
+                    let mut out_q4 = vec![f32::NAN; 8 * stride];
+                    let mut out_q6 = vec![f32::NAN; 8 * stride];
+                    gemm_q4_k_repacked8_8x_panels(
+                        caps,
+                        &repacked,
+                        &panels,
+                        panel_count,
+                        blocks,
+                        &mut out_q4,
+                        stride,
+                    );
+                    gemm_q6_k_8x_panels(
+                        caps,
+                        q6_refs,
+                        &panels,
+                        panel_count,
+                        blocks,
+                        &mut out_q6,
+                        stride,
+                    );
+
+                    for r in 0..8 {
+                        for t in 0..tokens {
+                            let act_tok = &flat_acts[t * blocks..(t + 1) * blocks];
+                            let want_q4 = dot_q4_k_row(port, &q4_rows[r], act_tok).to_bits();
+                            let want_q6 = dot_q6_k_row(port, q6_refs[r], act_tok).to_bits();
+                            let idx = r * stride + t;
+                            assert_eq!(
+                                out_q4[idx].to_bits(),
+                                want_q4,
+                                "q4_k mismatch mode={mode_name} blocks={blocks} panels={panel_count} r={r} t={t}"
+                            );
+                            assert_eq!(
+                                out_q6[idx].to_bits(),
+                                want_q6,
+                                "q6_k mismatch mode={mode_name} blocks={blocks} panels={panel_count} r={r} t={t}"
+                            );
+                        }
+                    }
+                }
             }
         }
     }
