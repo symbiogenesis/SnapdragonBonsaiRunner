@@ -18,11 +18,11 @@ use std::{
 use fearless_simd::{Level, dispatch, f32x4, prelude::*};
 
 use crate::{
-    SAMPLE_RATE,
+    SAMPLE_RATE, SAMPLE_RATE_48K,
     codec::{
         CausalConv1d, CausalTransConv1d, CodecDecodeScratch, CodecStreamState, ConvNeXtBlock,
         DacBlock, DacDecoder, DacResUnit, PadMode, RvqDecoder, RvqEncodeSide, RvqGroup, SnakeBeta,
-        TOKENIZER_HOP_24K,
+        TOKENIZER_HOP_24K, TOKENIZER_HOP_48K,
     },
     engine::{LinearProjection, swiglu_in_place},
     numerics::{axpy_simd, f32_dot_simd, usize_to_f32},
@@ -1343,22 +1343,41 @@ fn apply_rope_batch(
     sin_all: &[f32],
     threads: usize,
 ) -> io::Result<()> {
-    let width = num_heads * head_dim;
+    let width = num_heads.checked_mul(head_dim).ok_or_else(invalid)?;
+    let expected_buf_len = count.checked_mul(width).ok_or_else(invalid)?;
+    if head_dim == 0 || !head_dim.is_multiple_of(2) || width == 0 || buf.len() != expected_buf_len {
+        return Err(invalid());
+    }
     let half = head_dim / 2;
-    if threads > 1 && count >= 2 && buf.len() == count * width {
+    let expected_trig_len = count.checked_mul(half).ok_or_else(invalid)?;
+    if cos_all.len() != expected_trig_len || sin_all.len() != expected_trig_len {
+        return Err(invalid());
+    }
+    if count == 0 {
+        return Ok(());
+    }
+    if threads > 1 && count >= 2 {
+        let failed = AtomicBool::new(false);
         crate::engine::row_workers::run_aligned(buf, threads, width, &|elem_off, chunk| {
             let t_start = elem_off / width;
             for (local_t, tok) in chunk.chunks_exact_mut(width).enumerate() {
                 let t = t_start + local_t;
-                let _ = crate::engine::apply_rope_neox_with_tables(
+                if crate::engine::apply_rope_neox_with_tables(
                     tok,
                     num_heads,
                     head_dim,
                     &cos_all[t * half..(t + 1) * half],
                     &sin_all[t * half..(t + 1) * half],
-                );
+                )
+                .is_err()
+                {
+                    failed.store(true, Ordering::Relaxed);
+                }
             }
         });
+        if failed.load(Ordering::Relaxed) {
+            return Err(invalid());
+        }
         return Ok(());
     }
     for (t, tok) in buf.chunks_exact_mut(width).enumerate() {
@@ -2676,10 +2695,18 @@ fn load_dac_res_unit<S: CodecSource + ?Sized>(
 fn load_dac_decoder<S: CodecSource + ?Sized>(
     weights: &S,
     latent: usize,
+    output_rate: u32,
     threads: usize,
 ) -> io::Result<DacDecoder> {
-    const STRIDES: [(usize, usize, usize); 4] =
-        [(0, 8, 1536), (1, 5, 768), (2, 4, 384), (3, 3, 192)];
+    const STRIDES_24K: &[(usize, usize, usize)] =
+        &[(0, 8, 1536), (1, 5, 768), (2, 4, 384), (3, 3, 192)];
+    const STRIDES_48K: &[(usize, usize, usize)] = &[
+        (0, 8, 1536),
+        (1, 5, 768),
+        (2, 4, 384),
+        (3, 3, 192),
+        (4, 2, 96),
+    ];
     const DILATIONS: [usize; 3] = [1, 3, 9];
     enum DacLoadItem {
         ConvPre(CausalConv1d),
@@ -2688,8 +2715,19 @@ fn load_dac_decoder<S: CodecSource + ?Sized>(
         Post(SnakeBeta, CausalConv1d),
     }
 
-    // 1 conv_pre + 4 * (1 block head + 3 res_units) + 1 post = 18 fine-grained tasks.
-    let items = parallel_build(18, threads, |task| {
+    let (strides, post_channels) = match output_rate {
+        SAMPLE_RATE => (STRIDES_24K, 96_usize),
+        SAMPLE_RATE_48K => (STRIDES_48K, 48_usize),
+        _ => return Err(invalid()),
+    };
+    let num_blocks = strides.len();
+    let total_tasks = 1 + num_blocks * 4 + 1;
+    let post_task = total_tasks - 1;
+    let post_snake_idx = num_blocks + 1;
+    let post_conv_idx = num_blocks + 2;
+
+    // 1 conv_pre + N * (1 block head + 3 res_units) + 1 post.
+    let items = parallel_build(total_tasks, threads, |task| {
         if task == 0 {
             Ok(DacLoadItem::ConvPre(conv(
                 weights,
@@ -2702,13 +2740,17 @@ fn load_dac_decoder<S: CodecSource + ?Sized>(
                 true,
                 PadMode::Constant,
             )?))
-        } else if task == 17 {
+        } else if task == post_task {
             Ok(DacLoadItem::Post(
-                snake(weights, "tok_dec.dec.5.snake", 96)?,
+                snake(
+                    weights,
+                    &format!("tok_dec.dec.{post_snake_idx}.snake"),
+                    post_channels,
+                )?,
                 conv(
                     weights,
-                    "tok_dec.dec.6.conv",
-                    96,
+                    &format!("tok_dec.dec.{post_conv_idx}.conv"),
+                    post_channels,
                     1,
                     7,
                     1,
@@ -2720,7 +2762,7 @@ fn load_dac_decoder<S: CodecSource + ?Sized>(
         } else {
             let block_slot = (task - 1) / 4;
             let sub = (task - 1) % 4;
-            let (idx, stride, channels) = STRIDES[block_slot];
+            let (idx, stride, channels) = strides[block_slot];
             let next = channels / 2;
             if sub == 0 {
                 let name = format!("tok_dec.dec.{}", idx + 1);
@@ -2748,25 +2790,27 @@ fn load_dac_decoder<S: CodecSource + ?Sized>(
     })?;
 
     let mut conv_pre = None;
-    let mut block_heads: [Option<(SnakeBeta, CausalTransConv1d)>; 4] = [None, None, None, None];
-    let mut block_units: [[Option<DacResUnit>; 3]; 4] = [
-        [None, None, None],
-        [None, None, None],
-        [None, None, None],
-        [None, None, None],
-    ];
+    let mut block_heads: Vec<Option<(SnakeBeta, CausalTransConv1d)>> = vec![None; num_blocks];
+    let mut block_units: Vec<[Option<DacResUnit>; 3]> = vec![[None, None, None]; num_blocks];
     let mut post = None;
     for item in items {
         match item {
             DacLoadItem::ConvPre(c) => conv_pre = Some(c),
-            DacLoadItem::BlockHead(b, s, tc) => block_heads[b] = Some((s, tc)),
-            DacLoadItem::ResUnit(b, u, ru) => block_units[b][u] = Some(ru),
+            DacLoadItem::BlockHead(b, s, tc) => {
+                *block_heads.get_mut(b).ok_or_else(invalid)? = Some((s, tc));
+            }
+            DacLoadItem::ResUnit(b, u, ru) => {
+                *block_units
+                    .get_mut(b)
+                    .and_then(|arr| arr.get_mut(u))
+                    .ok_or_else(invalid)? = Some(ru);
+            }
             DacLoadItem::Post(s, c) => post = Some((s, c)),
         }
     }
     let conv_pre = conv_pre.ok_or_else(invalid)?;
     let (snake_post, conv_post) = post.ok_or_else(invalid)?;
-    let mut blocks = Vec::with_capacity(4);
+    let mut blocks = Vec::with_capacity(num_blocks);
     for (head_opt, [u0, u1, u2]) in block_heads.into_iter().zip(block_units) {
         let (snake1, trans_conv) = head_opt.ok_or_else(invalid)?;
         blocks.push(DacBlock {
@@ -2779,12 +2823,16 @@ fn load_dac_decoder<S: CodecSource + ?Sized>(
             ],
         });
     }
-    Ok(DacDecoder {
+    let decoder = DacDecoder {
         conv_pre,
         blocks,
         snake_post,
         conv_post,
-    })
+    };
+    if decoder.sample_rate() != output_rate {
+        return Err(invalid());
+    }
+    Ok(decoder)
 }
 
 impl Codec {
@@ -2793,11 +2841,17 @@ impl Codec {
         reason = "Keep the complete pinned decoder tensor mapping together; each subgraph validates its own fixed geometry."
     )]
     pub(crate) fn load(weights: &Weights, threads: usize) -> io::Result<Self> {
+        let output_rate = weights.u32("qwen3-tts-tokenizer.output_sample_rate")?;
+        let decode_hop = match output_rate {
+            SAMPLE_RATE => u32::try_from(TOKENIZER_HOP_24K).map_err(|_| invalid())?,
+            SAMPLE_RATE_48K => u32::try_from(TOKENIZER_HOP_48K).map_err(|_| invalid())?,
+            _ => return Err(invalid()),
+        };
+        let encode_hop = u32::try_from(TOKENIZER_HOP_24K).map_err(|_| invalid())?;
         for (key, expected) in [
             ("input_sample_rate", SAMPLE_RATE),
-            ("output_sample_rate", SAMPLE_RATE),
-            ("decode_upsample_rate", 1920),
-            ("encode_downsample_rate", 1920),
+            ("decode_upsample_rate", decode_hop),
+            ("encode_downsample_rate", encode_hop),
         ] {
             if weights.u32(&format!("qwen3-tts-tokenizer.{key}"))? != expected {
                 return Err(invalid());
@@ -2854,7 +2908,7 @@ impl Codec {
                 load_upsample_stage(weights, latent, index)
             })
         };
-        let load_dac = || load_dac_decoder(weights, latent, step_threads);
+        let load_dac = || load_dac_decoder(weights, latent, output_rate, step_threads);
         let (quantizer, pre, transformer, upsample, dac) = if parallel {
             let (quantizer_res, pre_res, tfm_res, upsample_res, dac_res) =
                 std::thread::scope(|scope| {
@@ -2903,6 +2957,14 @@ impl Codec {
 
     pub(crate) fn sample_rate(&self) -> u32 {
         self.dac.sample_rate()
+    }
+
+    pub(crate) fn hop(&self) -> usize {
+        if self.sample_rate() == SAMPLE_RATE_48K {
+            TOKENIZER_HOP_48K
+        } else {
+            TOKENIZER_HOP_24K
+        }
     }
 
     pub(crate) fn discard_reference(&mut self) {
@@ -3076,6 +3138,7 @@ impl Codec {
         } else {
             self.decode_scratch.latents.as_slice()
         };
+        let hop = self.hop();
         let samples = self.dac.forward_stream_with_dac_scratch(
             dac_input,
             frames,
@@ -3083,7 +3146,7 @@ impl Codec {
             self.threads,
             &mut self.decode_scratch.dac,
         )?;
-        let expected_samples = count.checked_mul(TOKENIZER_HOP_24K).ok_or_else(invalid)?;
+        let expected_samples = count.checked_mul(hop).ok_or_else(invalid)?;
         if samples.len() != expected_samples || !samples.iter().all(|value| value.is_finite()) {
             return Err(invalid());
         }
@@ -3114,7 +3177,7 @@ impl Codec {
         {
             return Err(invalid());
         }
-        let mut output = Vec::with_capacity(codes.len() * TOKENIZER_HOP_24K);
+        let mut output = Vec::with_capacity(codes.len() * self.hop());
         // Bound batch size per DAC call so cooperative cancellation stays responsive
         // during long reference decodes while streaming chunks run in one batch.
         for chunk in codes.chunks(16) {
@@ -4521,6 +4584,75 @@ mod tests {
         side.encode(&hidden, frames, &mut serial_codes)?;
         side.encode_parallel(&hidden, frames, 4, &mut parallel_codes)?;
         assert_eq!(parallel_codes, serial_codes);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_rope_batch_validates_dimensions_and_matches_serial_in_parallel() -> std::io::Result<()>
+    {
+        let count = 4_usize;
+        let num_heads = 2_usize;
+        let head_dim = 4_usize;
+        let half = head_dim / 2;
+        let width = num_heads * head_dim;
+        let cos = vec![1.0_f32; count * half];
+        let sin = vec![0.0_f32; count * half];
+        let mut valid = vec![0.5_f32; count * width];
+
+        // Reject invalid head_dim (0 and odd), zero num_heads, and buffer/trig mismatches.
+        assert!(super::apply_rope_batch(&mut valid, count, num_heads, 0, &cos, &sin, 2).is_err());
+        assert!(super::apply_rope_batch(&mut valid, count, num_heads, 3, &cos, &sin, 2).is_err());
+        assert!(super::apply_rope_batch(&mut valid, count, 0, head_dim, &cos, &sin, 2).is_err());
+        assert!(
+            super::apply_rope_batch(
+                &mut valid[..width],
+                count,
+                num_heads,
+                head_dim,
+                &cos,
+                &sin,
+                2
+            )
+            .is_err()
+        );
+        assert!(
+            super::apply_rope_batch(&mut valid, count, num_heads, head_dim, &cos[..1], &sin, 2)
+                .is_err()
+        );
+        assert!(
+            super::apply_rope_batch(&mut valid, count, num_heads, head_dim, &cos, &sin[..1], 2)
+                .is_err()
+        );
+
+        let mut serial = (0..count * width)
+            .map(|i| f32::from(u8::try_from(i).unwrap_or(0)) * 0.1)
+            .collect::<Vec<_>>();
+        let mut parallel = serial.clone();
+        let cos_rot: Vec<f32> = (0..count * half)
+            .map(|i| (f32::from(u8::try_from(i).unwrap_or(0)) * 0.2).cos())
+            .collect();
+        let sin_rot: Vec<f32> = (0..count * half)
+            .map(|i| (f32::from(u8::try_from(i).unwrap_or(0)) * 0.2).sin())
+            .collect();
+        super::apply_rope_batch(
+            &mut serial,
+            count,
+            num_heads,
+            head_dim,
+            &cos_rot,
+            &sin_rot,
+            1,
+        )?;
+        super::apply_rope_batch(
+            &mut parallel,
+            count,
+            num_heads,
+            head_dim,
+            &cos_rot,
+            &sin_rot,
+            4,
+        )?;
+        assert_eq!(serial, parallel);
         Ok(())
     }
 }

@@ -1101,10 +1101,20 @@ impl Talker {
         if !reused {
             *snapshot = None;
         }
-        let (mut caches, _cached_hidden) = restored
+        let (mut caches, cached_hidden) = restored
             .unwrap_or_else(|| (vec![LayerKvCache::default(); self.layers.len()], Vec::new()));
         let hidden = if reused {
-            self.forward_batch_range(&prompt.rows[prefix..], &mut caches, true, cancel, workspace)?
+            if prefix == prompt.rows.len() {
+                cached_hidden
+            } else {
+                self.forward_batch_range(
+                    &prompt.rows[prefix..],
+                    &mut caches,
+                    true,
+                    cancel,
+                    workspace,
+                )?
+            }
         } else if prefix > 0 && prefix < prompt.rows.len() {
             let prefix_hidden = self.forward_batch_range(
                 &prompt.rows[..prefix],
@@ -2632,6 +2642,28 @@ pub(crate) mod tests {
                 false,
             )?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_exact_prefix_hit_preserves_cached_hidden_state() -> std::io::Result<()> {
+        let talker = reference_fixture()?;
+        let prompt = Prompt {
+            rows: vec![vec![0.5; talker.geometry.hidden]; 3],
+            trailing: vec![vec![0.1; talker.geometry.hidden]],
+            cacheable_rows: 3,
+        };
+        let mut snapshot = None;
+        let mut workspace = super::DecoderWorkspace::default();
+        let (caches_first, hidden_first) =
+            talker.prefill(&prompt, &mut snapshot, &mut || Ok(()), &mut workspace)?;
+        assert!(snapshot.is_some());
+        assert_eq!(hidden_first.len(), talker.geometry.hidden);
+
+        let (caches_second, hidden_second) =
+            talker.prefill(&prompt, &mut snapshot, &mut || Ok(()), &mut workspace)?;
+        assert_eq!(hidden_second, hidden_first);
+        assert_eq!(caches_second.len(), caches_first.len());
         Ok(())
     }
 }

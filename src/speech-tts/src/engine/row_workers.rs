@@ -9,6 +9,21 @@ thread_local! {
     // The serving thread owns its team through voice/model switches. Dropping
     // that thread or changing its parallel team size releases the old workers.
     static TEAM: RefCell<Option<CachedTeam>> = const { RefCell::new(None) };
+    static IN_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct WorkerFlagGuard(bool);
+
+impl WorkerFlagGuard {
+    fn enter() -> Self {
+        Self(IN_WORKER.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for WorkerFlagGuard {
+    fn drop(&mut self) {
+        IN_WORKER.with(|flag| flag.set(self.0));
+    }
 }
 
 enum CachedTeam {
@@ -98,7 +113,7 @@ pub(crate) fn run_slice_aligned<T: Send, F>(
     F: Fn(usize, &mut [T]) + Sync,
 {
     let requested = worker_count.clamp(1, 18);
-    if requested <= 1 || out.len() < 2 {
+    if requested <= 1 || out.len() < 2 || IN_WORKER.with(std::cell::Cell::get) {
         compute_slice(0, out);
         return;
     }
@@ -116,8 +131,11 @@ pub(crate) fn run_slice_aligned<T: Send, F>(
         let Some(team) = CachedTeam::get_or_build(&mut team, requested) else {
             return false;
         };
-        team.pool
-            .run_slice_aligned(out, requested, alignment, compute_slice);
+        let run = |offset: usize, slice: &mut [T]| {
+            let _guard = WorkerFlagGuard::enter();
+            compute_slice(offset, slice);
+        };
+        team.pool.run_slice_aligned(out, requested, alignment, &run);
         true
     });
     if !completed {
@@ -287,5 +305,18 @@ mod tests {
 
         assert_eq!(team_ids(8)?, initial);
         Ok(())
+    }
+
+    #[test]
+    fn worker_flag_guard_restores_tls_flag_on_unwind() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        assert!(!super::IN_WORKER.with(std::cell::Cell::get));
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = super::WorkerFlagGuard::enter();
+            assert!(super::IN_WORKER.with(std::cell::Cell::get));
+            std::panic::resume_unwind(Box::new("worker panic"));
+        }));
+        assert!(unwound.is_err());
+        assert!(!super::IN_WORKER.with(std::cell::Cell::get));
     }
 }

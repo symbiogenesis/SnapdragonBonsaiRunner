@@ -228,7 +228,7 @@ where
     let chunk = codec
         .decode_stream_cancellable(frames, &mut || (cancel.borrow_mut())())
         .map_err(|error| SynthesisStage::CodecDecode.failure(error))?;
-    *count = sample_count(&chunk, *count)
+    *count = sample_count_for_rate(&chunk, *count, codec.sample_rate())
         .ok_or_else(|| SynthesisStage::AudioValidation.failure(invalid_audio()))?;
     observe.borrow_mut()(observation::Observation::Pcm {
         phase: observation::Phase::Base,
@@ -743,9 +743,15 @@ impl Synthesizer {
                 let samples = codec
                     .decode_cancellable(&codes, &mut || (cancel.borrow_mut())())
                     .map_err(|error| SynthesisStage::ReferenceDecode.failure(error))?;
-                let count = sample_count(&samples, 0)
+                let codec_rate = codec.sample_rate();
+                let count = sample_count_for_rate(&samples, 0, codec_rate)
                     .ok_or_else(|| SynthesisStage::ReferenceValidation.failure(invalid_audio()))?;
-                if !(1920..=24_000 * 30).contains(&count) {
+                let (min_ref_samples, max_ref_samples) = if codec_rate == SAMPLE_RATE_48K {
+                    (codec::TOKENIZER_HOP_48K, 48_000 * 30)
+                } else {
+                    (codec::TOKENIZER_HOP_24K, 24_000 * 30)
+                };
+                if !(min_ref_samples..=max_ref_samples).contains(&count) {
                     return Err(SynthesisStage::ReferenceValidation.failure(invalid_audio()));
                 }
                 observe.borrow_mut()(observation::Observation::Pcm {
@@ -766,12 +772,19 @@ impl Synthesizer {
                     },
                     |weights, samples| {
                         Self::validate_base_weights(weights)?;
+                        let decimated;
+                        let ref_24k = if codec_rate == SAMPLE_RATE_48K {
+                            decimated = codec::decimate_48k_to_24k(samples);
+                            decimated.as_slice()
+                        } else {
+                            samples
+                        };
                         let speaker = rust_codec::Speaker::load(weights, threads)
                             .map_err(|error| SynthesisStage::SpeakerWeights.failure(error))?
-                            .extract_cancellable(samples, &mut || (cancel.borrow_mut())())
+                            .extract_cancellable(ref_24k, &mut || (cancel.borrow_mut())())
                             .map_err(|error| SynthesisStage::SpeakerExtraction.failure(error))?;
                         let reference_codes = codec
-                            .encode_reference_cancellable(samples, &mut || (cancel.borrow_mut())())
+                            .encode_reference_cancellable(ref_24k, &mut || (cancel.borrow_mut())())
                             .map_err(|error| SynthesisStage::ReferenceEncoding.failure(error))?;
                         let talker = engine::with_explicit_threads(explicit_threads, || {
                             Self::load_talker_from_base_weights(weights, threads, &mut || {
@@ -1035,6 +1048,7 @@ fn invalid_audio() -> io::Error {
 
 // Shared by borrowed complete output and streaming callbacks. Native output is
 // admitted before copying or delivering it, with one token-completion policy.
+#[cfg(test)]
 fn sample_count(samples: &[f32], previous: usize) -> Option<usize> {
     sample_count_for_rate(samples, previous, SAMPLE_RATE)
 }
