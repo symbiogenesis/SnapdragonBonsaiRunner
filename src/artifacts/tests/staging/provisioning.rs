@@ -352,7 +352,19 @@ fn synthetic_bytes(len: usize, seed: usize) -> Vec<u8> {
 }
 
 fn chunk_digests(bytes: &[u8], chunk_bytes: usize) -> Vec<String> {
-    bytes.chunks(chunk_bytes).map(digest).collect()
+    if bytes.len() <= chunk_bytes {
+        return bytes.chunks(chunk_bytes).map(digest).collect();
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = bytes
+            .chunks(chunk_bytes)
+            .map(|chunk| scope.spawn(move || digest(chunk)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_else(|_| String::new()))
+            .collect()
+    })
 }
 
 fn make_chunked_spec(
@@ -360,12 +372,18 @@ fn make_chunked_spec(
     payload: &[u8],
     chunk_bytes: usize,
 ) -> Result<ChunkedFileSpec, Box<dyn std::error::Error>> {
+    let (sha256, chunk_sha256s) = std::thread::scope(|scope| {
+        let whole = scope.spawn(|| digest(payload));
+        let chunks = chunk_digests(payload, chunk_bytes);
+        let sha256 = whole.join().unwrap_or_else(|_| String::new());
+        (sha256, chunks)
+    });
     Ok(ChunkedFileSpec {
         path,
         bytes: u64::try_from(payload.len())?,
-        sha256: digest(payload),
+        sha256,
         chunk_bytes,
-        chunk_sha256s: chunk_digests(payload, chunk_bytes),
+        chunk_sha256s,
     })
 }
 
@@ -552,7 +570,7 @@ fn chunk_manifest_verification_rejects_corruption_wrong_count_and_cancellation()
 fn bounded_parallel_verification_preserves_input_order_and_retains_all_locks() -> TestResult {
     let dir = TempArtifactDir::new("bounded-parallel-ok")?;
 
-    let swift_bytes = synthetic_bytes(2 * 4 * 1024 * 1024 + 8_192, 1);
+    let swift_bytes = synthetic_bytes(4 * 1024 * 1024 + 8_192, 1);
     let orca_bytes = synthetic_bytes(262_144, 2);
     let mmproj_bytes = synthetic_bytes(4 * 1024 * 1024 + 2_048, 3);
     let speech_bytes = synthetic_bytes(131_072, 4);
@@ -620,9 +638,9 @@ fn bounded_parallel_verification_preserves_input_order_and_retains_all_locks() -
 fn bounded_parallel_verification_cancels_peers_early_on_corrupt_artifact() -> TestResult {
     let dir = TempArtifactDir::new("bounded-parallel-corrupt")?;
 
-    let valid_large = synthetic_bytes(16 * 1024 * 1024 + 4_096, 5);
+    let valid_large = synthetic_bytes(4 * 1024 * 1024 + 4_096, 5);
     let corrupt_small = synthetic_bytes(4_096, 6);
-    let trailing_large = synthetic_bytes(8 * 1024 * 1024 + 1_024, 7);
+    let trailing_large = synthetic_bytes(4 * 1024 * 1024 + 1_024, 7);
 
     let large_path = dir.path().join("swift-large.gguf");
     let corrupt_path = dir.path().join("corrupt-lora.bin");

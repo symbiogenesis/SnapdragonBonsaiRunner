@@ -1135,7 +1135,7 @@ mod tests {
         let f16_elems = 1_100_005_usize;
         let f32_elems = 550_003_usize;
         let f16_data = f16_bytes(&vec![0x3c00_u16; f16_elems]);
-        let mut f32_data = f32_bytes(&vec![0.5_f32; f32_elems]);
+        let f32_data = f32_bytes(&vec![0.5_f32; f32_elems]);
         let path = dir.0.join("large-valid.gguf");
         let gguf = build_gguf(
             16.0,
@@ -1146,7 +1146,7 @@ mod tests {
                     name: "blk.0.ffn_down.weight.lora_a",
                     dims: [u64::try_from(f16_elems)?, 1],
                     gguf_type: 1,
-                    data: f16_data.clone(),
+                    data: f16_data,
                 },
                 TensorBuildSpec {
                     name: "blk.0.ffn_down.weight.lora_b",
@@ -1170,7 +1170,7 @@ mod tests {
         );
         assert!(u64::try_from(gguf.len())? >= bonsai_windows_credentials::MIN_MAPPED_HASH_BYTES);
         fs::write(&path, &gguf)?;
-        let expected_sha = hex::encode(Sha256::digest(&gguf));
+        let expected_sha = hex::encode(bonsai_windows_credentials::Sha256::digest_bytes(&gguf)?);
         let verified = verify_multi_rank_lora_gguf(
             &path,
             16,
@@ -1182,47 +1182,20 @@ mod tests {
         assert_eq!(verified.target_count(), 2);
         drop(verified);
 
-        // Corrupt the final tail element of F32 tensor with NaN.
-        let tail_start = f32_data.len() - 4;
-        f32_data[tail_start..].copy_from_slice(&f32::NAN.to_le_bytes());
-        let nan_path = dir.0.join("large-nan-f32.gguf");
-        fs::write(
-            &nan_path,
-            build_gguf(
-                16.0,
-                None,
-                32,
-                vec![
-                    TensorBuildSpec {
-                        name: "blk.0.ffn_down.weight.lora_a",
-                        dims: [u64::try_from(f16_elems)?, 1],
-                        gguf_type: 1,
-                        data: f16_data,
-                    },
-                    TensorBuildSpec {
-                        name: "blk.0.ffn_down.weight.lora_b",
-                        dims: [1, 4],
-                        gguf_type: 1,
-                        data: f16_bytes(&[0x3800; 4]),
-                    },
-                    TensorBuildSpec {
-                        name: "blk.1.attn_q.weight.lora_a",
-                        dims: [u64::try_from(f32_elems)?, 1],
-                        gguf_type: 0,
-                        data: f32_data,
-                    },
-                    TensorBuildSpec {
-                        name: "blk.1.attn_q.weight.lora_b",
-                        dims: [1, 4],
-                        gguf_type: 0,
-                        data: f32_bytes(&[0.25; 4]),
-                    },
-                ],
-            ),
-        )?;
+        // Corrupt the final tail element of the F32 tensor in place with NaN.
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let padded_last_b = (4 * 4_usize).next_multiple_of(32);
+        let f32_a_pad = f32_data.len().next_multiple_of(32) - f32_data.len();
+        let tail_offset = gguf.len() - padded_last_b - f32_a_pad - 4;
+        assert_eq!(&gguf[tail_offset..tail_offset + 4], &0.5_f32.to_le_bytes());
+        let mut file = fs::OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(u64::try_from(tail_offset)?))?;
+        file.write_all(&f32::NAN.to_le_bytes())?;
+        file.flush()?;
+        drop(file);
         assert_eq!(
             verify_multi_rank_lora_gguf(
-                &nan_path,
+                &path,
                 16,
                 64 * 1024 * 1024,
                 MultiRankEnvelope::NpuFriendly

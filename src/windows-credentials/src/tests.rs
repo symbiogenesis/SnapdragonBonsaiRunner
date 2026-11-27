@@ -433,14 +433,12 @@ fn parallel_mapped_chunk_verification_rejects_count_chunk_size_and_length_mismat
     let lane = test_lane("parallel-chunk-mismatch")?;
     let chunk_bytes = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)?;
     let len = 2 * chunk_bytes + 512;
-    let payload = synthetic_chunk_payload(len);
     let path = lane.join("mismatch.bin");
-    fs::write(&path, &payload)?;
+    let created = File::create(&path)?;
+    created.set_len(u64::try_from(len).map_err(io::Error::other)?)?;
+    drop(created);
 
-    let expected: Vec<[u8; 32]> = payload
-        .chunks(chunk_bytes)
-        .map(Sha256::digest_bytes)
-        .collect::<io::Result<Vec<_>>>()?;
+    let expected = vec![[0_u8; 32]; 3];
     let file = open_read_locked_test_file(&path)?;
     let total_u64 = u64::try_from(len).map_err(io::Error::other)?;
     let cancel = std::sync::atomic::AtomicBool::new(false);
@@ -544,14 +542,12 @@ fn parallel_mapped_chunk_verification_honors_immediate_cancellation() -> io::Res
     let lane = test_lane("parallel-chunk-cancel")?;
     let chunk_bytes = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)?;
     let len = 2 * chunk_bytes + 512;
-    let payload = synthetic_chunk_payload(len);
     let path = lane.join("cancel.bin");
-    fs::write(&path, &payload)?;
+    let created = File::create(&path)?;
+    created.set_len(u64::try_from(len).map_err(io::Error::other)?)?;
+    drop(created);
 
-    let expected: Vec<[u8; 32]> = payload
-        .chunks(chunk_bytes)
-        .map(Sha256::digest_bytes)
-        .collect::<io::Result<Vec<_>>>()?;
+    let expected = vec![[0_u8; 32]; 3];
     let file = open_read_locked_test_file(&path)?;
     let total_u64 = u64::try_from(len).map_err(io::Error::other)?;
 

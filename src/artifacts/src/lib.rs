@@ -1542,7 +1542,7 @@ mod tests {
         let path = root.join("model.bin");
         let mut payload = vec![0xa5; HASH_BUFFER_BYTES + 137];
         let length = u64::try_from(payload.len())?;
-        let digest = digest_hex(Sha256::digest(&payload).into());
+        let digest = digest_hex(bonsai_windows_credentials::Sha256::digest_bytes(&payload)?);
         fs::write(&path, &payload)?;
         let guard = VerifiedFile::verify(&path, length, &digest)?;
         // Ordinary locked readers remain seekable while verification retains
