@@ -459,8 +459,7 @@ pub(crate) fn gemm_f32_fma_16oc_frames(
         let f_rem8 = acc_chunks8.len() * 8;
         let (acc_chunks4, acc_rem4) = acc_rem8.as_chunks_mut::<4>();
         if let Some(acc4) = acc_chunks4.first_mut() {
-            let xr: [&[f32]; 4] =
-                core::array::from_fn(|df| &x_rows[f_rem8 + df][ic_base..ic_end]);
+            let xr: [&[f32]; 4] = core::array::from_fn(|df| &x_rows[f_rem8 + df][ic_base..ic_end]);
             gemm_f32_fma_16oc::<4>(w_sub, xr, ic_len, acc4);
         }
 

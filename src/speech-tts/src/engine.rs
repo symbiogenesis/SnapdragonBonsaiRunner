@@ -982,7 +982,8 @@ impl LinearProjection {
                 dst.fill(0.0);
             }
         };
-        let worker_count = decode_worker_budget(threads, self.out_dim, projection_weight_bytes(&self.weight));
+        let worker_count =
+            decode_worker_budget(threads, self.out_dim, projection_weight_bytes(&self.weight));
         let level = Level::new();
 
         if let Some((ggml_type, bytes)) = self.weight.packed_slice() {
@@ -1385,8 +1386,8 @@ mod quant_dispatch {
         dot_q8_0_row, gemm_q4_k_4x2, gemm_q4_k_repacked8_8x_panels, gemm_q4_k_repacked8_8x2,
         gemm_q4_k_repacked8_8x4, gemm_q4_k_repacked8_8x8, gemm_q6_k_4x2, gemm_q6_k_8x_panels,
         gemm_q6_k_8x2, gemm_q6_k_8x4, gemm_q6_k_8x8, gemm_q8_0_4x2, gemm_q8_0_8x_panels,
-        gemm_q8_0_8x2, gemm_q8_0_8x4, gemm_q8_0_8x8, pack_q8_0_act_panels8,
-        pack_q8_k_act_panels8, quantize_row_q8_0, quantize_row_q8_k,
+        gemm_q8_0_8x2, gemm_q8_0_8x4, gemm_q8_0_8x8, pack_q8_0_act_panels8, pack_q8_k_act_panels8,
+        quantize_row_q8_0, quantize_row_q8_k,
     };
 
     use super::{
@@ -1671,10 +1672,7 @@ mod quant_dispatch {
                     &mut dst[..strip_rows],
                 );
                 if let Some(b_slice) = bias {
-                    for (slot, &b) in dst[..strip_rows]
-                        .iter_mut()
-                        .zip(&b_slice[..strip_rows])
-                    {
+                    for (slot, &b) in dst[..strip_rows].iter_mut().zip(&b_slice[..strip_rows]) {
                         *slot = b + *slot;
                     }
                 }
@@ -2867,12 +2865,12 @@ fn compute_decode_worker_budget(
     if policy.explicit {
         return threads.clamp(1, 18).min(total_out.max(1));
     }
-    let cluster_cap = if policy.in_code_predictor && max_target_out <= CODE_PREDICTOR_SMALL_ROW_LIMIT
-    {
-        CODE_PREDICTOR_SMALL_AUTO_CAP
-    } else {
-        TALKER_DECODE_AUTO_CAP
-    };
+    let cluster_cap =
+        if policy.in_code_predictor && max_target_out <= CODE_PREDICTOR_SMALL_ROW_LIMIT {
+            CODE_PREDICTOR_SMALL_AUTO_CAP
+        } else {
+            TALKER_DECODE_AUTO_CAP
+        };
     let byte_cap = (total_weight_bytes / MIN_DECODE_BYTES_PER_WORKER).max(1);
     threads
         .clamp(1, cluster_cap)
@@ -2958,13 +2956,8 @@ fn forward_group_into(
     }
 
     let policy = DECODE_THREAD_POLICY.with(std::cell::Cell::get);
-    let workers = compute_decode_worker_budget(
-        policy,
-        threads,
-        total_out,
-        max_target_out,
-        total_bytes,
-    );
+    let workers =
+        compute_decode_worker_budget(policy, threads, total_out, max_target_out, total_bytes);
     if workers > 1 && total_out >= 8 && targets.len() <= 4 {
         let caps = bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect();
         if caps.dotprod {
@@ -3024,36 +3017,42 @@ fn forward_group_into(
                     need_qk,
                     input,
                     |combined, q8_slice, qk_slice| -> io::Result<()> {
-                        run_row_chunks_aligned(combined, group_workers, alignment, |global_row, dst| {
-                            let chunk_end = global_row + dst.len();
-                            for seg in segments[..seg_count].iter().flatten() {
-                                let seg_end = seg.start + seg.len;
-                                let ov_start = global_row.max(seg.start);
-                                let ov_end = chunk_end.min(seg_end);
-                                if ov_start >= ov_end {
-                                    continue;
-                                }
-                                let dst_slice =
-                                    &mut dst[ov_start - global_row..ov_end - global_row];
-                                let local_row = ov_start - seg.start;
-                                let bias_slice =
-                                    seg.bias.map(|b| &b[local_row..local_row + dst_slice.len()]);
-                                match seg.kind {
-                                    quant_dispatch::GroupKind::Packed { ggml_type, bytes } => {
-                                        quant_dispatch::add_packed_rows(
-                                            ggml_type, bytes, seg.in_dim, caps, q8_slice, qk_slice,
-                                            bias_slice, local_row, dst_slice,
-                                        );
+                        run_row_chunks_aligned(
+                            combined,
+                            group_workers,
+                            alignment,
+                            |global_row, dst| {
+                                let chunk_end = global_row + dst.len();
+                                for seg in segments[..seg_count].iter().flatten() {
+                                    let seg_end = seg.start + seg.len;
+                                    let ov_start = global_row.max(seg.start);
+                                    let ov_end = chunk_end.min(seg_end);
+                                    if ov_start >= ov_end {
+                                        continue;
                                     }
-                                    quant_dispatch::GroupKind::Repacked(bytes) => {
-                                        quant_dispatch::add_repacked_rows(
-                                            bytes, seg.in_dim, caps, qk_slice, bias_slice,
-                                            local_row, dst_slice,
-                                        );
+                                    let dst_slice =
+                                        &mut dst[ov_start - global_row..ov_end - global_row];
+                                    let local_row = ov_start - seg.start;
+                                    let bias_slice = seg
+                                        .bias
+                                        .map(|b| &b[local_row..local_row + dst_slice.len()]);
+                                    match seg.kind {
+                                        quant_dispatch::GroupKind::Packed { ggml_type, bytes } => {
+                                            quant_dispatch::add_packed_rows(
+                                                ggml_type, bytes, seg.in_dim, caps, q8_slice,
+                                                qk_slice, bias_slice, local_row, dst_slice,
+                                            );
+                                        }
+                                        quant_dispatch::GroupKind::Repacked(bytes) => {
+                                            quant_dispatch::add_repacked_rows(
+                                                bytes, seg.in_dim, caps, qk_slice, bias_slice,
+                                                local_row, dst_slice,
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                        });
+                            },
+                        );
                         let mut offset = 0_usize;
                         for (proj, lora, out) in targets.iter_mut() {
                             let len = proj.out_dim;
@@ -7493,7 +7492,11 @@ mod tests {
             in_dim,
             24,
             3,
-            Some((0..24).map(|i| -0.03 * super::usize_to_f32(i % 5)).collect()),
+            Some(
+                (0..24)
+                    .map(|i| -0.03 * super::usize_to_f32(i % 5))
+                    .collect(),
+            ),
         )?;
 
         for seq_len in [1_usize, 2, 5, 8, 9, 17, 19] {

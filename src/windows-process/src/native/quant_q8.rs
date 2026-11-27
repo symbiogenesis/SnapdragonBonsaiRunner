@@ -15,9 +15,9 @@ use bonsai_neon_dot::kquants::{
 use core::arch::aarch64::{
     float32x4_t, float64x2_t, int8x16_t, int32x4_t, uint8x8_t, uint8x16_t, uint16x8_t, vaddq_f32,
     vaddq_f64, vaddvq_s32, vand_u16, vandq_u8, vandq_u16, vcombine_f32, vcombine_s8, vcombine_s16,
-    vcvt_f32_f16, vcvt_f32_f64, vcvt_f64_f32, vcvt_high_f32_f16, vcvt_high_f64_f32,
-    vcvtq_f32_s32, vcvtq_f64_s64, vdotq_s32, vdup_n_s16, vdup_n_u16, vdupq_n_f32, vdupq_n_f64,
-    vdupq_n_s8, vdupq_n_s32, vdupq_n_u8, vdupq_n_u16, vfmaq_f32, vget_high_s8, vget_high_u16, vget_low_f16,
+    vcvt_f32_f16, vcvt_f32_f64, vcvt_f64_f32, vcvt_high_f32_f16, vcvt_high_f64_f32, vcvtq_f32_s32,
+    vcvtq_f64_s64, vdotq_s32, vdup_n_s16, vdup_n_u16, vdupq_n_f32, vdupq_n_f64, vdupq_n_s8,
+    vdupq_n_s32, vdupq_n_u8, vdupq_n_u16, vfmaq_f32, vget_high_s8, vget_high_u16, vget_low_f16,
     vget_low_f32, vget_low_s8, vget_low_s16, vget_low_s32, vget_low_u16, vld1_u8, vld1_u16,
     vld1q_f32, vld1q_f64, vld1q_lane_u16, vld1q_s8, vld1q_s32, vld1q_u8, vld1q_u16, vmaxv_u16,
     vmaxvq_u16, vmlal_high_s16, vmlal_s16, vmlaq_s32, vmovl_high_s32, vmovl_s32, vmovl_u8,
@@ -963,7 +963,12 @@ fn s32x4_to_f64x2_pair(vec: int32x4_t) -> (float64x2_t, float64x2_t) {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
-fn store_f64x2_pairs_as_f32x8(acc: &[[float64x2_t; 4]; 8], out_rows: &mut [f32], row_stride: usize, t_off: usize) {
+fn store_f64x2_pairs_as_f32x8(
+    acc: &[[float64x2_t; 4]; 8],
+    out_rows: &mut [f32],
+    row_stride: usize,
+    t_off: usize,
+) {
     for (r, row_acc) in acc.iter().enumerate() {
         let base = r * row_stride + t_off;
         let lo = vcombine_f32(vcvt_f32_f64(row_acc[0]), vcvt_f32_f64(row_acc[1]));
@@ -1820,9 +1825,8 @@ fn gemm_q4_k_repacked8_8x_panels_i8mm(
             for (p_local, p_acc) in acc_buf[..p_len].iter_mut().enumerate() {
                 let p_idx = p_base + p_local;
                 let p_panels = &panels[p_idx * blocks + k_base..p_idx * blocks + k_base + k_len];
-                let mut acc: [[float64x2_t; 4]; 8] = std::array::from_fn(|r| {
-                    std::array::from_fn(|cp| load_f64x2(&p_acc[r][cp]))
-                });
+                let mut acc: [[float64x2_t; 4]; 8] =
+                    std::array::from_fn(|r| std::array::from_fn(|cp| load_f64x2(&p_acc[r][cp])));
 
                 for (wb, ap) in w_tile[..k_len].iter().zip(p_panels.iter()) {
                     let mut mint_lo = [vdupq_n_s32(0); 8];
@@ -1927,9 +1931,8 @@ fn gemm_q4_k_repacked8_8x_panels_i8mm(
         }
 
         for (p_local, p_acc) in acc_buf[..p_len].iter().enumerate() {
-            let acc: [[float64x2_t; 4]; 8] = std::array::from_fn(|r| {
-                std::array::from_fn(|cp| load_f64x2(&p_acc[r][cp]))
-            });
+            let acc: [[float64x2_t; 4]; 8] =
+                std::array::from_fn(|r| std::array::from_fn(|cp| load_f64x2(&p_acc[r][cp])));
             store_f64x2_pairs_as_f32x8(&acc, out_rows, row_stride, (p_base + p_local) * 8);
         }
     }
@@ -2350,8 +2353,7 @@ fn gemm_q6_k_8x_panels_i8mm(
                                     vcombine_s8(vget_high_s8(w_even[q]), vget_high_s8(w_odd[q])),
                                     &mut wb.qs[pair][hs][q][1],
                                 );
-                                wb.scales[pair][hs][q] =
-                                    [s_even[q], s_even[q], s_odd[q], s_odd[q]];
+                                wb.scales[pair][hs][q] = [s_even[q], s_even[q], s_odd[q], s_odd[q]];
                             }
                         }
                     }
@@ -2361,9 +2363,8 @@ fn gemm_q6_k_8x_panels_i8mm(
             for (p_local, p_acc) in acc_buf[..p_len].iter_mut().enumerate() {
                 let p_idx = p_base + p_local;
                 let p_panels = &panels[p_idx * blocks + k_base..p_idx * blocks + k_base + k_len];
-                let mut acc: [[float64x2_t; 4]; 8] = std::array::from_fn(|r| {
-                    std::array::from_fn(|cp| load_f64x2(&p_acc[r][cp]))
-                });
+                let mut acc: [[float64x2_t; 4]; 8] =
+                    std::array::from_fn(|r| std::array::from_fn(|cp| load_f64x2(&p_acc[r][cp])));
 
                 for (wb, ap) in w_tile[..k_len].iter().zip(p_panels.iter()) {
                     let d_act: [float64x2_t; 4] = [
@@ -2402,8 +2403,10 @@ fn gemm_q6_k_8x_panels_i8mm(
                         for cp in 0..4 {
                             let (v_r0, v_r1) = s32x4_to_f64x2_pair(pair_acc[cp]);
                             let da = d_act[cp];
-                            acc[r0][cp] = vaddq_f64(acc[r0][cp], vmulq_f64(vmulq_f64(dw0_v, da), v_r0));
-                            acc[r1][cp] = vaddq_f64(acc[r1][cp], vmulq_f64(vmulq_f64(dw1_v, da), v_r1));
+                            acc[r0][cp] =
+                                vaddq_f64(acc[r0][cp], vmulq_f64(vmulq_f64(dw0_v, da), v_r0));
+                            acc[r1][cp] =
+                                vaddq_f64(acc[r1][cp], vmulq_f64(vmulq_f64(dw1_v, da), v_r1));
                         }
                     }
                 }
@@ -2417,9 +2420,8 @@ fn gemm_q6_k_8x_panels_i8mm(
         }
 
         for (p_local, p_acc) in acc_buf[..p_len].iter().enumerate() {
-            let acc: [[float64x2_t; 4]; 8] = std::array::from_fn(|r| {
-                std::array::from_fn(|cp| load_f64x2(&p_acc[r][cp]))
-            });
+            let acc: [[float64x2_t; 4]; 8] =
+                std::array::from_fn(|r| std::array::from_fn(|cp| load_f64x2(&p_acc[r][cp])));
             store_f64x2_pairs_as_f32x8(&acc, out_rows, row_stride, (p_base + p_local) * 8);
         }
     }

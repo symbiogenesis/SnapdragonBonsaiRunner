@@ -2152,7 +2152,14 @@ fn convnext_pwconv1_gelu_channel_first_simd<S: Simd>(
         for f_start in (0..frames).step_by(CONV_F_TILE) {
             let f_len = (frames - f_start).min(CONV_F_TILE);
             let mut acc_tile = [[0.0_f32; 16]; CONV_F_TILE];
-            gemm_16oc_ic_tiled(w_blk, norm_buf, f_start, f_len, in_c, &mut acc_tile[..f_len]);
+            gemm_16oc_ic_tiled(
+                w_blk,
+                norm_buf,
+                f_start,
+                f_len,
+                in_c,
+                &mut acc_tile[..f_len],
+            );
             let (acc_quads, acc_tail) = acc_tile[..f_len].as_chunks::<4>();
             for (q_idx, aq) in acc_quads.iter().enumerate() {
                 let f = f_start + q_idx * 4;
@@ -2443,7 +2450,14 @@ fn convnext_pwconv2_res_channel_first_simd<S: Simd>(
         for f_start in (0..frames).step_by(CONV_F_TILE) {
             let f_len = (frames - f_start).min(CONV_F_TILE);
             let mut acc_tile = [[0.0_f32; 16]; CONV_F_TILE];
-            gemm_16oc_ic_tiled(w_blk, mid_buf, f_start, f_len, mid_c, &mut acc_tile[..f_len]);
+            gemm_16oc_ic_tiled(
+                w_blk,
+                mid_buf,
+                f_start,
+                f_len,
+                mid_c,
+                &mut acc_tile[..f_len],
+            );
             let (acc_quads, acc_tail) = acc_tile[..f_len].as_chunks::<4>();
             for (q_idx, aq) in acc_quads.iter().enumerate() {
                 let f = f_start + q_idx * 4;
@@ -3906,8 +3920,10 @@ impl ConvNeXtBlock {
             ));
         }
         let dw_weight_kc = Some(Self::pack_dw_kc(&dw_weight, channels, kernel));
-        let pwconv1_w_packed = (mid_c >= 16).then(|| Self::pack_pw_weights(&pwconv1_w, mid_c, channels));
-        let pwconv2_w_packed = (channels >= 16).then(|| Self::pack_pw_weights(&pwconv2_w, channels, mid_c));
+        let pwconv1_w_packed =
+            (mid_c >= 16).then(|| Self::pack_pw_weights(&pwconv1_w, mid_c, channels));
+        let pwconv2_w_packed =
+            (channels >= 16).then(|| Self::pack_pw_weights(&pwconv2_w, channels, mid_c));
         let pwconv1_w = if pwconv1_w_packed.is_some() {
             Vec::new()
         } else {
@@ -3998,8 +4014,16 @@ impl ConvNeXtBlock {
             || self.dw_bias.len() != c
             || self.norm_w.len() != c
             || self.norm_b.len() != c
-            || !Self::pw_weights_valid(&self.pwconv1_w, self.pwconv1_w_packed.as_deref(), expected_pw)
-            || !Self::pw_weights_valid(&self.pwconv2_w, self.pwconv2_w_packed.as_deref(), expected_pw)
+            || !Self::pw_weights_valid(
+                &self.pwconv1_w,
+                self.pwconv1_w_packed.as_deref(),
+                expected_pw,
+            )
+            || !Self::pw_weights_valid(
+                &self.pwconv2_w,
+                self.pwconv2_w_packed.as_deref(),
+                expected_pw,
+            )
             || self.pwconv2_b.len() != c
             || self.gamma.len() != c
         {
@@ -4197,8 +4221,7 @@ impl ConvNeXtBlock {
                             &|elem_off, slice| {
                                 let oc_off = elem_off / frames;
                                 let count = slice.len() / frames;
-                                let w_slice =
-                                    &pw2_w[oc_off * mid_c..(oc_off + count) * mid_c];
+                                let w_slice = &pw2_w[oc_off * mid_c..(oc_off + count) * mid_c];
                                 let b_slice = &self.pwconv2_b[oc_off..oc_off + count];
                                 let g_slice = &self.gamma[oc_off..oc_off + count];
                                 dispatch!(
@@ -6361,12 +6384,18 @@ mod tests {
                     let mut st_pkg = init_st.clone();
                     let out_raw =
                         raw_block.forward_stream_parallel(&input, frames, &mut st_raw, threads)?;
-                    let out_pkg =
-                        packed_block.forward_stream_parallel(&input, frames, &mut st_pkg, threads)?;
+                    let out_pkg = packed_block.forward_stream_parallel(
+                        &input,
+                        frames,
+                        &mut st_pkg,
+                        threads,
+                    )?;
                     assert_f32_bits_eq(
                         &out_pkg,
                         &out_raw,
-                        &format!("ConvNeXt packed_only mismatch c={channels} frames={frames} threads={threads}"),
+                        &format!(
+                            "ConvNeXt packed_only mismatch c={channels} frames={frames} threads={threads}"
+                        ),
                     );
                     assert_eq!(st_pkg, st_raw);
                 }

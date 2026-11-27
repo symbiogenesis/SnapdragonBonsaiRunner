@@ -93,8 +93,7 @@ pub fn gemm_f32_fma_16oc_frames(
 mod tests {
     use super::*;
     use crate::native::conv_f32::{
-        gemm_f32_fma_8oc_8f_portable, gemm_f32_fma_16oc_frames_portable,
-        gemm_f32_fma_16oc_portable,
+        gemm_f32_fma_8oc_8f_portable, gemm_f32_fma_16oc_frames_portable, gemm_f32_fma_16oc_portable,
     };
 
     fn make_edge_f32(len: usize, seed: usize) -> Vec<f32> {
@@ -238,12 +237,7 @@ mod tests {
         let w = make_edge_f32(19 * 8, 77);
         let xs: [Vec<f32>; 8] = std::array::from_fn(|f| make_edge_f32(19, 10 + f));
         let mut guard = [[-0.0_f32; 8]; 8];
-        gemm_f32_fma_8oc_8f(
-            &w,
-            std::array::from_fn(|f| xs[f].as_slice()),
-            0,
-            &mut guard,
-        );
+        gemm_f32_fma_8oc_8f(&w, std::array::from_fn(|f| xs[f].as_slice()), 0, &mut guard);
         gemm_f32_fma_8oc_8f(
             &w[..w.len() - 1],
             std::array::from_fn(|f| xs[f].as_slice()),
