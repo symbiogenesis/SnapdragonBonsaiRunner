@@ -20,11 +20,13 @@ fn wait_unpoisoned<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<
 }
 
 const MAX_POOL_WORKERS: usize = 32;
-const SPIN_ITERATIONS: usize = 4096;
+const SPIN_ITERATIONS: usize = 12_288;
 const GEN_SHIFT: u32 = 8;
 const DIRECT_FLAG: usize = 1 << (GEN_SHIFT - 1);
 const SLOT_MASK: usize = DIRECT_FLAG - 1;
 const GEN_MASK: usize = usize::MAX >> GEN_SHIFT;
+
+const _: () = assert!(MAX_POOL_WORKERS <= SLOT_MASK);
 
 #[repr(align(64))]
 struct CachePadded<T>(T);
@@ -75,7 +77,7 @@ unsafe fn call_closure<T: Send, F: Fn(usize, &mut [T]) + Sync>(
     len: usize,
 ) {
     // SAFETY: `env` points to the caller-owned `F` which remains live until
-    // `ScopeGuard::drop` confirms `workers_remaining == 0`.
+    // `ScopeGuard::drop` confirms every active worker updated `done_gen`.
     let func = unsafe { &*env.cast::<F>() };
     // SAFETY: `ptr..ptr + len` is a valid, properly aligned, disjoint mutable
     // sub-slice of `&mut [T]` held live through `ScopeGuard::drop`.
@@ -91,7 +93,7 @@ struct Shared {
     generation: CachePadded<AtomicUsize>,
     dispatch_state: CachePadded<AtomicUsize>,
     next_chunk: CachePadded<AtomicUsize>,
-    workers_remaining: CachePadded<AtomicUsize>,
+    done_gen: [CachePadded<AtomicUsize>; MAX_POOL_WORKERS],
     done_waiting: CachePadded<AtomicBool>,
     parked_count: CachePadded<AtomicUsize>,
     park_mutex: Mutex<()>,
@@ -105,9 +107,10 @@ struct Shared {
 }
 
 // SAFETY: `Shared` synchronizes chunk publication via `generation` (SeqCst/Release)
-// and exclusive atomic chunk claims via `next_chunk`; each chunk descriptor is
-// claimed by at most one thread over disjoint mutable sub-slices, and `ScopeGuard`
-// keeps all referenced stack data alive until `workers_remaining == 0`.
+// and per-worker direct slot assignment or exclusive atomic chunk claims; each
+// chunk descriptor is claimed by at most one thread over disjoint mutable
+// sub-slices, and `ScopeGuard` keeps all referenced stack data alive until
+// every active worker publishes completion in `done_gen`.
 unsafe impl Send for Shared {}
 
 // SAFETY: See `Send` contract above; all concurrent mutations happen through
@@ -124,7 +127,7 @@ impl Shared {
             generation: CachePadded(AtomicUsize::new(0)),
             dispatch_state: CachePadded(AtomicUsize::new(0)),
             next_chunk: CachePadded(AtomicUsize::new(0)),
-            workers_remaining: CachePadded(AtomicUsize::new(0)),
+            done_gen: std::array::from_fn(|_| CachePadded(AtomicUsize::new(0))),
             done_waiting: CachePadded(AtomicBool::new(false)),
             parked_count: CachePadded(AtomicUsize::new(0)),
             park_mutex: Mutex::new(()),
@@ -138,7 +141,7 @@ impl Shared {
         }
     }
 
-    fn try_claim_slot_for_gen(&self, gen_id: usize) -> ClaimedWork {
+    fn try_claim_slot_for_gen(&self, gen_id: usize, worker_id: usize) -> ClaimedWork {
         let mut state = self.dispatch_state.0.load(Ordering::Acquire);
         loop {
             let state_gen = state >> GEN_SHIFT;
@@ -146,7 +149,12 @@ impl Shared {
                 return ClaimedWork::None;
             }
             if (state & DIRECT_FLAG) != 0 {
-                return ClaimedWork::Direct;
+                let chunk_count = state & SLOT_MASK;
+                return if worker_id < chunk_count {
+                    ClaimedWork::Direct
+                } else {
+                    ClaimedWork::None
+                };
             }
             let remaining = state & SLOT_MASK;
             if remaining == 0 {
@@ -234,12 +242,12 @@ fn worker_loop(shared: &Shared, worker_id: usize) {
             }
         }
         last_gen = current_gen;
-        let claim = shared.try_claim_slot_for_gen(current_gen);
+        let claim = shared.try_claim_slot_for_gen(current_gen, worker_id);
         if claim == ClaimedWork::None {
             continue;
         }
         // SAFETY: `task` was published prior to incrementing `generation` and
-        // stays valid until `workers_remaining` drops to zero below.
+        // stays valid until every active worker publishes `done_gen == current_gen`.
         let task = unsafe { *shared.task.get() };
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| match claim {
             ClaimedWork::Direct => shared.run_chunk(task, worker_id),
@@ -253,9 +261,11 @@ fn worker_loop(shared: &Shared, worker_id: usize) {
             }
             shared.has_panic.store(true, Ordering::Release);
         }
-        if shared.workers_remaining.0.fetch_sub(1, Ordering::SeqCst) == 1
-            && shared.done_waiting.0.load(Ordering::SeqCst)
-        {
+        shared.done_gen[worker_id]
+            .0
+            .store(current_gen, Ordering::Release);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if shared.done_waiting.0.load(Ordering::Relaxed) {
             let _done_guard = lock_unpoisoned(&shared.done_mutex);
             shared.done_cv.notify_all();
         }
@@ -265,34 +275,36 @@ fn worker_loop(shared: &Shared, worker_id: usize) {
 struct ScopeGuard<'a> {
     shared: &'a Shared,
     previous_in_pool: bool,
-    chunks_written: usize,
+    gen_id: usize,
+    active_workers: usize,
 }
 
 impl Drop for ScopeGuard<'_> {
     fn drop(&mut self) {
-        if self.shared.workers_remaining.0.load(Ordering::Acquire) != 0 {
-            for _ in 0..SPIN_ITERATIONS {
-                if self.shared.workers_remaining.0.load(Ordering::Relaxed) == 0 {
-                    break;
-                }
-                std::hint::spin_loop();
+        let mut idx = 1_usize;
+        for _ in 0..SPIN_ITERATIONS {
+            while idx < self.active_workers
+                && self.shared.done_gen[idx].0.load(Ordering::Acquire) == self.gen_id
+            {
+                idx += 1;
             }
-            if self.shared.workers_remaining.0.load(Ordering::Acquire) != 0 {
-                let mut guard = lock_unpoisoned(&self.shared.done_mutex);
-                self.shared.done_waiting.0.store(true, Ordering::SeqCst);
-                while self.shared.workers_remaining.0.load(Ordering::SeqCst) != 0 {
+            if idx == self.active_workers {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        if idx < self.active_workers {
+            let mut guard = lock_unpoisoned(&self.shared.done_mutex);
+            self.shared.done_waiting.0.store(true, Ordering::SeqCst);
+            while idx < self.active_workers {
+                if self.shared.done_gen[idx].0.load(Ordering::SeqCst) == self.gen_id {
+                    idx += 1;
+                } else {
                     guard = wait_unpoisoned(&self.shared.done_cv, guard);
                 }
-                self.shared.done_waiting.0.store(false, Ordering::Release);
             }
+            self.shared.done_waiting.0.store(false, Ordering::Release);
         }
-        self.shared.num_chunks.store(0, Ordering::Release);
-        for slot in &self.shared.chunks[..self.chunks_written] {
-            // SAFETY: All background workers exited this generation (`workers_remaining == 0`).
-            unsafe { *slot.get() = ChunkDesc::default() };
-        }
-        // SAFETY: No worker can access `task` after reporting completion.
-        unsafe { *self.shared.task.get() = TaskPtr::default() };
         IN_ROW_POOL.with(|flag| flag.set(self.previous_in_pool));
         if self.shared.has_panic.load(Ordering::Acquire) {
             self.shared.has_panic.store(false, Ordering::Release);
@@ -369,12 +381,21 @@ impl NativeRowWorkerPool {
 
         let target_chunks = active.min(groups).min(MAX_POOL_WORKERS);
         let _dispatch = lock_unpoisoned(&self.shared.dispatch_mutex);
-        let chunk_elems = groups.div_ceil(target_chunks) * align;
+        let base_groups = groups / target_chunks;
+        let extra_chunks = groups % target_chunks;
+        let mut rest = out;
         let mut chunk_count = 0_usize;
         let mut offset = 0_usize;
-        for sub in out.chunks_mut(chunk_elems) {
+        for idx in 0..target_chunks {
+            let chunk_groups = base_groups + usize::from(idx < extra_chunks);
+            let take = (chunk_groups * align).min(rest.len());
+            if take == 0 {
+                break;
+            }
+            let (sub, tail) = rest.split_at_mut(take);
+            rest = tail;
             // SAFETY: Coordinator owns `&Shared` exclusively for the generation
-            // before bumping `generation` (`workers_remaining` is 0).
+            // before bumping `generation` (all previous workers completed).
             unsafe {
                 *self.shared.chunks[chunk_count].get() = ChunkDesc {
                     offset,
@@ -382,7 +403,7 @@ impl NativeRowWorkerPool {
                     len: sub.len(),
                 };
             }
-            offset += sub.len();
+            offset += take;
             chunk_count += 1;
         }
 
@@ -393,7 +414,7 @@ impl NativeRowWorkerPool {
         });
 
         let active_bg = chunk_count.saturating_sub(1).min(bg_count);
-        let direct = active_bg == bg_count && chunk_count == active;
+        let direct = chunk_count <= self.shared.worker_count;
         let next_gen = match self
             .shared
             .generation
@@ -409,12 +430,12 @@ impl NativeRowWorkerPool {
             call: call_closure::<T, F>,
             env: (&raw const *compute).cast::<()>(),
         };
-        // SAFETY: Previous generation completed (`workers_remaining == 0`).
+        // SAFETY: Previous generation completed across all workers.
         unsafe { *self.shared.task.get() = task };
-        self.shared.num_chunks.store(chunk_count, Ordering::Release);
         let dispatch_word = if direct {
-            (next_gen << GEN_SHIFT) | DIRECT_FLAG
+            (next_gen << GEN_SHIFT) | DIRECT_FLAG | chunk_count
         } else {
+            self.shared.num_chunks.store(chunk_count, Ordering::Release);
             self.shared.next_chunk.0.store(0, Ordering::Release);
             (next_gen << GEN_SHIFT) | active_bg
         };
@@ -422,22 +443,19 @@ impl NativeRowWorkerPool {
             .dispatch_state
             .0
             .store(dispatch_word, Ordering::Release);
-        self.shared
-            .workers_remaining
-            .0
-            .store(active_bg, Ordering::SeqCst);
 
         let _guard = ScopeGuard {
             shared: &self.shared,
             previous_in_pool,
-            chunks_written: chunk_count,
+            gen_id: next_gen,
+            active_workers: chunk_count,
         };
 
         self.shared.generation.0.store(next_gen, Ordering::SeqCst);
         let parked = self.shared.parked_count.0.load(Ordering::SeqCst);
         if parked > 0 && active_bg > 0 {
             let _park = lock_unpoisoned(&self.shared.park_mutex);
-            if active_bg >= parked {
+            if direct || active_bg >= parked {
                 self.shared.park_cv.notify_all();
             } else {
                 for _ in 0..active_bg {
@@ -628,20 +646,82 @@ mod tests {
             assert_eq!(val, u64::try_from(idx).unwrap_or(0) * 3 + 1);
         }
 
-        // Partial-team wake uses CAS + next_chunk path and clears DIRECT_FLAG.
+        // Partial-team wake (`chunk_count < worker_count`) also uses direct-dispatch
+        // without CAS or `next_chunk` atomic RMW.
         let mut partial = vec![0_u64; 16];
+        let partial_threads: Mutex<Vec<(usize, std::thread::ThreadId)>> = Mutex::new(Vec::new());
         pool.run_slice_aligned(&mut partial, 2, 4, &|offset, slice| {
+            lock_unpoisoned(&partial_threads).push((offset, std::thread::current().id()));
             for (i, slot) in slice.iter_mut().enumerate() {
                 *slot = u64::try_from(offset + i).unwrap_or(0) + 100;
             }
         });
+        let partial_state = pool.shared.dispatch_state.0.load(Ordering::Acquire);
+        assert_ne!(partial_state & DIRECT_FLAG, 0);
+        assert_eq!(partial_state & SLOT_MASK, 2);
         assert_eq!(
-            pool.shared.dispatch_state.0.load(Ordering::Acquire) & DIRECT_FLAG,
-            0
+            pool.shared.next_chunk.0.load(Ordering::Acquire),
+            0xDEAD_BEEF
         );
-        assert!(pool.shared.next_chunk.0.load(Ordering::Acquire) >= 2);
+        let partial_recorded = lock_unpoisoned(&partial_threads);
+        assert_eq!(partial_recorded.len(), 2);
+        assert!(
+            partial_recorded
+                .iter()
+                .any(|(offset, tid)| *offset == 0 && *tid == coordinator_id)
+        );
+        drop(partial_recorded);
         for (idx, &val) in partial.iter().enumerate() {
             assert_eq!(val, u64::try_from(idx).unwrap_or(0) + 100);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn balanced_chunking_uses_all_18_workers_on_1024_elements_aligned_8() -> io::Result<()> {
+        use std::collections::HashSet;
+
+        let pool = NativeRowWorkerPool::new(18, "test-18w-balanced")?;
+        let mut out = vec![0.0_f32; 1024];
+        pool.shared
+            .next_chunk
+            .0
+            .store(0xDEAD_BEEF, Ordering::Release);
+        let chunks: Mutex<Vec<(usize, usize, std::thread::ThreadId)>> = Mutex::new(Vec::new());
+        pool.run_aligned(&mut out, 18, 8, &|offset, slice| {
+            lock_unpoisoned(&chunks).push((offset, slice.len(), std::thread::current().id()));
+            for (i, slot) in slice.iter_mut().enumerate() {
+                *slot = u16::try_from(offset + i).map_or(0.0, f32::from);
+            }
+        });
+
+        let state = pool.shared.dispatch_state.0.load(Ordering::Acquire);
+        assert_ne!(state & DIRECT_FLAG, 0);
+        assert_eq!(state & SLOT_MASK, 18);
+        assert_eq!(
+            pool.shared.next_chunk.0.load(Ordering::Acquire),
+            0xDEAD_BEEF
+        );
+
+        let mut recorded = lock_unpoisoned(&chunks).clone();
+        recorded.sort_by_key(|(offset, _, _)| *offset);
+        assert_eq!(recorded.len(), 18);
+        let unique_threads: HashSet<_> = recorded.iter().map(|(_, _, tid)| *tid).collect();
+        assert_eq!(unique_threads.len(), 18);
+
+        let mut expected_offset = 0_usize;
+        for (idx, &(offset, len, _)) in recorded.iter().enumerate() {
+            assert_eq!(offset, expected_offset);
+            let expected_len = if idx < 2 { 64 } else { 56 };
+            assert_eq!(len, expected_len);
+            expected_offset += len;
+        }
+        assert_eq!(expected_offset, 1024);
+        for (idx, &val) in out.iter().enumerate() {
+            assert_eq!(
+                val.to_bits(),
+                u16::try_from(idx).map_or(0.0, f32::from).to_bits()
+            );
         }
         Ok(())
     }
