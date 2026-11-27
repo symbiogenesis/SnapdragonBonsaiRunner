@@ -19,6 +19,24 @@ $assets = @{
     'Windows-Arm64' = @('windows_arm64.zip', 'cadcf7ea4efe3a68728893813643cebe1185e5b1d4be5b96245f65c9a4d5ea41')
     'Windows-X64' = @('windows_amd64.zip', '6e7241b51e6817ea6a047693d8e6fed13b31819c9a0dd6c5a726e1592d22f6e9')
 }
+function Remove-WorkflowDirectoryWithRetry([string]$Path, [int]$MaxAttempts = 6, [int]$InitialDelayMs = 20) {
+    $delayMs = $InitialDelayMs
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force
+            return
+        } catch {
+            $exception = $_.Exception
+            if ($exception -is [Management.Automation.ActionPreferenceStopException] -and $null -ne $exception.ErrorRecord) {
+                $exception = $exception.ErrorRecord.Exception
+            }
+            $transient = ($exception -is [IO.IOException]) -or ($exception -is [UnauthorizedAccessException])
+            if (-not $transient -or $attempt -ge $MaxAttempts) { throw }
+            [Threading.Thread]::Sleep($delayMs)
+            $delayMs = [Math]::Min($delayMs * 2, 320)
+        }
+    }
+}
 function Get-PinnedActionlintArchive([string]$Uri, [string]$Digest, [string]$Asset,
     [string]$PrivateArchive, [string]$CacheRoot) {
     $cacheDirectory = Join-Path $CacheRoot $Digest
@@ -38,14 +56,23 @@ function Get-PinnedActionlintArchive([string]$Uri, [string]$Digest, [string]$Ass
             [IO.File]::Copy($PrivateArchive, $pending, $false)
             # A same-directory rename publishes complete bytes exclusively;
             # concurrent or poisoned entries are never overwritten.
-            [IO.File]::Move($pending, $cachedArchive, $false)
-        } finally { [IO.File]::Delete($pending) }
+            try {
+                [IO.File]::Move($pending, $cachedArchive, $false)
+            } catch [IO.IOException] {
+                if (-not [IO.File]::Exists($cachedArchive)) { throw }
+            }
+        } finally {
+            if ([IO.File]::Exists($pending)) {
+                try { [IO.File]::Delete($pending) } catch { }
+            }
+        }
     }
     return $PrivateArchive
 }
 if ($MyInvocation.InvocationName -eq '.') { return }
 . (Join-Path $PSScriptRoot 'check_workflow_startup.ps1') -Root $Root
 $scratch = $null
+$primaryFailed = $true
 try {
     if (-not $ActionlintPath) {
         $platform = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } else { throw 'Supply -ActionlintPath on this platform.' }
@@ -142,11 +169,21 @@ try {
     if ($CheckFixtures) {
         & (Join-Path $PSScriptRoot 'test_workflow_syntax.ps1') -ActionlintPath $ActionlintPath -Case $FixtureCase
     }
+    $primaryFailed = $false
 } finally {
     if ($scratch) {
         $temporary = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) + [IO.Path]::DirectorySeparatorChar
         $absolute = [IO.Path]::GetFullPath($scratch)
-        if (-not $absolute.StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase) -or -not [IO.Path]::GetFileName($absolute).StartsWith('bonsai-actionlint-', [StringComparison]::Ordinal)) { throw 'Workflow linter cleanup escaped its temporary directory.' }
-        Remove-Item -LiteralPath $absolute -Recurse -Force
+        if (-not $absolute.StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase) -or -not [IO.Path]::GetFileName($absolute).StartsWith('bonsai-actionlint-', [StringComparison]::Ordinal)) {
+            if (-not $primaryFailed) { throw 'Workflow linter cleanup escaped its temporary directory.' }
+            [Console]::Error.WriteLine('Workflow linter cleanup escaped its temporary directory.')
+        } elseif (Test-Path -LiteralPath $absolute) {
+            try {
+                Remove-WorkflowDirectoryWithRetry $absolute
+            } catch {
+                if (-not $primaryFailed) { throw }
+                [Console]::Error.WriteLine("Workflow linter cleanup warning: $($_.Exception.Message)")
+            }
+        }
     }
 }

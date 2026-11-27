@@ -44,7 +44,14 @@ function Test-CiCache([string]$Package, [string]$Source, [string]$HostIdentity) 
 function New-CiCacheReceipt([string]$Package, [string]$Source, [string]$HostIdentity, [string]$CompilerIdentity) {
     if ($Source -cnotmatch '^[a-f0-9]{64}$' -or -not $HostIdentity -or $HostIdentity.Trim() -cne $HostIdentity -or $HostIdentity.IndexOfAny([char[]]"`r`n`0") -ge 0) { throw 'Exact source and hosted image identities are required.' }
     $receipt=@{schemaVersion=1; sourceId=$Source; hostId=$HostIdentity; toolchain='nightly-2026-11-26-aarch64-pc-windows-msvc'; compiler=$CompilerIdentity; sha256=(Get-CiExecutableDigest (Join-Path $Package 'bonsai-ci.exe'))}
-    [IO.File]::WriteAllText((Join-Path $Package 'receipt.json'),($receipt | ConvertTo-Json)+"`n")
+    $receiptPath=Join-Path $Package 'receipt.json'
+    $partialPath=Join-Path $Package ('receipt.'+[guid]::NewGuid().ToString('N')+'.partial')
+    try {
+        [IO.File]::WriteAllText($partialPath,($receipt | ConvertTo-Json)+"`n",[Text.UTF8Encoding]::new($false))
+        [IO.File]::Move($partialPath,$receiptPath,$true)
+    } finally {
+        if ([IO.File]::Exists($partialPath)) { [IO.File]::Delete($partialPath) }
+    }
     return Test-CiCache $Package $Source $HostIdentity
 }
 if ($MyInvocation.InvocationName -ne '.') {

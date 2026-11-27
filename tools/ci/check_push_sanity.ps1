@@ -143,6 +143,38 @@ function Sync-PushSourceTree([string]$Source, [string]$Destination) {
         }
     }
 }
+function Invoke-PushFileRetry([scriptblock]$Operation, [int]$MaxAttempts = 6, [int]$InitialDelayMs = 20) {
+    $delayMs = $InitialDelayMs
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            & $Operation
+            return
+        } catch {
+            $exception = $_.Exception
+            if ($exception -is [Management.Automation.ActionPreferenceStopException] -and $null -ne $exception.ErrorRecord) {
+                $exception = $exception.ErrorRecord.Exception
+            }
+            $transient = ($exception -is [IO.IOException]) -or ($exception -is [UnauthorizedAccessException])
+            if (-not $transient -or $attempt -ge $MaxAttempts) { throw }
+            [Threading.Thread]::Sleep($delayMs)
+            $delayMs = [Math]::Min($delayMs * 2, 320)
+        }
+    }
+}
+function Write-PushReceiptAtomic([string]$Path, [hashtable]$Receipt) {
+    $directory = [IO.Path]::GetDirectoryName($Path)
+    if ($directory) { [void][IO.Directory]::CreateDirectory($directory) }
+    $partial = $Path + '.' + [guid]::NewGuid().ToString('N') + '.partial'
+    $json = ($Receipt | ConvertTo-Json) + "`n"
+    try {
+        [IO.File]::WriteAllText($partial, $json, [Text.UTF8Encoding]::new($false))
+        Invoke-PushFileRetry { [IO.File]::Move($partial, $Path, $true) }
+    } finally {
+        if ([IO.File]::Exists($partial)) {
+            try { [IO.File]::Delete($partial) } catch { }
+        }
+    }
+}
 function Add-PushCargoToPath {
     if (Get-Command cargo.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1) {
         return
@@ -170,38 +202,44 @@ function Add-PushCargoToPath {
 $updates = if (-not $Prepare -and [Console]::IsInputRedirected) { [Console]::In.ReadToEnd() } else { '' }
 if (-not $updates.Trim() -and -not $Prepare) { return }
 $started = [Diagnostics.Stopwatch]::StartNew()
-$originalPath = [Environment]::GetEnvironmentVariable('PATH')
-$originalPwsh = $env:BONSAI_PUSH_PWSH_PATH
-$originalTargetDir = $env:BONSAI_PUSH_CARGO_TARGET_DIR
-$originalChecksum = $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS
-$originalFingerprint = $env:CARGO_BUILD_FINGERPRINT
-$originalIncremental = $env:CARGO_INCREMENTAL
-$env:BONSAI_PUSH_PWSH_PATH = [Environment]::ProcessPath
-if ((Test-Path -LiteralPath (Join-Path $Root '.githooks/pre-push') -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $Root '.git'))) {
-    $previousNativePref = $PSNativeCommandUseErrorActionPreference
-    $PSNativeCommandUseErrorActionPreference = $false
-    try {
-        $hooksPath = [string](git -C $Root config --get core.hooksPath 2>$null)
-        $hooksExit = $LASTEXITCODE
-    } finally {
-        $PSNativeCommandUseErrorActionPreference = $previousNativePref
-    }
-    if ($Prepare -and ($hooksExit -ne 0 -or -not $hooksPath.Trim())) {
-        git -C $Root config core.hooksPath .githooks
-        $hooksPath = '.githooks'
-        $hooksExit = 0
-    }
-    if ($hooksExit -ne 0 -or $hooksPath.Trim() -cne '.githooks') {
-        throw "Push blocked: git config core.hooksPath must be '.githooks' (got '$($hooksPath.Trim())'). Run 'git config core.hooksPath .githooks'."
-    }
+$savedEnv = [ordered]@{
+    PATH = [Environment]::GetEnvironmentVariable('PATH')
+    BONSAI_PUSH_PWSH_PATH = $env:BONSAI_PUSH_PWSH_PATH
+    BONSAI_PUSH_CARGO_TARGET_DIR = $env:BONSAI_PUSH_CARGO_TARGET_DIR
+    CARGO_UNSTABLE_CHECKSUM_FRESHNESS = $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS
+    CARGO_BUILD_FINGERPRINT = $env:CARGO_BUILD_FINGERPRINT
+    CARGO_INCREMENTAL = $env:CARGO_INCREMENTAL
 }
-Add-Type -AssemblyName System.Windows.Forms, System.IO.Compression.FileSystem
-$power = [Windows.Forms.SystemInformation]::PowerStatus
-Write-Host "Push sanity power before: AC=$($power.PowerLineStatus); charge=$($power.BatteryLifePercent); flags=$($power.BatteryChargeStatus); battery saver unknown."
-$target = [IO.Path]::GetFullPath($TargetDirectory)
-$scratch = Join-Path ([IO.Path]::GetTempPath()) ('bonsai-push-bootstrap-' + [guid]::NewGuid().ToString('N'))
-[void][IO.Directory]::CreateDirectory($scratch)
+$scratch = $null
+$powerBeforePrinted = $false
+$outerPrimaryFailed = $true
 try {
+    $env:BONSAI_PUSH_PWSH_PATH = [Environment]::ProcessPath
+    if ((Test-Path -LiteralPath (Join-Path $Root '.githooks/pre-push') -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $Root '.git'))) {
+        $previousNativePref = $PSNativeCommandUseErrorActionPreference
+        $PSNativeCommandUseErrorActionPreference = $false
+        try {
+            $hooksPath = [string](git -C $Root config --get core.hooksPath 2>$null)
+            $hooksExit = $LASTEXITCODE
+        } finally {
+            $PSNativeCommandUseErrorActionPreference = $previousNativePref
+        }
+        if ($Prepare -and ($hooksExit -ne 0 -or -not $hooksPath.Trim())) {
+            git -C $Root config core.hooksPath .githooks
+            $hooksPath = '.githooks'
+            $hooksExit = 0
+        }
+        if ($hooksExit -ne 0 -or $hooksPath.Trim() -cne '.githooks') {
+            throw "Push blocked: git config core.hooksPath must be '.githooks' (got '$($hooksPath.Trim())'). Run 'git config core.hooksPath .githooks'."
+        }
+    }
+    Add-Type -AssemblyName System.Windows.Forms, System.IO.Compression.FileSystem
+    $power = [Windows.Forms.SystemInformation]::PowerStatus
+    Write-Host "Push sanity power before: AC=$($power.PowerLineStatus); charge=$($power.BatteryLifePercent); flags=$($power.BatteryChargeStatus); battery saver unknown."
+    $powerBeforePrinted = $true
+    $target = [IO.Path]::GetFullPath($TargetDirectory)
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ('bonsai-push-bootstrap-' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($scratch)
     Add-PushCargoToPath
     $inputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'tools/ci', 'src/artifacts', 'src/windows-process', 'src/windows-credentials', 'scripts/release/Release-Common.ps1')
     $revisions = @('HEAD') + @($inputs | ForEach-Object { 'HEAD:' + $_ })
@@ -298,25 +336,24 @@ try {
                         if ($LASTEXITCODE) { throw 'Push blocked: bonsai-push-recovery build failed during preparation.' }
                     }
                     finally { Pop-Location }
-                    @{ SchemaVersion = 1; SourceIdentity = $recoveryId; Sha256 = (Get-PushFileSha256 $recoveryTool) } | ConvertTo-Json | Set-Content -LiteralPath $recoveryReceiptPath -Encoding utf8NoBOM
+                    Write-PushReceiptAtomic $recoveryReceiptPath @{ SchemaVersion = 1; SourceIdentity = $recoveryId; Sha256 = (Get-PushFileSha256 $recoveryTool) }
                 } else {
                     & $recoveryTool --source $stableSource --target-directory $target --toolchain $toolchain --bootstrap-milliseconds $started.ElapsedMilliseconds
                     if ($LASTEXITCODE) { throw 'Push blocked: bonsai-push-recovery failed; checker receipt remains invalid.' }
+                }
+                Write-PushReceiptAtomic $receiptPath @{ SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-PushFileSha256 $tool) }
+                if (-not (Test-PushHelperReceipt $receiptPath $tool $sourceId)) {
+                    [IO.File]::Delete($receiptPath)
+                    throw 'Push blocked: rebuilt checker did not pass receipt verification.'
                 }
             } finally {
                 if ($null -ne $cacheLock) { $cacheLock.Dispose() }
             }
         }
-        if (-not $prepareForPush) {
-            @{ SchemaVersion = 1; SourceIdentity = $sourceId; Sha256 = (Get-PushFileSha256 $tool) } | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding utf8NoBOM
-            if (-not (Test-PushHelperReceipt $receiptPath $tool $sourceId)) {
-                [IO.File]::Delete($receiptPath)
-                throw 'Push blocked: rebuilt checker did not pass receipt verification.'
-            }
-        }
     }
     if ($Prepare) {
         'Prepared the committed native checker and recovery supervisor; this is not an outgoing-tip validation verdict.'
+        $outerPrimaryFailed = $false
         return
     }
     $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS = 'true'
@@ -324,32 +361,53 @@ try {
     $env:CARGO_INCREMENTAL = '1'
     $env:BONSAI_PUSH_CARGO_TARGET_DIR = $target
     $scratchTool = Join-Path $scratch 'bonsai-ci.exe'
-    [IO.File]::Copy($tool, $scratchTool, $true)
+    Invoke-PushFileRetry { [IO.File]::Copy($tool, $scratchTool, $true) }
+    $innerPrimaryFailed = $true
     try {
         $updates | & $scratchTool push-sanity --root $Root --policy-root $policy --bootstrap-milliseconds $started.ElapsedMilliseconds
         if ($LASTEXITCODE) { throw 'Push blocked: source sanity did not pass.' }
+        $innerPrimaryFailed = $false
     } finally {
         if ((Test-Path -LiteralPath $receiptPath -PathType Leaf) -and -not (Test-PushHelperReceipt $receiptPath $tool $sourceId)) {
-            [IO.File]::Copy($scratchTool, $tool, $true)
+            try {
+                Invoke-PushFileRetry { [IO.File]::Copy($scratchTool, $tool, $true) }
+            } catch {
+                if (-not $innerPrimaryFailed) { throw }
+                [Console]::Error.WriteLine("Push sanity tool restore warning: $($_.Exception.Message)")
+            }
         }
     }
+    $outerPrimaryFailed = $false
 } finally {
-    $temporary = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) + [IO.Path]::DirectorySeparatorChar
-    $absolute = [IO.Path]::GetFullPath($scratch)
-    if (-not $absolute.StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase) -or -not [IO.Path]::GetFileName($absolute).StartsWith('bonsai-push-bootstrap-', [StringComparison]::Ordinal)) { throw 'Push bootstrap cleanup escaped temporary storage.' }
-    Remove-Item -LiteralPath $absolute -Recurse -Force
-    $power = [Windows.Forms.SystemInformation]::PowerStatus
-    Write-Host "Push sanity power after: AC=$($power.PowerLineStatus); charge=$($power.BatteryLifePercent); flags=$($power.BatteryChargeStatus); battery saver unknown; aggregate elapsed=$($started.Elapsed)."
-    if ($null -eq $originalPath) { [Environment]::SetEnvironmentVariable('PATH', [NullString]::Value) }
-    else { [Environment]::SetEnvironmentVariable('PATH', $originalPath) }
-    if ($null -eq $originalPwsh) { [Environment]::SetEnvironmentVariable('BONSAI_PUSH_PWSH_PATH', [NullString]::Value) }
-    else { $env:BONSAI_PUSH_PWSH_PATH = $originalPwsh }
-    if ($null -eq $originalTargetDir) { [Environment]::SetEnvironmentVariable('BONSAI_PUSH_CARGO_TARGET_DIR', [NullString]::Value) }
-    else { $env:BONSAI_PUSH_CARGO_TARGET_DIR = $originalTargetDir }
-    if ($null -eq $originalChecksum) { [Environment]::SetEnvironmentVariable('CARGO_UNSTABLE_CHECKSUM_FRESHNESS', [NullString]::Value) }
-    else { $env:CARGO_UNSTABLE_CHECKSUM_FRESHNESS = $originalChecksum }
-    if ($null -eq $originalFingerprint) { [Environment]::SetEnvironmentVariable('CARGO_BUILD_FINGERPRINT', [NullString]::Value) }
-    else { $env:CARGO_BUILD_FINGERPRINT = $originalFingerprint }
-    if ($null -eq $originalIncremental) { [Environment]::SetEnvironmentVariable('CARGO_INCREMENTAL', [NullString]::Value) }
-    else { $env:CARGO_INCREMENTAL = $originalIncremental }
+    try {
+        if ($scratch) {
+            $temporary = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) + [IO.Path]::DirectorySeparatorChar
+            $absolute = [IO.Path]::GetFullPath($scratch)
+            if (-not $absolute.StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase) -or -not [IO.Path]::GetFileName($absolute).StartsWith('bonsai-push-bootstrap-', [StringComparison]::Ordinal)) {
+                if (-not $outerPrimaryFailed) { throw 'Push bootstrap cleanup escaped temporary storage.' }
+                [Console]::Error.WriteLine('Push bootstrap cleanup escaped temporary storage.')
+            } elseif (Test-Path -LiteralPath $absolute) {
+                try {
+                    Invoke-PushFileRetry { Remove-Item -LiteralPath $absolute -Recurse -Force }
+                } catch {
+                    if (-not $outerPrimaryFailed) { throw }
+                    [Console]::Error.WriteLine("Push sanity scratch cleanup warning: $($_.Exception.Message)")
+                }
+            }
+        }
+        if ($powerBeforePrinted) {
+            try {
+                $power = [Windows.Forms.SystemInformation]::PowerStatus
+                Write-Host "Push sanity power after: AC=$($power.PowerLineStatus); charge=$($power.BatteryLifePercent); flags=$($power.BatteryChargeStatus); battery saver unknown; aggregate elapsed=$($started.Elapsed)."
+            } catch {
+                if (-not $outerPrimaryFailed) { throw }
+                [Console]::Error.WriteLine("Push sanity power reporting warning: $($_.Exception.Message)")
+            }
+        }
+    } finally {
+        foreach ($pair in $savedEnv.GetEnumerator()) {
+            if ($null -eq $pair.Value) { [Environment]::SetEnvironmentVariable($pair.Key, [NullString]::Value) }
+            else { [Environment]::SetEnvironmentVariable($pair.Key, $pair.Value) }
+        }
+    }
 }
