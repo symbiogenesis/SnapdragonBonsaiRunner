@@ -27,6 +27,8 @@ use std::time::Duration;
 mod native;
 
 #[cfg(feature = "quant-kernels")]
+pub mod conv_kernels;
+#[cfg(feature = "quant-kernels")]
 pub mod quant_kernels;
 
 /// Internal CLI support for `bonsai-push-recovery`.

@@ -97,6 +97,8 @@ pub(super) mod caller;
 mod cleanup;
 #[cfg(feature = "containment")]
 pub(super) mod containment;
+#[cfg(feature = "quant-kernels")]
+pub(super) mod conv_f32;
 pub(super) mod cpu;
 pub(super) mod devices;
 mod environment;
