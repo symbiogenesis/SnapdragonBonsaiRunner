@@ -81,8 +81,8 @@
   "edges": [
     {
       "path": ".cargo/config.toml",
-      "bytes": 377,
-      "sha256": "d4d774fa35738ccec7c1f9e8b1f0163074657ebbe9aad2acf9e9c4ed11231ad1",
+      "bytes": 498,
+      "sha256": "b1dba965d4a86692eab4e3a6c795e8a8797a79b96421f1197863136b03141a9d",
       "family": "msvc-unwind"
     },
     {
