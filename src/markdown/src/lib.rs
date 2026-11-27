@@ -105,8 +105,9 @@ struct BuilderOut {
     mappings: Vec<Mapping>,
     segments: Vec<Segment>,
     quote_depth: usize,
-    spans: usize,
+    flushed_spans: usize,
     rendered_bytes: usize,
+    max_rendered_bytes: usize,
     images_emitted: usize,
     limited: bool,
 }
@@ -133,6 +134,7 @@ impl BuilderOut {
                 QUOTE_PREFIX,
                 QUOTE_PREFIX_BLOCK,
                 self.quote_depth,
+                self.max_rendered_bytes,
                 &mut overflow,
             );
             self.append_raw(source_text, prefix, None, Style::NORMAL);
@@ -150,14 +152,25 @@ impl BuilderOut {
         if text.is_empty() || self.limited {
             return;
         }
-        self.spans += 1;
         let next_bytes = self.rendered_bytes.saturating_add(text.len());
-        if self.spans > MAX_STYLE_SPANS || next_bytes > MAX_RENDERED_BYTES {
+        let display_start = self.text.len();
+        let merges_section = self
+            .sections
+            .last()
+            .is_some_and(|section| section.range.end == display_start && section.style == style);
+        let added_sections = usize::from(!merges_section);
+        let added_mappings = usize::from(source.as_ref().is_some_and(|range| !range.is_empty()));
+        let next_spans = self
+            .flushed_spans
+            .saturating_add(self.sections.len())
+            .saturating_add(self.mappings.len())
+            .saturating_add(added_sections)
+            .saturating_add(added_mappings);
+        if next_spans > MAX_STYLE_SPANS || next_bytes > self.max_rendered_bytes {
             self.limited = true;
             return;
         }
         self.rendered_bytes = next_bytes;
-        let display_start = self.text.len();
         self.text.push_str(text);
         if let Some(last) = self
             .sections
@@ -187,6 +200,10 @@ impl BuilderOut {
         let text = std::mem::take(&mut self.text);
         let sections = std::mem::take(&mut self.sections);
         let mappings = std::mem::take(&mut self.mappings);
+        self.flushed_spans = self
+            .flushed_spans
+            .saturating_add(sections.len())
+            .saturating_add(mappings.len());
         self.segments.push(Segment::Text(Layout {
             text,
             sections,
@@ -205,6 +222,7 @@ fn repeated_slice<'a>(
     unit: &str,
     static_block: &'a str,
     count: usize,
+    max_rendered_bytes: usize,
     scratch: &'a mut String,
 ) -> &'a str {
     if count == 0 {
@@ -216,7 +234,7 @@ fn repeated_slice<'a>(
         return slice;
     }
     scratch.clear();
-    let max_repeats = MAX_RENDERED_BYTES / unit.len().max(1);
+    let max_repeats = max_rendered_bytes / unit.len().max(1);
     let capped = count.min(max_repeats.saturating_add(1));
     for _ in 0..capped {
         scratch.push_str(unit);
@@ -244,7 +262,13 @@ impl Builder<'_> {
     }
 
     fn generated_repeated(&mut self, unit: &str, static_block: &str, count: usize, style: Style) {
-        let slice = repeated_slice(unit, static_block, count, &mut self.scratch);
+        let slice = repeated_slice(
+            unit,
+            static_block,
+            count,
+            self.out.max_rendered_bytes,
+            &mut self.scratch,
+        );
         self.out.append(self.source, slice, None, style);
     }
 
@@ -300,17 +324,19 @@ impl Builder<'_> {
 }
 
 fn plain(body: &str) -> Layout {
-    let sections = if body.is_empty() {
-        Vec::new()
-    } else {
-        vec![Section {
-            range: 0..body.len(),
-            style: Style::NORMAL,
-        }]
-    };
+    if body.is_empty() {
+        return Layout {
+            text: String::new(),
+            sections: Vec::new(),
+            mappings: Vec::new(),
+        };
+    }
     Layout {
         text: body.to_owned(),
-        sections,
+        sections: vec![Section {
+            range: 0..body.len(),
+            style: Style::NORMAL,
+        }],
         mappings: vec![Mapping {
             source: 0..body.len(),
             display: 0..body.len(),
@@ -336,6 +362,7 @@ fn parse_document(body: &str) -> DocumentLayout {
     } else {
         (body.len() / 16).clamp(4, MAX_STYLE_SPANS)
     };
+    let max_rendered_bytes = MAX_RENDERED_BYTES.min(body.len().saturating_mul(4));
     let mut builder = Builder {
         source: body,
         scratch: String::new(),
@@ -345,8 +372,9 @@ fn parse_document(body: &str) -> DocumentLayout {
             mappings: Vec::with_capacity(estimated_spans),
             segments: Vec::new(),
             quote_depth: 0,
-            spans: 0,
+            flushed_spans: 0,
             rendered_bytes: 0,
+            max_rendered_bytes,
             images_emitted: 0,
             limited: false,
         },
@@ -387,5 +415,5 @@ pub fn parse(source: &str) -> Vec<u8> {
     if source.len() > MAX_MARKDOWN_BYTES {
         return Vec::new();
     }
-    wire::encode(&parse_document(source))
+    wire::encode(source, &parse_document(source))
 }

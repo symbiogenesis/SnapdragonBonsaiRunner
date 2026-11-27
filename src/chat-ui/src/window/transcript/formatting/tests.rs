@@ -372,3 +372,21 @@ fn presentation_append_coalesces_single_newlines_and_splits_only_paragraph_gaps(
         "para 2\nline 4"
     );
 }
+
+#[test]
+fn markdown_worker_packets_align_with_trusted_wire_bounds_for_svg_and_expansions() {
+    for source in [
+        format!("{}1. x", "  ".repeat(12)),
+        "```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"0.0005\" height=\"10\"><rect width=\"1\" height=\"1\"/></svg>\n```".to_owned(),
+        "```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20000000\" height=\"10\"><rect width=\"1\" height=\"1\"/></svg>\n```".to_owned(),
+        "```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"0.001\" height=\"10000000\"><rect width=\"1\" height=\"1\"/></svg>\n```".to_owned(),
+        format!("```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\"/></svg>\n```\n\n{}", "*x* ".repeat(MAX_STYLE_SPANS / 2 + 10)),
+        String::new(),
+    ] {
+        let packet = bonsai_markdown::parse(&source);
+        assert!(
+            wire::decode(&source, &packet).is_some(),
+            "trusted wire decoder rejected worker packet for {source:?}"
+        );
+    }
+}

@@ -808,3 +808,51 @@ fn nested_quotes_deep_ordered_lists_and_multiline_code_coalesce_sections() -> io
     assert!(parse(code_source).starts_with(b"BMD1"));
     Ok(())
 }
+
+#[test]
+fn wire_bounds_svg_dimensions_span_budget_and_plain_fallback_align() {
+    // 1. Rendered bytes stay capped at 4x source length; expansion falls back to plain BMD1.
+    let nested_lists = format!("{}1. x", "  ".repeat(12));
+    let list_packet = parse(&nested_lists);
+    assert!(list_packet.starts_with(b"BMD1"));
+    let doc = parse_document(&nested_lists);
+    assert_eq!(doc.segments.len(), 1);
+    if let Segment::Text(layout) = &doc.segments[0] {
+        assert!(layout.text.len() <= nested_lists.len() * 4);
+    }
+
+    // 2. Out-of-range SVG dimensions (< 1.0e-3 or > 1.0e7) are rejected by inspect and stay BMD1.
+    for (w, h) in [("0.0005", "10"), ("20000000", "10")] {
+        let svg_src = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\"><rect width=\"1\" height=\"1\"/></svg>"
+        );
+        assert!(svg::inspect(&svg_src).is_none());
+        let md = format!("```svg\n{svg_src}\n```");
+        assert!(parse(&md).starts_with(b"BMD1"));
+    }
+    let min_ok = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"0.001\" height=\"0.001\"><rect width=\"1\" height=\"1\"/></svg>";
+    assert!(svg::inspect(min_ok).is_some());
+    let max_ok = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10000000\" height=\"10000000\"><rect width=\"1\" height=\"1\"/></svg>";
+    assert!(svg::inspect(max_ok).is_some());
+
+    // 3. Segmented documents enforce sections.len() + mappings.len() <= MAX_STYLE_SPANS.
+    let many_spans = format!(
+        "```svg\n{SAMPLE_SVG}\n```\n\n{}",
+        "*x* ".repeat(super::MAX_STYLE_SPANS / 2 + 10)
+    );
+    let spanned_doc = parse_document(&many_spans);
+    assert_eq!(spanned_doc.segments.len(), 1);
+    assert!(parse(&many_spans).starts_with(b"BMD1"));
+
+    // 4. wire::encode falls back to encode_single(&plain(body)) instead of empty Vec::new(),
+    // and handles empty body cleanly.
+    let invalid_doc = super::DocumentLayout {
+        segments: vec![Segment::Image(super::ImageBlock {
+            source: 0..3,
+            intrinsic_width: 0.0,
+            intrinsic_height: 10.0,
+        })],
+    };
+    assert_eq!(super::wire::encode("abc", &invalid_doc), parse("abc"));
+    assert_eq!(super::wire::encode("", &invalid_doc), parse(""));
+}

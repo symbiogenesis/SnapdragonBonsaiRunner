@@ -23,7 +23,15 @@ pub const MAX_RASTER_PIXELS: usize = 4_194_304;
 pub(crate) const RASTER_MAGIC: &[u8; 4] = b"BMG1";
 /// Byte length of the raster header (`BMG1` + `ok:u8` + `width:u32` + `height:u32`).
 pub(crate) const RASTER_HEADER_BYTES: usize = 13;
+const MIN_INTRINSIC_DIM: f32 = 1.0e-3;
+const MAX_INTRINSIC_DIM: f32 = 1.0e7;
 const PARSE_TREE_CACHE_CAPACITY: usize = MAX_SVG_IMAGES;
+
+/// Validates finite intrinsic SVG dimensions against the wire protocol bounds.
+pub(crate) fn valid_intrinsic_dimensions(width: f32, height: f32) -> bool {
+    (MIN_INTRINSIC_DIM..=MAX_INTRINSIC_DIM).contains(&width)
+        && (MIN_INTRINSIC_DIM..=MAX_INTRINSIC_DIM).contains(&height)
+}
 
 struct EmbeddedFonts {
     database: Arc<resvg::usvg::fontdb::Database>,
@@ -218,8 +226,7 @@ pub(crate) fn inspect(svg: &str) -> Option<(f32, f32)> {
     let size = tree.size();
     let width = size.width();
     let height = size.height();
-    (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
-        .then_some((width, height))
+    valid_intrinsic_dimensions(width, height).then_some((width, height))
 }
 
 fn clamp_round_u16(value: f64, limit: u16) -> u16 {
@@ -260,13 +267,7 @@ fn target_dimensions(
     max_height: u32,
     max_pixels_limit: usize,
 ) -> Option<(u32, u32)> {
-    if !intrinsic_w.is_finite()
-        || !intrinsic_h.is_finite()
-        || intrinsic_w <= 0.0
-        || intrinsic_h <= 0.0
-        || max_width == 0
-        || max_height == 0
-    {
+    if !valid_intrinsic_dimensions(intrinsic_w, intrinsic_h) || max_width == 0 || max_height == 0 {
         return None;
     }
     let max_w = u16::try_from(max_width.min(MAX_RASTER_DIMENSION)).ok()?;

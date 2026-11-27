@@ -1,6 +1,7 @@
 //! Only inert text, bounded native styles, source ranges and validated SVG bounds leave the parser.
 use super::{
-    DocumentLayout, ImageBlock, Layout, MAX_RENDERED_BYTES, MAX_STYLE_SPANS, Segment, svg,
+    DocumentLayout, ImageBlock, Layout, MAX_MARKDOWN_BYTES, MAX_RENDERED_BYTES, MAX_STYLE_SPANS,
+    Segment, svg,
 };
 use std::ops::Range;
 
@@ -68,10 +69,7 @@ fn encode_image_segment(
 ) -> Option<()> {
     if image.source.start < *previous_source_end
         || image.source.start >= image.source.end
-        || !image.intrinsic_width.is_finite()
-        || !image.intrinsic_height.is_finite()
-        || image.intrinsic_width <= 0.0
-        || image.intrinsic_height <= 0.0
+        || !svg::valid_intrinsic_dimensions(image.intrinsic_width, image.intrinsic_height)
     {
         return None;
     }
@@ -83,8 +81,8 @@ fn encode_image_segment(
     Some(())
 }
 
-fn encode_single(layout: &Layout) -> Option<Vec<u8>> {
-    if layout.text.len() > MAX_RENDERED_BYTES
+fn encode_single(layout: &Layout, max_rendered_bytes: usize) -> Option<Vec<u8>> {
+    if layout.text.len() > max_rendered_bytes
         || layout.sections.len() > MAX_STYLE_SPANS
         || layout.mappings.len() > MAX_STYLE_SPANS
     {
@@ -101,7 +99,7 @@ fn encode_single(layout: &Layout) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-fn encode_segmented(segments: &[Segment]) -> Option<Vec<u8>> {
+fn encode_segmented(segments: &[Segment], max_rendered_bytes: usize) -> Option<Vec<u8>> {
     if segments.is_empty() || segments.len() > MAX_SEGMENTS {
         return None;
     }
@@ -124,7 +122,7 @@ fn encode_segmented(segments: &[Segment]) -> Option<Vec<u8>> {
             }
         }
     }
-    if rendered_bytes > MAX_RENDERED_BYTES
+    if rendered_bytes > max_rendered_bytes
         || span_count > MAX_STYLE_SPANS
         || length > MAX_FRAME_BYTES
     {
@@ -148,11 +146,19 @@ fn encode_segmented(segments: &[Segment]) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-pub(super) fn encode(document: &DocumentLayout) -> Vec<u8> {
-    if document.segments.len() == 1
+pub(super) fn encode(source: &str, document: &DocumentLayout) -> Vec<u8> {
+    if source.len() > MAX_MARKDOWN_BYTES {
+        return Vec::new();
+    }
+    let max_rendered_bytes = MAX_RENDERED_BYTES.min(source.len().saturating_mul(4));
+    let encoded = if document.segments.len() == 1
         && let Some(Segment::Text(only)) = document.segments.first()
     {
-        return encode_single(only).unwrap_or_default();
-    }
-    encode_segmented(&document.segments).unwrap_or_default()
+        encode_single(only, max_rendered_bytes)
+    } else {
+        encode_segmented(&document.segments, max_rendered_bytes)
+    };
+    encoded
+        .or_else(|| encode_single(&super::plain(source), max_rendered_bytes))
+        .unwrap_or_default()
 }
