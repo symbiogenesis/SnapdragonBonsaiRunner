@@ -44,6 +44,17 @@ struct Work {
     pruned_target_cache: bool,
 }
 
+impl Drop for Work {
+    fn drop(&mut self) {
+        let in_temp = super::canonical_path(std::env::temp_dir())
+            .is_ok_and(|temp| self.directory.starts_with(&temp))
+            || self.directory.starts_with(std::env::temp_dir());
+        if in_temp {
+            let _ = Self::remove_entry(&self.directory);
+        }
+    }
+}
+
 impl Work {
     fn command(
         &mut self,
@@ -342,57 +353,80 @@ impl Work {
         clippy::permissions_set_readonly_false,
         reason = "Windows-only helper clearing FILE_ATTRIBUTE_READONLY before replacing or removing cached files"
     )]
-    fn clear_readonly_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    fn clear_readonly_metadata_io(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
         if metadata.file_type().is_symlink() {
             return Ok(());
         }
         let mut permissions = metadata.permissions();
         if permissions.readonly() {
             permissions.set_readonly(false);
-            fs::set_permissions(path, permissions).map_err(|error| error.to_string())?;
+            fs::set_permissions(path, permissions)?;
         }
         Ok(())
     }
 
-    fn remove_entry(path: &Path) -> Result<()> {
+    fn clear_readonly_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+        Self::clear_readonly_metadata_io(path, metadata).map_err(|error| error.to_string())
+    }
+
+    fn is_transient_remove_error(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::PermissionDenied
+            || error.kind() == std::io::ErrorKind::WouldBlock
+            || error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+            || matches!(error.raw_os_error(), Some(5 | 32 | 33 | 145))
+    }
+
+    fn remove_entry_once(path: &Path) -> std::io::Result<()> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(error),
         };
-        Self::clear_readonly_metadata(path, &metadata)?;
+        Self::clear_readonly_metadata_io(path, &metadata)?;
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
-            return fs::remove_dir(path)
-                .or_else(|_| fs::remove_file(path))
-                .map_err(|error| error.to_string());
+            return fs::remove_dir(path).or_else(|_| fs::remove_file(path));
         }
         if !file_type.is_dir() {
-            return fs::remove_file(path).map_err(|error| error.to_string());
+            return fs::remove_file(path);
         }
         let mut stack = vec![path.to_path_buf()];
         let mut dirs = Vec::new();
         while let Some(dir) = stack.pop() {
             dirs.push(dir.clone());
-            for entry in fs::read_dir(&dir).map_err(|error| error.to_string())? {
-                let entry = entry.map_err(|error| error.to_string())?;
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
                 let child = entry.path();
-                let child_meta = entry.metadata().map_err(|error| error.to_string())?;
-                Self::clear_readonly_metadata(&child, &child_meta)?;
+                let child_meta = fs::symlink_metadata(&child)?;
+                Self::clear_readonly_metadata_io(&child, &child_meta)?;
                 let child_type = child_meta.file_type();
                 if child_type.is_symlink() {
-                    fs::remove_dir(&child)
-                        .or_else(|_| fs::remove_file(&child))
-                        .map_err(|error| error.to_string())?;
+                    fs::remove_dir(&child).or_else(|_| fs::remove_file(&child))?;
                 } else if child_type.is_dir() {
                     stack.push(child);
                 } else {
-                    fs::remove_file(&child).map_err(|error| error.to_string())?;
+                    fs::remove_file(&child)?;
                 }
             }
         }
         while let Some(dir) = dirs.pop() {
-            fs::remove_dir(&dir).map_err(|error| error.to_string())?;
+            fs::remove_dir(&dir)?;
+        }
+        Ok(())
+    }
+
+    fn remove_entry(path: &Path) -> Result<()> {
+        const MAX_ATTEMPTS: usize = 6;
+        let mut delay = Duration::from_millis(10);
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::remove_entry_once(path) {
+                Ok(()) => return Ok(()),
+                Err(error) if attempt < MAX_ATTEMPTS && Self::is_transient_remove_error(&error) => {
+                    std::thread::sleep(delay);
+                    delay = delay.saturating_mul(2);
+                }
+                Err(error) => return Err(error.to_string()),
+            }
         }
         Ok(())
     }
@@ -1501,6 +1535,19 @@ fn verify_hexagon_locks(source: &Path, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn finalize_with_cleanup(result: Result<String>, cleanup: Result<()>) -> Result<String> {
+    match (result, cleanup) {
+        (Err(primary), Err(cleanup_error)) => {
+            let mut output = std::io::stderr().lock();
+            let _ = writeln!(output, "{cleanup_error}");
+            Err(primary)
+        }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Ok(summary), Ok(())) => Ok(summary),
+    }
+}
+
 pub(super) fn check(
     root: &Path,
     policy: &Path,
@@ -1513,6 +1560,9 @@ pub(super) fn check(
     if bootstrap_milliseconds >= 270_000 {
         return Err("Push sanity bootstrap exhausted the shared allowance; push blocked.".into());
     }
+    let started = Instant::now()
+        .checked_sub(Duration::from_millis(bootstrap_milliseconds))
+        .ok_or("Push bootstrap start predates the monotonic clock.")?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
@@ -1523,9 +1573,7 @@ pub(super) fn check(
     let before = bonsai_windows_process::power_status();
     let mut work = Work {
         directory,
-        started: Instant::now()
-            .checked_sub(Duration::from_millis(bootstrap_milliseconds))
-            .ok_or("Push bootstrap start predates the monotonic clock.")?,
+        started,
         sequence: 0,
         pruned_target_cache: false,
     };
@@ -1606,12 +1654,13 @@ pub(super) fn check(
         work.started.elapsed()
     );
     // Only remove this invocation's verified direct child of system temporary storage.
-    if work.directory.parent() != Some(temporary.as_path()) {
-        return Err("Push sanity scratch ownership changed.".into());
-    }
-    fs::remove_dir_all(&work.directory)
-        .map_err(|error| format!("Push sanity cleanup failed: {error}"))?;
-    result
+    let cleanup = if work.directory.parent() != Some(temporary.as_path()) {
+        Err("Push sanity scratch ownership changed.".into())
+    } else {
+        Work::remove_entry(&work.directory)
+            .map_err(|error| format!("Push sanity cleanup failed: {error}"))
+    };
+    finalize_with_cleanup(result, cleanup)
 }
 
 #[cfg(test)]
@@ -2410,5 +2459,52 @@ mod tests {
             Work::remove_entry(&scratch)?;
         }
         result
+    }
+
+    #[test]
+    fn push_sanity_work_drop_cleans_readonly_scratch_and_preserves_primary_error() -> Result<()> {
+        let temporary = super::super::canonical_path(std::env::temp_dir())?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let scratch = temporary.join(format!(
+            "bonsai-push-drop-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(scratch.join("nested")).map_err(|error| error.to_string())?;
+        let locked_file = scratch.join("nested").join("readonly.txt");
+        fs::write(&locked_file, b"locked").map_err(|error| error.to_string())?;
+        let mut permissions = fs::metadata(&locked_file)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&locked_file, permissions).map_err(|error| error.to_string())?;
+        {
+            let _work = Work {
+                directory: scratch.clone(),
+                started: Instant::now(),
+                sequence: 0,
+                pruned_target_cache: false,
+            };
+        }
+        assert!(
+            !scratch.exists(),
+            "Work Drop guard must remove scratch tree."
+        );
+
+        assert_eq!(
+            finalize_with_cleanup(Err("primary".into()), Err("cleanup".into())),
+            Err("primary".into())
+        );
+        assert_eq!(
+            finalize_with_cleanup(Ok("ok".into()), Err("cleanup".into())),
+            Err("cleanup".into())
+        );
+        assert_eq!(
+            finalize_with_cleanup(Ok("ok".into()), Ok(())),
+            Ok("ok".into())
+        );
+        Ok(())
     }
 }

@@ -253,6 +253,69 @@ fn github_agent() -> ureq::Agent {
 }
 
 #[cfg(feature = "github-api")]
+const GITHUB_GET_MAX_ATTEMPTS: usize = 4;
+#[cfg(feature = "github-api")]
+const GITHUB_GET_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[cfg(feature = "github-api")]
+fn is_transient_github_error(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::StatusCode(code) => matches!(*code, 408 | 429 | 500..=599),
+        ureq::Error::Io(_)
+        | ureq::Error::Timeout(_)
+        | ureq::Error::ConnectionFailed
+        | ureq::Error::HostNotFound
+        | ureq::Error::Protocol(_) => true,
+        _ => false,
+    }
+}
+
+#[cfg(feature = "github-api")]
+fn sanitize_github_error(error: &ureq::Error) -> String {
+    match error {
+        ureq::Error::StatusCode(code) => format!("HTTP status {code}"),
+        ureq::Error::Io(io_error) => format!("transport I/O: {:?}", io_error.kind()),
+        ureq::Error::Timeout(_) => "request timeout".into(),
+        ureq::Error::HostNotFound => "host not found".into(),
+        ureq::Error::ConnectionFailed => "connection failed".into(),
+        ureq::Error::Protocol(_) => "HTTP protocol error".into(),
+        ureq::Error::Tls(_) => "TLS error".into(),
+        ureq::Error::Http(_) => "HTTP request error".into(),
+        ureq::Error::BadUri(_) => "invalid URI".into(),
+        ureq::Error::RedirectFailed | ureq::Error::TooManyRedirects => "redirect error".into(),
+        ureq::Error::LargeResponseHeader(_, _) => "response header too large".into(),
+        ureq::Error::ConnectProxyFailed(_) => "proxy connection failed".into(),
+        ureq::Error::InvalidProxyUrl => "invalid proxy configuration".into(),
+        ureq::Error::RequireHttpsOnly(_) => "HTTPS required".into(),
+        _ => "transport or TLS failure".into(),
+    }
+}
+
+#[cfg(feature = "github-api")]
+fn retry_with_backoff<T, E>(
+    max_attempts: usize,
+    base_delay: std::time::Duration,
+    mut operation: impl FnMut() -> std::result::Result<T, E>,
+    is_transient: impl Fn(&E) -> bool,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> std::result::Result<T, E> {
+    let attempts = max_attempts.max(1);
+    let mut attempt = 1_usize;
+    let mut delay = base_delay;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < attempts && is_transient(&error) => {
+                sleep(delay);
+                delay = delay.saturating_mul(2);
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(feature = "github-api")]
 fn github_get_json(
     agent: &ureq::Agent,
     url: &str,
@@ -262,13 +325,21 @@ fn github_get_json(
     response_error: &str,
     malformed_error: &str,
 ) -> Result<Value> {
-    let mut response = agent
-        .get(url)
-        .header("Authorization", &format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", user_agent)
-        .call()
-        .map_err(|_| api_error.to_owned())?;
+    let mut response = retry_with_backoff(
+        GITHUB_GET_MAX_ATTEMPTS,
+        GITHUB_GET_BASE_DELAY,
+        || {
+            agent
+                .get(url)
+                .header("Authorization", &format!("Bearer {token}"))
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", user_agent)
+                .call()
+        },
+        is_transient_github_error,
+        std::thread::sleep,
+    )
+    .map_err(|error| format!("{api_error} ({})", sanitize_github_error(&error)))?;
     let bytes = impact::workspace::read_bounded_reader(
         response.body_mut().as_reader(),
         MAX_GITHUB_RESPONSE_BYTES,
@@ -507,5 +578,86 @@ mod tests {
             Some(super::MAX_ACTION_OUTPUT_PATHS)
         );
         Ok(())
+    }
+
+    #[cfg(feature = "github-api")]
+    #[test]
+    fn github_error_classification_sanitization_and_exponential_retry() {
+        for status in [408_u16, 429, 500, 502, 503, 504] {
+            let err = ureq::Error::StatusCode(status);
+            assert!(super::is_transient_github_error(&err), "status {status}");
+            assert_eq!(
+                super::sanitize_github_error(&err),
+                format!("HTTP status {status}")
+            );
+        }
+        for status in [400_u16, 401, 403, 404, 422] {
+            let err = ureq::Error::StatusCode(status);
+            assert!(!super::is_transient_github_error(&err), "status {status}");
+            assert_eq!(
+                super::sanitize_github_error(&err),
+                format!("HTTP status {status}")
+            );
+        }
+        assert!(super::is_transient_github_error(&ureq::Error::HostNotFound));
+        assert!(super::is_transient_github_error(
+            &ureq::Error::ConnectionFailed
+        ));
+        assert!(super::is_transient_github_error(&ureq::Error::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "secret-token-url")
+        )));
+        assert_eq!(
+            super::sanitize_github_error(&ureq::Error::BadUri("https://token@secret".into())),
+            "invalid URI"
+        );
+        assert_eq!(
+            super::sanitize_github_error(&ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "do not leak"
+            ))),
+            "transport I/O: TimedOut"
+        );
+
+        let mut attempts = 0_usize;
+        let mut sleeps = Vec::new();
+        let recovered = super::retry_with_backoff(
+            4,
+            std::time::Duration::from_millis(10),
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(ureq::Error::StatusCode(503))
+                } else {
+                    Ok("ok")
+                }
+            },
+            super::is_transient_github_error,
+            |delay| sleeps.push(delay),
+        );
+        assert!(recovered.is_ok());
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            sleeps,
+            vec![
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(20),
+            ]
+        );
+
+        let mut permanent_attempts = 0_usize;
+        let mut permanent_sleeps = Vec::new();
+        let rejected: Result<(), ureq::Error> = super::retry_with_backoff(
+            4,
+            std::time::Duration::from_millis(10),
+            || {
+                permanent_attempts += 1;
+                Err(ureq::Error::StatusCode(404))
+            },
+            super::is_transient_github_error,
+            |delay| permanent_sleeps.push(delay),
+        );
+        assert!(matches!(rejected, Err(ureq::Error::StatusCode(404))));
+        assert_eq!(permanent_attempts, 1);
+        assert!(permanent_sleeps.is_empty());
     }
 }

@@ -502,9 +502,94 @@ pub(in crate::command) fn command_with_deadline(
     Ok((code, String::from_utf8_lossy(&stdout).trim().into()))
 }
 
+fn is_transient_fs_error(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        || error.kind() == std::io::ErrorKind::WouldBlock
+        || matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
+fn rename_with_retry(source: &Path, destination: &Path) -> std::io::Result<()> {
+    const MAX_ATTEMPTS: usize = 6;
+    let mut delay = Duration::from_millis(10);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match fs::rename(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < MAX_ATTEMPTS && is_transient_fs_error(&error) => {
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn receipt(path: &Path, value: &Value) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    fs::write(path, bytes).map_err(|error| error.to_string())
+    let mut partial_name = path
+        .file_name()
+        .ok_or("Receipt path must include a file name.")?
+        .to_os_string();
+    partial_name.push(".partial");
+    let partial_path = path.with_file_name(partial_name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&partial_path)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&partial_path);
+        return Err(error.to_string());
+    }
+    drop(file);
+    if let Err(error) = rename_with_retry(&partial_path, path) {
+        let _ = fs::remove_file(&partial_path);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+struct TempWorkDir(PathBuf);
+
+impl TempWorkDir {
+    fn create(path: PathBuf) -> Result<Self> {
+        fs::create_dir(&path).map_err(|error| error.to_string())?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempWorkDir {
+    fn drop(&mut self) {
+        if self.0.starts_with(std::env::temp_dir())
+            && fs::symlink_metadata(&self.0)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            const MAX_ATTEMPTS: usize = 5;
+            let mut delay = Duration::from_millis(10);
+            for attempt in 1..=MAX_ATTEMPTS {
+                match fs::remove_dir_all(&self.0) {
+                    Ok(()) => return,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(error)
+                        if attempt < MAX_ATTEMPTS
+                            && (is_transient_fs_error(&error)
+                                || error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                                || error.raw_os_error() == Some(145)) =>
+                    {
+                        std::thread::sleep(delay);
+                        delay = delay.saturating_mul(2);
+                    }
+                    Err(_) => return,
+                }
+            }
+        }
+    }
 }
 
 struct Execution<'a> {
@@ -698,12 +783,12 @@ pub(super) fn run(
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     fs::create_dir(evidence).map_err(|error| error.to_string())?;
-    fs::create_dir(&work).map_err(|error| error.to_string())?;
+    let work = TempWorkDir::create(work)?;
     let mut report = json!({
         "SchemaVersion": 2, "Revision": std::env::var("GITHUB_SHA").ok(), "Toolchain": toolchain,
         "CheckProfile": options.profile, "FingerprintMode": std::env::var("CARGO_BUILD_FINGERPRINT").unwrap_or_else(|_| "mtime".into()),
         "Packages": packages.iter().map(|package| &package.name).collect::<Vec<_>>(), "TargetDirectory": target,
-        "WorkingDirectory": work, "CompilerIdentity": null, "Checks": [], "SkippedChecks": [], "Success": false, "Error": null,
+        "WorkingDirectory": work.path(), "CompilerIdentity": null, "Checks": [], "SkippedChecks": [], "Success": false, "Error": null,
         "PerformanceMeasured": false, "PlannedCargoInvocations": plan.len(), "UnbatchedCargoInvocations": packages.len() * options.phases.len(),
         "GitHubReleaseDeadline": options.github_release,
         "WorkspaceSha256": workspace_hash, "LockSha256": lock_hash, "RegistrySha256": registry_hash
@@ -716,7 +801,7 @@ pub(super) fn run(
         toolchain,
         target,
         evidence,
-        work: &work,
+        work: work.path(),
         started,
         owner: std::env::var("RUNNER_ENVIRONMENT").as_deref() != Ok("github-hosted"),
     };
@@ -855,6 +940,42 @@ mod tests {
         );
         assert!(summary.contains("**`bonsai-speech-asr-test` crash:**"));
         assert!(summary.contains("**`bonsai-speech-asr-test` failed tests:** `beta`"));
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_writes_atomically_and_temp_work_dir_cleans_up_on_drop() -> Result<()> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let scratch = std::env::temp_dir().join(format!(
+            "SwiftBonsai-RustCheck-Test-{}-{nonce}",
+            std::process::id()
+        ));
+        let receipt_path = scratch.join("rust-checks.json");
+        let partial_path = scratch.join("rust-checks.json.partial");
+        {
+            let guard = TempWorkDir::create(scratch.clone())?;
+            fs::write(guard.path().join("stale.txt"), b"scratch")
+                .map_err(|error| error.to_string())?;
+            receipt(
+                &receipt_path,
+                &json!({"SchemaVersion": 2, "Success": false}),
+            )?;
+            assert!(!partial_path.exists());
+            receipt(&receipt_path, &json!({"SchemaVersion": 2, "Success": true}))?;
+            assert!(!partial_path.exists());
+            let parsed: Value = serde_json::from_slice(
+                &fs::read(&receipt_path).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            assert_eq!(parsed["Success"], json!(true));
+        }
+        assert!(
+            !scratch.exists(),
+            "TempWorkDir Drop guard must remove SwiftBonsai-RustCheck-* directory."
+        );
         Ok(())
     }
 }
