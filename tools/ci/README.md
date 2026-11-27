@@ -51,7 +51,12 @@ checks enabled, static CRT). Incremental Release compilation is explicitly disab
 in `check-rust` because `rustc` incremental + `opt-level = 3` on
 `aarch64-pc-windows-msvc` miscompiles cross-CGU SEH `.xdata` unwind tables
 (`0xc0000409`) and diverges from published binaries. Dependency artifacts remain
-cached per lane in `CARGO_TARGET_DIR`.
+cached per lane in `CARGO_TARGET_DIR`. For local inner-loop `check`, `build`,
+`run`, and focused `test` invocations, omit `--release`: `[profile.dev]` and
+`[profile.test]` share `opt-level = 1`, `debug = "line-tables-only"`,
+incremental workspace compilation, and `opt-level = 2`, `debug = 0`
+dependencies, letting `build` and `test` share compiled dependencies without O3
+rebuilds or the incremental + O3 SEH unwind bug.
 
 A TTS-only source edit selects its Rust lane without scheduling the maintenance CLI
 producer. ASR still selects that producer for its native source preparation. Changes
