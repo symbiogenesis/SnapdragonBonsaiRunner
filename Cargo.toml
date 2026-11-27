@@ -29,15 +29,15 @@ repository = "https://github.com/symbiogenesis/SnapdragonBonsaiRunner"
 ash = { version = "=0.38.0", default-features = false }
 base64ct = { version = "=1.8.3", default-features = false, features = ["alloc"] }
 bonsai-artifacts = { path = "src/artifacts" }
-bonsai-gguf = { version = "=0.1.10", default-features = false }
-bonsai-native-hash = "=0.1.7"
-bonsai-neon-dot = "=0.1.10"
-bonsai-ternary = "=0.1.6"
+bonsai-gguf = { version = "=0.1.11", default-features = false }
+bonsai-native-hash = "=0.1.8"
+bonsai-neon-dot = "=0.1.11"
+bonsai-ternary = "=0.1.7"
 bonsai-audio = { path = "src/audio" }
 bonsai-cpu-policy = { path = "src/cpu-policy" }
 bonsai-markdown = { path = "src/markdown" }
 bonsai-speech-service = { path = "src/speech-service" }
-bonsai-windows-credentials = { version = "=0.1.8", path = "src/windows-credentials" }
+bonsai-windows-credentials = { version = "=0.1.9", path = "src/windows-credentials" }
 bonsai-windows-process = { version = "=0.1.8", path = "src/windows-process" }
 epaint_default_fonts = { version = "=0.37.0", default-features = false }
 fearless_simd = "=1.2.0"
