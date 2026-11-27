@@ -526,6 +526,42 @@ impl Weights {
         )
     }
 
+    pub(crate) fn projection_repacked_q4_k(
+        &self,
+        name: &str,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> io::Result<LinearProjection> {
+        if let Some(mapped) = &self.mapped
+            && bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect().dotprod
+            && in_dim > 0
+            && out_dim > 0
+            && in_dim.is_multiple_of(256)
+            && out_dim.is_multiple_of(8)
+            && let Some(tensor) = self.tensors.get(name)
+            && tensor.kind == 12
+            && tensor.shape == [in_dim, out_dim]
+        {
+            let start = usize::try_from(tensor.offset).map_err(|_| invalid())?;
+            let end = start.checked_add(tensor.bytes).ok_or_else(invalid)?;
+            let bytes = mapped.as_slice().get(start..end).ok_or_else(invalid)?;
+            if let Some(repacked) =
+                bonsai_windows_process::quant_kernels::repack_q4_k_8rows(bytes, in_dim, out_dim)
+            {
+                return LinearProjection::new(
+                    name,
+                    in_dim,
+                    out_dim,
+                    WeightQuantization::RepackedQ4K8 { bytes: repacked },
+                    None,
+                );
+            }
+        }
+        let mut proj = self.projection(name, in_dim, out_dim)?;
+        proj.repack_q4_k_if_aligned();
+        Ok(proj)
+    }
+
     pub(crate) fn projection_mapped(
         &self,
         name: &str,
@@ -770,7 +806,22 @@ pub(crate) fn validate_packed_parallel(kind: u32, bytes: &[u8], threads: usize) 
 fn decode_slice_f32(kind: u32, bytes: &[u8], output: &mut [f32]) -> io::Result<()> {
     match kind {
         0 => {
-            for (raw, dst) in bytes.as_chunks::<4>().0.iter().zip(output.iter_mut()) {
+            let (in8, in_tail) = bytes.as_chunks::<32>();
+            let (out8, out_tail) = output.as_chunks_mut::<8>();
+            for (src, dst) in in8.iter().zip(out8.iter_mut()) {
+                let quads = src.as_chunks::<4>().0;
+                let bits: [u32; 8] = std::array::from_fn(|idx| u32::from_le_bytes(quads[idx]));
+                let nonfinite = bits
+                    .iter()
+                    .fold(false, |bad, &raw| bad | ((raw & 0x7F80_0000) == 0x7F80_0000));
+                if nonfinite {
+                    return Err(invalid());
+                }
+                for (slot, raw) in dst.iter_mut().zip(bits) {
+                    *slot = f32::from_bits(raw);
+                }
+            }
+            for (raw, dst) in in_tail.as_chunks::<4>().0.iter().zip(out_tail.iter_mut()) {
                 if !f32_bytes_finite(*raw) {
                     return Err(invalid());
                 }
@@ -784,7 +835,10 @@ fn decode_slice_f32(kind: u32, bytes: &[u8], output: &mut [f32]) -> io::Result<(
             for (src, dst) in in8.iter().zip(out8.iter_mut()) {
                 let pairs = src.as_chunks::<2>().0;
                 let bits: [u16; 8] = std::array::from_fn(|idx| u16::from_le_bytes(pairs[idx]));
-                if bits.iter().any(|&raw| (raw & 0x7C00) == 0x7C00) {
+                let nonfinite = bits
+                    .iter()
+                    .fold(false, |bad, &raw| bad | ((raw & 0x7C00) == 0x7C00));
+                if nonfinite {
                     return Err(invalid());
                 }
                 let [lo, hi] = bonsai_neon_dot::widen_f16_eight(&bits);
@@ -819,7 +873,16 @@ fn decode_slice_f32(kind: u32, bytes: &[u8], output: &mut [f32]) -> io::Result<(
             {
                 decode_block(kind, source, destination);
             }
-            if output.iter().any(|value| !value.is_finite()) {
+            let (out8, out_tail) = output.as_chunks::<8>();
+            for chunk in out8 {
+                let nonfinite = chunk.iter().fold(false, |bad, &v| {
+                    bad | ((v.to_bits() & 0x7F80_0000) == 0x7F80_0000)
+                });
+                if nonfinite {
+                    return Err(invalid());
+                }
+            }
+            if out_tail.iter().any(|value| !value.is_finite()) {
                 return Err(invalid());
             }
             Ok(())

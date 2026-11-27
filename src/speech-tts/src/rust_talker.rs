@@ -84,61 +84,6 @@ impl Geometry {
     }
 }
 
-struct TalkerGlobals {
-    text_fc1: LinearProjection,
-    text_fc2: LinearProjection,
-    codec_embedding: LinearProjection,
-    head: LinearProjection,
-    norm: Vec<f32>,
-    mtp_proj: Option<LinearProjection>,
-    cp_norm_w: Vec<f32>,
-}
-
-fn load_talker_globals(
-    weights: &Weights,
-    geometry: &Geometry,
-    predictor_geometry: &Geometry,
-    text_dim: usize,
-) -> io::Result<TalkerGlobals> {
-    let mut text_fc1 = weights.projection("talker.text_proj.fc1.weight", text_dim, text_dim)?;
-    text_fc1.repack_q4_k_if_aligned();
-    text_fc1.bias = Some(weights.tensor_f32("talker.text_proj.fc1.bias", &[text_dim])?);
-    let mut text_fc2 =
-        weights.projection("talker.text_proj.fc2.weight", text_dim, geometry.hidden)?;
-    text_fc2.repack_q4_k_if_aligned();
-    text_fc2.bias = Some(weights.tensor_f32("talker.text_proj.fc2.bias", &[geometry.hidden])?);
-    let codec_embedding =
-        weights.projection("talker.codec_embd.weight", geometry.hidden, geometry.vocab)?;
-    let mut head =
-        weights.projection("talker.codec_head.weight", geometry.hidden, geometry.vocab)?;
-    head.repack_q4_k_if_aligned();
-    let norm = weights.tensor_f32("talker.output_norm.weight", &[geometry.hidden])?;
-    let mtp_proj = if predictor_geometry.hidden == geometry.hidden {
-        None
-    } else {
-        let mut projection = weights.projection(
-            "code_pred.mtp_proj.weight",
-            geometry.hidden,
-            predictor_geometry.hidden,
-        )?;
-        projection.repack_q4_k_if_aligned();
-        projection.bias =
-            Some(weights.tensor_f32("code_pred.mtp_proj.bias", &[predictor_geometry.hidden])?);
-        Some(projection)
-    };
-    let cp_norm_w =
-        weights.tensor_f32("code_pred.output_norm.weight", &[predictor_geometry.hidden])?;
-    Ok(TalkerGlobals {
-        text_fc1,
-        text_fc2,
-        codec_embedding,
-        head,
-        norm,
-        mtp_proj,
-        cp_norm_w,
-    })
-}
-
 fn load_codebook_pair(
     weights: &Weights,
     hidden: usize,
@@ -151,12 +96,11 @@ fn load_codebook_pair(
         hidden,
         cp_vocab,
     )?;
-    let mut head = weights.projection(
+    let head = weights.projection_repacked_q4_k(
         &format!("code_pred.lm_head.{codebook}.weight"),
         cp_hidden,
         cp_vocab,
     )?;
-    head.repack_q4_k_if_aligned();
     Ok((embd, head))
 }
 
@@ -172,26 +116,42 @@ impl Geometry {
         let name = format!("{prefix}.blk.{index}");
         Ok(QwenDecoderLayer {
             attn_norm_w: weights.tensor_f32(&format!("{name}.attn_norm.weight"), &[self.hidden])?,
-            q_proj: weights.projection(&format!("{name}.attn_q.weight"), self.hidden, q)?,
-            k_proj: weights.projection(&format!("{name}.attn_k.weight"), self.hidden, kv)?,
-            v_proj: weights.projection(&format!("{name}.attn_v.weight"), self.hidden, kv)?,
-            o_proj: weights.projection(&format!("{name}.attn_output.weight"), q, self.hidden)?,
+            q_proj: weights.projection_repacked_q4_k(
+                &format!("{name}.attn_q.weight"),
+                self.hidden,
+                q,
+            )?,
+            k_proj: weights.projection_repacked_q4_k(
+                &format!("{name}.attn_k.weight"),
+                self.hidden,
+                kv,
+            )?,
+            v_proj: weights.projection_repacked_q4_k(
+                &format!("{name}.attn_v.weight"),
+                self.hidden,
+                kv,
+            )?,
+            o_proj: weights.projection_repacked_q4_k(
+                &format!("{name}.attn_output.weight"),
+                q,
+                self.hidden,
+            )?,
             q_norm_w: weights
                 .tensor_f32(&format!("{name}.attn_q_norm.weight"), &[self.head_dim])?,
             k_norm_w: weights
                 .tensor_f32(&format!("{name}.attn_k_norm.weight"), &[self.head_dim])?,
             ffn_norm_w: weights.tensor_f32(&format!("{name}.ffn_norm.weight"), &[self.hidden])?,
-            gate_proj: weights.projection(
+            gate_proj: weights.projection_repacked_q4_k(
                 &format!("{name}.ffn_gate.weight"),
                 self.hidden,
                 self.intermediate,
             )?,
-            up_proj: weights.projection(
+            up_proj: weights.projection_repacked_q4_k(
                 &format!("{name}.ffn_up.weight"),
                 self.hidden,
                 self.intermediate,
             )?,
-            down_proj: weights.projection(
+            down_proj: weights.projection_repacked_q4_k(
                 &format!("{name}.ffn_down.weight"),
                 self.intermediate,
                 self.hidden,
@@ -437,7 +397,11 @@ impl Talker {
     ) -> io::Result<Self> {
         enum TalkerLoadItem {
             Tokenizer(Tokenizer),
-            Globals(TalkerGlobals),
+            TextFc1(LinearProjection),
+            TextFc2(LinearProjection),
+            CodecEmbedding(LinearProjection),
+            Head(LinearProjection),
+            NormsAndMtp(Vec<f32>, Option<LinearProjection>, Vec<f32>),
             Layer(QwenDecoderLayer),
             CpLayer(QwenDecoderLayer),
             Codebook(LinearProjection, LinearProjection),
@@ -480,8 +444,12 @@ impl Talker {
             threads,
         )?;
         let tokenizer_offset = usize::from(provided_tokenizer.is_none());
-        let globals_task = tokenizer_offset;
-        let layer_start = globals_task + 1;
+        let text_fc1_task = tokenizer_offset;
+        let text_fc2_task = text_fc1_task + 1;
+        let codec_emb_task = text_fc2_task + 1;
+        let head_task = codec_emb_task + 1;
+        let norms_task = head_task + 1;
+        let layer_start = norms_task + 1;
         let cp_start = layer_start + geometry.layers;
         let codebook_start = cp_start + predictor_geometry.layers;
         let total_tasks = codebook_start + 15;
@@ -489,22 +457,62 @@ impl Talker {
         let items = crate::weights::parallel_build(total_tasks, build_threads, |task| {
             if task < tokenizer_offset {
                 Ok(TalkerLoadItem::Tokenizer(Tokenizer::from_weights(weights)?))
-            } else if task == globals_task {
-                Ok(TalkerLoadItem::Globals(load_talker_globals(
-                    weights,
-                    &geometry,
-                    &predictor_geometry,
+            } else if task == text_fc1_task {
+                let mut text_fc1 = weights.projection_repacked_q4_k(
+                    "talker.text_proj.fc1.weight",
                     text_dim,
+                    text_dim,
+                )?;
+                text_fc1.bias = Some(weights.tensor_f32("talker.text_proj.fc1.bias", &[text_dim])?);
+                Ok(TalkerLoadItem::TextFc1(text_fc1))
+            } else if task == text_fc2_task {
+                let mut text_fc2 = weights.projection_repacked_q4_k(
+                    "talker.text_proj.fc2.weight",
+                    text_dim,
+                    geometry.hidden,
+                )?;
+                text_fc2.bias =
+                    Some(weights.tensor_f32("talker.text_proj.fc2.bias", &[geometry.hidden])?);
+                Ok(TalkerLoadItem::TextFc2(text_fc2))
+            } else if task == codec_emb_task {
+                Ok(TalkerLoadItem::CodecEmbedding(weights.projection(
+                    "talker.codec_embd.weight",
+                    geometry.hidden,
+                    geometry.vocab,
                 )?))
+            } else if task == head_task {
+                Ok(TalkerLoadItem::Head(weights.projection_repacked_q4_k(
+                    "talker.codec_head.weight",
+                    geometry.hidden,
+                    geometry.vocab,
+                )?))
+            } else if task == norms_task {
+                let norm = weights.tensor_f32("talker.output_norm.weight", &[geometry.hidden])?;
+                let mtp_proj = if predictor_geometry.hidden == geometry.hidden {
+                    None
+                } else {
+                    let mut projection = weights.projection_repacked_q4_k(
+                        "code_pred.mtp_proj.weight",
+                        geometry.hidden,
+                        predictor_geometry.hidden,
+                    )?;
+                    projection.bias = Some(weights.tensor_f32(
+                        "code_pred.mtp_proj.bias",
+                        &[predictor_geometry.hidden],
+                    )?);
+                    Some(projection)
+                };
+                let cp_norm_w = weights
+                    .tensor_f32("code_pred.output_norm.weight", &[predictor_geometry.hidden])?;
+                Ok(TalkerLoadItem::NormsAndMtp(norm, mtp_proj, cp_norm_w))
             } else if task < cp_start {
-                let mut layer = geometry.load_layer(weights, "talker", task - layer_start)?;
-                layer.repack_q4_k_if_aligned();
-                Ok(TalkerLoadItem::Layer(layer))
+                Ok(TalkerLoadItem::Layer(
+                    geometry.load_layer(weights, "talker", task - layer_start)?,
+                ))
             } else if task < codebook_start {
-                let mut layer =
-                    predictor_geometry.load_layer(weights, "code_pred", task - cp_start)?;
-                layer.repack_q4_k_if_aligned();
-                Ok(TalkerLoadItem::CpLayer(layer))
+                Ok(TalkerLoadItem::CpLayer(
+                    predictor_geometry.load_layer(weights, "code_pred", task - cp_start)?,
+                ))
             } else {
                 let (embd, head) = load_codebook_pair(
                     weights,
@@ -518,7 +526,11 @@ impl Talker {
         })?;
 
         let mut tokenizer = provided_tokenizer;
-        let mut globals = None;
+        let mut text_fc1 = None;
+        let mut text_fc2 = None;
+        let mut codec_embedding = None;
+        let mut head = None;
+        let mut norms_and_mtp = None;
         let mut layers = Vec::with_capacity(geometry.layers);
         let mut cp_layers = Vec::with_capacity(predictor_geometry.layers);
         let mut codec_embeddings = Vec::with_capacity(15);
@@ -526,17 +538,29 @@ impl Talker {
         for item in items {
             match item {
                 TalkerLoadItem::Tokenizer(tok) => tokenizer = Some(tok),
-                TalkerLoadItem::Globals(loaded_globals) => globals = Some(loaded_globals),
+                TalkerLoadItem::TextFc1(p) => text_fc1 = Some(p),
+                TalkerLoadItem::TextFc2(p) => text_fc2 = Some(p),
+                TalkerLoadItem::CodecEmbedding(p) => codec_embedding = Some(p),
+                TalkerLoadItem::Head(p) => head = Some(p),
+                TalkerLoadItem::NormsAndMtp(norm, mtp_proj, cp_norm_w) => {
+                    norms_and_mtp = Some((norm, mtp_proj, cp_norm_w));
+                }
                 TalkerLoadItem::Layer(layer) => layers.push(layer),
                 TalkerLoadItem::CpLayer(layer) => cp_layers.push(layer),
-                TalkerLoadItem::Codebook(embd, head) => {
+                TalkerLoadItem::Codebook(embd, cb_head) => {
                     codec_embeddings.push(embd);
-                    lm_heads.push(head);
+                    lm_heads.push(cb_head);
                 }
             }
         }
         let tokenizer = tokenizer.ok_or_else(|| invalid("Missing Talker tokenizer."))?;
-        let globals = globals.ok_or_else(|| invalid("Missing Talker projections."))?;
+        let text_fc1 = text_fc1.ok_or_else(|| invalid("Missing Talker text_fc1."))?;
+        let text_fc2 = text_fc2.ok_or_else(|| invalid("Missing Talker text_fc2."))?;
+        let codec_embedding =
+            codec_embedding.ok_or_else(|| invalid("Missing Talker codec embedding."))?;
+        let head = head.ok_or_else(|| invalid("Missing Talker codec head."))?;
+        let (norm, mtp_proj, cp_norm_w) =
+            norms_and_mtp.ok_or_else(|| invalid("Missing Talker norms."))?;
 
         let predictor = CodePredictorModel {
             hidden_size: predictor_geometry.hidden,
@@ -547,21 +571,21 @@ impl Talker {
             num_acoustic_codebooks: 15,
             rope_theta: predictor_geometry.rope_theta,
             rms_norm_eps: predictor_geometry.norm_eps,
-            mtp_proj: globals.mtp_proj,
+            mtp_proj,
             layers: cp_layers,
-            norm_w: globals.cp_norm_w,
+            norm_w: cp_norm_w,
             codec_embeddings,
             lm_heads,
         };
         let mut result = Self {
             geometry,
             layers,
-            norm: globals.norm,
-            head: globals.head,
+            norm,
+            head,
             text_embedding,
-            text_fc1: globals.text_fc1,
-            text_fc2: globals.text_fc2,
-            codec_embedding: globals.codec_embedding,
+            text_fc1,
+            text_fc2,
+            codec_embedding,
             predictor,
             tokenizer,
             specials,

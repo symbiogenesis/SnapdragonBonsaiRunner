@@ -24,7 +24,7 @@ use fearless_simd::{Level, dispatch, f32x4, prelude::*};
 
 use crate::{
     engine::row_workers,
-    numerics::{axpy_simd, f32_dot_simd, usize_to_f32},
+    numerics::{f32_dot_simd, usize_to_f32},
 };
 
 #[expect(
@@ -34,6 +34,267 @@ use crate::{
 )]
 const fn coefficient(value: f64) -> f32 {
     value as f32
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Register-blocked 4x4 TDNN convolution kernel keeps 16 accumulators live across k and ic."
+)]
+fn tdnn_4oc_row_simd<S: Simd>(
+    simd: S,
+    padded: &[f32],
+    padded_frames: usize,
+    weight: &[f32],
+    bias: [f32; 4],
+    in_c: usize,
+    kernel: usize,
+    dilation: usize,
+    frames: usize,
+    apply_relu: bool,
+    out_quad: &mut [f32],
+) {
+    let zero_v = f32x4::splat(simd, 0.0_f32);
+    let (r0_r1, r2_r3) = out_quad.split_at_mut(2 * frames);
+    let (r0, r1) = r0_r1.split_at_mut(frames);
+    let (r2, r3) = r2_r3.split_at_mut(frames);
+    let b0 = f32x4::splat(simd, bias[0]);
+    let b1 = f32x4::splat(simd, bias[1]);
+    let b2 = f32x4::splat(simd, bias[2]);
+    let b3 = f32x4::splat(simd, bias[3]);
+    let w_stride = in_c * kernel;
+
+    let mut f = 0_usize;
+    while f + 16 <= frames {
+        let mut a00 = b0;
+        let mut a01 = b0;
+        let mut a02 = b0;
+        let mut a03 = b0;
+        let mut a10 = b1;
+        let mut a11 = b1;
+        let mut a12 = b1;
+        let mut a13 = b1;
+        let mut a20 = b2;
+        let mut a21 = b2;
+        let mut a22 = b2;
+        let mut a23 = b2;
+        let mut a30 = b3;
+        let mut a31 = b3;
+        let mut a32 = b3;
+        let mut a33 = b3;
+        for k in 0..kernel {
+            let tap_off = k * dilation + f;
+            for ic in 0..in_c {
+                let x_off = ic * padded_frames + tap_off;
+                let x0 = f32x4::from_slice(simd, &padded[x_off..x_off + 4]);
+                let x1 = f32x4::from_slice(simd, &padded[x_off + 4..x_off + 8]);
+                let x2 = f32x4::from_slice(simd, &padded[x_off + 8..x_off + 12]);
+                let x3 = f32x4::from_slice(simd, &padded[x_off + 12..x_off + 16]);
+                let w_off = ic * kernel + k;
+                let w0 = f32x4::splat(simd, weight[w_off]);
+                let w1 = f32x4::splat(simd, weight[w_stride + w_off]);
+                let w2 = f32x4::splat(simd, weight[2 * w_stride + w_off]);
+                let w3 = f32x4::splat(simd, weight[3 * w_stride + w_off]);
+                a00 = w0.mul_add(x0, a00);
+                a01 = w0.mul_add(x1, a01);
+                a02 = w0.mul_add(x2, a02);
+                a03 = w0.mul_add(x3, a03);
+                a10 = w1.mul_add(x0, a10);
+                a11 = w1.mul_add(x1, a11);
+                a12 = w1.mul_add(x2, a12);
+                a13 = w1.mul_add(x3, a13);
+                a20 = w2.mul_add(x0, a20);
+                a21 = w2.mul_add(x1, a21);
+                a22 = w2.mul_add(x2, a22);
+                a23 = w2.mul_add(x3, a23);
+                a30 = w3.mul_add(x0, a30);
+                a31 = w3.mul_add(x1, a31);
+                a32 = w3.mul_add(x2, a32);
+                a33 = w3.mul_add(x3, a33);
+            }
+        }
+        if apply_relu {
+            a00 = a00.max(zero_v);
+            a01 = a01.max(zero_v);
+            a02 = a02.max(zero_v);
+            a03 = a03.max(zero_v);
+            a10 = a10.max(zero_v);
+            a11 = a11.max(zero_v);
+            a12 = a12.max(zero_v);
+            a13 = a13.max(zero_v);
+            a20 = a20.max(zero_v);
+            a21 = a21.max(zero_v);
+            a22 = a22.max(zero_v);
+            a23 = a23.max(zero_v);
+            a30 = a30.max(zero_v);
+            a31 = a31.max(zero_v);
+            a32 = a32.max(zero_v);
+            a33 = a33.max(zero_v);
+        }
+        a00.store_slice(&mut r0[f..f + 4]);
+        a01.store_slice(&mut r0[f + 4..f + 8]);
+        a02.store_slice(&mut r0[f + 8..f + 12]);
+        a03.store_slice(&mut r0[f + 12..f + 16]);
+        a10.store_slice(&mut r1[f..f + 4]);
+        a11.store_slice(&mut r1[f + 4..f + 8]);
+        a12.store_slice(&mut r1[f + 8..f + 12]);
+        a13.store_slice(&mut r1[f + 12..f + 16]);
+        a20.store_slice(&mut r2[f..f + 4]);
+        a21.store_slice(&mut r2[f + 4..f + 8]);
+        a22.store_slice(&mut r2[f + 8..f + 12]);
+        a23.store_slice(&mut r2[f + 12..f + 16]);
+        a30.store_slice(&mut r3[f..f + 4]);
+        a31.store_slice(&mut r3[f + 4..f + 8]);
+        a32.store_slice(&mut r3[f + 8..f + 12]);
+        a33.store_slice(&mut r3[f + 12..f + 16]);
+        f += 16;
+    }
+    while f + 4 <= frames {
+        let mut a0 = b0;
+        let mut a1 = b1;
+        let mut a2 = b2;
+        let mut a3 = b3;
+        for k in 0..kernel {
+            let tap_off = k * dilation + f;
+            for ic in 0..in_c {
+                let x_off = ic * padded_frames + tap_off;
+                let xv = f32x4::from_slice(simd, &padded[x_off..x_off + 4]);
+                let w_off = ic * kernel + k;
+                a0 = f32x4::splat(simd, weight[w_off]).mul_add(xv, a0);
+                a1 = f32x4::splat(simd, weight[w_stride + w_off]).mul_add(xv, a1);
+                a2 = f32x4::splat(simd, weight[2 * w_stride + w_off]).mul_add(xv, a2);
+                a3 = f32x4::splat(simd, weight[3 * w_stride + w_off]).mul_add(xv, a3);
+            }
+        }
+        if apply_relu {
+            a0 = a0.max(zero_v);
+            a1 = a1.max(zero_v);
+            a2 = a2.max(zero_v);
+            a3 = a3.max(zero_v);
+        }
+        a0.store_slice(&mut r0[f..f + 4]);
+        a1.store_slice(&mut r1[f..f + 4]);
+        a2.store_slice(&mut r2[f..f + 4]);
+        a3.store_slice(&mut r3[f..f + 4]);
+        f += 4;
+    }
+    while f < frames {
+        let mut a0 = bias[0];
+        let mut a1 = bias[1];
+        let mut a2 = bias[2];
+        let mut a3 = bias[3];
+        for k in 0..kernel {
+            let tap_off = k * dilation + f;
+            for ic in 0..in_c {
+                let xv = padded[ic * padded_frames + tap_off];
+                let w_off = ic * kernel + k;
+                a0 = weight[w_off].mul_add(xv, a0);
+                a1 = weight[w_stride + w_off].mul_add(xv, a1);
+                a2 = weight[2 * w_stride + w_off].mul_add(xv, a2);
+                a3 = weight[3 * w_stride + w_off].mul_add(xv, a3);
+            }
+        }
+        if apply_relu {
+            a0 = a0.max(0.0_f32);
+            a1 = a1.max(0.0_f32);
+            a2 = a2.max(0.0_f32);
+            a3 = a3.max(0.0_f32);
+        }
+        r0[f] = a0;
+        r1[f] = a1;
+        r2[f] = a2;
+        r3[f] = a3;
+        f += 1;
+    }
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Register-blocked 1x4 TDNN tail convolution kernel keeps 4 accumulators live across k and ic."
+)]
+fn tdnn_1oc_row_simd<S: Simd>(
+    simd: S,
+    padded: &[f32],
+    padded_frames: usize,
+    weight_row: &[f32],
+    bias: f32,
+    in_c: usize,
+    kernel: usize,
+    dilation: usize,
+    frames: usize,
+    apply_relu: bool,
+    out_row: &mut [f32],
+) {
+    let zero_v = f32x4::splat(simd, 0.0_f32);
+    let b_v = f32x4::splat(simd, bias);
+    let mut f = 0_usize;
+    while f + 16 <= frames {
+        let mut a0 = b_v;
+        let mut a1 = b_v;
+        let mut a2 = b_v;
+        let mut a3 = b_v;
+        for k in 0..kernel {
+            let tap_off = k * dilation + f;
+            for ic in 0..in_c {
+                let x_off = ic * padded_frames + tap_off;
+                let w = f32x4::splat(simd, weight_row[ic * kernel + k]);
+                a0 = w.mul_add(f32x4::from_slice(simd, &padded[x_off..x_off + 4]), a0);
+                a1 = w.mul_add(f32x4::from_slice(simd, &padded[x_off + 4..x_off + 8]), a1);
+                a2 = w.mul_add(f32x4::from_slice(simd, &padded[x_off + 8..x_off + 12]), a2);
+                a3 = w.mul_add(
+                    f32x4::from_slice(simd, &padded[x_off + 12..x_off + 16]),
+                    a3,
+                );
+            }
+        }
+        if apply_relu {
+            a0 = a0.max(zero_v);
+            a1 = a1.max(zero_v);
+            a2 = a2.max(zero_v);
+            a3 = a3.max(zero_v);
+        }
+        a0.store_slice(&mut out_row[f..f + 4]);
+        a1.store_slice(&mut out_row[f + 4..f + 8]);
+        a2.store_slice(&mut out_row[f + 8..f + 12]);
+        a3.store_slice(&mut out_row[f + 12..f + 16]);
+        f += 16;
+    }
+    while f + 4 <= frames {
+        let mut acc = b_v;
+        for k in 0..kernel {
+            let tap_off = k * dilation + f;
+            for ic in 0..in_c {
+                let x_off = ic * padded_frames + tap_off;
+                let w = f32x4::splat(simd, weight_row[ic * kernel + k]);
+                acc = w.mul_add(f32x4::from_slice(simd, &padded[x_off..x_off + 4]), acc);
+            }
+        }
+        if apply_relu {
+            acc = acc.max(zero_v);
+        }
+        acc.store_slice(&mut out_row[f..f + 4]);
+        f += 4;
+    }
+    while f < frames {
+        let mut acc = bias;
+        for k in 0..kernel {
+            let tap_off = k * dilation + f;
+            for ic in 0..in_c {
+                acc = weight_row[ic * kernel + k].mul_add(padded[ic * padded_frames + tap_off], acc);
+            }
+        }
+        out_row[f] = if apply_relu { acc.max(0.0_f32) } else { acc };
+        f += 1;
+    }
 }
 
 #[expect(
@@ -99,77 +360,6 @@ fn f32_dot_pair_simd<S: Simd>(simd: S, x: &[f32], y0: &[f32], y1: &[f32]) -> (f3
         s1 = xv.mul_add(v1, s1);
     }
     (s0, s1)
-}
-
-#[expect(
-    clippy::inline_always,
-    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
-)]
-#[inline(always)]
-fn axpy4_simd<S: Simd>(
-    simd: S,
-    w: [f32; 4],
-    x0: &[f32],
-    x1: &[f32],
-    x2: &[f32],
-    x3: &[f32],
-    dst: &mut [f32],
-) {
-    let w0 = f32x4::splat(simd, w[0]);
-    let w1 = f32x4::splat(simd, w[1]);
-    let w2 = f32x4::splat(simd, w[2]);
-    let w3 = f32x4::splat(simd, w[3]);
-    let (c0, t0) = x0.as_chunks::<4>();
-    let (c1, t1) = x1.as_chunks::<4>();
-    let (c2, t2) = x2.as_chunks::<4>();
-    let (c3, t3) = x3.as_chunks::<4>();
-    let (dc, dt) = dst.as_chunks_mut::<4>();
-    for ((((v0, v1), v2), v3), d) in c0
-        .iter()
-        .zip(c1.iter())
-        .zip(c2.iter())
-        .zip(c3.iter())
-        .zip(dc.iter_mut())
-    {
-        let mut acc = f32x4::from_slice(simd, d);
-        acc = w0.mul_add(f32x4::from_slice(simd, v0), acc);
-        acc = w1.mul_add(f32x4::from_slice(simd, v1), acc);
-        acc = w2.mul_add(f32x4::from_slice(simd, v2), acc);
-        acc = w3.mul_add(f32x4::from_slice(simd, v3), acc);
-        acc.store_slice(d);
-    }
-    for ((((&s0, &s1), &s2), &s3), d) in t0
-        .iter()
-        .zip(t1.iter())
-        .zip(t2.iter())
-        .zip(t3.iter())
-        .zip(dt.iter_mut())
-    {
-        let mut acc = *d;
-        acc = w[0].mul_add(s0, acc);
-        acc = w[1].mul_add(s1, acc);
-        acc = w[2].mul_add(s2, acc);
-        acc = w[3].mul_add(s3, acc);
-        *d = acc;
-    }
-}
-
-#[expect(
-    clippy::inline_always,
-    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
-)]
-#[inline(always)]
-fn relu_in_place_simd<S: Simd>(simd: S, dst: &mut [f32]) {
-    let zero_v = f32x4::splat(simd, 0.0_f32);
-    let (chunks, tail) = dst.as_chunks_mut::<4>();
-    for c in chunks {
-        f32x4::from_slice(simd, c).max(zero_v).store_slice(c);
-    }
-    for val in tail {
-        if *val < 0.0_f32 {
-            *val = 0.0_f32;
-        }
-    }
 }
 
 /// Expected input sample rate for the Qwen3-TTS speaker encoder (`24_000` Hz).
@@ -704,44 +894,54 @@ impl TdnnConv1d {
             threads.clamp(1, 18)
         };
         let level = Level::new();
-        row_workers::run_aligned(&mut out, workers, frames, &|offset, slice| {
+        let align = if self.out_c >= 4 { 4 * frames } else { frames };
+        let w_stride = self.in_c * self.kernel;
+        row_workers::run_aligned(&mut out, workers, align, &|offset, slice| {
             let first_oc = offset / frames;
+            let oc_count = slice.len() / frames;
+            let oc_quads = oc_count / 4;
             dispatch!(level, simd => {
-                for (local_oc, out_row) in slice.chunks_exact_mut(frames).enumerate() {
+                for q_oc in 0..oc_quads {
+                    let oc = first_oc + q_oc * 4;
+                    let w_quad = &self.weight[oc * w_stride..(oc + 4) * w_stride];
+                    let bias = [
+                        self.bias[oc],
+                        self.bias[oc + 1],
+                        self.bias[oc + 2],
+                        self.bias[oc + 3],
+                    ];
+                    let out_quad = &mut slice[q_oc * 4 * frames..(q_oc + 1) * 4 * frames];
+                    tdnn_4oc_row_simd(
+                        simd,
+                        padded,
+                        padded_frames,
+                        w_quad,
+                        bias,
+                        self.in_c,
+                        self.kernel,
+                        self.dilation,
+                        frames,
+                        apply_relu,
+                        out_quad,
+                    );
+                }
+                for local_oc in (oc_quads * 4)..oc_count {
                     let oc = first_oc + local_oc;
-                    out_row.fill(self.bias[oc]);
-                    for k in 0..self.kernel {
-                        let offset = k * self.dilation;
-                        let mut ic = 0;
-                        while ic + 4 <= self.in_c {
-                            let w = [
-                                self.weight[(oc * self.in_c + ic) * self.kernel + k],
-                                self.weight[(oc * self.in_c + ic + 1) * self.kernel + k],
-                                self.weight[(oc * self.in_c + ic + 2) * self.kernel + k],
-                                self.weight[(oc * self.in_c + ic + 3) * self.kernel + k],
-                            ];
-                            let r0 = &padded
-                                [ic * padded_frames + offset..ic * padded_frames + offset + frames];
-                            let r1 = &padded[(ic + 1) * padded_frames + offset
-                                ..(ic + 1) * padded_frames + offset + frames];
-                            let r2 = &padded[(ic + 2) * padded_frames + offset
-                                ..(ic + 2) * padded_frames + offset + frames];
-                            let r3 = &padded[(ic + 3) * padded_frames + offset
-                                ..(ic + 3) * padded_frames + offset + frames];
-                            axpy4_simd(simd, w, r0, r1, r2, r3, out_row);
-                            ic += 4;
-                        }
-                        while ic < self.in_c {
-                            let in_row =
-                                &padded[ic * padded_frames + offset..ic * padded_frames + offset + frames];
-                            let w = self.weight[(oc * self.in_c + ic) * self.kernel + k];
-                            axpy_simd(simd, w, in_row, out_row);
-                            ic += 1;
-                        }
-                    }
-                    if apply_relu {
-                        relu_in_place_simd(simd, out_row);
-                    }
+                    let w_row = &self.weight[oc * w_stride..(oc + 1) * w_stride];
+                    let out_row = &mut slice[local_oc * frames..(local_oc + 1) * frames];
+                    tdnn_1oc_row_simd(
+                        simd,
+                        padded,
+                        padded_frames,
+                        w_row,
+                        self.bias[oc],
+                        self.in_c,
+                        self.kernel,
+                        self.dilation,
+                        frames,
+                        apply_relu,
+                        out_row,
+                    );
                 }
             });
         });

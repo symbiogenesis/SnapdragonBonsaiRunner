@@ -2359,22 +2359,20 @@ impl Encoder {
         for stage in &self.stages {
             cancel()?;
             let residual = hidden.clone();
-            elu(&mut hidden);
+            elu_in_place_parallel(&mut hidden, self.threads);
             (hidden, _) = stage
                 .first
                 .forward_parallel(&hidden, frames, self.threads)?;
-            elu(&mut hidden);
+            elu_in_place_parallel(&mut hidden, self.threads);
             (hidden, _) = stage
                 .second
                 .forward_parallel(&hidden, frames, self.threads)?;
-            for (value, residual) in hidden.iter_mut().zip(residual) {
-                *value += residual;
-            }
-            elu(&mut hidden);
+            add_in_place_parallel(&mut hidden, &residual, self.threads);
+            elu_in_place_parallel(&mut hidden, self.threads);
             (hidden, frames) = stage.down.forward_parallel(&hidden, frames, self.threads)?;
         }
         cancel()?;
-        elu(&mut hidden);
+        elu_in_place_parallel(&mut hidden, self.threads);
         (hidden, frames) = self.last.forward_parallel(&hidden, frames, self.threads)?;
         let mut state = TransformerState::default();
         let mut scratch = CodecTransformerScratch::default();
@@ -2401,11 +2399,75 @@ impl Encoder {
     }
 }
 
-fn elu(values: &mut [f32]) {
-    for value in values {
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn elu_slice_simd<S: Simd>(simd: S, values: &mut [f32]) {
+    let zero = f32x4::splat(simd, 0.0_f32);
+    let one = f32x4::splat(simd, 1.0_f32);
+    let poly_limit = f32x4::splat(simd, -0.125_f32);
+    let c2 = f32x4::splat(simd, 0.5_f32);
+    let c3 = f32x4::splat(simd, 1.0_f32 / 6.0_f32);
+    let c4 = f32x4::splat(simd, 1.0_f32 / 24.0_f32);
+    let c5 = f32x4::splat(simd, 1.0_f32 / 120.0_f32);
+
+    let (chunks, tail) = values.as_chunks_mut::<4>();
+    for chunk in chunks {
+        let x = f32x4::from_slice(simd, chunk);
+        let small = x.simd_gt(poly_limit);
+        let p = c5.mul_add(x, c4);
+        let p = p.mul_add(x, c3);
+        let p = p.mul_add(x, c2);
+        let poly_val = p.mul_add(x * x, x);
+        let exp_val = crate::engine::exp_f32x4(simd, x) - one;
+        let neg_val = small.select(poly_val, exp_val);
+        x.simd_lt(zero).select(neg_val, x).store_slice(chunk);
+    }
+    for value in tail {
         if *value < 0.0 {
             *value = value.exp_m1();
         }
+    }
+}
+
+fn elu_in_place_parallel(values: &mut [f32], threads: usize) {
+    let level = Level::new();
+    if threads > 1 && values.len() >= 4096 {
+        crate::engine::row_workers::run_aligned(values, threads, 4, &|_, chunk| {
+            dispatch!(level, simd => elu_slice_simd(simd, chunk));
+        });
+    } else {
+        dispatch!(level, simd => elu_slice_simd(simd, values));
+    }
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn add_slice_in_place_simd<S: Simd>(simd: S, dst: &mut [f32], rhs: &[f32]) {
+    let (dst_chunks, dst_tail) = dst.as_chunks_mut::<4>();
+    let (rhs_chunks, rhs_tail) = rhs.as_chunks::<4>();
+    for (dc, rc) in dst_chunks.iter_mut().zip(rhs_chunks.iter()) {
+        (f32x4::from_slice(simd, dc) + f32x4::from_slice(simd, rc)).store_slice(dc);
+    }
+    for (d, &r) in dst_tail.iter_mut().zip(rhs_tail.iter()) {
+        *d += r;
+    }
+}
+
+fn add_in_place_parallel(values: &mut [f32], rhs: &[f32], threads: usize) {
+    let level = Level::new();
+    if threads > 1 && values.len() >= 4096 {
+        crate::engine::row_workers::run_aligned(values, threads, 4, &|offset, chunk| {
+            let rhs_slice = &rhs[offset..offset + chunk.len()];
+            dispatch!(level, simd => add_slice_in_place_simd(simd, chunk, rhs_slice));
+        });
+    } else {
+        dispatch!(level, simd => add_slice_in_place_simd(simd, values, rhs));
     }
 }
 
@@ -2556,55 +2618,149 @@ fn load_upsample_stage<S: CodecSource + ?Sized>(
     })
 }
 
-fn load_dac_block<S: CodecSource + ?Sized>(
+fn load_dac_res_unit<S: CodecSource + ?Sized>(
     weights: &S,
-    index: usize,
-    stride: usize,
-    channels: usize,
-) -> io::Result<DacBlock> {
-    let next = channels / 2;
-    let name = format!("tok_dec.dec.{}", index + 1);
-    let mut units = Vec::with_capacity(3);
-    for (unit, dilation) in [1, 3, 9].into_iter().enumerate() {
-        let unit_name = format!("{name}.res.{unit}");
-        units.push(DacResUnit {
-            act1: snake(weights, &format!("{unit_name}.act1"), next)?,
-            conv1: conv(
+    block_index: usize,
+    next: usize,
+    unit: usize,
+    dilation: usize,
+) -> io::Result<DacResUnit> {
+    let unit_name = format!("tok_dec.dec.{}.res.{unit}", block_index + 1);
+    Ok(DacResUnit {
+        act1: snake(weights, &format!("{unit_name}.act1"), next)?,
+        conv1: conv(
+            weights,
+            &format!("{unit_name}.conv1"),
+            next,
+            next,
+            7,
+            dilation,
+            1,
+            true,
+            PadMode::Constant,
+        )?,
+        act2: snake(weights, &format!("{unit_name}.act2"), next)?,
+        conv2: conv(
+            weights,
+            &format!("{unit_name}.conv2"),
+            next,
+            next,
+            1,
+            1,
+            1,
+            true,
+            PadMode::Constant,
+        )?,
+    })
+}
+
+fn load_dac_decoder<S: CodecSource + ?Sized>(
+    weights: &S,
+    latent: usize,
+    threads: usize,
+) -> io::Result<DacDecoder> {
+    const STRIDES: [(usize, usize, usize); 4] =
+        [(0, 8, 1536), (1, 5, 768), (2, 4, 384), (3, 3, 192)];
+    const DILATIONS: [usize; 3] = [1, 3, 9];
+    enum DacLoadItem {
+        ConvPre(CausalConv1d),
+        BlockHead(usize, SnakeBeta, CausalTransConv1d),
+        ResUnit(usize, usize, DacResUnit),
+        Post(SnakeBeta, CausalConv1d),
+    }
+
+    // 1 conv_pre + 4 * (1 block head + 3 res_units) + 1 post = 18 fine-grained tasks.
+    let items = parallel_build(18, threads, |task| {
+        if task == 0 {
+            Ok(DacLoadItem::ConvPre(conv(
                 weights,
-                &format!("{unit_name}.conv1"),
-                next,
-                next,
+                "tok_dec.dec.0.conv",
+                latent,
+                1536,
                 7,
-                dilation,
-                1,
-                true,
-                PadMode::Constant,
-            )?,
-            act2: snake(weights, &format!("{unit_name}.act2"), next)?,
-            conv2: conv(
-                weights,
-                &format!("{unit_name}.conv2"),
-                next,
-                next,
-                1,
                 1,
                 1,
                 true,
                 PadMode::Constant,
-            )?,
+            )?))
+        } else if task == 17 {
+            Ok(DacLoadItem::Post(
+                snake(weights, "tok_dec.dec.5.snake", 96)?,
+                conv(
+                    weights,
+                    "tok_dec.dec.6.conv",
+                    96,
+                    1,
+                    7,
+                    1,
+                    1,
+                    true,
+                    PadMode::Constant,
+                )?,
+            ))
+        } else {
+            let block_slot = (task - 1) / 4;
+            let sub = (task - 1) % 4;
+            let (idx, stride, channels) = STRIDES[block_slot];
+            let next = channels / 2;
+            if sub == 0 {
+                let name = format!("tok_dec.dec.{}", idx + 1);
+                Ok(DacLoadItem::BlockHead(
+                    block_slot,
+                    snake(weights, &format!("{name}.snake"), channels)?,
+                    trans_conv(
+                        weights,
+                        &format!("{name}.conv_t"),
+                        channels,
+                        next,
+                        stride * 2,
+                        stride,
+                    )?,
+                ))
+            } else {
+                let unit = sub - 1;
+                Ok(DacLoadItem::ResUnit(
+                    block_slot,
+                    unit,
+                    load_dac_res_unit(weights, idx, next, unit, DILATIONS[unit])?,
+                ))
+            }
+        }
+    })?;
+
+    let mut conv_pre = None;
+    let mut block_heads: [Option<(SnakeBeta, CausalTransConv1d)>; 4] = [None, None, None, None];
+    let mut block_units: [[Option<DacResUnit>; 3]; 4] =
+        [[None, None, None], [None, None, None], [None, None, None], [None, None, None]];
+    let mut post = None;
+    for item in items {
+        match item {
+            DacLoadItem::ConvPre(c) => conv_pre = Some(c),
+            DacLoadItem::BlockHead(b, s, tc) => block_heads[b] = Some((s, tc)),
+            DacLoadItem::ResUnit(b, u, ru) => block_units[b][u] = Some(ru),
+            DacLoadItem::Post(s, c) => post = Some((s, c)),
+        }
+    }
+    let conv_pre = conv_pre.ok_or_else(invalid)?;
+    let (snake_post, conv_post) = post.ok_or_else(invalid)?;
+    let mut blocks = Vec::with_capacity(4);
+    for (head_opt, [u0, u1, u2]) in block_heads.into_iter().zip(block_units) {
+        let (snake1, trans_conv) = head_opt.ok_or_else(invalid)?;
+        blocks.push(DacBlock {
+            snake1,
+            trans_conv,
+            res_units: [
+                u0.ok_or_else(invalid)?,
+                u1.ok_or_else(invalid)?,
+                u2.ok_or_else(invalid)?,
+            ],
         });
     }
-    Ok(DacBlock {
-        snake1: snake(weights, &format!("{name}.snake"), channels)?,
-        trans_conv: trans_conv(
-            weights,
-            &format!("{name}.conv_t"),
-            channels,
-            next,
-            stride * 2,
-            stride,
-        )?,
-        res_units: units.try_into().map_err(|_| invalid())?,
+    Ok(DacDecoder {
+        conv_pre,
+        blocks,
+        snake_post,
+        conv_post,
     })
 }
 
@@ -2675,44 +2831,7 @@ impl Codec {
                 load_upsample_stage(weights, latent, index)
             })
         };
-        let load_dac = || {
-            let strides = [
-                (0_usize, 8_usize, 1536_usize),
-                (1, 5, 768),
-                (2, 4, 384),
-                (3, 3, 192),
-            ];
-            let blocks = parallel_build(4, step_threads, |i| {
-                let (idx, stride, ch) = strides[i];
-                load_dac_block(weights, idx, stride, ch)
-            })?;
-            Ok::<_, io::Error>(DacDecoder {
-                conv_pre: conv(
-                    weights,
-                    "tok_dec.dec.0.conv",
-                    latent,
-                    1536,
-                    7,
-                    1,
-                    1,
-                    true,
-                    PadMode::Constant,
-                )?,
-                blocks,
-                snake_post: snake(weights, "tok_dec.dec.5.snake", 96)?,
-                conv_post: conv(
-                    weights,
-                    "tok_dec.dec.6.conv",
-                    96,
-                    1,
-                    7,
-                    1,
-                    1,
-                    true,
-                    PadMode::Constant,
-                )?,
-            })
-        };
+        let load_dac = || load_dac_decoder(weights, latent, step_threads);
         let (quantizer, pre, transformer, upsample, dac) = if parallel {
             let (quantizer_res, pre_res, tfm_res, upsample_res, dac_res) =
                 std::thread::scope(|scope| {
@@ -4172,7 +4291,7 @@ mod tests {
             samples.push(v);
         }
         let expected_gelu: Vec<f32> = samples.iter().copied().map(gelu_erf).collect();
-        let mut actual_gelu = samples;
+        let mut actual_gelu = samples.clone();
         super::gelu_erf_in_place(&mut actual_gelu);
         for (idx, (&got, &want)) in actual_gelu.iter().zip(&expected_gelu).enumerate() {
             if want.is_nan() {
@@ -4184,6 +4303,60 @@ mod tests {
                     (got - want).abs() <= 5e-7,
                     "gelu idx={idx} got={got} want={want}"
                 );
+            }
+        }
+
+        // ELU SIMD vs scalar exp_m1 within <= 2 ULP across small polynomial and exp branches
+        let mut elu_samples = samples;
+        for &edge in &[
+            -100.0_f32,
+            -87.4,
+            -87.0,
+            -1.0,
+            -0.5,
+            -0.1251,
+            -0.125,
+            -0.1249,
+            -0.05,
+            -1e-4,
+            -1e-7,
+            1e-7,
+        ] {
+            elu_samples.push(edge);
+        }
+        let expected_elu: Vec<f32> = elu_samples
+            .iter()
+            .copied()
+            .map(|v| if v < 0.0 { v.exp_m1() } else { v })
+            .collect();
+        let mut actual_elu_1 = elu_samples.clone();
+        let mut actual_elu_4 = elu_samples.clone();
+        super::elu_in_place_parallel(&mut actual_elu_1, 1);
+        super::elu_in_place_parallel(&mut actual_elu_4, 4);
+        assert_eq!(
+            actual_elu_1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            actual_elu_4.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "elu parallel vs serial must match bit-exact"
+        );
+        for (idx, (&x, (&got, &want))) in elu_samples
+            .iter()
+            .zip(actual_elu_1.iter().zip(&expected_elu))
+            .enumerate()
+        {
+            if want.is_nan() {
+                assert!(got.is_nan(), "elu idx={idx} x={x} got={got}");
+            } else if want.is_infinite() || want == 0.0 {
+                assert_eq!(got.to_bits(), want.to_bits(), "elu idx={idx} x={x}");
+            } else {
+                let err = (got - want).abs();
+                assert!(err <= 2e-7, "elu idx={idx} x={x} got={got} want={want} err={err}");
+                if x > -0.125 || x <= -0.7 {
+                    let ulp = got.to_bits().abs_diff(want.to_bits());
+                    assert!(
+                        ulp <= 2,
+                        "elu idx={idx} x={x} got={got} want={want} ulp={ulp}"
+                    );
+                }
             }
         }
 

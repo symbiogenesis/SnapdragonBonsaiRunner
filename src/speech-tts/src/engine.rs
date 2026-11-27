@@ -3418,6 +3418,7 @@ pub(crate) fn narrow_f32_slice(src: &[f32], dst: &mut [u16]) -> bool {
 
 impl QwenDecoderLayer {
     /// Repack eligible `Q4_K` layer projections into the aligned ARM64 kernel layout.
+    #[cfg(test)]
     pub(crate) fn repack_q4_k_if_aligned(&mut self) {
         for proj in [
             &mut self.q_proj,
