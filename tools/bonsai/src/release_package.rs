@@ -259,7 +259,7 @@ fn package(
         )?;
         smoke(&bundle, &manifest, &evidence.join("executable-smoke"))?;
         let asset = json!({"name":bundle.file_name().and_then(|name|name.to_str()).ok_or("Missing bundle name.")?,"bytes":fs::metadata(&bundle).map_err(|error|error.to_string())?.len(),"sha256":crate::startup_cache::digest_file(&bundle)?});
-        let receipt = json!({"schemaVersion":1,"distribution":"portable-executable","version":version,"tag":tag,"sourceRevision":revision,"target":TARGET,"toolchain":"nightly-2026-11-12-aarch64-pc-windows-msvc","manifestSha256":manifest,"signed":false,"runUrl":format!("https://github.com/{}/actions/runs/{}",std::env::var("GITHUB_REPOSITORY").unwrap_or_default(),std::env::var("GITHUB_RUN_ID").unwrap_or_default()),"executableSmoke":"passed-inspect-extract-verify-without-model","builds":builds,"assets":[asset]});
+        let receipt = json!({"schemaVersion":1,"distribution":"portable-executable","version":version,"tag":tag,"sourceRevision":revision,"target":TARGET,"toolchain":"nightly-2026-11-26-aarch64-pc-windows-msvc","manifestSha256":manifest,"signed":false,"runUrl":format!("https://github.com/{}/actions/runs/{}",std::env::var("GITHUB_REPOSITORY").unwrap_or_default(),std::env::var("GITHUB_RUN_ID").unwrap_or_default()),"executableSmoke":"passed-inspect-extract-verify-without-model","builds":builds,"assets":[asset]});
         save(&output.join("release-manifest.json"), &receipt)?;
         let mut checksums = String::new();
         for name in [

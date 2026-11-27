@@ -106,7 +106,7 @@ fn package_identity(value: &Value, revision: &str, run: &str, attempt: &str) -> 
         || value["Revision"] != revision
         || value["RunId"] != run
         || value["RunAttempt"] != attempt
-        || value["Toolchain"] != "nightly-2026-11-12-aarch64-pc-windows-msvc"
+        || value["Toolchain"] != "nightly-2026-11-26-aarch64-pc-windows-msvc"
         || value["ModelExecuted"] != false
         || value["CompilerIdentity"]
             .as_str()
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn hosted_package_identity_rejects_changed_source_run_and_untyped_flags() -> crate::Result<()> {
-        let receipt = json!({"SchemaVersion":2,"Revision":"a".repeat(40),"RunId":"123","RunAttempt":"1","Toolchain":"nightly-2026-11-12-aarch64-pc-windows-msvc","ModelExecuted":false,"CompilerIdentity":"rustc fixed","ToolsSourceId":"b".repeat(64)});
+        let receipt = json!({"SchemaVersion":2,"Revision":"a".repeat(40),"RunId":"123","RunAttempt":"1","Toolchain":"nightly-2026-11-26-aarch64-pc-windows-msvc","ModelExecuted":false,"CompilerIdentity":"rustc fixed","ToolsSourceId":"b".repeat(64)});
         package_identity(&receipt, &"a".repeat(40), "123", "1")?;
         for (field, value) in [
             ("Revision", json!("c".repeat(40))),

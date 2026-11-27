@@ -431,7 +431,7 @@ mod tests {
         let arguments = policy::Arguments {
             source: PathBuf::from("source"),
             target: PathBuf::from("target"),
-            toolchain: "nightly-2026-11-12-aarch64-pc-windows-msvc".into(),
+            toolchain: "nightly-2026-11-26-aarch64-pc-windows-msvc".into(),
             elapsed: 0,
         };
         let first = policy::cargo_arguments(
@@ -475,7 +475,7 @@ mod tests {
             "--target-directory",
             root,
             "--toolchain",
-            "nightly-2026-11-12-aarch64-pc-windows-msvc",
+            "nightly-2026-11-26-aarch64-pc-windows-msvc",
             "--bootstrap-milliseconds",
             "17",
         ]
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(parsed.elapsed, 17);
         assert_eq!(
             parsed.toolchain,
-            "nightly-2026-11-12-aarch64-pc-windows-msvc"
+            "nightly-2026-11-26-aarch64-pc-windows-msvc"
         );
         for (index, poisoned) in [
             (0, "--target-directory"),
@@ -506,17 +506,17 @@ mod tests {
 
     #[test]
     fn recovery_requires_the_committed_compiler_pin() {
-        let compiler = "nightly-2026-11-12-aarch64-pc-windows-msvc";
+        let compiler = "nightly-2026-11-26-aarch64-pc-windows-msvc";
         assert!(policy::toolchain(compiler));
         assert!(policy::matching_pin(
-            "[toolchain]\nchannel = \"nightly-2026-11-12\" # pin\nprofile = \"minimal\"",
+            "[toolchain]\nchannel = \"nightly-2026-11-26\" # pin\nprofile = \"minimal\"",
             compiler
         ));
         for document in [
-            "channel = \"nightly-2026-11-12\"",
+            "channel = \"nightly-2026-11-26\"",
             "[toolchain]\nchannel = \"nightly-2026-11-09\"",
-            "[toolchain]\nchannel = \"nightly-2026-11-12\"\nchannel = \"nightly-2026-11-12\"",
-            "[toolchain]\nchannel = \"nightly-2026-11-12\"\n[other]\nchannel = \"nightly-2026-11-09\"",
+            "[toolchain]\nchannel = \"nightly-2026-11-26\"\nchannel = \"nightly-2026-11-26\"",
+            "[toolchain]\nchannel = \"nightly-2026-11-26\"\n[other]\nchannel = \"nightly-2026-11-09\"",
         ] {
             if document.contains("[other]") {
                 assert!(policy::matching_pin(document, compiler));

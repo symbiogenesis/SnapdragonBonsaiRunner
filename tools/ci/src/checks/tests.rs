@@ -1,6 +1,6 @@
 use super::*;
 
-const PINNED_TOOLCHAIN: &str = "nightly-2026-11-12-aarch64-pc-windows-msvc";
+const PINNED_TOOLCHAIN: &str = "nightly-2026-11-26-aarch64-pc-windows-msvc";
 
 fn fixture(name: &str, restricted: bool) -> Package {
     Package {
@@ -194,9 +194,9 @@ fn production_batches_preserve_explicit_package_coverage_and_release_policy() ->
 fn static_runtime_compile_plans_reject_nonmatching_compiler_hosts() {
     let package = fixture("application", false);
     for toolchain in [
-        "nightly-2026-11-12-x86_64-pc-windows-msvc",
-        "nightly-2026-11-12-aarch64-unknown-linux-gnu",
-        "nightly-2026-11-12",
+        "nightly-2026-11-26-x86_64-pc-windows-msvc",
+        "nightly-2026-11-26-aarch64-unknown-linux-gnu",
+        "nightly-2026-11-26",
     ] {
         for phase in ["clippy", "doc", "test", "build"] {
             assert_eq!(

@@ -216,7 +216,7 @@ fn package(request: &Value) -> crate::Result<Value> {
         let (bytes, hash) = digest(&root.join(name))?;
         files.push(json!({"Name":name,"Bytes":bytes,"Sha256":hash}));
     }
-    let mut receipt = json!({"SchemaVersion":2,"Revision":std::env::var("GITHUB_SHA").unwrap_or_default(),"RunId":std::env::var("GITHUB_RUN_ID").unwrap_or_default(),"RunAttempt":std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_default(),"Toolchain":"nightly-2026-11-12-aarch64-pc-windows-msvc","CompilerIdentity":text(request,"compilerIdentity")?,"ToolsSourceId":text(request,"toolsSourceId")?,"Files":files,"ModelExecuted":false});
+    let mut receipt = json!({"SchemaVersion":2,"Revision":std::env::var("GITHUB_SHA").unwrap_or_default(),"RunId":std::env::var("GITHUB_RUN_ID").unwrap_or_default(),"RunAttempt":std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_default(),"Toolchain":"nightly-2026-11-26-aarch64-pc-windows-msvc","CompilerIdentity":text(request,"compilerIdentity")?,"ToolsSourceId":text(request,"toolsSourceId")?,"Files":files,"ModelExecuted":false});
     super::package_identity(
         &receipt,
         text(&receipt, "Revision")?,

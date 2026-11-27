@@ -12,7 +12,7 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $filter = if ($Test) { 'cpu_evaluation::bundle::tests::' + $Test } else { 'cpu_evaluation::bundle::tests::' }
-$arguments = @('+nightly-2026-11-12', 'test', '--locked', '--manifest-path', (Join-Path $root 'Cargo.toml'), '-p', 'bonsai-tools', '--lib', $filter, '--', '--nocapture')
+$arguments = @('+nightly-2026-11-26', 'test', '--locked', '--manifest-path', (Join-Path $root 'Cargo.toml'), '-p', 'bonsai-tools', '--lib', $filter, '--', '--nocapture')
 if ($Test) { $arguments += '--exact' }
 if ($env:BONSAI_TOOLS_TARGET) { $arguments = $arguments[0..1] + @('--target-dir', $env:BONSAI_TOOLS_TARGET) + $arguments[2..($arguments.Count - 1)] }
 & cargo @arguments

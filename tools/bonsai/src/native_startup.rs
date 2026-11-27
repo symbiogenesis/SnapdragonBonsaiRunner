@@ -896,7 +896,7 @@ mod tests {
         assert!(crate::identity::is_lower_hex(key, 64));
         let data = Path::new("C:/data");
         let repo = Path::new("C:/source");
-        let channel = "nightly-2026-11-12-aarch64-pc-windows-msvc";
+        let channel = "nightly-2026-11-26-aarch64-pc-windows-msvc";
         let architecture = "armv8-a+dotprod+i8mm";
         let directory = host_cache_directory(data, repo, channel, key, architecture);
         let target = Path::new("C:/restored cargo cache");

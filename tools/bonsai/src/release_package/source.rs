@@ -342,7 +342,7 @@ mod tests {
                 .and_then(|()| {
                     fs::write(
                         root.join("rust-toolchain.toml"),
-                        "[toolchain]\nchannel = \"nightly-2026-11-12\"\n",
+                        "[toolchain]\nchannel = \"nightly-2026-11-26\"\n",
                     )
                 })
                 .map_err(|error| error.to_string())?;

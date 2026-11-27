@@ -34,7 +34,7 @@ function Test-CiCache([string]$Package, [string]$Source, [string]$HostIdentity) 
     if ($Source -cnotmatch '^[a-f0-9]{64}$') { throw 'An exact SHA-256 source identity is required.' }
     if (-not $HostIdentity -or $HostIdentity.Trim() -cne $HostIdentity -or $HostIdentity.IndexOfAny([char[]]"`r`n`0") -ge 0) { throw 'An exact hosted image/OS identity is required.' }
     $receipt=Read-CiCacheReceipt (Join-Path $Package 'receipt.json')
-    if ($receipt.sourceId -cne $Source -or $receipt.hostId -cne $HostIdentity -or $receipt.toolchain -cne 'nightly-2026-11-12-aarch64-pc-windows-msvc') { throw 'The CI bootstrap receipt has different build inputs.' }
+    if ($receipt.sourceId -cne $Source -or $receipt.hostId -cne $HostIdentity -or $receipt.toolchain -cne 'nightly-2026-11-26-aarch64-pc-windows-msvc') { throw 'The CI bootstrap receipt has different build inputs.' }
     if ($receipt.compiler -isnot [string] -or 'host: aarch64-pc-windows-msvc' -cnotin ($receipt.compiler -split '\r?\n')) { throw 'The CI bootstrap compiler identity has a different native host.' }
     if ($receipt.sha256 -isnot [string] -or $receipt.sha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'The CI bootstrap receipt has an invalid executable digest.' }
     $executable=Join-Path $Package 'bonsai-ci.exe'
@@ -43,7 +43,7 @@ function Test-CiCache([string]$Package, [string]$Source, [string]$HostIdentity) 
 }
 function New-CiCacheReceipt([string]$Package, [string]$Source, [string]$HostIdentity, [string]$CompilerIdentity) {
     if ($Source -cnotmatch '^[a-f0-9]{64}$' -or -not $HostIdentity -or $HostIdentity.Trim() -cne $HostIdentity -or $HostIdentity.IndexOfAny([char[]]"`r`n`0") -ge 0) { throw 'Exact source and hosted image identities are required.' }
-    $receipt=@{schemaVersion=1; sourceId=$Source; hostId=$HostIdentity; toolchain='nightly-2026-11-12-aarch64-pc-windows-msvc'; compiler=$CompilerIdentity; sha256=(Get-CiExecutableDigest (Join-Path $Package 'bonsai-ci.exe'))}
+    $receipt=@{schemaVersion=1; sourceId=$Source; hostId=$HostIdentity; toolchain='nightly-2026-11-26-aarch64-pc-windows-msvc'; compiler=$CompilerIdentity; sha256=(Get-CiExecutableDigest (Join-Path $Package 'bonsai-ci.exe'))}
     [IO.File]::WriteAllText((Join-Path $Package 'receipt.json'),($receipt | ConvertTo-Json)+"`n")
     return Test-CiCache $Package $Source $HostIdentity
 }

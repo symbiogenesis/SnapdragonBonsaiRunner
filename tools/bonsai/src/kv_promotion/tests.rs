@@ -9,7 +9,7 @@ fn fixture() -> crate::Result<(Value, Value)> {
     let ids = json!({"runnerRevision": "a".repeat(40), "prismRevision": "b".repeat(40),
         "runtimeSha256": "c".repeat(64), "modelSha256": "d".repeat(64),
         "adapterSha256": "e".repeat(64), "templateSha256": "f".repeat(64),
-        "compilerIdentity": "nightly-2026-11-12 aarch64-pc-windows-msvc",
+        "compilerIdentity": "nightly-2026-11-26 aarch64-pc-windows-msvc",
         "deviceIdentity": "owner-device-1", "processorName": "Snapdragon X2 Elite Extreme",
         "driverIdentity": "reviewed-driver-1", "codecIdentity": "1".repeat(64),
         "samplerSha256": "2".repeat(64), "adapterScale": 1.3, "seed": 42,

@@ -327,7 +327,7 @@ mod tests {
             root: std::env::temp_dir().join("source"),
             target_directory: std::env::temp_dir().join("compiler"),
             package: "bonsai-tools".into(),
-            toolchain: "nightly-2026-11-12-aarch64-pc-windows-msvc".into(),
+            toolchain: "nightly-2026-11-26-aarch64-pc-windows-msvc".into(),
             target_kind: "lib".into(),
             target_name: String::new(),
             selections: vec![
@@ -351,7 +351,7 @@ mod tests {
         assert_eq!(
             &plan[0].arguments[..4],
             [
-                "+nightly-2026-11-12-aarch64-pc-windows-msvc",
+                "+nightly-2026-11-26-aarch64-pc-windows-msvc",
                 "test",
                 "--locked",
                 "--release"

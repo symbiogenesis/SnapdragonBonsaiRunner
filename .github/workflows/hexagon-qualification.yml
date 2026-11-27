@@ -68,7 +68,7 @@ jobs:
       - uses: $/.github/actions/rust-toolchain
         id: rust
         with:
-          toolchain: nightly-2026-11-12-aarch64-pc-windows-msvc
+          toolchain: nightly-2026-11-26-aarch64-pc-windows-msvc
           components: ''
       - name: Cache Cargo registry and public ABI supervisor outputs
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -91,7 +91,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           # Build this lane's own native supervisor; the ABI control stays independent.
           $target = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-Public-ABI-Tools'
-          cargo +nightly-2026-11-12-aarch64-pc-windows-msvc build --locked --release --manifest-path (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') --package bonsai-tools --bin bonsai-tools --target-dir $target
+          cargo +nightly-2026-11-26-aarch64-pc-windows-msvc build --locked --release --manifest-path (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') --package bonsai-tools --bin bonsai-tools --target-dir $target
           $env:BONSAI_TOOLS_PATH = Join-Path $target 'release/bonsai-tools.exe'
           & (Join-Path $env:GITHUB_WORKSPACE 'tools/hexagon/windows_queue_abi.ps1') -Output (Join-Path $env:RUNNER_TEMP 'SwiftBonsai-Hexagon-Windows-ABI') -Rustc (Join-Path '${{ steps.rust.outputs.toolchain-path }}' 'bin/rustc.exe')
       - name: Retain independent compiler, source, ABI, wire and losing-control evidence
@@ -118,7 +118,7 @@ jobs:
       - uses: $/.github/actions/rust-toolchain
         id: rust
         with:
-          toolchain: nightly-2026-11-12-aarch64-pc-windows-msvc
+          toolchain: nightly-2026-11-26-aarch64-pc-windows-msvc
       - uses: $/.github/actions/bonsai-tools
       - name: Identify the policy-test Cargo cache separately from executable reuse
         id: target-cache
@@ -147,7 +147,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo +nightly-2026-11-12-aarch64-pc-windows-msvc test --locked --release --manifest-path (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') --package bonsai-tools --all-features --target-dir $env:BONSAI_TOOLS_TARGET --lib hexagon_
+          cargo +nightly-2026-11-26-aarch64-pc-windows-msvc test --locked --release --manifest-path (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') --package bonsai-tools --all-features --target-dir $env:BONSAI_TOOLS_TARGET --lib hexagon_
       - name: Stage the current source-bound policy executable
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -206,7 +206,7 @@ jobs:
           & tools/hexagon/verify_resident_traffic.ps1
       - uses: $/.github/actions/rust-toolchain
         with:
-          toolchain: nightly-2026-11-12-aarch64-pc-windows-msvc
+          toolchain: nightly-2026-11-26-aarch64-pc-windows-msvc
       - name: Check bounded SDK archive decoding and metadata review without SDK execution
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -214,7 +214,7 @@ jobs:
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo +nightly-2026-11-12-aarch64-pc-windows-msvc test --locked --release --manifest-path (Join-Path $env:GITHUB_WORKSPACE 'tools/hexagon/sdk-reader/Cargo.toml') --target-dir (Join-Path $env:RUNNER_TEMP 'Bonsai-Sdk-Reader-Checks')
+          cargo +nightly-2026-11-26-aarch64-pc-windows-msvc test --locked --release --manifest-path (Join-Path $env:GITHUB_WORKSPACE 'tools/hexagon/sdk-reader/Cargo.toml') --target-dir (Join-Path $env:RUNNER_TEMP 'Bonsai-Sdk-Reader-Checks')
           & (Join-Path $env:GITHUB_WORKSPACE 'tools/hexagon/test_sdk_functional_review.ps1')
   ranking-controls:
     runs-on: windows-11-arm
@@ -226,7 +226,7 @@ jobs:
       - uses: $/.github/actions/rust-toolchain
         id: rust
         with:
-          toolchain: nightly-2026-11-12-aarch64-pc-windows-msvc
+          toolchain: nightly-2026-11-26-aarch64-pc-windows-msvc
       - name: Reuse compiler and image isolated ranking build outputs
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -246,9 +246,9 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $manifest = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
           $target = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-Hexagon-Control-Target'
-          cargo +nightly-2026-11-12-aarch64-pc-windows-msvc test --manifest-path $manifest --target-dir $target --locked --release -p bonsai-cpu-policy hardware::ranking::tests
-          cargo +nightly-2026-11-12-aarch64-pc-windows-msvc clippy --manifest-path $manifest --target-dir $target --locked --release -p bonsai-cpu-policy --all-targets -- -D warnings
-          cargo +nightly-2026-11-12-aarch64-pc-windows-msvc fmt --manifest-path $manifest -p bonsai-cpu-policy -- --check
+          cargo +nightly-2026-11-26-aarch64-pc-windows-msvc test --manifest-path $manifest --target-dir $target --locked --release -p bonsai-cpu-policy hardware::ranking::tests
+          cargo +nightly-2026-11-26-aarch64-pc-windows-msvc clippy --manifest-path $manifest --target-dir $target --locked --release -p bonsai-cpu-policy --all-targets -- -D warnings
+          cargo +nightly-2026-11-26-aarch64-pc-windows-msvc fmt --manifest-path $manifest -p bonsai-cpu-policy -- --check
   controls:
     # Preserve all earlier control prerequisites before any owner-device intake.
     needs: [checked-policy, layout-controls, ranking-controls]
@@ -261,7 +261,7 @@ jobs:
       - uses: $/.github/actions/rust-toolchain
         id: rust
         with:
-          toolchain: nightly-2026-11-12-aarch64-pc-windows-msvc
+          toolchain: nightly-2026-11-26-aarch64-pc-windows-msvc
           components: ''
       - uses: $/.github/actions/use-bonsai-tools
       - name: Select reusable Cargo storage outside fresh hosted evidence
@@ -335,7 +335,7 @@ jobs:
       - uses: $/.github/actions/rust-toolchain
         id: rust
         with:
-          toolchain: nightly-2026-11-12-aarch64-pc-windows-msvc
+          toolchain: nightly-2026-11-26-aarch64-pc-windows-msvc
           components: ''
       - uses: $/.github/actions/use-bonsai-tools
       - name: Check out the exact Rust GGUF reader for the narrow artifact binder

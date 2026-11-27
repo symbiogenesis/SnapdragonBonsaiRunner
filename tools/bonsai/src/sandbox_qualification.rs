@@ -45,7 +45,7 @@ const CASES: &[(&str, &str)] = &[
         "contained_verification_retains_exact_artifact_and_credential",
     ),
 ];
-const TOOLCHAIN: &str = "nightly-2026-11-12-aarch64-pc-windows-msvc";
+const TOOLCHAIN: &str = "nightly-2026-11-26-aarch64-pc-windows-msvc";
 // Fixed controls contain different numbers of ten-second native waits. Keep
 // their conservative remaining estimates attached to the original case order.
 const CASE_SECONDS: &[u64] = &[45, 25, 15, 15, 50, 30];

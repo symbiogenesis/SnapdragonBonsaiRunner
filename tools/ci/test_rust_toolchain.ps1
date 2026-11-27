@@ -7,7 +7,7 @@ function New-ToolchainPhase([string]$Name,[hashtable]$Environment=@{}) { return 
 function Invoke-ToolchainFixture([object[]]$Phases) {
     $scratch=New-CiScratch 'bonsai-toolchain-control-'; $original=@{}; foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) { $original[$entry.Key]=$entry.Value }
     try {
-        $initial=@{ PINNED_TOOLCHAIN='nightly-2026-11-12-aarch64-pc-windows-msvc'; REQUIRED_COMPONENTS='rustfmt,clippy'; EXPECTED_HOST=''; RUNNER_ENVIRONMENT='github-hosted'; ImageOS='fixture-os'; ImageVersion='fixture-image'; GITHUB_OUTPUT=(Join-Path $scratch 'output'); GITHUB_ENV=(Join-Path $scratch 'environment'); FIXTURE_HOME=(Join-Path $scratch 'rustup'); FIXTURE_HOST='aarch64-pc-windows-msvc'; FIXTURE_COMPONENTS='clippy,rustfmt'; FIXTURE_SYSROOT='' }
+        $initial=@{ PINNED_TOOLCHAIN='nightly-2026-11-26-aarch64-pc-windows-msvc'; REQUIRED_COMPONENTS='rustfmt,clippy'; EXPECTED_HOST=''; RUNNER_ENVIRONMENT='github-hosted'; ImageOS='fixture-os'; ImageVersion='fixture-image'; GITHUB_OUTPUT=(Join-Path $scratch 'output'); GITHUB_ENV=(Join-Path $scratch 'environment'); FIXTURE_HOME=(Join-Path $scratch 'rustup'); FIXTURE_HOST='aarch64-pc-windows-msvc'; FIXTURE_COMPONENTS='clippy,rustfmt'; FIXTURE_SYSROOT='' }
         foreach ($key in $initial.Keys) { [Environment]::SetEnvironmentVariable($key,$initial[$key]) }; Remove-Item Env:BONSAI_RUST_TOOLCHAIN_VERIFIED_KEY -ErrorAction SilentlyContinue
         function rustup {
             if ($args[0] -ceq 'show' -and $args[1] -ceq 'home') { return $env:FIXTURE_HOME }

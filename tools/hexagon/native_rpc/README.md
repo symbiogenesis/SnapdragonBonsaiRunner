@@ -300,6 +300,6 @@ The binding vendors no vendor/ggml implementation. Build and full regressions
 belong to hosted CI; owner diagnostics consume prebuilt source-bound helpers.
 
 ```powershell
-rustup run nightly-2026-11-12-aarch64-pc-windows-msvc rustc --edition=2024 --crate-type=lib --crate-name=hexagon_native_rpc -D warnings -O tools/hexagon/native_rpc/lib.rs --out-dir ABSOLUTE_EXTERNAL_BUILD
-rustup run nightly-2026-11-12-aarch64-pc-windows-msvc rustc --edition=2024 -D warnings -O tools/hexagon/native_rpc/query.rs --extern hexagon_native_rpc=ABSOLUTE_EXTERNAL_BUILD/libhexagon_native_rpc.rlib -o ABSOLUTE_EXTERNAL_BUILD/hexagon-native-query.exe
+rustup run nightly-2026-11-26-aarch64-pc-windows-msvc rustc --edition=2024 --crate-type=lib --crate-name=hexagon_native_rpc -D warnings -O tools/hexagon/native_rpc/lib.rs --out-dir ABSOLUTE_EXTERNAL_BUILD
+rustup run nightly-2026-11-26-aarch64-pc-windows-msvc rustc --edition=2024 -D warnings -O tools/hexagon/native_rpc/query.rs --extern hexagon_native_rpc=ABSOLUTE_EXTERNAL_BUILD/libhexagon_native_rpc.rlib -o ABSOLUTE_EXTERNAL_BUILD/hexagon-native-query.exe
 ```

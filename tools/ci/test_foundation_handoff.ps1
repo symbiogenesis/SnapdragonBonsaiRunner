@@ -21,7 +21,7 @@ function Assert-FoundationPlannerCache([string]$Planner) {
     $save=@($steps | Where-Object { $_ -cmatch '^name: Preserve planner compiler outputs after checks' })
     Assert-CiEqual $restore.Count 1; Assert-CiEqual $checks.Count 1; Assert-CiEqual $save.Count 1
     Assert-Ci ($restore[0] -cmatch 'uses: actions/cache/restore@')
-    Assert-Ci ($checks[0].Contains('cargo +nightly-2026-11-12 test --locked'))
+    Assert-Ci ($checks[0].Contains('cargo +nightly-2026-11-26 test --locked'))
     Assert-Ci (-not $checks[0].Contains('pwsh -NoProfile')) 'Fixture failures must precede and skip the Cargo step.'
     foreach ($step in @($steps | Where-Object { $_ -cnotmatch '^name: Preserve planner compiler outputs after checks' })) {
         Assert-Ci ($step -cnotmatch '(?m)^        if:') 'A cache hit must never skip planner checks, selection or publication.'
@@ -81,7 +81,7 @@ $cases=[ordered]@{
     $release=[IO.File]::ReadAllText((Join-Path $repository '.github/workflows/release.yml')); Assert-Ci ($release -cmatch 'uses: \$/\.github/actions/bonsai-tools\r?\n\s+if: matrix.lane == ''asr''\r?\n'); Assert-Ci ([IO.File]::ReadAllText((Join-Path $repository 'tools/ci/src/checks/mod.rs')).Contains('--all-targets'))
  }
  planner_reuses_build_but_runs_regressions={
-    $planner=$jobs.changes; foreach ($fragment in @('id: compiler','restore-keys:','ci-tool-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.image-identity }}-${{ steps.compiler.outputs.compiler-identity }}','~/.cargo/registry/cache',"'rust-toolchain.toml', '.cargo/**'","'tools/bonsai/**'",'cargo +nightly-2026-11-12 test --locked','test_native_ci_cache.ps1','test_tools_cache_inputs.ps1','test_rust_toolchain.ps1')) { Assert-Ci ($planner.Contains($fragment)) $fragment }
+    $planner=$jobs.changes; foreach ($fragment in @('id: compiler','restore-keys:','ci-tool-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.image-identity }}-${{ steps.compiler.outputs.compiler-identity }}','~/.cargo/registry/cache',"'rust-toolchain.toml', '.cargo/**'","'tools/bonsai/**'",'cargo +nightly-2026-11-26 test --locked','test_native_ci_cache.ps1','test_tools_cache_inputs.ps1','test_rust_toolchain.ps1')) { Assert-Ci ($planner.Contains($fragment)) $fragment }
     Assert-Ci ($planner -cnotmatch 'env\.Image(?:OS|Version)') 'Runner OS environment variables are not in GitHub expression env context unless exported.'
     Assert-FoundationPlannerCache $planner
  }

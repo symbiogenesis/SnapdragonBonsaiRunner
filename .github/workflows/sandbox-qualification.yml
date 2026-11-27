@@ -27,7 +27,7 @@ jobs:
       - uses: $/.github/actions/rust-toolchain
         id: compiler
         with:
-          toolchain: nightly-2026-11-12-aarch64-pc-windows-msvc
+          toolchain: nightly-2026-11-26-aarch64-pc-windows-msvc
       - uses: $/.github/actions/ci-tool
       - name: Select external preparation paths
         shell: pwsh
@@ -43,9 +43,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/Bonsai-Sandbox-Target
-          key: sandbox-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.image-identity }}-nightly-2026-11-12-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'src/**', 'tools/bonsai/**', 'tools/ci/**', '.github/workflows/sandbox-qualification.yml') }}-content-v1
+          key: sandbox-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.image-identity }}-nightly-2026-11-26-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', 'src/**', 'tools/bonsai/**', 'tools/ci/**', '.github/workflows/sandbox-qualification.yml') }}-content-v1
           restore-keys: |
-            sandbox-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.image-identity }}-nightly-2026-11-12-
+            sandbox-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.image-identity }}-nightly-2026-11-26-
       - name: Prepare the exact source-bound native sandbox fixtures
         shell: pwsh
         working-directory: ${{ runner.temp }}
@@ -131,7 +131,7 @@ jobs:
           if ($receipt.SchemaVersion -ne 1 -or $receipt.Kind -cne 'native-sandbox-prebuilt-package' -or
               $receipt.Revision -cne $env:GITHUB_SHA -or $receipt.RunId -cne $env:GITHUB_RUN_ID -or
               $receipt.RunAttempt -cne $env:GITHUB_RUN_ATTEMPT -or
-              $receipt.Toolchain -cne 'nightly-2026-11-12-aarch64-pc-windows-msvc') { throw 'Sandbox bootstrap source/run identity differs.' }
+              $receipt.Toolchain -cne 'nightly-2026-11-26-aarch64-pc-windows-msvc') { throw 'Sandbox bootstrap source/run identity differs.' }
           $identity = @($receipt.Files | Where-Object Name -CEQ 'bonsai-tools.exe')
           $tool = Join-Path $package 'bonsai-tools.exe'
           if ($identity.Count -ne 1 -or $identity[0].Bytes -le 0 -or $identity[0].Bytes -gt 134217728 -or

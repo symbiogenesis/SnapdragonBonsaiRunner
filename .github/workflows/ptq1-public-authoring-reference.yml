@@ -47,7 +47,7 @@ jobs:
       - uses: $/.github/actions/rust-toolchain
         id: rust
         with:
-          toolchain: nightly-2026-11-12-aarch64-pc-windows-msvc
+          toolchain: nightly-2026-11-26-aarch64-pc-windows-msvc
           components: ''
       - name: Reuse the source-bound native reference policy command
         uses: $/.github/actions/bonsai-tools

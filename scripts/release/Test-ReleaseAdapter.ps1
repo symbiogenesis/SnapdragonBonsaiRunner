@@ -18,7 +18,7 @@ $capturedError = [IO.StringWriter]::new()
 $engine = (Get-Process -Id $PID).Path
 $probeMode = 'success'
 $repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
-$expectedCompiler = '+nightly-2026-11-12-aarch64-pc-windows-msvc'
+$expectedCompiler = '+nightly-2026-11-26-aarch64-pc-windows-msvc'
 function Invoke-AdapterProbe {
     # Keep the outer adapter's actual native stream redirection. Only executable
     # selection is replaced, and the child never executes the supplied Cargo args.

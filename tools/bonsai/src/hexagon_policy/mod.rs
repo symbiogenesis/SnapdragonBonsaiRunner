@@ -14,7 +14,7 @@ mod session;
 mod tests;
 
 // Build receipts and their verifier share one compiler/source inventory contract.
-pub(super) const TOOLCHAIN: &str = "nightly-2026-11-12-aarch64-pc-windows-msvc";
+pub(super) const TOOLCHAIN: &str = "nightly-2026-11-26-aarch64-pc-windows-msvc";
 pub(super) const SOURCE_NAMES: &[&str] = &[
     "lib.rs",
     "windows.rs",

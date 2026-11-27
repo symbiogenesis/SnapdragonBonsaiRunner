@@ -24,7 +24,7 @@ $cases=[ordered]@{
     Assert-Ci ($jobs['layout-controls'].Contains('inputs.reference_initialization && !inputs.run_session_probe')); foreach ($fragment in @('hardware::ranking::tests','--all-targets -- -D warnings','-- --check')) { Assert-Ci ($jobs['ranking-controls'].Contains($fragment)) }; Assert-Ci ($jobs['ranking-controls'] -cnotmatch 'if:.*cache-hit')
  }
  sdk_reader_has_hosted_fixture_owner={
-    $block=$jobs['layout-controls']; foreach ($fragment in @('runs-on: windows-11-arm','uses: $/.github/actions/rust-toolchain','cargo +nightly-2026-11-12-aarch64-pc-windows-msvc test --locked --release','tools/hexagon/sdk-reader/Cargo.toml','Bonsai-Sdk-Reader-Checks','tools/hexagon/test_sdk_functional_review.ps1')) { Assert-Ci ($block.Contains($fragment)) $fragment }; Assert-Ci (-not $block.Contains('self-hosted'))
+    $block=$jobs['layout-controls']; foreach ($fragment in @('runs-on: windows-11-arm','uses: $/.github/actions/rust-toolchain','cargo +nightly-2026-11-26-aarch64-pc-windows-msvc test --locked --release','tools/hexagon/sdk-reader/Cargo.toml','Bonsai-Sdk-Reader-Checks','tools/hexagon/test_sdk_functional_review.ps1')) { Assert-Ci ($block.Contains($fragment)) $fragment }; Assert-Ci (-not $block.Contains('self-hosted'))
  }
  caches_exclude_fresh_bundles_and_evidence={
     foreach ($fragment in @("CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'",'CARGO_BUILD_FINGERPRINT: content')) { Assert-Ci ($workflow.Contains($fragment)) }

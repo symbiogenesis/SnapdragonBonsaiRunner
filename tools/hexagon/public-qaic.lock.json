@@ -5,7 +5,7 @@
   "deviceInvocationAuthorized": false,
   "profileEligible": false,
   "rustWireControl": {
-    "toolchain": "nightly-2026-11-12-aarch64-pc-windows-msvc",
+    "toolchain": "nightly-2026-11-26-aarch64-pc-windows-msvc",
     "target": "aarch64-pc-windows-msvc",
     "source": {
       "name": "public_idl_control.rs",

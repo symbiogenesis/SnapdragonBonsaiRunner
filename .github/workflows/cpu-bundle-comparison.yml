@@ -56,8 +56,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo +nightly-2026-11-12 test --locked --release --target-dir $env:BONSAI_TOOLS_TARGET -p bonsai-tools --lib cpu_evaluation::conditions
-          cargo +nightly-2026-11-12 test --locked --release --target-dir $env:BONSAI_TOOLS_TARGET -p bonsai-tools --test completion
+          cargo +nightly-2026-11-26 test --locked --release --target-dir $env:BONSAI_TOOLS_TARGET -p bonsai-tools --lib cpu_evaluation::conditions
+          cargo +nightly-2026-11-26 test --locked --release --target-dir $env:BONSAI_TOOLS_TARGET -p bonsai-tools --test completion
       - uses: $/.github/actions/rust-toolchain
         with:
           toolchain: nightly-2026-11-09-aarch64-pc-windows-msvc

@@ -43,7 +43,7 @@ function Get-PushRecoveryTemplate([bool]$WithPreparation) {
     $recoveryInputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'src/windows-process')
     foreach ($path in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/fixture.txt', 'tools/ci/fixture.txt', 'src/artifacts/fixture.txt', 'src/windows-process/fixture.txt', 'src/windows-credentials/fixture.txt')) { Write-CiFixture $repository $path 'Inert committed build identity; no Cargo consumer.' }
     Write-CiFixture $repository 'unrelated-source.txt' 'Committed full-source input.'
-    Write-CiFixture $repository 'scripts/release/Release-Common.ps1' "function Get-ReleaseToolchain([string]`$RepositoryRoot) { 'nightly-2026-11-12-aarch64-pc-windows-msvc' }"
+    Write-CiFixture $repository 'scripts/release/Release-Common.ps1' "function Get-ReleaseToolchain([string]`$RepositoryRoot) { 'nightly-2026-11-26-aarch64-pc-windows-msvc' }"
     if ($WithPreparation) {
         Write-CiFixture $repository 'tools/ci/prepare_push_helpers.ps1' @'
 #Requires -Version 7.6

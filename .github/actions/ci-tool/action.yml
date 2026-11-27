@@ -40,19 +40,19 @@ runs:
       with:
         path: ${{ env.BONSAI_CI_PACKAGE }}
         # No fallback keys: only identical inputs can skip compilation.
-        key: native-ci-executable-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.BONSAI_CI_CACHE_HOST }}-nightly-2026-11-12-${{ env.BONSAI_CI_SOURCE_ID }}
+        key: native-ci-executable-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.BONSAI_CI_CACHE_HOST }}-nightly-2026-11-26-${{ env.BONSAI_CI_SOURCE_ID }}
     - uses: $/.github/actions/rust-toolchain
       if: env.BONSAI_CI_PATH == '' && steps.executable-cache.outputs.cache-hit != 'true'
       with:
-        toolchain: nightly-2026-11-12-aarch64-pc-windows-msvc
+        toolchain: nightly-2026-11-26-aarch64-pc-windows-msvc
     - name: Reuse the CI command build artifacts after an executable miss
       if: env.BONSAI_CI_PATH == '' && steps.executable-cache.outputs.cache-hit != 'true'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/SwiftBonsai-CiBootstrap
-        key: native-ci-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.BONSAI_CI_CACHE_HOST }}-nightly-2026-11-12-${{ env.BONSAI_CI_SOURCE_ID }}
+        key: native-ci-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.BONSAI_CI_CACHE_HOST }}-nightly-2026-11-26-${{ env.BONSAI_CI_SOURCE_ID }}
         restore-keys: |
-          native-ci-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.BONSAI_CI_CACHE_HOST }}-nightly-2026-11-12-
+          native-ci-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.BONSAI_CI_CACHE_HOST }}-nightly-2026-11-26-
     - name: Build the CI executable only after its inputs change
       if: env.BONSAI_CI_PATH == '' && steps.executable-cache.outputs.cache-hit != 'true'
       shell: pwsh
@@ -70,11 +70,11 @@ runs:
         $ErrorActionPreference = 'Stop'
         $PSNativeCommandUseErrorActionPreference = $true
         $target = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-CiBootstrap'
-        cargo +nightly-2026-11-12-aarch64-pc-windows-msvc build --locked --release --manifest-path (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --target-dir $target
+        cargo +nightly-2026-11-26-aarch64-pc-windows-msvc build --locked --release --manifest-path (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') --package bonsai-ci --bin bonsai-ci --target-dir $target
         [void][IO.Directory]::CreateDirectory($env:BONSAI_CI_PACKAGE)
         Copy-Item -LiteralPath (Join-Path $target 'release/bonsai-ci.exe') -Destination (Join-Path $env:BONSAI_CI_PACKAGE 'bonsai-ci.exe')
         $compiler = Join-Path $env:RUNNER_TEMP 'SwiftBonsai-CiBootstrap-Compiler.txt'
-        rustup run nightly-2026-11-12-aarch64-pc-windows-msvc rustc -vV | Set-Content -LiteralPath $compiler -Encoding utf8NoBOM
+        rustup run nightly-2026-11-26-aarch64-pc-windows-msvc rustc -vV | Set-Content -LiteralPath $compiler -Encoding utf8NoBOM
         & (Join-Path $env:GITHUB_WORKSPACE 'tools/ci/native_ci_cache.ps1') create -PackageDirectory $env:BONSAI_CI_PACKAGE -SourceId $env:BONSAI_CI_SOURCE_ID -HostId $env:BONSAI_CI_CACHE_HOST -Compiler $compiler
     - name: Verify cached CI bytes before selecting a separate executable image
       if: env.BONSAI_CI_PATH == ''

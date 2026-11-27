@@ -1382,8 +1382,8 @@ mod tests {
         }
 
         let env = BTreeMap::new();
-        let chat_id = "crt-static-v1\nchat\nnightly-2026-11-12-aarch64-pc-windows-msvc\naarch64-pc-windows-msvc\nbonsai-broker\nbonsai-chat";
-        let speech_id = "crt-static-v1\n{\"Engine\":\"rust-qwen-tts-v1\"}\nnightly-2026-11-12-aarch64-pc-windows-msvc\naarch64-pc-windows-msvc\nbonsai-speech-asr\nbonsai-speech-tts";
+        let chat_id = "crt-static-v1\nchat\nnightly-2026-11-26-aarch64-pc-windows-msvc\naarch64-pc-windows-msvc\nbonsai-broker\nbonsai-chat";
+        let speech_id = "crt-static-v1\n{\"Engine\":\"rust-qwen-tts-v1\"}\nnightly-2026-11-26-aarch64-pc-windows-msvc\naarch64-pc-windows-msvc\nbonsai-speech-asr\nbonsai-speech-tts";
         assert_eq!(BuildScope::from_identity(chat_id), BuildScope::Chat);
         assert_eq!(BuildScope::from_identity(speech_id), BuildScope::Speech);
         assert_eq!(BuildScope::from_identity("test"), BuildScope::All);

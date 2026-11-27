@@ -543,7 +543,7 @@ mod tests {
     fn shared_workspace_validators_and_scratch_dir_enforce_bounds() -> crate::Result<()> {
         assert!(is_lower_hex(&"0123456789abcdef".repeat(4), 64));
         assert!(!is_lower_hex(&"0123456789ABCDEF".repeat(4), 64));
-        assert!(is_dated_nightly_channel("nightly-2026-11-12"));
+        assert!(is_dated_nightly_channel("nightly-2026-11-26"));
         assert!(!is_dated_nightly_channel("nightly-2026-11"));
         assert!(validate_repo_relative_path("tools/ci/src/lib.rs"));
         assert!(!validate_repo_relative_path("../escape.rs"));
@@ -574,12 +574,12 @@ mod tests {
         let scratch = ScratchDir::new("Bonsai-ToolchainChannel")?;
         std::fs::write(
             scratch.join("rust-toolchain.toml"),
-            "[toolchain]\nchannel = \"nightly-2026-11-12\"\n",
+            "[toolchain]\nchannel = \"nightly-2026-11-26\"\n",
         )
         .map_err(|error| error.to_string())?;
         assert_eq!(
             super::pinned_toolchain_channel(scratch.path())?,
-            "nightly-2026-11-12"
+            "nightly-2026-11-26"
         );
         Ok(())
     }

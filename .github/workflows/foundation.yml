@@ -44,7 +44,7 @@ jobs:
       - uses: $/.github/actions/rust-toolchain
         id: compiler
         with:
-          toolchain: nightly-2026-11-12-aarch64-unknown-linux-gnu
+          toolchain: nightly-2026-11-26-aarch64-unknown-linux-gnu
           components: ''
       - name: Reuse compiled CI tooling
         id: cargo-cache
@@ -73,14 +73,14 @@ jobs:
         id: ci-regressions
         working-directory: ${{ runner.temp }}
         run: |
-          cargo +nightly-2026-11-12 test --locked --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --package bonsai-ci
+          cargo +nightly-2026-11-26 test --locked --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --package bonsai-ci
       - name: Select affected crates and app groups
         id: impact
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BEFORE: ${{ github.event.before }}
         working-directory: ${{ runner.temp }}
-        run: cargo +nightly-2026-11-12 run --locked --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --package bonsai-ci -- impact --workflow foundation.yml --before "$BEFORE" --after "$GITHUB_SHA"
+        run: cargo +nightly-2026-11-26 run --locked --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --package bonsai-ci -- impact --workflow foundation.yml --before "$BEFORE" --after "$GITHUB_SHA"
       - name: Share the checked CI gate executable
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
