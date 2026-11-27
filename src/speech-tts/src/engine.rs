@@ -982,7 +982,7 @@ impl LinearProjection {
                 dst.fill(0.0);
             }
         };
-        let worker_count = threads.clamp(1, 18).min(self.out_dim.max(1));
+        let worker_count = decode_worker_budget(threads, self.out_dim, projection_weight_bytes(&self.weight));
         let level = Level::new();
 
         if let Some((ggml_type, bytes)) = self.weight.packed_slice() {
@@ -1378,20 +1378,92 @@ mod quant_dispatch {
 
     use bonsai_windows_process::quant_kernels::{
         Arm64QuantCaps, Q4_K_BLOCK_BYTES, Q4_K_REPACK8_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
-        Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, Q8_0ActBlock, Q8_KActBlock, QK_K, dot_q4_k_4rows,
-        dot_q4_k_repacked8, dot_q4_k_row, dot_q6_k_4rows, dot_q6_k_8rows, dot_q6_k_row,
-        dot_q8_0_4rows, dot_q8_0_8rows, dot_q8_0_row, gemm_q4_k_4x2, gemm_q4_k_repacked8_8x2,
-        gemm_q4_k_repacked8_8x4, gemm_q4_k_repacked8_8x8, gemm_q6_k_4x2, gemm_q6_k_8x2,
-        gemm_q6_k_8x4, gemm_q6_k_8x8, gemm_q8_0_4x2, gemm_q8_0_8x2, gemm_q8_0_8x4, gemm_q8_0_8x8,
-        quantize_row_q8_0, quantize_row_q8_k,
+        Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, Q8_0ActBlock, Q8_0ActPanel8, Q8_KActBlock,
+        Q8_KActPanel8, QK_K, dot_q4_k_4rows, dot_q4_k_repacked8,
+        dot_q4_k_repacked8_finite_scales_strips, dot_q4_k_row, dot_q6_k_4rows, dot_q6_k_8rows,
+        dot_q6_k_row, dot_q8_0_4rows, dot_q8_0_8rows, dot_q8_0_8rows_finite_scales_strips,
+        dot_q8_0_row, gemm_q4_k_4x2, gemm_q4_k_repacked8_8x_panels, gemm_q4_k_repacked8_8x2,
+        gemm_q4_k_repacked8_8x4, gemm_q4_k_repacked8_8x8, gemm_q6_k_4x2, gemm_q6_k_8x_panels,
+        gemm_q6_k_8x2, gemm_q6_k_8x4, gemm_q6_k_8x8, gemm_q8_0_4x2, gemm_q8_0_8x_panels,
+        gemm_q8_0_8x2, gemm_q8_0_8x4, gemm_q8_0_8x8, pack_q8_0_act_panels8,
+        pack_q8_k_act_panels8, quantize_row_q8_0, quantize_row_q8_k,
     };
 
-    use super::{LinearProjection, WeightQuantization, row_workers, run_row_chunks_aligned};
+    use super::{
+        LinearProjection, WeightQuantization, batch_worker_budget, row_workers,
+        run_row_chunks_aligned,
+    };
 
     thread_local! {
         static ACT_Q8_0: RefCell<Vec<Q8_0ActBlock>> = const { RefCell::new(Vec::new()) };
+        static ACT_Q8_0_PANELS8: RefCell<Vec<Q8_0ActPanel8>> = const { RefCell::new(Vec::new()) };
         static ACT_Q8_K: RefCell<Vec<Q8_KActBlock>> = const { RefCell::new(Vec::new()) };
+        static ACT_Q8_K_PANELS8: RefCell<Vec<Q8_KActPanel8>> = const { RefCell::new(Vec::new()) };
         static GROUP_COMBINED: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn with_tls_vec<T: Default + Clone, R>(
+        cell: &'static std::thread::LocalKey<RefCell<Vec<T>>>,
+        len: usize,
+        f: impl FnOnce(&mut [T]) -> R,
+    ) -> R {
+        if len == 0 {
+            return f(&mut []);
+        }
+        cell.with(|c| {
+            let mut fallback = Vec::new();
+            let mut guard = c.try_borrow_mut().ok();
+            let slice = match guard.as_deref_mut() {
+                Some(buf) => {
+                    buf.resize(len, T::default());
+                    &mut buf[..len]
+                }
+                None => {
+                    fallback.resize(len, T::default());
+                    &mut fallback[..len]
+                }
+            };
+            f(slice)
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Packs 8-token Q8_0 or Q8_K activation panels across workers when batch work is large."
+    )]
+    fn pack_panels8_parallel<B: Sync, P: Send>(
+        acts: &[B],
+        blocks_per_tok: usize,
+        panel_count: usize,
+        seq_len: usize,
+        in_dim: usize,
+        panels: &mut [P],
+        workers: usize,
+        pack_fn: impl Fn(&[B], usize, usize, &mut [P]) + Sync,
+    ) {
+        if panel_count == 0 || blocks_per_tok == 0 {
+            return;
+        }
+        let active = workers.clamp(1, 18).min(panel_count);
+        if active <= 1 || seq_len.saturating_mul(in_dim) < 4096 {
+            pack_fn(acts, blocks_per_tok, panel_count, panels);
+            return;
+        }
+        row_workers::run_slice_aligned(
+            &mut panels[..panel_count * blocks_per_tok],
+            active,
+            blocks_per_tok,
+            &|panel_off, panel_slice| {
+                let first_p = panel_off / blocks_per_tok;
+                let p_here = panel_slice.len() / blocks_per_tok;
+                pack_fn(
+                    &acts[first_p * 8 * blocks_per_tok..],
+                    blocks_per_tok,
+                    p_here,
+                    panel_slice,
+                );
+            },
+        );
     }
 
     fn quantize_batch_parallel<Act: Send>(
@@ -1438,61 +1510,25 @@ mod quant_dispatch {
     fn with_batch_group_workspace<R>(
         combined_len: usize,
         q8_blocks: usize,
+        q8_panel_elems: usize,
         qk_blocks: usize,
-        action: impl FnOnce(&mut [f32], &mut [Q8_0ActBlock], &mut [Q8_KActBlock]) -> R,
+        qk_panel_elems: usize,
+        action: impl FnOnce(
+            &mut [f32],
+            &mut [Q8_0ActBlock],
+            &mut [Q8_0ActPanel8],
+            &mut [Q8_KActBlock],
+            &mut [Q8_KActPanel8],
+        ) -> R,
     ) -> R {
-        GROUP_COMBINED.with(|comb_cell| {
-            let mut comb_fallback = Vec::new();
-            let mut comb_guard = comb_cell.try_borrow_mut().ok();
-            let combined = match comb_guard.as_deref_mut() {
-                Some(buf) => {
-                    buf.resize(combined_len, 0.0);
-                    &mut buf[..combined_len]
-                }
-                None => {
-                    comb_fallback.resize(combined_len, 0.0);
-                    &mut comb_fallback[..combined_len]
-                }
-            };
-            ACT_Q8_0.with(|q8_cell| {
-                ACT_Q8_K.with(|qk_cell| {
-                    let mut q8_fallback = Vec::new();
-                    let mut q8_guard = (q8_blocks > 0)
-                        .then(|| q8_cell.try_borrow_mut().ok())
-                        .flatten();
-                    let q8_slice: &mut [Q8_0ActBlock] = if q8_blocks > 0 {
-                        match q8_guard.as_deref_mut() {
-                            Some(buf) => {
-                                buf.resize(q8_blocks, Q8_0ActBlock::default());
-                                &mut buf[..q8_blocks]
-                            }
-                            None => {
-                                q8_fallback.resize(q8_blocks, Q8_0ActBlock::default());
-                                &mut q8_fallback[..q8_blocks]
-                            }
-                        }
-                    } else {
-                        &mut []
-                    };
-                    let mut qk_fallback = Vec::new();
-                    let mut qk_guard = (qk_blocks > 0)
-                        .then(|| qk_cell.try_borrow_mut().ok())
-                        .flatten();
-                    let qk_slice: &mut [Q8_KActBlock] = if qk_blocks > 0 {
-                        match qk_guard.as_deref_mut() {
-                            Some(buf) => {
-                                buf.resize(qk_blocks, Q8_KActBlock::default());
-                                &mut buf[..qk_blocks]
-                            }
-                            None => {
-                                qk_fallback.resize(qk_blocks, Q8_KActBlock::default());
-                                &mut qk_fallback[..qk_blocks]
-                            }
-                        }
-                    } else {
-                        &mut []
-                    };
-                    action(combined, q8_slice, qk_slice)
+        with_tls_vec(&GROUP_COMBINED, combined_len, |combined| {
+            with_tls_vec(&ACT_Q8_0, q8_blocks, |q8_slice| {
+                with_tls_vec(&ACT_Q8_0_PANELS8, q8_panel_elems, |q8_panels| {
+                    with_tls_vec(&ACT_Q8_K, qk_blocks, |qk_slice| {
+                        with_tls_vec(&ACT_Q8_K_PANELS8, qk_panel_elems, |qk_panels| {
+                            action(combined, q8_slice, q8_panels, qk_slice, qk_panels)
+                        })
+                    })
                 })
             })
         })
@@ -1621,18 +1657,37 @@ mod quant_dispatch {
         };
         let row_bytes = (in_dim / block) * elem_bytes;
         let mut processed = 0_usize;
-        if ggml_type == 8 || ggml_type == 14 {
+        if ggml_type == 8 {
+            let strip_count = dst.len() / 8;
+            if strip_count > 0 {
+                let strip_rows = strip_count * 8;
+                // Q8_0 scales are validated finite at load time via weights::validate_packed_parallel.
+                dot_q8_0_8rows_finite_scales_strips(
+                    caps,
+                    bytes,
+                    start_row,
+                    strip_count,
+                    q8_act,
+                    &mut dst[..strip_rows],
+                );
+                if let Some(b_slice) = bias {
+                    for (slot, &b) in dst[..strip_rows]
+                        .iter_mut()
+                        .zip(&b_slice[..strip_rows])
+                    {
+                        *slot = b + *slot;
+                    }
+                }
+                processed = strip_rows;
+            }
+        } else if ggml_type == 14 {
             for oct in dst.chunks_exact_mut(8) {
                 let r0 = (start_row + processed) * row_bytes;
                 let row_refs: [&[u8]; 8] = std::array::from_fn(|r| {
                     let start = r0 + r * row_bytes;
                     &bytes[start..start + row_bytes]
                 });
-                let sums = if ggml_type == 8 {
-                    dot_q8_0_8rows(caps, row_refs, q8_act)
-                } else {
-                    dot_q6_k_8rows(caps, row_refs, qk_act)
-                };
+                let sums = dot_q6_k_8rows(caps, row_refs, qk_act);
                 if let Some(b_slice) = bias {
                     for ((slot, &b), add) in oct
                         .iter_mut()
@@ -1753,6 +1808,29 @@ mod quant_dispatch {
             let abs_row = start_row + idx;
             let strip_idx = abs_row / 8;
             let lane = abs_row % 8;
+            if lane == 0 && dst.len() - idx >= 8 {
+                let strip_count = (dst.len() - idx) / 8;
+                let take = strip_count * 8;
+                // RepackedQ4K8 scales are validated finite at load time via repack_q4_k_8rows.
+                dot_q4_k_repacked8_finite_scales_strips(
+                    caps,
+                    bytes,
+                    strip_idx,
+                    strip_count,
+                    qk_act,
+                    &mut dst[idx..idx + take],
+                );
+                if let Some(b_slice) = bias {
+                    for (slot, &b) in dst[idx..idx + take]
+                        .iter_mut()
+                        .zip(&b_slice[idx..idx + take])
+                    {
+                        *slot = b + *slot;
+                    }
+                }
+                idx += take;
+                continue;
+            }
             let strip = &bytes[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
             let vals = dot_q4_k_repacked8(caps, strip, qk_act);
             let take = (8 - lane).min(dst.len() - idx);
@@ -1881,7 +1959,7 @@ mod quant_dispatch {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "Executes repacked 8-row Q4_K batched GEMM over an arbitrary row sub-range."
+        reason = "Executes repacked 8-row Q4_K batched GEMM with optional Q8_KActPanel8s over an arbitrary row sub-range."
     )]
     fn add_batch_repacked_gemm(
         dst: &mut [f32],
@@ -1893,6 +1971,8 @@ mod quant_dispatch {
         rows_here: usize,
         caps: Arm64QuantCaps,
         acts: &[Q8_KActBlock],
+        qk_panels: &[Q8_KActPanel8],
+        panel_count: usize,
     ) {
         let blocks_per_tok = in_dim / QK_K;
         let strip_bytes = blocks_per_tok * Q4_K_REPACK8_BLOCK_BYTES;
@@ -1904,23 +1984,46 @@ mod quant_dispatch {
             let take = (8 - lane).min(rows_here - idx);
             let strip = &bytes[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
             let mut t = 0_usize;
-            while t + 8 <= seq_len {
-                let acts: [&[Q8_KActBlock]; 8] = std::array::from_fn(|k| {
-                    &acts[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
-                });
-                let tile = gemm_q4_k_repacked8_8x8(caps, strip, acts);
-                for k in 0..take {
-                    let base = (idx + k) * seq_len + t;
-                    if let Some(b_slice) = bias {
+            if panel_count > 0 && lane == 0 && take == 8 {
+                let tokens = panel_count * 8;
+                gemm_q4_k_repacked8_8x_panels(
+                    caps,
+                    strip,
+                    qk_panels,
+                    panel_count,
+                    blocks_per_tok,
+                    &mut dst[idx * seq_len..],
+                    seq_len,
+                );
+                if let Some(b_slice) = bias {
+                    for k in 0..8 {
                         let br = b_slice[idx + k];
-                        for (col_idx, &val) in tile[lane + k].iter().enumerate() {
-                            dst[base + col_idx] = br + val;
+                        let base = (idx + k) * seq_len;
+                        for val in &mut dst[base..base + tokens] {
+                            *val = br + *val;
                         }
-                    } else {
-                        dst[base..base + 8].copy_from_slice(&tile[lane + k]);
                     }
                 }
-                t += 8;
+                t = tokens;
+            } else {
+                while t + 8 <= seq_len {
+                    let acts: [&[Q8_KActBlock]; 8] = std::array::from_fn(|k| {
+                        &acts[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
+                    });
+                    let tile = gemm_q4_k_repacked8_8x8(caps, strip, acts);
+                    for k in 0..take {
+                        let base = (idx + k) * seq_len + t;
+                        if let Some(b_slice) = bias {
+                            let br = b_slice[idx + k];
+                            for (col_idx, &val) in tile[lane + k].iter().enumerate() {
+                                dst[base + col_idx] = br + val;
+                            }
+                        } else {
+                            dst[base..base + 8].copy_from_slice(&tile[lane + k]);
+                        }
+                    }
+                    t += 8;
+                }
             }
             if t + 4 <= seq_len {
                 let acts: [&[Q8_KActBlock]; 4] = std::array::from_fn(|k| {
@@ -2051,7 +2154,7 @@ mod quant_dispatch {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "Generic 8-row I8MM GEMM kernel processes 8x8/8x4/8x2/8x1 tiles and delegates tail rows to 4-row GEMM."
+        reason = "Generic 8-row I8MM GEMM kernel processes pre-packed panels, 8x8/8x4/8x2/8x1 tiles, and delegates tail rows to 4-row GEMM."
     )]
     fn add_batch_8row_gemm<Act>(
         dst: &mut [f32],
@@ -2064,6 +2167,8 @@ mod quant_dispatch {
         block_elems: usize,
         elem_bytes: usize,
         acts_buf: &[Act],
+        panel_count: usize,
+        gemm_panels: impl Fn([&[u8]; 8], &mut [f32], usize),
         gemm_8x8: impl Fn([&[u8]; 8], [&[Act]; 8]) -> [[f32; 8]; 8],
         gemm_8x4: impl Fn([&[u8]; 8], [&[Act]; 4]) -> [[f32; 4]; 8],
         gemm_8x2: impl Fn([&[u8]; 8], [&[Act]; 2]) -> [[f32; 2]; 8],
@@ -2082,23 +2187,38 @@ mod quant_dispatch {
                 &bytes[start..start + row_bytes]
             });
             let mut t = 0_usize;
-            while t + 8 <= seq_len {
-                let acts: [&[Act]; 8] = std::array::from_fn(|k| {
-                    &acts_buf[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
-                });
-                let tile = gemm_8x8(row_refs, acts);
-                for (r, row_vals) in tile.iter().enumerate() {
-                    let base = (processed + r) * seq_len + t;
-                    if let Some(b_slice) = bias {
+            if panel_count > 0 {
+                let tokens = panel_count * 8;
+                gemm_panels(row_refs, &mut dst[processed * seq_len..], seq_len);
+                if let Some(b_slice) = bias {
+                    for r in 0..8 {
                         let br = b_slice[processed + r];
-                        for (k, &val) in row_vals.iter().enumerate() {
-                            dst[base + k] = br + val;
+                        let base = (processed + r) * seq_len;
+                        for val in &mut dst[base..base + tokens] {
+                            *val = br + *val;
                         }
-                    } else {
-                        dst[base..base + 8].copy_from_slice(row_vals);
                     }
                 }
-                t += 8;
+                t = tokens;
+            } else {
+                while t + 8 <= seq_len {
+                    let acts: [&[Act]; 8] = std::array::from_fn(|k| {
+                        &acts_buf[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
+                    });
+                    let tile = gemm_8x8(row_refs, acts);
+                    for (r, row_vals) in tile.iter().enumerate() {
+                        let base = (processed + r) * seq_len + t;
+                        if let Some(b_slice) = bias {
+                            let br = b_slice[processed + r];
+                            for (k, &val) in row_vals.iter().enumerate() {
+                                dst[base + k] = br + val;
+                            }
+                        } else {
+                            dst[base..base + 8].copy_from_slice(row_vals);
+                        }
+                    }
+                    t += 8;
+                }
             }
             if t + 4 <= seq_len {
                 let acts: [&[Act]; 4] = std::array::from_fn(|k| {
@@ -2170,7 +2290,7 @@ mod quant_dispatch {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "Dispatches batched quantized GEMM kernels over shared pre-quantized batch activations."
+        reason = "Dispatches batched quantized GEMM kernels over shared pre-quantized batch activations and optional panel buffers."
     )]
     fn dispatch_batch_segment(
         kind: GroupKind<'_>,
@@ -2182,31 +2302,50 @@ mod quant_dispatch {
         rows_here: usize,
         caps: Arm64QuantCaps,
         q8_act: &[Q8_0ActBlock],
+        q8_panels: &[Q8_0ActPanel8],
+        q8_panel_count: usize,
         qk_act: &[Q8_KActBlock],
+        qk_panels: &[Q8_KActPanel8],
+        qk_panel_count: usize,
     ) {
         match kind {
             GroupKind::Packed {
                 ggml_type: 8,
                 bytes,
-            } => add_batch_8row_gemm(
-                dst,
-                bytes,
-                bias,
-                in_dim,
-                seq_len,
-                local_row,
-                rows_here,
-                Q8_0_BLOCK_ELEMENTS,
-                Q8_0_BLOCK_BYTES,
-                q8_act,
-                |r, a| gemm_q8_0_8x8(caps, r, a),
-                |r, a| gemm_q8_0_8x4(caps, r, a),
-                |r, a| gemm_q8_0_8x2(caps, r, a),
-                |r, a| dot_q8_0_8rows(caps, r, a),
-                |r, a0, a1| gemm_q8_0_4x2(caps, r, a0, a1),
-                |r, a0| dot_q8_0_4rows(caps, r, a0),
-                |r, a0| dot_q8_0_row(caps, r, a0),
-            ),
+            } => {
+                let blocks = in_dim / Q8_0_BLOCK_ELEMENTS;
+                add_batch_8row_gemm(
+                    dst,
+                    bytes,
+                    bias,
+                    in_dim,
+                    seq_len,
+                    local_row,
+                    rows_here,
+                    Q8_0_BLOCK_ELEMENTS,
+                    Q8_0_BLOCK_BYTES,
+                    q8_act,
+                    q8_panel_count,
+                    |r, out_rows, stride| {
+                        gemm_q8_0_8x_panels(
+                            caps,
+                            r,
+                            q8_panels,
+                            q8_panel_count,
+                            blocks,
+                            out_rows,
+                            stride,
+                        );
+                    },
+                    |r, a| gemm_q8_0_8x8(caps, r, a),
+                    |r, a| gemm_q8_0_8x4(caps, r, a),
+                    |r, a| gemm_q8_0_8x2(caps, r, a),
+                    |r, a| dot_q8_0_8rows(caps, r, a),
+                    |r, a0, a1| gemm_q8_0_4x2(caps, r, a0, a1),
+                    |r, a0| dot_q8_0_4rows(caps, r, a0),
+                    |r, a0| dot_q8_0_row(caps, r, a0),
+                );
+            }
             GroupKind::Packed {
                 ggml_type: 12,
                 bytes,
@@ -2225,7 +2364,41 @@ mod quant_dispatch {
                 |r, a0| dot_q4_k_4rows(caps, r, a0),
                 |r, a0| dot_q4_k_row(caps, r, a0),
             ),
-            GroupKind::Packed { bytes, .. } => add_batch_8row_gemm(
+            GroupKind::Packed { bytes, .. } => {
+                let blocks = in_dim / QK_K;
+                add_batch_8row_gemm(
+                    dst,
+                    bytes,
+                    bias,
+                    in_dim,
+                    seq_len,
+                    local_row,
+                    rows_here,
+                    QK_K,
+                    Q6_K_BLOCK_BYTES,
+                    qk_act,
+                    qk_panel_count,
+                    |r, out_rows, stride| {
+                        gemm_q6_k_8x_panels(
+                            caps,
+                            r,
+                            qk_panels,
+                            qk_panel_count,
+                            blocks,
+                            out_rows,
+                            stride,
+                        );
+                    },
+                    |r, a| gemm_q6_k_8x8(caps, r, a),
+                    |r, a| gemm_q6_k_8x4(caps, r, a),
+                    |r, a| gemm_q6_k_8x2(caps, r, a),
+                    |r, a| dot_q6_k_8rows(caps, r, a),
+                    |r, a0, a1| gemm_q6_k_4x2(caps, r, a0, a1),
+                    |r, a0| dot_q6_k_4rows(caps, r, a0),
+                    |r, a0| dot_q6_k_row(caps, r, a0),
+                );
+            }
+            GroupKind::Repacked(bytes) => add_batch_repacked_gemm(
                 dst,
                 bytes,
                 bias,
@@ -2233,19 +2406,10 @@ mod quant_dispatch {
                 seq_len,
                 local_row,
                 rows_here,
-                QK_K,
-                Q6_K_BLOCK_BYTES,
+                caps,
                 qk_act,
-                |r, a| gemm_q6_k_8x8(caps, r, a),
-                |r, a| gemm_q6_k_8x4(caps, r, a),
-                |r, a| gemm_q6_k_8x2(caps, r, a),
-                |r, a| dot_q6_k_8rows(caps, r, a),
-                |r, a0, a1| gemm_q6_k_4x2(caps, r, a0, a1),
-                |r, a0| dot_q6_k_4rows(caps, r, a0),
-                |r, a0| dot_q6_k_row(caps, r, a0),
-            ),
-            GroupKind::Repacked(bytes) => add_batch_repacked_gemm(
-                dst, bytes, bias, in_dim, seq_len, local_row, rows_here, caps, qk_act,
+                qk_panels,
+                qk_panel_count,
             ),
         }
     }
@@ -2274,15 +2438,31 @@ mod quant_dispatch {
         let mut segments = Vec::with_capacity(targets.len());
         let mut need_q8 = false;
         let mut need_qk = false;
+        let mut need_q8_panels = false;
+        let mut need_qk_panels = false;
         let mut total_out = 0_usize;
+        let mut max_target_out = 0_usize;
+        let panel_count = seq_len / 8;
         for (proj, _, _) in targets.iter() {
             let Some(kind) = classify_group_proj(proj) else {
                 return false;
             };
             match kind {
-                GroupKind::Packed { ggml_type: 8, .. } => need_q8 = true,
+                GroupKind::Packed { ggml_type: 8, .. } => {
+                    need_q8 = true;
+                    if caps.i8mm && panel_count > 0 && proj.out_dim >= 8 {
+                        need_q8_panels = true;
+                    }
+                }
+                GroupKind::Repacked(_) | GroupKind::Packed { ggml_type: 14, .. } => {
+                    need_qk = true;
+                    if caps.i8mm && panel_count > 0 && proj.out_dim >= 8 {
+                        need_qk_panels = true;
+                    }
+                }
                 _ => need_qk = true,
             }
+            max_target_out = max_target_out.max(proj.out_dim);
             segments.push(Segment {
                 start: total_out,
                 len: proj.out_dim,
@@ -2293,16 +2473,30 @@ mod quant_dispatch {
             total_out += proj.out_dim;
         }
         let in_dim = segments[0].in_dim;
+        let q8_blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
+        let qk_blocks_per_tok = in_dim / QK_K;
         let q8_blocks = if need_q8 {
-            seq_len * (in_dim / Q8_0_BLOCK_ELEMENTS)
+            seq_len * q8_blocks_per_tok
         } else {
             0
         };
         let qk_blocks = if need_qk {
-            seq_len * (in_dim / QK_K)
+            seq_len * qk_blocks_per_tok
         } else {
             0
         };
+        let q8_panel_count = if need_q8_panels && q8_blocks_per_tok > 0 {
+            panel_count
+        } else {
+            0
+        };
+        let qk_panel_count = if need_qk_panels && qk_blocks_per_tok > 0 {
+            panel_count
+        } else {
+            0
+        };
+        let q8_panel_elems = q8_panel_count * q8_blocks_per_tok;
+        let qk_panel_elems = qk_panel_count * qk_blocks_per_tok;
         let row_align = if segments.iter().all(|s| s.len.is_multiple_of(8)) {
             8
         } else if segments.iter().all(|s| s.len.is_multiple_of(4)) {
@@ -2310,38 +2504,65 @@ mod quant_dispatch {
         } else {
             1
         };
-        let workers = worker_count.clamp(1, 18).min(total_out.max(1));
+        let effective_workers = batch_worker_budget(worker_count, max_target_out);
+        let workers = effective_workers.min(total_out.max(1));
         with_batch_group_workspace(
             total_out * seq_len,
             q8_blocks,
+            q8_panel_elems,
             qk_blocks,
-            |combined, q8_buf, qk_buf| {
+            qk_panel_elems,
+            |combined, q8_buf, q8_panels_buf, qk_buf, qk_panels_buf| {
                 if need_q8 {
-                    let blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
                     quantize_batch_parallel(
                         inputs,
                         in_dim,
                         seq_len,
-                        blocks_per_tok,
+                        q8_blocks_per_tok,
                         q8_buf,
-                        worker_count,
+                        effective_workers,
                         quantize_row_q8_0,
                     );
+                    if q8_panel_count > 0 {
+                        pack_panels8_parallel(
+                            q8_buf,
+                            q8_blocks_per_tok,
+                            q8_panel_count,
+                            seq_len,
+                            in_dim,
+                            q8_panels_buf,
+                            effective_workers,
+                            pack_q8_0_act_panels8,
+                        );
+                    }
                 }
                 if need_qk {
-                    let blocks_per_tok = in_dim / QK_K;
                     quantize_batch_parallel(
                         inputs,
                         in_dim,
                         seq_len,
-                        blocks_per_tok,
+                        qk_blocks_per_tok,
                         qk_buf,
-                        worker_count,
+                        effective_workers,
                         quantize_row_q8_k,
                     );
+                    if qk_panel_count > 0 {
+                        pack_panels8_parallel(
+                            qk_buf,
+                            qk_blocks_per_tok,
+                            qk_panel_count,
+                            seq_len,
+                            in_dim,
+                            qk_panels_buf,
+                            effective_workers,
+                            pack_q8_k_act_panels8,
+                        );
+                    }
                 }
                 let q8_slice: &[Q8_0ActBlock] = q8_buf;
+                let q8_panels_slice: &[Q8_0ActPanel8] = q8_panels_buf;
                 let qk_slice: &[Q8_KActBlock] = qk_buf;
+                let qk_panels_slice: &[Q8_KActPanel8] = qk_panels_buf;
                 run_row_chunks_aligned(combined, workers, row_align * seq_len, |flat_off, dst| {
                     let global_row = flat_off / seq_len;
                     let rows_total = dst.len() / seq_len;
@@ -2359,14 +2580,32 @@ mod quant_dispatch {
                         let rows_here = ov_end - ov_start;
                         let bias_slice = seg.bias.map(|b| &b[local_row..local_row + rows_here]);
                         dispatch_batch_segment(
-                            seg.kind, dst_slice, bias_slice, seg.in_dim, seq_len, local_row,
-                            rows_here, caps, q8_slice, qk_slice,
+                            seg.kind,
+                            dst_slice,
+                            bias_slice,
+                            seg.in_dim,
+                            seq_len,
+                            local_row,
+                            rows_here,
+                            caps,
+                            q8_slice,
+                            q8_panels_slice,
+                            q8_panel_count,
+                            qk_slice,
+                            qk_panels_slice,
+                            qk_panel_count,
                         );
                     }
                 });
                 for (seg, (_, _, out)) in segments.iter().zip(targets.iter_mut()) {
                     let src_slice = &combined[seg.start * seq_len..(seg.start + seg.len) * seq_len];
-                    transpose_to_row_major_parallel(src_slice, seg.len, seq_len, out, worker_count);
+                    transpose_to_row_major_parallel(
+                        src_slice,
+                        seg.len,
+                        seq_len,
+                        out,
+                        effective_workers,
+                    );
                 }
             },
         );
@@ -2391,13 +2630,41 @@ mod quant_dispatch {
         let out_dim = proj.out_dim;
         let bias = proj.bias.as_deref();
         let is_q8 = matches!(kind, GroupKind::Packed { ggml_type: 8, .. });
+        let q8_blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
+        let qk_blocks_per_tok = in_dim / QK_K;
+        let panel_count = seq_len / 8;
         let q8_blocks = if is_q8 {
-            seq_len * (in_dim / Q8_0_BLOCK_ELEMENTS)
+            seq_len * q8_blocks_per_tok
         } else {
             0
         };
-        let qk_blocks = if is_q8 { 0 } else { seq_len * (in_dim / QK_K) };
-        let row_workers_active = worker_count.clamp(1, 18).min(out_dim.max(1));
+        let qk_blocks = if is_q8 {
+            0
+        } else {
+            seq_len * qk_blocks_per_tok
+        };
+        let q8_panel_count =
+            if is_q8 && caps.i8mm && panel_count > 0 && out_dim >= 8 && q8_blocks_per_tok > 0 {
+                panel_count
+            } else {
+                0
+            };
+        let qk_panel_count = if matches!(
+            kind,
+            GroupKind::Repacked(_) | GroupKind::Packed { ggml_type: 14, .. }
+        ) && caps.i8mm
+            && panel_count > 0
+            && out_dim >= 8
+            && qk_blocks_per_tok > 0
+        {
+            panel_count
+        } else {
+            0
+        };
+        let q8_panel_elems = q8_panel_count * q8_blocks_per_tok;
+        let qk_panel_elems = qk_panel_count * qk_blocks_per_tok;
+        let effective_workers = batch_worker_budget(worker_count, out_dim);
+        let row_workers_active = effective_workers.min(out_dim.max(1));
         let row_align = match kind {
             GroupKind::Repacked(_)
             | GroupKind::Packed {
@@ -2408,33 +2675,59 @@ mod quant_dispatch {
         with_batch_group_workspace(
             out_dim * seq_len,
             q8_blocks,
+            q8_panel_elems,
             qk_blocks,
-            |transposed, q8_buf, qk_buf| {
+            qk_panel_elems,
+            |transposed, q8_buf, q8_panels_buf, qk_buf, qk_panels_buf| {
                 if is_q8 {
-                    let blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
                     quantize_batch_parallel(
                         inputs,
                         in_dim,
                         seq_len,
-                        blocks_per_tok,
+                        q8_blocks_per_tok,
                         q8_buf,
-                        worker_count,
+                        effective_workers,
                         quantize_row_q8_0,
                     );
+                    if q8_panel_count > 0 {
+                        pack_panels8_parallel(
+                            q8_buf,
+                            q8_blocks_per_tok,
+                            q8_panel_count,
+                            seq_len,
+                            in_dim,
+                            q8_panels_buf,
+                            effective_workers,
+                            pack_q8_0_act_panels8,
+                        );
+                    }
                 } else {
-                    let blocks_per_tok = in_dim / QK_K;
                     quantize_batch_parallel(
                         inputs,
                         in_dim,
                         seq_len,
-                        blocks_per_tok,
+                        qk_blocks_per_tok,
                         qk_buf,
-                        worker_count,
+                        effective_workers,
                         quantize_row_q8_k,
                     );
+                    if qk_panel_count > 0 {
+                        pack_panels8_parallel(
+                            qk_buf,
+                            qk_blocks_per_tok,
+                            qk_panel_count,
+                            seq_len,
+                            in_dim,
+                            qk_panels_buf,
+                            effective_workers,
+                            pack_q8_k_act_panels8,
+                        );
+                    }
                 }
                 let q8_slice: &[Q8_0ActBlock] = q8_buf;
+                let q8_panels_slice: &[Q8_0ActPanel8] = q8_panels_buf;
                 let qk_slice: &[Q8_KActBlock] = qk_buf;
+                let qk_panels_slice: &[Q8_KActPanel8] = qk_panels_buf;
                 run_row_chunks_aligned(
                     transposed,
                     row_workers_active,
@@ -2444,12 +2737,30 @@ mod quant_dispatch {
                         let rows_here = dst.len() / seq_len;
                         let bias_slice = bias.map(|b| &b[start_row..start_row + rows_here]);
                         dispatch_batch_segment(
-                            kind, dst, bias_slice, in_dim, seq_len, start_row, rows_here, caps,
-                            q8_slice, qk_slice,
+                            kind,
+                            dst,
+                            bias_slice,
+                            in_dim,
+                            seq_len,
+                            start_row,
+                            rows_here,
+                            caps,
+                            q8_slice,
+                            q8_panels_slice,
+                            q8_panel_count,
+                            qk_slice,
+                            qk_panels_slice,
+                            qk_panel_count,
                         );
                     },
                 );
-                transpose_to_row_major_parallel(transposed, out_dim, seq_len, out, worker_count);
+                transpose_to_row_major_parallel(
+                    transposed,
+                    out_dim,
+                    seq_len,
+                    out,
+                    effective_workers,
+                );
             },
         );
         Ok(true)
@@ -2459,6 +2770,142 @@ mod quant_dispatch {
 use quant_dispatch::{
     dispatch_batch_quant_kernels, dispatch_packed_quant_kernels, dispatch_repacked_q4_k,
 };
+
+const TALKER_DECODE_AUTO_CAP: usize = 8;
+const CODE_PREDICTOR_SMALL_AUTO_CAP: usize = 6;
+const CODE_PREDICTOR_SMALL_ROW_LIMIT: usize = 2048;
+const MIN_DECODE_BYTES_PER_WORKER: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct DecodeThreadPolicy {
+    explicit: bool,
+    in_code_predictor: bool,
+}
+
+impl DecodeThreadPolicy {
+    const fn default_const() -> Self {
+        Self {
+            explicit: false,
+            in_code_predictor: false,
+        }
+    }
+}
+
+std::thread_local! {
+    static DECODE_THREAD_POLICY: std::cell::Cell<DecodeThreadPolicy> =
+        const { std::cell::Cell::new(DecodeThreadPolicy::default_const()) };
+}
+
+struct ThreadPolicyGuard(DecodeThreadPolicy);
+
+impl Drop for ThreadPolicyGuard {
+    fn drop(&mut self) {
+        DECODE_THREAD_POLICY.with(|cell| cell.set(self.0));
+    }
+}
+
+pub(crate) fn with_explicit_threads<R>(explicit: bool, body: impl FnOnce() -> R) -> R {
+    let prev = DECODE_THREAD_POLICY.with(|cell| {
+        let old = cell.get();
+        cell.set(DecodeThreadPolicy {
+            explicit,
+            in_code_predictor: old.in_code_predictor,
+        });
+        old
+    });
+    let _guard = ThreadPolicyGuard(prev);
+    body()
+}
+
+fn with_code_predictor_scope<R>(body: impl FnOnce() -> R) -> R {
+    let prev = DECODE_THREAD_POLICY.with(|cell| {
+        let old = cell.get();
+        cell.set(DecodeThreadPolicy {
+            explicit: old.explicit,
+            in_code_predictor: true,
+        });
+        old
+    });
+    let _guard = ThreadPolicyGuard(prev);
+    body()
+}
+
+fn projection_weight_bytes(weight: &WeightQuantization) -> usize {
+    match weight {
+        WeightQuantization::F32(w) => w.len().saturating_mul(size_of::<f32>()),
+        WeightQuantization::Packed { bytes, .. } | WeightQuantization::RepackedQ4K8 { bytes } => {
+            bytes.len()
+        }
+        WeightQuantization::MappedPacked { bytes, .. } => bytes.as_slice().len(),
+        WeightQuantization::Q8_0 { blocks } => blocks.len().saturating_mul(size_of::<Q8Block>()),
+        WeightQuantization::PQ2_0 {
+            packed_trits,
+            scales,
+            ..
+        } => packed_trits
+            .len()
+            .saturating_add(scales.len().saturating_mul(size_of::<f32>())),
+        WeightQuantization::PTQ1_0 {
+            nz_mask,
+            sign_mask,
+            scales,
+            ..
+        } => nz_mask
+            .len()
+            .saturating_add(sign_mask.len())
+            .saturating_add(scales.len().saturating_mul(size_of::<f32>())),
+    }
+}
+
+fn compute_decode_worker_budget(
+    policy: DecodeThreadPolicy,
+    threads: usize,
+    total_out: usize,
+    max_target_out: usize,
+    total_weight_bytes: usize,
+) -> usize {
+    if policy.explicit {
+        return threads.clamp(1, 18).min(total_out.max(1));
+    }
+    let cluster_cap = if policy.in_code_predictor && max_target_out <= CODE_PREDICTOR_SMALL_ROW_LIMIT
+    {
+        CODE_PREDICTOR_SMALL_AUTO_CAP
+    } else {
+        TALKER_DECODE_AUTO_CAP
+    };
+    let byte_cap = (total_weight_bytes / MIN_DECODE_BYTES_PER_WORKER).max(1);
+    threads
+        .clamp(1, cluster_cap)
+        .min(total_out.max(1))
+        .min(byte_cap)
+}
+
+fn decode_worker_budget(threads: usize, out_dim: usize, weight_bytes: usize) -> usize {
+    let policy = DECODE_THREAD_POLICY.with(std::cell::Cell::get);
+    compute_decode_worker_budget(policy, threads, out_dim, out_dim, weight_bytes)
+}
+
+fn batch_worker_budget(threads: usize, max_target_out: usize) -> usize {
+    let policy = DECODE_THREAD_POLICY.with(std::cell::Cell::get);
+    if policy.explicit || !policy.in_code_predictor {
+        return threads.clamp(1, 18);
+    }
+    let cap = if max_target_out <= CODE_PREDICTOR_SMALL_ROW_LIMIT {
+        CODE_PREDICTOR_SMALL_AUTO_CAP
+    } else {
+        TALKER_DECODE_AUTO_CAP
+    };
+    threads.clamp(1, cap)
+}
+
+fn step_attention_worker_budget(threads: usize) -> usize {
+    let policy = DECODE_THREAD_POLICY.with(std::cell::Cell::get);
+    if policy.explicit {
+        threads.clamp(1, 18)
+    } else {
+        threads.clamp(1, TALKER_DECODE_AUTO_CAP)
+    }
+}
 
 fn run_row_chunks_aligned<F>(out: &mut [f32], worker_count: usize, alignment: usize, compute: F)
 where
@@ -2483,6 +2930,8 @@ fn forward_group_into(
         ));
     }
     let mut total_out = 0_usize;
+    let mut max_target_out = 0_usize;
+    let mut total_bytes = 0_usize;
     for (proj, lora, out) in targets.iter_mut() {
         let _layout = projection_layout::validate(proj.in_dim, proj.out_dim, &proj.weight)?;
         if input.len() != proj.in_dim {
@@ -2504,9 +2953,19 @@ fn forward_group_into(
         }
         out.resize(proj.out_dim, 0.0);
         total_out = total_out.saturating_add(proj.out_dim);
+        max_target_out = max_target_out.max(proj.out_dim);
+        total_bytes = total_bytes.saturating_add(projection_weight_bytes(&proj.weight));
     }
 
-    if threads > 1 && total_out >= 8 && targets.len() <= 4 {
+    let policy = DECODE_THREAD_POLICY.with(std::cell::Cell::get);
+    let workers = compute_decode_worker_budget(
+        policy,
+        threads,
+        total_out,
+        max_target_out,
+        total_bytes,
+    );
+    if workers > 1 && total_out >= 8 && targets.len() <= 4 {
         let caps = bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect();
         if caps.dotprod {
             #[derive(Clone, Copy)]
@@ -2558,14 +3017,14 @@ fn forward_group_into(
                 } else {
                     1
                 };
-                let workers = threads.clamp(1, 18).min(total_out);
+                let group_workers = workers;
                 quant_dispatch::with_group_workspace(
                     total_out,
                     need_q8,
                     need_qk,
                     input,
                     |combined, q8_slice, qk_slice| -> io::Result<()> {
-                        run_row_chunks_aligned(combined, workers, alignment, |global_row, dst| {
+                        run_row_chunks_aligned(combined, group_workers, alignment, |global_row, dst| {
                             let chunk_end = global_row + dst.len();
                             for seg in segments[..seg_count].iter().flatten() {
                                 let seg_end = seg.start + seg.len;
@@ -3738,7 +4197,7 @@ impl QwenDecoderLayer {
             scale,
             scores,
             attn_out,
-            workers,
+            step_attention_worker_budget(workers),
         )?;
 
         self.o_proj
@@ -4822,12 +5281,43 @@ impl CodePredictorModel {
         )
     }
 
+    fn predict_frame_inner(
+        &self,
+        talker_hidden: &[f32],
+        c0: i32,
+        talker_codec_embd: &LinearProjection,
+        params: DecoupledSamplingParams,
+        seed: i64,
+        subseq_base: i64,
+        workers: usize,
+        cancel: &mut (impl FnMut() -> io::Result<()> + ?Sized),
+        workspace: &mut predictor_workspace::PredictorWorkspace,
+        mut observe: Option<
+            &mut (impl FnMut(crate::observation::PredictorObservation<'_>) -> io::Result<()> + ?Sized),
+        >,
+    ) -> io::Result<[i32; TOTAL_CODE_GROUPS]> {
+        with_code_predictor_scope(|| {
+            self.predict_frame_inner_scoped(
+                talker_hidden,
+                c0,
+                talker_codec_embd,
+                params,
+                seed,
+                subseq_base,
+                workers,
+                cancel,
+                workspace,
+                observe.as_deref_mut(),
+            )
+        })
+    }
+
     #[expect(
         clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "Batch step-0 + g=0 prefill while preserving exact 1-position Prefill observation when observed."
     )]
-    fn predict_frame_inner(
+    fn predict_frame_inner_scoped(
         &self,
         talker_hidden: &[f32],
         c0: i32,
@@ -6975,5 +7465,98 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn q8_k_panels_and_finite_strips_match_single_token_bit_exact() -> std::io::Result<()> {
+        let in_dim = 512_usize;
+        let mut p_repack = make_packed_test_proj(
+            "talker.blk.0.attn_q.weight",
+            12,
+            in_dim,
+            24,
+            1,
+            Some((0..24).map(|i| 0.05 * super::usize_to_f32(i % 7)).collect()),
+        )?;
+        p_repack.repack_q4_k_if_aligned();
+        let p_q6 = make_packed_test_proj(
+            "talker.blk.0.ffn_down.weight",
+            14,
+            in_dim,
+            16,
+            2,
+            Some(vec![-0.125; 16]),
+        )?;
+        let p_q8 = make_packed_test_proj(
+            "talker.blk.0.attn_k.weight",
+            8,
+            in_dim,
+            24,
+            3,
+            Some((0..24).map(|i| -0.03 * super::usize_to_f32(i % 5)).collect()),
+        )?;
+
+        for seq_len in [1_usize, 2, 5, 8, 9, 17, 19] {
+            let inputs: Vec<f32> = (0..seq_len * in_dim)
+                .map(|i| f32::from(i16::try_from((i * 13 + 7) % 41).unwrap_or(0) - 20) * 0.04)
+                .collect();
+            for proj in [&p_repack, &p_q6, &p_q8] {
+                let mut ref_batch = Vec::with_capacity(seq_len * proj.out_dim);
+                let mut step = Vec::new();
+                for t in 0..seq_len {
+                    proj.forward_vec_into(
+                        &inputs[t * in_dim..(t + 1) * in_dim],
+                        None,
+                        None,
+                        1,
+                        &mut step,
+                    )?;
+                    ref_batch.extend_from_slice(&step);
+                }
+                for threads in [1_usize, 4] {
+                    let mut got = Vec::new();
+                    proj.forward_batch_into(&inputs, seq_len, None, threads, &mut got)?;
+                    assert_eq!(
+                        got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        ref_batch.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "proj={} seq_len={seq_len} threads={threads}",
+                        proj.name
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_aware_decode_thread_budget_caps_auto_and_preserves_explicit_overrides() {
+        // Talker decode auto mode caps to <= 8 and applies ~256 KiB/worker floor.
+        assert_eq!(super::decode_worker_budget(16, 4096, 8 * 1024 * 1024), 8);
+        assert_eq!(super::decode_worker_budget(10, 4096, 8 * 1024 * 1024), 8);
+        assert_eq!(super::decode_worker_budget(16, 1024, 576 * 1024), 2);
+        assert_eq!(super::decode_worker_budget(16, 64, 64 * 1024), 1);
+
+        // Batch prefill keeps avail - 2 (up to 18) outside CodePredictor.
+        assert_eq!(super::batch_worker_budget(16, 2048), 16);
+        assert_eq!(super::batch_worker_budget(10, 1024), 10);
+
+        // Inside CodePredictor, auto mode caps <= 2048-row projections to <= 6 and > 2048 to <= 8.
+        super::with_code_predictor_scope(|| {
+            assert_eq!(super::decode_worker_budget(16, 2048, 2 * 1024 * 1024), 6);
+            assert_eq!(super::decode_worker_budget(16, 1024, 590 * 1024), 2);
+            assert_eq!(super::decode_worker_budget(16, 3072, 4 * 1024 * 1024), 8);
+            assert_eq!(super::batch_worker_budget(16, 2048), 6);
+            assert_eq!(super::batch_worker_budget(16, 3072), 8);
+        });
+
+        // Explicit --threads overrides bypass auto cluster/byte caps everywhere.
+        super::with_explicit_threads(true, || {
+            assert_eq!(super::decode_worker_budget(16, 2048, 64 * 1024), 16);
+            assert_eq!(super::decode_worker_budget(1, 4096, 8 * 1024 * 1024), 1);
+            super::with_code_predictor_scope(|| {
+                assert_eq!(super::decode_worker_budget(12, 2048, 64 * 1024), 12);
+                assert_eq!(super::batch_worker_budget(16, 2048), 16);
+            });
+        });
     }
 }

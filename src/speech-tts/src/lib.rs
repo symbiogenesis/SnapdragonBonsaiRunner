@@ -178,6 +178,23 @@ pub struct Synthesizer {
     threads: usize,
 }
 
+const EXPLICIT_THREADS_BIT: usize = 1 << 16;
+
+const fn encode_synthesizer_threads(threads: usize, explicit: bool) -> usize {
+    if explicit {
+        threads | EXPLICIT_THREADS_BIT
+    } else {
+        threads
+    }
+}
+
+const fn decode_synthesizer_threads(encoded: usize) -> (usize, bool) {
+    (
+        encoded & (EXPLICIT_THREADS_BIT - 1),
+        (encoded & EXPLICIT_THREADS_BIT) != 0,
+    )
+}
+
 // A callback can unwind as well as return an error. Keep cleanup outside the
 // callback stack so neither voice nor codec snapshots survive non-cooperative failure.
 struct SynthesisGuard<'a> {
@@ -586,8 +603,11 @@ impl Synthesizer {
         threads: Option<usize>,
     ) -> io::Result<LoadedDesign> {
         model_path(model)?;
+        let explicit = threads.is_some();
         let threads = select_threads(threads, std::thread::available_parallelism()?.get())?;
-        let talker = load_talker(model, "voice_design", threads)?;
+        let talker = engine::with_explicit_threads(explicit, || {
+            load_talker(model, "voice_design", threads)
+        })?;
         Ok(LoadedDesign { talker })
     }
 
@@ -604,6 +624,7 @@ impl Synthesizer {
     ) -> io::Result<Self> {
         model_path(model)?;
         model_path(voice_model)?;
+        let explicit_threads = threads.is_some();
         let threads = select_threads(threads, std::thread::available_parallelism()?.get())?;
         Ok(Self {
             voices: VoiceCache(None),
@@ -611,7 +632,7 @@ impl Synthesizer {
             model_path: model.to_owned(),
             voice_model_path: voice_model.to_owned(),
             codec: codec.codec,
-            threads,
+            threads: encode_synthesizer_threads(threads, explicit_threads),
         })
     }
 
@@ -664,8 +685,9 @@ impl Synthesizer {
             model_path,
             voice_model_path,
             codec,
-            threads,
+            threads: encoded_threads,
         } = self;
+        let (threads, explicit_threads) = decode_synthesizer_threads(*encoded_threads);
         voices.get_or_acquire(
             profile,
             design,
@@ -682,8 +704,10 @@ impl Synthesizer {
                 let weights = weights::Weights::open(voice_model_path)
                     .map_err(|error| SynthesisStage::BaseWeights.failure(error))?;
                 Self::validate_base_weights(&weights)?;
-                Self::load_talker_from_base_weights(&weights, *threads, &mut || {
-                    (cancel.borrow_mut())()
+                engine::with_explicit_threads(explicit_threads, || {
+                    Self::load_talker_from_base_weights(&weights, threads, &mut || {
+                        (cancel.borrow_mut())()
+                    })
                 })
             },
             |design| {
@@ -691,12 +715,14 @@ impl Synthesizer {
                     .map_err(|error| SynthesisStage::DesignModel.failure(error))?;
                 let mut talker = match design.take() {
                     Some(talker) => talker,
-                    None => load_talker(model_path, "voice_design", *threads)
-                        .map_err(|error| SynthesisStage::DesignModel.failure(error))?,
+                    None => engine::with_explicit_threads(explicit_threads, || {
+                        load_talker(model_path, "voice_design", threads)
+                    })
+                    .map_err(|error| SynthesisStage::DesignModel.failure(error))?,
                 };
                 let mut codes = Vec::new();
-                talker
-                    .generate_observed(
+                engine::with_explicit_threads(explicit_threads, || {
+                    talker.generate_observed(
                         rust_talker::REFERENCE_TEXT,
                         Some(profile),
                         None,
@@ -712,7 +738,8 @@ impl Synthesizer {
                             })
                         },
                     )
-                    .map_err(|error| SynthesisStage::ReferenceGeneration.failure(error))?;
+                })
+                .map_err(|error| SynthesisStage::ReferenceGeneration.failure(error))?;
                 let samples = codec
                     .decode_cancellable(&codes, &mut || (cancel.borrow_mut())())
                     .map_err(|error| SynthesisStage::ReferenceDecode.failure(error))?;
@@ -739,17 +766,18 @@ impl Synthesizer {
                     },
                     |weights, samples| {
                         Self::validate_base_weights(weights)?;
-                        let speaker = rust_codec::Speaker::load(weights, *threads)
+                        let speaker = rust_codec::Speaker::load(weights, threads)
                             .map_err(|error| SynthesisStage::SpeakerWeights.failure(error))?
                             .extract_cancellable(samples, &mut || (cancel.borrow_mut())())
                             .map_err(|error| SynthesisStage::SpeakerExtraction.failure(error))?;
                         let reference_codes = codec
                             .encode_reference_cancellable(samples, &mut || (cancel.borrow_mut())())
                             .map_err(|error| SynthesisStage::ReferenceEncoding.failure(error))?;
-                        let talker =
-                            Self::load_talker_from_base_weights(weights, *threads, &mut || {
+                        let talker = engine::with_explicit_threads(explicit_threads, || {
+                            Self::load_talker_from_base_weights(weights, threads, &mut || {
                                 (cancel.borrow_mut())()
-                            })?;
+                            })
+                        })?;
                         let reference = rust_talker::Reference {
                             speaker,
                             codes: reference_codes,
@@ -917,7 +945,13 @@ impl Synthesizer {
         let synthesizer = &mut *guard.synthesizer;
         let result = (|| {
             let _ = synthesizer.voice(profile, &cancel_ref, &observe)?;
-            let Self { voices, codec, .. } = synthesizer;
+            let Self {
+                voices,
+                codec,
+                threads: encoded_threads,
+                ..
+            } = synthesizer;
+            let (_, explicit_threads) = decode_synthesizer_threads(*encoded_threads);
             let (_, voice) = voices.0.as_mut().ok_or_else(invalid_audio)?;
             (cancel_ref.borrow_mut())()
                 .map_err(|error| SynthesisStage::CodecPriming.failure(error))?;
@@ -935,9 +969,8 @@ impl Synthesizer {
             let mut pending_frames: Vec<[i32; engine::TOTAL_CODE_GROUPS]> =
                 Vec::with_capacity(chunk_cfg.steady_chunk_frames);
             let mut count = 0;
-            voice
-                .talker
-                .generate_observed(
+            engine::with_explicit_threads(explicit_threads, || {
+                voice.talker.generate_observed(
                     text,
                     None,
                     Some(&voice.reference),
@@ -965,7 +998,8 @@ impl Synthesizer {
                         })
                     },
                 )
-                .map_err(|error| SynthesisStage::Generation.failure(error))?;
+            })
+            .map_err(|error| SynthesisStage::Generation.failure(error))?;
             if !pending_frames.is_empty() {
                 flush_pcm_chunk(
                     codec,
