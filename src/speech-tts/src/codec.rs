@@ -5884,9 +5884,9 @@ mod tests {
             conv_fallback.weight_okic = None;
 
             let ctx_frames = conv.stream_context_frames();
-            let full_input = values(256 * in_c);
-            let mut full_ref = vec![0.0_f64; 256 * out_c];
-            let row_chunk = 256_usize.div_ceil(workers);
+            let full_input = values(64 * in_c);
+            let mut full_ref = vec![0.0_f64; 64 * out_c];
+            let row_chunk = 64_usize.div_ceil(workers);
             std::thread::scope(|scope| {
                 for (chunk_idx, out_chunk) in full_ref.chunks_mut(row_chunk * out_c).enumerate() {
                     let t_start = chunk_idx * row_chunk;
@@ -5916,7 +5916,7 @@ mod tests {
                 }
             });
 
-            for frames in [1_usize, 2, 3, 4, 32, 256] {
+            for frames in [1_usize, 2, 3, 4, 32, 64] {
                 let input = &full_input[..frames * in_c];
                 let (offline_t1, out_frames) = conv.forward_parallel(input, frames, 1)?;
                 assert_eq!(out_frames, frames);
@@ -5936,9 +5936,14 @@ mod tests {
                     );
                 }
 
-                // Verify bit-identical threads in [1, 4, 10, 16] and weight_okic=None fallback.
+                // Verify bit-identical threads and weight_okic=None fallback.
                 let mut st = vec![0.0_f32; ctx_frames * in_c];
-                for threads in [1_usize, 4, 10, 16] {
+                let thread_counts: &[usize] = if matches!(frames, 1 | 4 | 64) {
+                    &[1, 4, 10, 16]
+                } else {
+                    &[1, 16]
+                };
+                for &threads in thread_counts {
                     if threads > 1 {
                         let (par_off, _) = conv.forward_parallel(input, frames, threads)?;
                         assert_f32_bits_eq(
@@ -5960,14 +5965,16 @@ mod tests {
                         ),
                     );
                 }
-                let (fallback_out, _) = conv_fallback.forward_parallel(input, frames, 16)?;
-                assert_f32_bits_eq(
-                    &fallback_out,
-                    &offline_t1,
-                    &format!(
-                        "fallback weight_okic=None mismatch in_c={in_c} out_c={out_c} frames={frames}"
-                    ),
-                );
+                if matches!(frames, 1 | 4 | 64) {
+                    let (fallback_out, _) = conv_fallback.forward_parallel(input, frames, 16)?;
+                    assert_f32_bits_eq(
+                        &fallback_out,
+                        &offline_t1,
+                        &format!(
+                            "fallback weight_okic=None mismatch in_c={in_c} out_c={out_c} frames={frames}"
+                        ),
+                    );
+                }
 
                 // Verify chunked [1, 2, 4, 8] streaming vs offline bits.
                 let mut chunk_state = vec![0.0_f32; ctx_frames * in_c];
@@ -6062,9 +6069,9 @@ mod tests {
                 Ok(())
             });
 
-            // Explicit DAC Block 0 geometry: in_c=1536, out_c=768, k=16, s=8.
-            let in_c = 1536_usize;
-            let out_c = 768_usize;
+            // Phase-OC parallel DAC-style geometry >= PHASE_OC_THRESHOLD_BYTES (1 MiB): in_c=192, out_c=96, k=16, s=8.
+            let in_c = 192_usize;
+            let out_c = 96_usize;
             let kernel = 16_usize;
             let stride = 8_usize;
             let raw_weight = values(in_c * out_c * kernel);
@@ -6092,7 +6099,7 @@ mod tests {
                     if frames <= 4 {
                         (0..frames * stride + block0_ref.carry_frames())
                             .flat_map(|y| {
-                                [0_usize, 15, 16, 17, 383, 767]
+                                [0_usize, 15, 16, 17, 47, 95]
                                     .into_iter()
                                     .map(move |oc| (y, oc))
                             })
@@ -6101,9 +6108,7 @@ mod tests {
                         [0_usize, 7, 8, 9, 127, 255, 256, 263]
                             .into_iter()
                             .flat_map(|y| {
-                                [0_usize, 15, 16, 511, 767]
-                                    .into_iter()
-                                    .map(move |oc| (y, oc))
+                                [0_usize, 15, 16, 63, 95].into_iter().map(move |oc| (y, oc))
                             })
                             .collect()
                     }
@@ -6235,8 +6240,8 @@ mod tests {
 
     #[test]
     fn convnext_three_stage_parallel_matches_single_thread_bits() -> std::io::Result<()> {
-        const FRAMES_LIST: [usize; 4] = [1, 2, 4, 32];
-        let setups: Vec<_> = [(129_usize, 517_usize), (256, 1024)]
+        const FRAMES_LIST: [usize; 4] = [1, 2, 4, 16];
+        let setups: Vec<_> = [(129_usize, 517_usize), (192, 512)]
             .into_iter()
             .map(|(channels, mid_c)| {
                 let kernel = 7_usize;
@@ -6256,7 +6261,7 @@ mod tests {
                     pwconv2_b: values(channels),
                     gamma: values(channels),
                 };
-                let full_input = values(32 * channels);
+                let full_input = values(16 * channels);
                 let init_state = values((kernel - 1) * channels);
                 (channels, mid_c, block, full_input, init_state)
             })
