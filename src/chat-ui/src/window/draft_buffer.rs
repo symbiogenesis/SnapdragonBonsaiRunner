@@ -438,8 +438,7 @@ impl<'a> Buffer<'a> {
 
         let (has_mutating_event, frame_time, input_mode, history_action) =
             inspect_frame_events(ctx, id);
-        let legacy_mode =
-            history_empty && has_mutating_event && legacy_undoer_populated(&previous);
+        let legacy_mode = history_empty && has_mutating_event && legacy_undoer_populated(&previous);
 
         let undoer = legacy_mode.then(|| previous.undoer());
         let mut buffer = Self {

@@ -1404,7 +1404,10 @@ mod quant_dispatch {
         quantize_row: impl Fn(&[f32], &mut [Act]) + Sync,
     ) {
         let active = workers.clamp(1, 18).min(seq_len);
-        if active <= 1 || seq_len < 2 || seq_len.saturating_mul(in_dim) < 4096 || blocks_per_tok == 0
+        if active <= 1
+            || seq_len < 2
+            || seq_len.saturating_mul(in_dim) < 4096
+            || blocks_per_tok == 0
         {
             for t in 0..seq_len {
                 quantize_row(
@@ -1719,7 +1722,15 @@ mod quant_dispatch {
                 run_row_chunks_aligned(out, worker_count, align, |start_row, dst| {
                     let b_slice = bias.map(|b| &b[start_row..start_row + dst.len()]);
                     add_packed_rows(
-                        ggml_type, bytes, in_dim, caps, &[], act, b_slice, start_row, dst,
+                        ggml_type,
+                        bytes,
+                        in_dim,
+                        caps,
+                        &[],
+                        act,
+                        b_slice,
+                        start_row,
+                        dst,
                     );
                 });
             });
@@ -2348,16 +2359,8 @@ mod quant_dispatch {
                         let rows_here = ov_end - ov_start;
                         let bias_slice = seg.bias.map(|b| &b[local_row..local_row + rows_here]);
                         dispatch_batch_segment(
-                            seg.kind,
-                            dst_slice,
-                            bias_slice,
-                            seg.in_dim,
-                            seq_len,
-                            local_row,
-                            rows_here,
-                            caps,
-                            q8_slice,
-                            qk_slice,
+                            seg.kind, dst_slice, bias_slice, seg.in_dim, seq_len, local_row,
+                            rows_here, caps, q8_slice, qk_slice,
                         );
                     }
                 });
@@ -6068,7 +6071,8 @@ mod tests {
             &mut workspace,
             &mut |event| {
                 if let crate::observation::PredictorObservation::Prefill { cache } = event {
-                    obs_prefill_lens.extend(cache.iter().map(|c| (c.seq_len, c.k.len(), c.v.len())));
+                    obs_prefill_lens
+                        .extend(cache.iter().map(|c| (c.seq_len, c.k.len(), c.v.len())));
                 }
                 Ok(())
             },
@@ -6076,7 +6080,14 @@ mod tests {
         assert_eq!(observed_codes, first);
         assert_eq!(
             obs_prefill_lens,
-            vec![(1, model.num_kv_heads * model.head_dim, model.num_kv_heads * model.head_dim); model.layers.len()]
+            vec![
+                (
+                    1,
+                    model.num_kv_heads * model.head_dim,
+                    model.num_kv_heads * model.head_dim
+                );
+                model.layers.len()
+            ]
         );
         Ok(())
     }

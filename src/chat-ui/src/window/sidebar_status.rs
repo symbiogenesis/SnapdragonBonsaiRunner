@@ -39,7 +39,8 @@ fn cached_galleys(ui: &egui::Ui, model_label: &'static str) -> SidebarStatusGall
             ..cached
         };
         let result = updated.clone();
-        ui.ctx().data_mut(|data| data.insert_temp(cache_id, updated));
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(cache_id, updated));
         return result;
     }
     let created = SidebarStatusGalleys {
@@ -59,7 +60,8 @@ fn cached_galleys(ui: &egui::Ui, model_label: &'static str) -> SidebarStatusGall
         pixels_per_point_bits,
     };
     let result = created.clone();
-    ui.ctx().data_mut(|data| data.insert_temp(cache_id, created));
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(cache_id, created));
     result
 }
 

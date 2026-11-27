@@ -344,7 +344,8 @@ pub(super) fn split_streaming_svg(text: &str) -> (&str, bool) {
             break;
         };
         let hit = offset + rel;
-        let line_start = memchr::memrchr(b'\n', &bytes[offset..hit]).map_or(offset, |nl| offset + nl + 1);
+        let line_start =
+            memchr::memrchr(b'\n', &bytes[offset..hit]).map_or(offset, |nl| offset + nl + 1);
         let line_end = memchr::memchr(b'\n', &bytes[hit..]).map_or(bytes.len(), |nl| hit + nl + 1);
         let line = &text[line_start..line_end];
         match state {

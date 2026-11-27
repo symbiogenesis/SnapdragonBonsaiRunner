@@ -1822,7 +1822,10 @@ mod tests {
                 b"{\"messages\":[{\"role\":\"user\",",
                 b"\"content\":\"hi\"}]}",
             ];
-            let expected: Vec<u8> = parts.iter().flat_map(|slice| slice.iter().copied()).collect();
+            let expected: Vec<u8> = parts
+                .iter()
+                .flat_map(|slice| slice.iter().copied())
+                .collect();
             assert!(expected.len() < MAX_FRAME_PAYLOAD);
 
             let mut slices: [io::IoSlice<'_>; 12] = parts.map(io::IoSlice::new);

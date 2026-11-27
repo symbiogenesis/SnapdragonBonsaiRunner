@@ -370,7 +370,9 @@ fn windows_directory_cached(checked_ancestors: &mut HashSet<PathBuf>) -> io::Res
     Ok(windows)
 }
 
-fn runtime_paths_cached(checked_ancestors: &mut HashSet<PathBuf>) -> io::Result<Vec<(String, Vec<u16>)>> {
+fn runtime_paths_cached(
+    checked_ancestors: &mut HashSet<PathBuf>,
+) -> io::Result<Vec<(String, Vec<u16>)>> {
     let windows = windows_directory_cached(checked_ancestors)?;
     let mut paths = Vec::new();
     for name in ["System32", "WinSxS", "SysWOW64"] {

@@ -393,7 +393,11 @@ fn append_tail_slice(
         if found.range.start >= abs_end {
             break;
         }
-        let start = found.range.start.saturating_sub(base_offset).min(tail.len());
+        let start = found
+            .range
+            .start
+            .saturating_sub(base_offset)
+            .min(tail.len());
         let end = found.range.end.saturating_sub(base_offset).min(tail.len());
         if end <= start {
             continue;
@@ -939,12 +943,7 @@ fn render_parsed_text_segment_chunked(
     for (idx, &(chunk_start, chunk_end)) in blocks.iter().enumerate() {
         let is_last_parsed = idx + 1 == blocks.len();
         if is_last_parsed {
-            advance_parsed_cursors(
-                parsed,
-                chunk_start,
-                &mut span_cursor,
-                &mut mapping_cursor,
-            );
+            advance_parsed_cursors(parsed, chunk_start, &mut span_cursor, &mut mapping_cursor);
             last_block_display_start = chunk_start;
             last_block_span_cursor = span_cursor;
             last_block_mapping_cursor = mapping_cursor;
@@ -1002,7 +1001,9 @@ pub(super) fn layout_document_tail(
     streaming_visible_prefix: Option<usize>,
 ) -> Option<(Vec<BodySegment>, bool)> {
     if let Some(prefix_end) = streaming_visible_prefix
-        && matches.last().is_some_and(|found| found.range.end > prefix_end)
+        && matches
+            .last()
+            .is_some_and(|found| found.range.end > prefix_end)
     {
         return None;
     }
@@ -1206,12 +1207,12 @@ pub(super) fn layout_document(
                 while matches
                     .get(match_cursor)
                     .is_some_and(|found| found.range.end <= tail_start)
-                    && !layout
+                    && !layout.source_map.covers_exact(&matches[match_cursor].range)
+                    && layout
                         .source_map
-                        .covers_exact(&matches[match_cursor].range)
-                    && layout.source_map.entries.last().is_some_and(|entry| {
-                        matches[match_cursor].range.end <= entry.source.start
-                    })
+                        .entries
+                        .last()
+                        .is_some_and(|entry| matches[match_cursor].range.end <= entry.source.start)
                 {
                     match_cursor += 1;
                 }

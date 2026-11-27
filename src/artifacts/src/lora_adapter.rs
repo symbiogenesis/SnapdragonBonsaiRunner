@@ -618,7 +618,12 @@ pub fn verify_multi_rank_lora_gguf(
             .map_err(|_| ArtifactError::Identity)?;
         let parsed = parse_gguf_header(BufReader::new(&mut file), file_len)?;
         let plan = validate_header_and_pairs(&parsed, file_len, max_rank_limit, envelope)?;
-        let max_span = plan.spans.iter().map(|span| span.byte_len).max().unwrap_or(0);
+        let max_span = plan
+            .spans
+            .iter()
+            .map(|span| span.byte_len)
+            .max()
+            .unwrap_or(0);
         let buf_len = FINITE_SCAN_CHUNK_BYTES
             .min(usize::try_from(max_span).unwrap_or(FINITE_SCAN_CHUNK_BYTES))
             .max(4);

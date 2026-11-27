@@ -359,7 +359,14 @@ fn emit_checking_status_unless_cached(
     if kind == "existing" && crate::startup_download::verify_length(path, bytes).is_ok() {
         return Ok(());
     }
-    status(working, stage, message, kind, "checking", Some((path, bytes)))
+    status(
+        working,
+        stage,
+        message,
+        kind,
+        "checking",
+        Some((path, bytes)),
+    )
 }
 
 #[expect(

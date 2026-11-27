@@ -811,9 +811,9 @@ fn decode_slice_f32(kind: u32, bytes: &[u8], output: &mut [f32]) -> io::Result<(
             for (src, dst) in in8.iter().zip(out8.iter_mut()) {
                 let quads = src.as_chunks::<4>().0;
                 let bits: [u32; 8] = std::array::from_fn(|idx| u32::from_le_bytes(quads[idx]));
-                let nonfinite = bits
-                    .iter()
-                    .fold(false, |bad, &raw| bad | ((raw & 0x7F80_0000) == 0x7F80_0000));
+                let nonfinite = bits.iter().fold(false, |bad, &raw| {
+                    bad | ((raw & 0x7F80_0000) == 0x7F80_0000)
+                });
                 if nonfinite {
                     return Err(invalid());
                 }

@@ -806,8 +806,14 @@ fn build_pair_index(
         let bytes = line.as_bytes();
         let left = &bytes[..split_idx];
         let right = &bytes[split_idx + 1..];
-        let left_sym =
-            resolve_symbol_indexed(&vocab_index, token_arena, token_spans, &extras, vocab_cap, left);
+        let left_sym = resolve_symbol_indexed(
+            &vocab_index,
+            token_arena,
+            token_spans,
+            &extras,
+            vocab_cap,
+            left,
+        );
         let right_sym = resolve_symbol_indexed(
             &vocab_index,
             token_arena,

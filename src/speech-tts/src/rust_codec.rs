@@ -2730,8 +2730,12 @@ fn load_dac_decoder<S: CodecSource + ?Sized>(
 
     let mut conv_pre = None;
     let mut block_heads: [Option<(SnakeBeta, CausalTransConv1d)>; 4] = [None, None, None, None];
-    let mut block_units: [[Option<DacResUnit>; 3]; 4] =
-        [[None, None, None], [None, None, None], [None, None, None], [None, None, None]];
+    let mut block_units: [[Option<DacResUnit>; 3]; 4] = [
+        [None, None, None],
+        [None, None, None],
+        [None, None, None],
+        [None, None, None],
+    ];
     let mut post = None;
     for item in items {
         match item {
@@ -4309,17 +4313,7 @@ mod tests {
         // ELU SIMD vs scalar exp_m1 within <= 2 ULP across small polynomial and exp branches
         let mut elu_samples = samples;
         for &edge in &[
-            -100.0_f32,
-            -87.4,
-            -87.0,
-            -1.0,
-            -0.5,
-            -0.1251,
-            -0.125,
-            -0.1249,
-            -0.05,
-            -1e-4,
-            -1e-7,
+            -100.0_f32, -87.4, -87.0, -1.0, -0.5, -0.1251, -0.125, -0.1249, -0.05, -1e-4, -1e-7,
             1e-7,
         ] {
             elu_samples.push(edge);
@@ -4349,7 +4343,10 @@ mod tests {
                 assert_eq!(got.to_bits(), want.to_bits(), "elu idx={idx} x={x}");
             } else {
                 let err = (got - want).abs();
-                assert!(err <= 2e-7, "elu idx={idx} x={x} got={got} want={want} err={err}");
+                assert!(
+                    err <= 2e-7,
+                    "elu idx={idx} x={x} got={got} want={want} err={err}"
+                );
                 if x > -0.125 || x <= -0.7 {
                     let ulp = got.to_bits().abs_diff(want.to_bits());
                     assert!(

@@ -976,8 +976,10 @@ impl Message {
         }
         // Move reusable owners on a partial update. A complete cache hit above
         // does not reconstruct the cache or adjust any galley's Arc count.
-        let (previous_segments, previous_reasoning, previous_anchor, prev_streaming_chunks) =
-            self.cache.take().map_or((None, None, None, false), |cache| {
+        let (previous_segments, previous_reasoning, previous_anchor, prev_streaming_chunks) = self
+            .cache
+            .take()
+            .map_or((None, None, None, false), |cache| {
                 (
                     Some(cache.segments),
                     cache.reasoning,
@@ -1014,11 +1016,7 @@ impl Message {
                     self.underline_layouts += 1;
                 }
                 let segment_count = segments.len();
-                let start_index = if underline_was_same {
-                    prefix_reused
-                } else {
-                    0
-                };
+                let start_index = if underline_was_same { prefix_reused } else { 0 };
                 for index in start_index..segment_count {
                     let active_here = handles_source_offset(&segments, index, selected.start);
                     if let CachedSegment::Text(text) = &mut segments[index] {
@@ -1125,11 +1123,7 @@ impl Message {
         can_reuse_galleys: bool,
         mut previous_segments: Option<Vec<CachedSegment>>,
         previous_anchor: Option<formatting::PrefixAnchor>,
-    ) -> (
-        Vec<CachedSegment>,
-        Option<formatting::PrefixAnchor>,
-        usize,
-    ) {
+    ) -> (Vec<CachedSegment>, Option<formatting::PrefixAnchor>, usize) {
         #[cfg(test)]
         self.highlight_range_visits
             .set(self.highlight_range_visits.get() + matches.len());
@@ -1181,9 +1175,7 @@ impl Message {
             streaming_visible_prefix,
             streaming_chunks,
         );
-        let prevs = previous_segments
-            .as_deref()
-            .filter(|_| can_reuse_galleys);
+        let prevs = previous_segments.as_deref().filter(|_| can_reuse_galleys);
         let mut cached = Vec::with_capacity(body_segments.len() + usize::from(show_generating));
         self.append_cached_segments(
             ui,

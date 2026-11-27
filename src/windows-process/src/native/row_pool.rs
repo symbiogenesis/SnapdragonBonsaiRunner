@@ -584,8 +584,8 @@ mod tests {
     }
 
     #[test]
-    fn direct_dispatch_runs_without_next_chunk_fetch_and_supports_run_slice_aligned() -> io::Result<()>
-    {
+    fn direct_dispatch_runs_without_next_chunk_fetch_and_supports_run_slice_aligned()
+    -> io::Result<()> {
         use std::collections::HashSet;
 
         let pool = NativeRowWorkerPool::new(4, "test-direct-row")?;
@@ -595,7 +595,10 @@ mod tests {
         // Full-team aligned workload: active == worker_count == chunk_count (4).
         // Marker 0xDEAD_BEEF in next_chunk must remain untouched because direct-dispatch
         // bypasses CAS and next_chunk.fetch_add.
-        pool.shared.next_chunk.0.store(0xDEAD_BEEF, Ordering::Release);
+        pool.shared
+            .next_chunk
+            .0
+            .store(0xDEAD_BEEF, Ordering::Release);
         let chunk_threads: Mutex<Vec<(usize, std::thread::ThreadId)>> = Mutex::new(Vec::new());
         pool.run_slice_aligned(&mut out, 4, 8, &|offset, slice| {
             lock_unpoisoned(&chunk_threads).push((offset, std::thread::current().id()));
@@ -603,7 +606,10 @@ mod tests {
                 *slot = u64::try_from(offset + i).unwrap_or(0) * 3 + 1;
             }
         });
-        assert_eq!(pool.shared.next_chunk.0.load(Ordering::Acquire), 0xDEAD_BEEF);
+        assert_eq!(
+            pool.shared.next_chunk.0.load(Ordering::Acquire),
+            0xDEAD_BEEF
+        );
         assert_ne!(
             pool.shared.dispatch_state.0.load(Ordering::Acquire) & DIRECT_FLAG,
             0

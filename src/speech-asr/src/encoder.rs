@@ -767,8 +767,9 @@ fn im2col_quads_slice(
             let y0 = base_pos / out_width;
             let x0 = base_pos % out_width;
             if x0 + 3 < out_width && x0 > 0 && 2 * (x0 + 3) + 1 < width {
-                let py_opts: [Option<usize>; 3] =
-                    std::array::from_fn(|ky| (2 * y0 + ky).checked_sub(1).filter(|&py| py < height));
+                let py_opts: [Option<usize>; 3] = std::array::from_fn(|ky| {
+                    (2 * y0 + ky).checked_sub(1).filter(|&py| py < height)
+                });
                 for ch in 0..channels {
                     let ch_in_base = ch * height;
                     let ch_p_base = ch * 9;
@@ -778,12 +779,8 @@ fn im2col_quads_slice(
                                 &rounded[(ch_in_base + py) * width..(ch_in_base + py + 1) * width];
                             for kx in 0..3 {
                                 let bx = 2 * x0 + kx - 1;
-                                quad_slice[ch_p_base + ky * 3 + kx] = [
-                                    in_row[bx],
-                                    in_row[bx + 2],
-                                    in_row[bx + 4],
-                                    in_row[bx + 6],
-                                ];
+                                quad_slice[ch_p_base + ky * 3 + kx] =
+                                    [in_row[bx], in_row[bx + 2], in_row[bx + 4], in_row[bx + 6]];
                             }
                         } else {
                             quad_slice[ch_p_base + ky * 3..ch_p_base + ky * 3 + 3].fill([0.0; 4]);

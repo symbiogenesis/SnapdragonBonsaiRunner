@@ -250,10 +250,7 @@ fn tdnn_1oc_row_simd<S: Simd>(
                 a0 = w.mul_add(f32x4::from_slice(simd, &padded[x_off..x_off + 4]), a0);
                 a1 = w.mul_add(f32x4::from_slice(simd, &padded[x_off + 4..x_off + 8]), a1);
                 a2 = w.mul_add(f32x4::from_slice(simd, &padded[x_off + 8..x_off + 12]), a2);
-                a3 = w.mul_add(
-                    f32x4::from_slice(simd, &padded[x_off + 12..x_off + 16]),
-                    a3,
-                );
+                a3 = w.mul_add(f32x4::from_slice(simd, &padded[x_off + 12..x_off + 16]), a3);
             }
         }
         if apply_relu {
@@ -289,7 +286,8 @@ fn tdnn_1oc_row_simd<S: Simd>(
         for k in 0..kernel {
             let tap_off = k * dilation + f;
             for ic in 0..in_c {
-                acc = weight_row[ic * kernel + k].mul_add(padded[ic * padded_frames + tap_off], acc);
+                acc =
+                    weight_row[ic * kernel + k].mul_add(padded[ic * padded_frames + tap_off], acc);
             }
         }
         out_row[f] = if apply_relu { acc.max(0.0_f32) } else { acc };

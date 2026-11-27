@@ -192,9 +192,8 @@ impl State {
     fn serialize_workspace(&self) -> Result<Vec<u8>, serde_json::Error> {
         const LIMIT: usize = 8 * 1024 * 1024;
         let initial_capacity = self.last_workspace_bytes.get().max(4096);
-        let mut writer =
-            crate::bounded_json::BoundedWriter::with_capacity(LIMIT, initial_capacity)
-                .map_err(serde_json::Error::io)?;
+        let mut writer = crate::bounded_json::BoundedWriter::with_capacity(LIMIT, initial_capacity)
+            .map_err(serde_json::Error::io)?;
         writer.write_raw(br#"{"version":1,"conversations":["#)?;
         for (index, conversation) in self.conversations.iter().enumerate() {
             if index > 0 {

@@ -2030,15 +2030,17 @@ fn prefill_rows_inner(
                 },
             )?;
             ws.prepared.prepare_meta(total, c.intermediate);
-            block.down.multiply_batch_prepared_biased_prevalidated_into(
-                &mut ws.prepared,
-                &ws.batch_gate,
-                None,
-                workers,
-                &mut ws.transposed_scratch,
-                &mut ws.batch_proj,
-                cancel,
-            )?;
+            block
+                .down
+                .multiply_batch_prepared_biased_prevalidated_into(
+                    &mut ws.prepared,
+                    &ws.batch_gate,
+                    None,
+                    workers,
+                    &mut ws.transposed_scratch,
+                    &mut ws.batch_proj,
+                    cancel,
+                )?;
             add_residual_batch(&mut ws.batch_a, &ws.batch_proj, workers, hidden)?;
         }
     }
@@ -2185,14 +2187,14 @@ fn prefill_causal_attention_hm(
         let r0 = tile_idx * 2;
         let k_slab = &k_hm[kv_head * kv_head_stride..(kv_head + 1) * kv_head_stride];
         let v_slab = &v_hm[kv_head * kv_head_stride..(kv_head + 1) * kv_head_stride];
-        let q_a = &queries[r0 * q_width + kv_head * group_width
-            ..r0 * q_width + (kv_head + 1) * group_width];
+        let q_a = &queries
+            [r0 * q_width + kv_head * group_width..r0 * q_width + (kv_head + 1) * group_width];
         let len_a = start_pos + r0 + 1;
         if let Some(out_b_slice) = out_b {
             let r1 = r0 + 1;
             let len_b = len_a + 1;
-            let q_b = &queries[r1 * q_width + kv_head * group_width
-                ..r1 * q_width + (kv_head + 1) * group_width];
+            let q_b = &queries
+                [r1 * q_width + kv_head * group_width..r1 * q_width + (kv_head + 1) * group_width];
             let (sa, sb_rest) = scores.split_at_mut(gqa_group * len_a);
             let sb = &mut sb_rest[..gqa_group * len_b];
             packed::attend_kv_group_2pos_f32(

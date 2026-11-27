@@ -906,7 +906,8 @@ fn gemm_q6_k_8x_i8mm<const TOKENS: usize, const COL_PAIRS: usize>(
             for half_idx in 0..2 {
                 for sub in 0..2 {
                     let hs = half_idx * 2 + sub;
-                    let (w_even, s_even) = unpack_q6_k_4quarters_16(blocks[pair * 2], half_idx, sub);
+                    let (w_even, s_even) =
+                        unpack_q6_k_4quarters_16(blocks[pair * 2], half_idx, sub);
                     let (w_odd, s_odd) =
                         unpack_q6_k_4quarters_16(blocks[pair * 2 + 1], half_idx, sub);
                     for q in 0..4 {
@@ -914,8 +915,7 @@ fn gemm_q6_k_8x_i8mm<const TOKENS: usize, const COL_PAIRS: usize>(
                         let w_1 = vcombine_s8(vget_high_s8(w_even[q]), vget_high_s8(w_odd[q]));
                         let s_vec = load_s32x4(&[s_even[q], s_even[q], s_odd[q], s_odd[q]]);
                         for (cp, &[a_0, a_1]) in packed_a[hs][q].iter().enumerate() {
-                            let g =
-                                smmla_s32(smmla_s32(vdupq_n_s32(0), w_0, a_0), w_1, a_1);
+                            let g = smmla_s32(smmla_s32(vdupq_n_s32(0), w_0, a_0), w_1, a_1);
                             pair_acc[cp] = vmlaq_s32(pair_acc[cp], g, s_vec);
                         }
                     }
@@ -1171,13 +1171,7 @@ pub(crate) fn dot_f16_pair_f32(q0: &[f32], q1: &[f32], k_f16: &[u16]) -> (f32, f
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-fn axpy_f16_pair_f32_neon(
-    w0: f32,
-    w1: f32,
-    v_f16: &[u16],
-    out0: &mut [f32],
-    out1: &mut [f32],
-) {
+fn axpy_f16_pair_f32_neon(w0: f32, w1: f32, v_f16: &[u16], out0: &mut [f32], out1: &mut [f32]) {
     let w0_v = vdupq_n_f32(w0);
     let w1_v = vdupq_n_f32(w1);
 
@@ -1233,11 +1227,7 @@ pub(crate) fn axpy_f16_pair_f32_portable(
     if out0.len() != v_f16.len() || out1.len() != v_f16.len() {
         return;
     }
-    for ((&v_bits, d0), d1) in v_f16
-        .iter()
-        .zip(out0.iter_mut())
-        .zip(out1.iter_mut())
-    {
+    for ((&v_bits, d0), d1) in v_f16.iter().zip(out0.iter_mut()).zip(out1.iter_mut()) {
         let vv = bonsai_ternary::half_to_float(v_bits);
         *d0 = w0.mul_add(vv, *d0);
         *d1 = w1.mul_add(vv, *d1);

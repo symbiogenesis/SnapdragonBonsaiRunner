@@ -783,8 +783,8 @@ pub fn build_loudness_matched_listening_wav(
         return Err(LoudnessError::InvalidTruePeakCeiling);
     }
 
-    let header = crate::mono_pcm16_header(sample_rate, samples.len())
-        .ok_or(WavError::InvalidSamples)?;
+    let header =
+        crate::mono_pcm16_header(sample_rate, samples.len()).ok_or(WavError::InvalidSamples)?;
     let pcm_bytes = samples
         .len()
         .checked_mul(2)

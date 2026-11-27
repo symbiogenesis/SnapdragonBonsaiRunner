@@ -365,14 +365,10 @@ fn scatter_frame_quads_simd<S: Simd>(
             );
             let cols = transpose_4x4(simd, [r0, r1, r2, r3]);
             if let Some((rp0, rp1, rp2, rp3)) = res_p {
-                (cols[0] + f32x4::from_slice(simd, &rp0[r..r + 4]))
-                    .store_slice(&mut p0[r..r + 4]);
-                (cols[1] + f32x4::from_slice(simd, &rp1[r..r + 4]))
-                    .store_slice(&mut p1[r..r + 4]);
-                (cols[2] + f32x4::from_slice(simd, &rp2[r..r + 4]))
-                    .store_slice(&mut p2[r..r + 4]);
-                (cols[3] + f32x4::from_slice(simd, &rp3[r..r + 4]))
-                    .store_slice(&mut p3[r..r + 4]);
+                (cols[0] + f32x4::from_slice(simd, &rp0[r..r + 4])).store_slice(&mut p0[r..r + 4]);
+                (cols[1] + f32x4::from_slice(simd, &rp1[r..r + 4])).store_slice(&mut p1[r..r + 4]);
+                (cols[2] + f32x4::from_slice(simd, &rp2[r..r + 4])).store_slice(&mut p2[r..r + 4]);
+                (cols[3] + f32x4::from_slice(simd, &rp3[r..r + 4])).store_slice(&mut p3[r..r + 4]);
             } else {
                 cols[0].store_slice(&mut p0[r..r + 4]);
                 cols[1].store_slice(&mut p1[r..r + 4]);
@@ -2398,15 +2394,7 @@ impl CausalConv1d {
         bias: Option<Vec<f32>>,
     ) -> io::Result<Self> {
         Self::from_oc_ic_k_inner(
-            out_c,
-            in_c,
-            kernel,
-            dilation,
-            stride,
-            pad_mode,
-            weight,
-            bias,
-            false,
+            out_c, in_c, kernel, dilation, stride, pad_mode, weight, bias, false,
         )
     }
 
@@ -2427,15 +2415,7 @@ impl CausalConv1d {
         bias: Option<Vec<f32>>,
     ) -> io::Result<Self> {
         Self::from_oc_ic_k_inner(
-            out_c,
-            in_c,
-            kernel,
-            dilation,
-            stride,
-            pad_mode,
-            weight,
-            bias,
-            true,
+            out_c, in_c, kernel, dilation, stride, pad_mode, weight, bias, true,
         )
     }
 
@@ -3514,10 +3494,7 @@ impl ConvNeXtBlock {
             || input.len() != frames * c
             || dw_state.len() != ctx_len * c
             || self.dw_weight.len() != c * k
-            || self
-                .dw_weight_kc
-                .as_ref()
-                .is_some_and(|w| w.len() != c * k)
+            || self.dw_weight_kc.as_ref().is_some_and(|w| w.len() != c * k)
             || self.dw_bias.len() != c
             || self.norm_w.len() != c
             || self.norm_b.len() != c
@@ -5901,7 +5878,11 @@ mod tests {
 
     #[test]
     fn packed_only_conv_drops_duplicate_weight_and_matches_full_bits() -> std::io::Result<()> {
-        for (in_c, out_c, kernel, dilation) in [(17_usize, 13_usize, 7_usize, 3_usize), (131, 289, 7, 1), (16, 20, 1, 1)] {
+        for (in_c, out_c, kernel, dilation) in [
+            (17_usize, 13_usize, 7_usize, 3_usize),
+            (131, 289, 7, 1),
+            (16, 20, 1, 1),
+        ] {
             let weight = values(out_c * in_c * kernel);
             let bias = Some(values(out_c));
             let full = CausalConv1d::from_oc_ic_k(

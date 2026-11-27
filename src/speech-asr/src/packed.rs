@@ -2093,7 +2093,7 @@ fn scatter_quads_simd<S: Simd>(
                 & cols[1].abs().simd_lt(inf)
                 & cols[2].abs().simd_lt(inf)
                 & cols[3].abs().simd_lt(inf))
-                .all_true()
+            .all_true()
             {
                 all_finite = false;
             }
@@ -2704,14 +2704,15 @@ fn scatter_group_to_batch(
     let all_finite = std::sync::atomic::AtomicBool::new(true);
 
     if full_quads > 0 {
-        let active_workers = workers.clamp(1, crate::threads::MAX_WORKERS).min(full_quads);
+        let active_workers = workers
+            .clamp(1, crate::threads::MAX_WORKERS)
+            .min(full_quads);
         if active_workers > 1 && total_quad_elems >= PARALLEL_SCATTER_WORK {
             let chunk_quads = full_quads.div_ceil(active_workers);
             let num_tasks = full_quads.div_ceil(chunk_quads);
             let mut task_slots: [Option<std::sync::Mutex<[Option<&mut [f32]>; 4]>>;
                 crate::threads::MAX_WORKERS] = [const { None }; crate::threads::MAX_WORKERS];
-            let mut per_target: [Option<std::vec::IntoIter<&mut [f32]>>; 4] =
-                [const { None }; 4];
+            let mut per_target: [Option<std::vec::IntoIter<&mut [f32]>>; 4] = [const { None }; 4];
             for (idx, out) in outs.iter_mut().enumerate() {
                 let output = outputs[idx];
                 if output > 0 {
@@ -4783,10 +4784,10 @@ fn attend_kv_group_2pos_f32_simd<S: Simd>(
         };
         let mut g_base = 0_usize;
         while g_base + 1 < gqa_group {
-            let (oa0, oa1) = out_group_a[g_base * head_dim..(g_base + 2) * head_dim]
-                .split_at_mut(head_dim);
-            let (ob0, ob1) = out_group_b[g_base * head_dim..(g_base + 2) * head_dim]
-                .split_at_mut(head_dim);
+            let (oa0, oa1) =
+                out_group_a[g_base * head_dim..(g_base + 2) * head_dim].split_at_mut(head_dim);
+            let (ob0, ob1) =
+                out_group_b[g_base * head_dim..(g_base + 2) * head_dim].split_at_mut(head_dim);
             weighted_value_accum_4_tile_simd(
                 simd,
                 [oa0, oa1, ob0, ob1],
@@ -4817,10 +4818,10 @@ fn attend_kv_group_2pos_f32_simd<S: Simd>(
         let v = &values_hm[row * head_dim..(row + 1) * head_dim];
         let mut g_base = 0_usize;
         while g_base + 1 < gqa_group {
-            let (oa0, oa1) = out_group_a[g_base * head_dim..(g_base + 2) * head_dim]
-                .split_at_mut(head_dim);
-            let (ob0, ob1) = out_group_b[g_base * head_dim..(g_base + 2) * head_dim]
-                .split_at_mut(head_dim);
+            let (oa0, oa1) =
+                out_group_a[g_base * head_dim..(g_base + 2) * head_dim].split_at_mut(head_dim);
+            let (ob0, ob1) =
+                out_group_b[g_base * head_dim..(g_base + 2) * head_dim].split_at_mut(head_dim);
             weighted_value_accum_tile_simd(
                 simd,
                 [oa0, oa1, ob0, ob1],
@@ -4854,8 +4855,8 @@ fn attend_kv_group_2pos_f32_simd<S: Simd>(
         let v_last = &values_hm[len_a * head_dim..(len_a + 1) * head_dim];
         let mut g_base = 0_usize;
         while g_base + 1 < gqa_group {
-            let (ob0, ob1) = out_group_b[g_base * head_dim..(g_base + 2) * head_dim]
-                .split_at_mut(head_dim);
+            let (ob0, ob1) =
+                out_group_b[g_base * head_dim..(g_base + 2) * head_dim].split_at_mut(head_dim);
             weighted_value_accum_tile_simd(
                 simd,
                 [ob0, ob1],
@@ -6283,16 +6284,27 @@ mod tests {
                     let len_b = len_a + 1;
                     let group_elems = gqa_group * head_dim;
                     let q_a: Vec<f32> = (0..group_elems)
-                        .map(|i| (f32::from(u16::try_from((i * 11 + 3) % 29).unwrap_or(0)) - 14.0) * 0.0625)
+                        .map(|i| {
+                            (f32::from(u16::try_from((i * 11 + 3) % 29).unwrap_or(0)) - 14.0)
+                                * 0.0625
+                        })
                         .collect();
                     let q_b: Vec<f32> = (0..group_elems)
-                        .map(|i| (f32::from(u16::try_from((i * 17 + 7) % 31).unwrap_or(0)) - 15.0) * 0.0625)
+                        .map(|i| {
+                            (f32::from(u16::try_from((i * 17 + 7) % 31).unwrap_or(0)) - 15.0)
+                                * 0.0625
+                        })
                         .collect();
                     let keys_hm: Vec<f32> = (0..len_b * head_dim)
-                        .map(|i| (f32::from(u16::try_from((i * 7 + 5) % 23).unwrap_or(0)) - 11.0) * 0.05)
+                        .map(|i| {
+                            (f32::from(u16::try_from((i * 7 + 5) % 23).unwrap_or(0)) - 11.0) * 0.05
+                        })
                         .collect();
                     let values_hm: Vec<f32> = (0..len_b * head_dim)
-                        .map(|i| (f32::from(u16::try_from((i * 13 + 1) % 25).unwrap_or(0)) - 12.0) * 0.0625)
+                        .map(|i| {
+                            (f32::from(u16::try_from((i * 13 + 1) % 25).unwrap_or(0)) - 12.0)
+                                * 0.0625
+                        })
                         .collect();
                     let divisor = super::scalar_f32(head_dim).sqrt();
 

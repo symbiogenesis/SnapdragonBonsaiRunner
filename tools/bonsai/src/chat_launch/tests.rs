@@ -2235,7 +2235,12 @@ fn staged_model_with_prebuilt_binaries_enters_inference_and_artifacts() -> crate
             self.model_apps_calls += 1;
             self.inner.model_apps(request, packages, working)
         }
-        fn models(&mut self, request: &Request, model: &str, working: &Path) -> crate::Result<Value> {
+        fn models(
+            &mut self,
+            request: &Request,
+            model: &str,
+            working: &Path,
+        ) -> crate::Result<Value> {
             self.inner.models(request, model, working)
         }
         fn apps(
@@ -2246,7 +2251,12 @@ fn staged_model_with_prebuilt_binaries_enters_inference_and_artifacts() -> crate
         ) -> crate::Result<Value> {
             self.inner.apps(request, packages, working)
         }
-        fn native(&mut self, request: &Request, model: &str, working: &Path) -> crate::Result<Value> {
+        fn native(
+            &mut self,
+            request: &Request,
+            model: &str,
+            working: &Path,
+        ) -> crate::Result<Value> {
             self.inner.native(request, model, working)
         }
         fn keys(&mut self, parent: &Path) -> crate::Result<PathBuf> {

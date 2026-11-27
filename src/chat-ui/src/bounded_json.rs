@@ -19,7 +19,8 @@ pub(crate) fn to_vec_with_capacity(
     limit: usize,
     initial_capacity: usize,
 ) -> Result<Vec<u8>, serde_json::Error> {
-    let mut writer = BoundedWriter::with_capacity(limit, initial_capacity).map_err(serde_json::Error::io)?;
+    let mut writer =
+        BoundedWriter::with_capacity(limit, initial_capacity).map_err(serde_json::Error::io)?;
     writer.write_json(value)?;
     Ok(writer.into_vec())
 }

@@ -223,7 +223,9 @@ pub(super) fn load_mapped(
                 ))
             });
             let proj1_res = p1_handle.join().unwrap_or_else(|_| {
-                Err(io::Error::other("ASR encoder proj1 intake thread panicked."))
+                Err(io::Error::other(
+                    "ASR encoder proj1 intake thread panicked.",
+                ))
             });
             (conv_out_res, ln_post_res, proj1_res, proj2_res)
         });
@@ -248,9 +250,9 @@ pub(super) fn load_mapped(
                 "ASR encoder convolution intake thread panicked.",
             ))
         });
-        let tail_res = tail_handle.join().unwrap_or_else(|_| {
-            Err(io::Error::other("ASR encoder tail intake thread panicked."))
-        });
+        let tail_res = tail_handle
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("ASR encoder tail intake thread panicked.")));
         (frontend_res, conv_res, blocks_res, tail_res)
     });
 

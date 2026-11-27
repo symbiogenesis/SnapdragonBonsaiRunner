@@ -126,13 +126,7 @@ pub fn dot_f16_pair_f32(q0: &[f32], q1: &[f32], k_f16: &[u16]) -> (f32, f32) {
 /// using baseline ARM64 `FCVTL`/`FCVTL2` widening and exact per-lane/tail `fma` rounding.
 ///
 /// No-ops when slice lengths do not match.
-pub fn axpy_f16_pair_f32(
-    w0: f32,
-    w1: f32,
-    v_f16: &[u16],
-    out0: &mut [f32],
-    out1: &mut [f32],
-) {
+pub fn axpy_f16_pair_f32(w0: f32, w1: f32, v_f16: &[u16], out0: &mut [f32], out1: &mut [f32]) {
     crate::native::quant_q8::axpy_f16_pair_f32(w0, w1, v_f16, out0, out1);
 }
 
@@ -973,8 +967,12 @@ mod tests {
 
             let w0 = f32::from_bits(0x3f80_0001);
             let w1 = -0.375_f32;
-            let mut out0_nat: Vec<f32> = (0..len).map(|i| -1.0 + f32::from(u8::try_from(i).unwrap_or(0)) * 0.0625).collect();
-            let mut out1_nat: Vec<f32> = (0..len).map(|i| 0.5 - f32::from(u8::try_from(i).unwrap_or(0)) * 0.03125).collect();
+            let mut out0_nat: Vec<f32> = (0..len)
+                .map(|i| -1.0 + f32::from(u8::try_from(i).unwrap_or(0)) * 0.0625)
+                .collect();
+            let mut out1_nat: Vec<f32> = (0..len)
+                .map(|i| 0.5 - f32::from(u8::try_from(i).unwrap_or(0)) * 0.03125)
+                .collect();
             let mut out0_prt = out0_nat.clone();
             let mut out1_prt = out1_nat.clone();
 
@@ -987,19 +985,37 @@ mod tests {
                 &mut out1_prt,
             );
             assert_eq!(
-                out0_nat.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                out0_prt.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                out0_nat
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>(),
+                out0_prt
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>(),
                 "len={len} axpy0"
             );
             assert_eq!(
-                out1_nat.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
-                out1_prt.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                out1_nat
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>(),
+                out1_prt
+                    .iter()
+                    .copied()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>(),
                 "len={len} axpy1"
             );
         }
 
         // Exceptional / NaN inputs preserve exact portable NaN payload and bit parity.
-        let special_k = [0x7c01_u16, 0xfc01, 0x7e00, 0x3c00, 0x7c00, 0xfc00, 0x0001, 0x8000, 0x7c01];
+        let special_k = [
+            0x7c01_u16, 0xfc01, 0x7e00, 0x3c00, 0x7c00, 0xfc00, 0x0001, 0x8000, 0x7c01,
+        ];
         let sq0 = [1.0_f32; 9];
         let sq1 = [2.0_f32; 9];
         let nat_s = dot_f16_pair_f32(&sq0, &sq1, &special_k);
@@ -1012,7 +1028,9 @@ mod tests {
         let mut po0 = [0.0_f32; 9];
         let mut po1 = [0.0_f32; 9];
         axpy_f16_pair_f32(1.0, 2.0, &special_k, &mut ao0, &mut ao1);
-        crate::native::quant_q8::axpy_f16_pair_f32_portable(1.0, 2.0, &special_k, &mut po0, &mut po1);
+        crate::native::quant_q8::axpy_f16_pair_f32_portable(
+            1.0, 2.0, &special_k, &mut po0, &mut po1,
+        );
         assert_eq!(ao0.map(f32::to_bits), po0.map(f32::to_bits));
         assert_eq!(ao1.map(f32::to_bits), po1.map(f32::to_bits));
 
@@ -1023,7 +1041,13 @@ mod tests {
         );
         let mut untouched0 = [7.0_f32; 2];
         let mut untouched1 = [9.0_f32; 1];
-        axpy_f16_pair_f32(1.0, 1.0, &[0x3c00, 0x3c00], &mut untouched0, &mut untouched1);
+        axpy_f16_pair_f32(
+            1.0,
+            1.0,
+            &[0x3c00, 0x3c00],
+            &mut untouched0,
+            &mut untouched1,
+        );
         assert_eq!(untouched0.map(f32::to_bits), [7.0_f32.to_bits(); 2]);
         assert_eq!(untouched1.map(f32::to_bits), [9.0_f32.to_bits(); 1]);
     }

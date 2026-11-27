@@ -1277,7 +1277,9 @@ impl LaunchConfig {
         let total_workers = crate::artifacts::default_chunk_workers();
         let exe_workers = usize::from(self.native_engine);
         let lora_workers = if daisyrose_selection.is_some() { 2 } else { 0 };
-        let remaining = total_workers.saturating_sub(exe_workers + lora_workers).max(1);
+        let remaining = total_workers
+            .saturating_sub(exe_workers + lora_workers)
+            .max(1);
         let mmproj_workers = if verify_vision {
             (remaining / 4).max(1)
         } else {

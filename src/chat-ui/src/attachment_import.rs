@@ -136,7 +136,8 @@ impl PartialEq for PrehashedPng {
     fn eq(&self, other: &Self) -> bool {
         self.hash == other.hash
             && self.bytes.len() == other.bytes.len()
-            && (Arc::ptr_eq(&self.bytes, &other.bytes) || self.bytes.as_ref() == other.bytes.as_ref())
+            && (Arc::ptr_eq(&self.bytes, &other.bytes)
+                || self.bytes.as_ref() == other.bytes.as_ref())
     }
 }
 

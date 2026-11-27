@@ -496,23 +496,27 @@ impl Talker {
                         geometry.hidden,
                         predictor_geometry.hidden,
                     )?;
-                    projection.bias = Some(weights.tensor_f32(
-                        "code_pred.mtp_proj.bias",
-                        &[predictor_geometry.hidden],
-                    )?);
+                    projection.bias = Some(
+                        weights
+                            .tensor_f32("code_pred.mtp_proj.bias", &[predictor_geometry.hidden])?,
+                    );
                     Some(projection)
                 };
                 let cp_norm_w = weights
                     .tensor_f32("code_pred.output_norm.weight", &[predictor_geometry.hidden])?;
                 Ok(TalkerLoadItem::NormsAndMtp(norm, mtp_proj, cp_norm_w))
             } else if task < cp_start {
-                Ok(TalkerLoadItem::Layer(
-                    geometry.load_layer(weights, "talker", task - layer_start)?,
-                ))
+                Ok(TalkerLoadItem::Layer(geometry.load_layer(
+                    weights,
+                    "talker",
+                    task - layer_start,
+                )?))
             } else if task < codebook_start {
-                Ok(TalkerLoadItem::CpLayer(
-                    predictor_geometry.load_layer(weights, "code_pred", task - cp_start)?,
-                ))
+                Ok(TalkerLoadItem::CpLayer(predictor_geometry.load_layer(
+                    weights,
+                    "code_pred",
+                    task - cp_start,
+                )?))
             } else {
                 let (embd, head) = load_codebook_pair(
                     weights,
