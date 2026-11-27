@@ -4,30 +4,63 @@ use crate::context::{self, Estimate, Pressure};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct InputSignature {
+    revision: u64,
+    len: usize,
+    digest: u64,
+}
+
+impl InputSignature {
+    fn compute(revision: u64, text: &str) -> Self {
+        let bytes = text.as_bytes();
+        let digest = if bytes.len() <= 1024 {
+            hash_value(bytes)
+        } else {
+            // O(1) length/sample guard for large drafts so idle frames do not hash
+            // the entire buffer, while <= 1 KiB direct test mutations still rehash.
+            let len = bytes.len();
+            let mid = (len / 2).saturating_sub(16);
+            let mut hasher = DefaultHasher::new();
+            len.hash(&mut hasher);
+            bytes[..32].hash(&mut hasher);
+            bytes[mid..mid + 32].hash(&mut hasher);
+            bytes[len - 32..].hash(&mut hasher);
+            hasher.finish()
+        };
+        Self {
+            revision,
+            len: bytes.len(),
+            digest,
+        }
+    }
+}
+
 #[derive(Default)]
 struct MemoryCache {
     valid: bool,
     committed_len: usize,
     committed_tail_hash: u64,
     memory_revision: u64,
-    memory_hash: u64,
-    input_len: usize,
-    input_hash: u64,
+    input: InputSignature,
     estimated_tokens: usize,
 }
 
 #[derive(Default)]
 pub(super) struct DraftCache {
     units: context::IncrementalDraftUnits,
-    attachment_input: String,
+    input_sig: InputSignature,
     has_attachments: bool,
     attachments_revision: u64,
+    attachment_prefix_units: usize,
+    attachment_has_prefix: bool,
+    attachment_images: usize,
     estimate: Option<Estimate>,
     extra_effort: bool,
     memory: MemoryCache,
 }
 
-fn hash_value<T: Hash>(value: &T) -> u64 {
+fn hash_value<T: Hash + ?Sized>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
@@ -53,17 +86,13 @@ impl State {
         let committed_len = self.committed.len();
         let tail_hash = committed_tail_hash(&self.committed);
         let memory_revision = self.memory_revision;
-        let memory_hash = hash_value(&self.memory);
-        let input_len = self.input.len();
-        let input_hash = hash_value(&self.input);
+        let input_sig = InputSignature::compute(self.input_revision, &self.input);
         let cache = &self.context_draft.memory;
         if cache.valid
             && cache.committed_len == committed_len
             && cache.committed_tail_hash == tail_hash
             && cache.memory_revision == memory_revision
-            && cache.memory_hash == memory_hash
-            && cache.input_len == input_len
-            && cache.input_hash == input_hash
+            && cache.input == input_sig
         {
             return cache.estimated_tokens;
         }
@@ -76,9 +105,7 @@ impl State {
             committed_len,
             committed_tail_hash: tail_hash,
             memory_revision,
-            memory_hash,
-            input_len,
-            input_hash,
+            input: input_sig,
             estimated_tokens,
         };
         estimated_tokens
@@ -90,10 +117,14 @@ impl State {
             .context_history
             .get_or_insert_with(|| context::history_tokens(&self.committed));
         let output = self.selected_output_cap();
-        let draft_matches = if self.draft_attachments.is_empty() {
-            !self.context_draft.has_attachments && self.context_draft.units.matches(&self.input)
+        let input_sig = InputSignature::compute(self.input_revision, &self.input);
+        let attachments_empty = self.draft_attachments.is_empty();
+        let draft_matches = if attachments_empty {
+            !self.context_draft.has_attachments && self.context_draft.input_sig == input_sig
         } else {
-            self.context_draft.has_attachments && self.context_draft.attachment_input == self.input
+            self.context_draft.has_attachments
+                && self.context_draft.attachments_revision == self.draft_attachments_revision
+                && self.context_draft.input_sig == input_sig
         };
         if let Some(estimate) = self.context_draft.estimate
             && estimate.history == history
@@ -101,14 +132,12 @@ impl State {
             && estimate.output == usize::try_from(output).unwrap_or(usize::MAX)
             && self.context_draft.extra_effort == self.extra_effort
             && estimate.capacity == self.context_tokens
-            && self.context_draft.attachments_revision == self.draft_attachments_revision
             && draft_matches
         {
             return estimate;
         }
-        let estimate = if self.draft_attachments.is_empty() {
+        let estimate = if attachments_empty {
             self.context_draft.has_attachments = false;
-            self.context_draft.attachment_input = String::new();
             let draft_tokens = self.context_draft.units.tokens(&self.input);
             Estimate::from_draft_tokens(
                 history,
@@ -119,22 +148,47 @@ impl State {
                 self.context_tokens,
             )
         } else {
-            let (formatted_text, images) =
-                crate::attachment_import::format_user_turn(&self.input, &self.draft_attachments);
-            self.context_draft.has_attachments = true;
-            self.input
-                .clone_into(&mut self.context_draft.attachment_input);
-            let draft_tokens = self.context_draft.units.tokens(&formatted_text);
+            if !self.context_draft.has_attachments
+                || self.context_draft.attachments_revision != self.draft_attachments_revision
+            {
+                let (prefix, images) =
+                    crate::attachment_import::format_user_turn("", &self.draft_attachments);
+                self.context_draft.attachment_prefix_units = context::text_units(&prefix);
+                self.context_draft.attachment_has_prefix = !prefix.is_empty();
+                self.context_draft.attachment_images = images.len();
+                self.context_draft.has_attachments = true;
+            }
+            let draft_tokens = if !self.context_draft.attachment_has_prefix {
+                self.context_draft.units.tokens(&self.input)
+            } else if self.input.trim().is_empty() {
+                context::units_to_tokens(self.context_draft.attachment_prefix_units)
+            } else {
+                let leading_ws_bytes = self.input.len() - self.input.trim_start().len();
+                let leading_ws_units = self.input[..leading_ws_bytes].chars().count();
+                let caption_units = self
+                    .context_draft
+                    .units
+                    .units(&self.input)
+                    .saturating_add(leading_ws_units);
+                // `format_user_turn` joins the attachment prefix and non-empty caption with "\n\n".
+                context::units_to_tokens(
+                    self.context_draft
+                        .attachment_prefix_units
+                        .saturating_add(2)
+                        .saturating_add(caption_units),
+                )
+            };
             Estimate::from_draft_tokens(
                 history,
                 draft_tokens,
-                images.len(),
+                self.context_draft.attachment_images,
                 output,
                 self.extra_effort,
                 self.context_tokens,
             )
         }
         .with_memory(memory);
+        self.context_draft.input_sig = input_sig;
         self.context_draft.attachments_revision = self.draft_attachments_revision;
         self.context_draft.extra_effort = self.extra_effort;
         self.context_draft.estimate = Some(estimate);

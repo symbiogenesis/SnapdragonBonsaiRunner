@@ -139,8 +139,11 @@ impl State {
                 egui::Key::Enter,
             )))
             .show(ui);
+        let mutated = buffer.was_mutated() || output.response.changed();
         if buffer.finish(&mut output) {
             self.set_status(draft_buffer::LIMIT_MESSAGE, true);
+        } else if mutated {
+            self.input_revision = self.input_revision.wrapping_add(1);
         }
         output
     }

@@ -467,14 +467,48 @@ impl FoldedMatcher {
             return 0;
         }
         if body.is_ascii() {
-            for (start, byte) in body.bytes().enumerate() {
-                if self.push(
-                    byte.to_ascii_lowercase(),
-                    offset + start,
-                    offset + start + 1,
-                    ranges,
-                ) {
-                    return start + 1;
+            let bytes = body.as_bytes();
+            let first_lower = self.query[0];
+            if first_lower.is_ascii() {
+                let first_upper = if first_lower.is_ascii_alphabetic() {
+                    first_lower.to_ascii_uppercase()
+                } else {
+                    first_lower
+                };
+                let mut index = 0;
+                while index < bytes.len() {
+                    if self.matched == 0 {
+                        let Some(found) =
+                            memchr::memchr2(first_lower, first_upper, &bytes[index..])
+                        else {
+                            break;
+                        };
+                        index += found;
+                    }
+                    let byte = bytes[index];
+                    if self.push(
+                        byte.to_ascii_lowercase(),
+                        offset + index,
+                        offset + index + 1,
+                        ranges,
+                    ) {
+                        return index + 1;
+                    }
+                    index += 1;
+                }
+            } else {
+                for (start, byte) in bytes.iter().copied().enumerate() {
+                    if self.matched == 0 {
+                        break;
+                    }
+                    if self.push(
+                        byte.to_ascii_lowercase(),
+                        offset + start,
+                        offset + start + 1,
+                        ranges,
+                    ) {
+                        return start + 1;
+                    }
                 }
             }
         } else {

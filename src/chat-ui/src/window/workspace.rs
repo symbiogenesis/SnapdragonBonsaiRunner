@@ -45,6 +45,12 @@ pub(super) struct ConversationSnapshot {
     pub(super) stage: Option<&'static str>,
 }
 
+pub(super) struct CachedConversationJson {
+    pub(super) title: String,
+    pub(super) renamed: bool,
+    pub(super) json: std::sync::Arc<[u8]>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Conversation {
@@ -54,6 +60,8 @@ pub(super) struct Conversation {
     pub(super) saved: Option<ConversationSnapshot>,
     #[serde(skip)]
     pub(super) search: history_search::MatchCache,
+    #[serde(skip)]
+    pub(super) cached_json: std::sync::Mutex<Option<CachedConversationJson>>,
 }
 
 impl Conversation {
@@ -64,6 +72,13 @@ impl Conversation {
             renamed: false,
             saved: None,
             search: history_search::MatchCache::default(),
+            cached_json: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(super) fn invalidate_json_cache(&self) {
+        if let Ok(mut slot) = self.cached_json.lock() {
+            *slot = None;
         }
     }
 }
@@ -122,6 +137,7 @@ impl State {
     }
 
     pub(super) fn take_conversation(&mut self) -> ConversationSnapshot {
+        self.input_revision = self.input_revision.wrapping_add(1);
         self.draft_attachments_revision = self.draft_attachments_revision.wrapping_add(1);
         ConversationSnapshot {
             transcript: std::mem::take(&mut self.transcript),
@@ -163,6 +179,7 @@ impl State {
             .find(|conversation| conversation.id == self.active_conversation)
         {
             conversation.saved = Some(snapshot);
+            conversation.invalidate_json_cache();
         }
     }
 
@@ -171,6 +188,7 @@ impl State {
         self.committed.clear();
         self.context_history = None;
         self.input.clear();
+        self.input_revision = self.input_revision.wrapping_add(1);
         self.set_draft_attachments(Vec::new());
         self.attachment_notice = None;
         super::clear_and_shrink_buffer(&mut self.last_answer);
@@ -196,6 +214,7 @@ impl State {
         self.committed = snapshot.committed;
         self.context_history = snapshot.context_history;
         self.input = snapshot.input;
+        self.input_revision = self.input_revision.wrapping_add(1);
         self.set_draft_attachments(snapshot.draft_attachments);
         self.attachment_notice = None;
         self.last_answer = snapshot.last_answer;
@@ -312,6 +331,7 @@ impl State {
             .find(|value| value.id == owner)
         {
             conversation.saved = Some(saved);
+            conversation.invalidate_json_cache();
         }
         (
             self.composer_cursor,
@@ -330,6 +350,7 @@ impl State {
         std::mem::swap(&mut self.committed, &mut saved.committed);
         std::mem::swap(&mut self.context_history, &mut saved.context_history);
         std::mem::swap(&mut self.input, &mut saved.input);
+        self.input_revision = self.input_revision.wrapping_add(1);
         std::mem::swap(&mut self.draft_attachments, &mut saved.draft_attachments);
         self.draft_attachments_revision = self.draft_attachments_revision.wrapping_add(1);
         std::mem::swap(&mut self.last_answer, &mut saved.last_answer);
@@ -406,6 +427,7 @@ impl State {
         self.save_conversation();
         self.conversation_notice = None;
         if let Some(snapshot) = self.conversations[index].saved.take() {
+            self.conversations[index].invalidate_json_cache();
             self.active_conversation = id;
             self.load_conversation(snapshot);
             self.recovery_dirty = true;

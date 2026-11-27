@@ -12,6 +12,7 @@ pub(super) struct Search {
     previous: String,
     query: Arc<Query>,
     pub(super) rows: Vec<usize>,
+    unfiltered_count: Option<usize>,
     reset_scroll: bool,
 }
 
@@ -68,6 +69,16 @@ impl Search {
             }
             self.reset_scroll = true;
         }
+        if self.query.text.is_empty() {
+            if !changed && self.unfiltered_count == Some(conversations.len()) {
+                return false;
+            }
+            self.rows.clear();
+            self.rows.extend(0..conversations.len());
+            self.unfiltered_count = Some(conversations.len());
+            return changed;
+        }
+        self.unfiltered_count = None;
         self.rows.clear();
         for (index, conversation) in conversations.iter_mut().enumerate() {
             let transcript = if conversation.id == active {
@@ -75,10 +86,9 @@ impl Search {
             } else {
                 conversation.saved.as_ref().map(|saved| &saved.transcript)
             };
-            if self.query.text.is_empty()
-                || conversation
-                    .search
-                    .matches(&self.query, &conversation.title, transcript)
+            if conversation
+                .search
+                .matches(&self.query, &conversation.title, transcript)
             {
                 self.rows.push(index);
             }
@@ -92,6 +102,8 @@ pub(super) struct MatchCache {
     query: Option<Arc<Query>>,
     title: String,
     revision: Option<u64>,
+    structural_revision: Option<u64>,
+    scanned_last_body_len: usize,
     result: Option<bool>,
     #[cfg(test)]
     pub(super) scans: usize,
@@ -105,15 +117,43 @@ impl MatchCache {
         transcript: Option<&Transcript>,
     ) -> bool {
         let revision = transcript.map(Transcript::history_revision);
-        if self
+        let structural_revision = transcript.map(Transcript::structural_revision);
+        let query_same = self
             .query
             .as_ref()
-            .is_some_and(|cached| Arc::ptr_eq(cached, query))
-            && self.title == title
+            .is_some_and(|cached| Arc::ptr_eq(cached, query));
+        let title_same = self.title == title;
+        if query_same
+            && title_same
             && self.revision == revision
             && let Some(result) = self.result
         {
             return result;
+        }
+        if query_same
+            && title_same
+            && let Some(transcript) = transcript
+            && self.structural_revision == structural_revision
+            && let Some(prior_result) = self.result
+            && let Some(last) = transcript.messages.last()
+            && last.body.len() >= self.scanned_last_body_len
+            && last.body.is_char_boundary(self.scanned_last_body_len)
+        {
+            if prior_result {
+                self.revision = revision;
+                self.scanned_last_body_len = last.body.len();
+                return true;
+            }
+            #[cfg(test)]
+            {
+                self.scans += 1;
+            }
+            let tail_start = tail_scan_start(&last.body, self.scanned_last_body_len, &query.text);
+            let matched = query.contains(&last.body[tail_start..]);
+            self.revision = revision;
+            self.scanned_last_body_len = last.body.len();
+            self.result = Some(matched);
+            return matched;
         }
         #[cfg(test)]
         {
@@ -129,9 +169,25 @@ impl MatchCache {
         self.query = Some(Arc::clone(query));
         title.clone_into(&mut self.title);
         self.revision = revision;
+        self.structural_revision = structural_revision;
+        self.scanned_last_body_len = transcript
+            .and_then(|transcript| transcript.messages.last())
+            .map_or(0, |last| last.body.len());
         self.result = Some(result);
         result
     }
+}
+
+fn tail_scan_start(body: &str, scanned_len: usize, folded_query: &str) -> usize {
+    let overlap_chars = folded_query.chars().count().saturating_sub(1);
+    if overlap_chars == 0 || scanned_len == 0 {
+        return scanned_len;
+    }
+    body[..scanned_len]
+        .char_indices()
+        .rev()
+        .nth(overlap_chars.saturating_sub(1))
+        .map_or(0, |(index, _)| index)
 }
 
 // Query-sized KMP state avoids making a lowercase copy of every retained body.
@@ -161,6 +217,51 @@ impl Query {
     }
 
     fn contains(&self, text: &str) -> bool {
+        let query = self.text.as_bytes();
+        if query.is_empty() {
+            return true;
+        }
+        if text.is_ascii() {
+            if !self.text.is_ascii() {
+                return false;
+            }
+            let bytes = text.as_bytes();
+            if query.len() > bytes.len() {
+                return false;
+            }
+            let first_lower = query[0];
+            let first_upper = if first_lower.is_ascii_alphabetic() {
+                first_lower.to_ascii_uppercase()
+            } else {
+                first_lower
+            };
+            let mut matched = 0;
+            let mut index = 0;
+            while index < bytes.len() {
+                if matched == 0 {
+                    let Some(found) = memchr::memchr2(first_lower, first_upper, &bytes[index..])
+                    else {
+                        return false;
+                    };
+                    index += found;
+                    if bytes.len() - index < query.len() {
+                        return false;
+                    }
+                }
+                let byte = bytes[index].to_ascii_lowercase();
+                while matched > 0 && byte != query[matched] {
+                    matched = self.fallback[matched - 1];
+                }
+                if byte == query[matched] {
+                    matched += 1;
+                    if matched == query.len() {
+                        return true;
+                    }
+                }
+                index += 1;
+            }
+            return false;
+        }
         self.contains_chars(text.chars())
     }
 

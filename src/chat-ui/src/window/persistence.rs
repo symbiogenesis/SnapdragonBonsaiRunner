@@ -92,18 +92,6 @@ where
     })
 }
 
-#[derive(serde::Serialize)]
-struct WorkspaceView<'a> {
-    version: u32,
-    conversations: &'a [Conversation],
-    active_conversation: u64,
-    next_conversation: u64,
-    active: ActiveView<'a>,
-    voice_profile: &'a str,
-    #[serde(skip_serializing_if = "crate::context_cards::MemoryStore::is_default_empty")]
-    memory: &'a crate::context_cards::MemoryStore,
-}
-
 fn attachments_empty(attachments: &[crate::attachment_import::Attachment]) -> bool {
     attachments.is_empty()
 }
@@ -190,33 +178,7 @@ impl State {
                 "Conversation recovery reached its saved-state limits. Delete older conversations or disable saving.",
             ));
         }
-        crate::bounded_json::to_vec(&WorkspaceView {
-            version: 1,
-            conversations: &self.conversations,
-            active_conversation: self.active_conversation,
-            next_conversation: self.next_conversation,
-            active: ActiveView {
-                transcript: &self.transcript,
-                committed: &self.committed,
-                input: &self.input,
-                draft_attachments: &self.draft_attachments,
-                last_answer: &self.last_answer,
-                retained_draft: &self.retained_draft,
-                answer_complete: self.answer_complete,
-                extra_effort: self.extra_effort,
-                enable_thinking: self.enable_thinking,
-                streaming_read_aloud: self.streaming_read_aloud,
-                output_budget: self.output_budget,
-                daisyrose_enabled: self.daisyrose_enabled,
-                daisyrose_scale: self.daisyrose_scale,
-                cognitive: self.cognitive,
-                status: &self.status,
-                warning: self.warning,
-            },
-            voice_profile: &self.voice_profile,
-            memory: &self.memory,
-        }, 8 * 1024 * 1024)
-        .map_err(|error| {
+        self.serialize_workspace().map_err(|error| {
             if error.io_error_kind() == Some(io::ErrorKind::FileTooLarge) {
                 io::Error::other(
                     "Conversation recovery reached its 8 MiB limit. Delete older conversations or disable saving.",
@@ -225,6 +187,83 @@ impl State {
                 io::Error::other(error)
             }
         })
+    }
+
+    fn serialize_workspace(&self) -> Result<Vec<u8>, serde_json::Error> {
+        const LIMIT: usize = 8 * 1024 * 1024;
+        let initial_capacity = self.last_workspace_bytes.get().max(4096);
+        let mut writer =
+            crate::bounded_json::BoundedWriter::with_capacity(LIMIT, initial_capacity)
+                .map_err(serde_json::Error::io)?;
+        writer.write_raw(br#"{"version":1,"conversations":["#)?;
+        for (index, conversation) in self.conversations.iter().enumerate() {
+            if index > 0 {
+                writer.write_raw(b",")?;
+            }
+            if conversation.id != self.active_conversation && conversation.saved.is_some() {
+                let cached = conversation.cached_json.lock().ok().and_then(|slot| {
+                    slot.as_ref()
+                        .filter(|entry| {
+                            entry.title == conversation.title
+                                && entry.renamed == conversation.renamed
+                        })
+                        .map(|entry| std::sync::Arc::clone(&entry.json))
+                });
+                if let Some(bytes) = cached {
+                    writer.write_raw(&bytes)?;
+                } else {
+                    let encoded = crate::bounded_json::to_vec_with_capacity(
+                        conversation,
+                        writer.remaining(),
+                        4096,
+                    )?;
+                    let arc: std::sync::Arc<[u8]> = std::sync::Arc::from(encoded);
+                    if let Ok(mut slot) = conversation.cached_json.lock() {
+                        *slot = Some(super::workspace::CachedConversationJson {
+                            title: conversation.title.clone(),
+                            renamed: conversation.renamed,
+                            json: std::sync::Arc::clone(&arc),
+                        });
+                    }
+                    writer.write_raw(&arc)?;
+                }
+            } else {
+                writer.write_json(conversation)?;
+            }
+        }
+        writer.write_raw(br#"],"active_conversation":"#)?;
+        writer.write_json(&self.active_conversation)?;
+        writer.write_raw(br#","next_conversation":"#)?;
+        writer.write_json(&self.next_conversation)?;
+        writer.write_raw(br#","active":"#)?;
+        writer.write_json(&ActiveView {
+            transcript: &self.transcript,
+            committed: &self.committed,
+            input: &self.input,
+            draft_attachments: &self.draft_attachments,
+            last_answer: &self.last_answer,
+            retained_draft: &self.retained_draft,
+            answer_complete: self.answer_complete,
+            extra_effort: self.extra_effort,
+            enable_thinking: self.enable_thinking,
+            streaming_read_aloud: self.streaming_read_aloud,
+            output_budget: self.output_budget,
+            daisyrose_enabled: self.daisyrose_enabled,
+            daisyrose_scale: self.daisyrose_scale,
+            cognitive: self.cognitive,
+            status: &self.status,
+            warning: self.warning,
+        })?;
+        writer.write_raw(br#","voice_profile":"#)?;
+        writer.write_json(&self.voice_profile)?;
+        if !self.memory.is_default_empty() {
+            writer.write_raw(br#","memory":"#)?;
+            writer.write_json(&self.memory)?;
+        }
+        writer.write_raw(b"}")?;
+        let bytes = writer.into_vec();
+        self.last_workspace_bytes.set(bytes.len());
+        Ok(bytes)
     }
 
     pub(super) fn restore_workspace(&mut self, bytes: &[u8]) -> io::Result<()> {

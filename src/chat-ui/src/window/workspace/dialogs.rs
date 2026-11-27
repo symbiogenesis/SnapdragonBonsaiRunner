@@ -25,6 +25,7 @@ impl State {
                 {
                     title.trim().clone_into(&mut conversation.title);
                     conversation.renamed = true;
+                    conversation.invalidate_json_cache();
                     self.touch_conversation(id);
                 }
             }

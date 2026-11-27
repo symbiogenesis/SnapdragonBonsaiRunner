@@ -248,14 +248,15 @@ impl IncrementalDraftUnits {
         self.prev_trimmed.as_ptr()
     }
 
+    #[cfg(test)]
     pub(crate) fn matches(&self, draft: &str) -> bool {
         self.prev_trimmed == draft.trim()
     }
 
-    pub(crate) fn tokens(&mut self, draft: &str) -> usize {
+    pub(crate) fn units(&mut self, draft: &str) -> usize {
         let trimmed = draft.trim();
         if self.prev_trimmed == trimmed {
-            return units_to_tokens(self.trimmed_units);
+            return self.trimmed_units;
         }
         let (prefix, old_mid_end, new_mid_end) = utf8_diff_bounds(&self.prev_trimmed, trimmed);
         let old_units = text_units(&self.prev_trimmed[prefix..old_mid_end]);
@@ -266,7 +267,11 @@ impl IncrementalDraftUnits {
             .saturating_add(new_units);
         self.prev_trimmed
             .replace_range(prefix..old_mid_end, &trimmed[prefix..new_mid_end]);
-        units_to_tokens(self.trimmed_units)
+        self.trimmed_units
+    }
+
+    pub(crate) fn tokens(&mut self, draft: &str) -> usize {
+        units_to_tokens(self.units(draft))
     }
 }
 

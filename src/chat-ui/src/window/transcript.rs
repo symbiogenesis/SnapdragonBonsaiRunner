@@ -291,6 +291,8 @@ pub(super) struct Transcript {
     #[serde(skip)]
     history_revision: u64,
     #[serde(skip)]
+    structural_revision: u64,
+    #[serde(skip)]
     search: search::Search,
     #[serde(skip)]
     viewport: layout::Viewport,
@@ -350,6 +352,10 @@ impl Transcript {
         self.history_revision
     }
 
+    pub(super) const fn structural_revision(&self) -> u64 {
+        self.structural_revision
+    }
+
     pub(super) fn valid_saved(&self) -> bool {
         self.messages.len() <= MAX_MESSAGES
             && self.messages.iter().fold(0_usize, |total, message| {
@@ -365,6 +371,7 @@ impl Transcript {
 
     pub(super) fn clear(&mut self) {
         self.history_revision = self.history_revision.wrapping_add(1);
+        self.structural_revision = self.structural_revision.wrapping_add(1);
         self.messages.clear();
         self.text_bytes = 0;
         self.search = search::Search::default();
@@ -381,6 +388,7 @@ impl Transcript {
         });
         if removed.is_some() {
             self.history_revision = self.history_revision.wrapping_add(1);
+            self.structural_revision = self.structural_revision.wrapping_add(1);
             self.search.invalidate();
         }
     }
@@ -397,6 +405,7 @@ impl Transcript {
     ) {
         self.presentation = None;
         self.history_revision = self.history_revision.wrapping_add(1);
+        self.structural_revision = self.structural_revision.wrapping_add(1);
         self.search.invalidate();
         self.next_id = self.next_id.wrapping_add(1);
         self.text_bytes = self.text_bytes.saturating_add(body.len());
@@ -445,6 +454,7 @@ impl Transcript {
         if let Some(message) = self.messages.last_mut() {
             message.measured_height = Some(message.height());
             self.history_revision = self.history_revision.wrapping_add(1);
+            self.structural_revision = self.structural_revision.wrapping_add(1);
             self.search.replaced(message.id);
             self.text_bytes = self.text_bytes.saturating_sub(message.text_bytes());
             text.clone_into(&mut message.body);
@@ -522,6 +532,7 @@ impl Transcript {
         }
         if removed > 0 {
             self.history_revision = self.history_revision.wrapping_add(1);
+            self.structural_revision = self.structural_revision.wrapping_add(1);
             self.search.invalidate();
             drop(self.messages.drain(..removed));
             #[cfg(test)]

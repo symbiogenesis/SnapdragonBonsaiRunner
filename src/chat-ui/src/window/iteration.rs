@@ -155,6 +155,7 @@ impl State {
                     );
                 if self.branch_history(prompt_index, "Regenerated") {
                     self.input = prompt;
+                    self.input_revision = self.input_revision.wrapping_add(1);
                     self.set_draft_attachments(attachments);
                     self.submit();
                 }
@@ -192,6 +193,7 @@ impl State {
                     };
                 if self.branch_history(end, "Branch") {
                     self.input = prompt;
+                    self.input_revision = self.input_revision.wrapping_add(1);
                     self.set_draft_attachments(attachments);
                     self.place_composer_cursor(self.input.chars().count());
                 }
@@ -212,6 +214,7 @@ impl State {
         action: impl FnOnce(&mut Self),
     ) {
         let draft = std::mem::replace(&mut self.input, prompt);
+        self.input_revision = self.input_revision.wrapping_add(1);
         let draft_attachments = self.replace_draft_attachments(attachments);
         let cursor = (
             self.composer_cursor,
@@ -221,6 +224,7 @@ impl State {
         self.restore_selected_history();
         action(self);
         self.input = draft;
+        self.input_revision = self.input_revision.wrapping_add(1);
         self.set_draft_attachments(draft_attachments);
         (
             self.composer_cursor,
@@ -463,6 +467,7 @@ impl State {
         }
         if self.branch_history(prefix, "Edited") {
             self.input = edit.text;
+            self.input_revision = self.input_revision.wrapping_add(1);
             self.set_draft_attachments(edit.attachments);
             self.submit();
         }
@@ -651,6 +656,7 @@ impl State {
                     return false;
                 }
                 self.input = chosen_text;
+                self.input_revision = self.input_revision.wrapping_add(1);
                 self.place_composer_cursor(self.input.chars().count());
                 self.touch_conversation(conversation_id);
                 self.branch_comparison = None;
@@ -668,6 +674,7 @@ impl State {
                     return false;
                 }
                 self.input = chosen_text;
+                self.input_revision = self.input_revision.wrapping_add(1);
                 self.set_draft_attachments(Vec::new());
                 self.place_composer_cursor(self.input.chars().count());
                 self.branch_comparison = None;

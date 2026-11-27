@@ -175,6 +175,7 @@ struct State {
     vision_available: bool,
     preview: bool,
     input: String,
+    input_revision: u64,
     draft_attachments: Vec<crate::attachment_import::Attachment>,
     draft_attachments_revision: u64,
     transcript: Transcript,
@@ -203,6 +204,7 @@ struct State {
     recovery_erase_pending: bool,
     recovery_notice: String,
     last_recovery_save: Instant,
+    last_workspace_bytes: std::cell::Cell<usize>,
     restore_history: bool,
     status: String,
     status_detail: String,
@@ -353,6 +355,7 @@ impl State {
             vision_available: false,
             preview: true,
             input: String::new(),
+            input_revision: 0,
             draft_attachments: Vec::new(),
             draft_attachments_revision: 0,
             transcript: Transcript::default(),
@@ -381,6 +384,7 @@ impl State {
             recovery_erase_pending: false,
             recovery_notice: String::new(),
             last_recovery_save: Instant::now(),
+            last_workspace_bytes: std::cell::Cell::new(0),
             restore_history: false,
             status: "Preparing your local model…".to_owned(),
             status_detail: String::new(),
@@ -915,6 +919,7 @@ impl State {
         self.auto_continuing = false;
         self.touch_conversation(self.active_conversation);
         self.input.clear();
+        self.input_revision = self.input_revision.wrapping_add(1);
         self.place_composer_cursor(0);
         self.model = ModelLifecycle::Generating;
         self.awaiting_first_token = true;
@@ -1197,21 +1202,27 @@ impl State {
                 // A worker can reject a queued Send after announcing teardown.
                 // Restore its prompt only to the conversation that sent it.
                 let mut restored = false;
-                if let Some(saved) = self
+                if let Some(conversation) = self
                     .conversations
                     .iter_mut()
                     .find(|conversation| conversation.id == id)
-                    .and_then(|conversation| conversation.saved.as_mut())
                 {
-                    let mut revision = 0_u64;
-                    restored = restore_rejected_draft_for(
-                        &mut saved.input,
-                        &mut saved.draft_attachments,
-                        &mut revision,
-                        &saved.transcript,
-                        saved.committed.len(),
-                        text,
-                    );
+                    if let Some(saved) = conversation.saved.as_mut() {
+                        let mut input_revision = 0_u64;
+                        let mut attachment_revision = 0_u64;
+                        restored = restore_rejected_draft_for(
+                            &mut saved.input,
+                            &mut input_revision,
+                            &mut saved.draft_attachments,
+                            &mut attachment_revision,
+                            &saved.transcript,
+                            saved.committed.len(),
+                            text,
+                        );
+                    }
+                    if restored {
+                        conversation.invalidate_json_cache();
+                    }
                 }
                 if restored {
                     self.touch_conversation(id);
@@ -1580,6 +1591,7 @@ impl State {
     fn restore_rejected_draft_into_active(&mut self, wire_text: &str) {
         if restore_rejected_draft_for(
             &mut self.input,
+            &mut self.input_revision,
             &mut self.draft_attachments,
             &mut self.draft_attachments_revision,
             &self.transcript,
@@ -2066,6 +2078,7 @@ impl State {
             return false;
         };
         let cursor = plan.apply(&mut self.input);
+        self.input_revision = self.input_revision.wrapping_add(1);
         self.place_composer_cursor(cursor);
         self.touch_conversation(self.active_conversation);
         true
@@ -2159,6 +2172,7 @@ impl Drop for State {
 
 fn restore_rejected_draft_for(
     input: &mut String,
+    input_revision: &mut u64,
     draft_attachments: &mut Vec<crate::attachment_import::Attachment>,
     draft_attachments_revision: &mut u64,
     transcript: &Transcript,
@@ -2174,6 +2188,7 @@ fn restore_rejected_draft_for(
         let mut restored = false;
         if input.is_empty() && !turn_user.body.is_empty() && draft_buffer::fits(&turn_user.body) {
             turn_user.body.clone_into(input);
+            *input_revision = input_revision.wrapping_add(1);
             restored = true;
         }
         if draft_attachments.is_empty() {
@@ -2185,6 +2200,7 @@ fn restore_rejected_draft_for(
     }
     if input.is_empty() && draft_buffer::fits(wire_text) {
         wire_text.clone_into(input);
+        *input_revision = input_revision.wrapping_add(1);
         true
     } else {
         false
@@ -2500,6 +2516,7 @@ impl State {
                     .clicked()
                 {
                     prompt.clone_into(&mut self.input);
+                    self.input_revision = self.input_revision.wrapping_add(1);
                     self.place_composer_cursor(self.input.chars().count());
                     self.touch_conversation(self.active_conversation);
                     self.focus_composer = true;

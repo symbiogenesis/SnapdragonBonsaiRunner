@@ -468,6 +468,10 @@ impl<'a> Buffer<'a> {
         buffer
     }
 
+    pub(super) const fn was_mutated(&self) -> bool {
+        !self.rejected && (!self.tx_ops.is_empty() || self.history_applied)
+    }
+
     pub(super) fn finish(mut self, output: &mut TextEditOutput) -> bool {
         if self.rejected {
             self.rollback_tx();
@@ -824,8 +828,12 @@ fn inspect_frame_events(
 }
 
 pub(super) fn fits(text: &str) -> bool {
-    text.len() <= super::INPUT_LIMIT * 4
-        && text.chars().take(super::INPUT_LIMIT + 1).count() <= super::INPUT_LIMIT
+    if text.is_ascii() {
+        text.len() <= super::INPUT_LIMIT
+    } else {
+        text.len() <= super::INPUT_LIMIT * 4
+            && text.chars().take(super::INPUT_LIMIT + 1).count() <= super::INPUT_LIMIT
+    }
 }
 
 impl TextBuffer for Buffer<'_> {

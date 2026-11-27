@@ -11,17 +11,54 @@ pub(crate) fn to_vec(
     value: &(impl serde::Serialize + ?Sized),
     limit: usize,
 ) -> Result<Vec<u8>, serde_json::Error> {
-    let mut writer = BoundedWriter {
-        bytes: Vec::new(),
-        limit,
-    };
-    serde_json::to_writer(&mut writer, value)?;
-    Ok(writer.bytes)
+    to_vec_with_capacity(value, limit, 0)
 }
 
-struct BoundedWriter {
+pub(crate) fn to_vec_with_capacity(
+    value: &(impl serde::Serialize + ?Sized),
+    limit: usize,
+    initial_capacity: usize,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut writer = BoundedWriter::with_capacity(limit, initial_capacity).map_err(serde_json::Error::io)?;
+    writer.write_json(value)?;
+    Ok(writer.into_vec())
+}
+
+pub(crate) struct BoundedWriter {
     bytes: Vec<u8>,
     limit: usize,
+}
+
+impl BoundedWriter {
+    pub(crate) fn with_capacity(limit: usize, initial_capacity: usize) -> io::Result<Self> {
+        let mut bytes = Vec::new();
+        let reserve = initial_capacity.min(limit);
+        if reserve > 0 {
+            bytes
+                .try_reserve_exact(reserve)
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        }
+        Ok(Self { bytes, limit })
+    }
+
+    pub(crate) const fn remaining(&self) -> usize {
+        self.limit.saturating_sub(self.bytes.len())
+    }
+
+    pub(crate) fn write_json(
+        &mut self,
+        value: &(impl serde::Serialize + ?Sized),
+    ) -> Result<(), serde_json::Error> {
+        serde_json::to_writer(self, value)
+    }
+
+    pub(crate) fn write_raw(&mut self, bytes: &[u8]) -> Result<(), serde_json::Error> {
+        self.write_all(bytes).map_err(serde_json::Error::io)
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 impl Write for BoundedWriter {

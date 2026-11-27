@@ -115,7 +115,7 @@ impl Recovery {
             bonsai_windows_credentials::validate_external_path(candidate)?;
         }
         let mut lock = open_lock(&lock_path)?;
-        let saving_disabled = saving_disabled(&mut lock)?;
+        let (saving_disabled, mut saving_enabled_persisted) = lock_preference(&mut lock)?;
         let loaded = if saving_disabled {
             Ok(None)
         } else {
@@ -132,9 +132,17 @@ impl Recovery {
                     let event = match command {
                         Command::Save(operation, bytes, slot) => {
                             let saved = save(&path, &bytes).and_then(|()| {
-                                set_saving_disabled(&mut lock, false).map_err(|error| {
-                                    Failure::at("remembering the saving preference", &error)
-                                })
+                                if saving_enabled_persisted {
+                                    Ok(())
+                                } else {
+                                    set_saving_disabled(&mut lock, false)
+                                        .map(|()| {
+                                            saving_enabled_persisted = true;
+                                        })
+                                        .map_err(|error| {
+                                            Failure::at("remembering the saving preference", &error)
+                                        })
+                                }
                             });
                             drop(bytes);
                             drop(slot);
@@ -144,6 +152,7 @@ impl Recovery {
                             }
                         }
                         Command::Erase(operation) => {
+                            saving_enabled_persisted = false;
                             match set_saving_disabled(&mut lock, true)
                                 .map_err(|error| {
                                     Failure::at("remembering the saving preference", &error)
@@ -328,15 +337,15 @@ fn open_lock(path: &Path) -> io::Result<File> {
 // content. Legacy empty sentinels select automatic saving. Record opt-out before
 // deletion so even an interrupted/failed erase cannot restore an unwanted chat;
 // clear it only after a new encrypted snapshot has been published successfully.
-fn saving_disabled(lock: &mut File) -> io::Result<bool> {
+fn lock_preference(lock: &mut File) -> io::Result<(bool, bool)> {
     match lock.metadata()?.len() {
-        0 => Ok(false),
+        0 => Ok((false, false)),
         1 => {
             let mut preference = [0];
             lock.read_exact(&mut preference)?;
             match preference[0] {
-                b'0' => Ok(true),
-                b'1' => Ok(false),
+                b'0' => Ok((true, false)),
+                b'1' => Ok((false, true)),
                 _ => Err(io::Error::other("Invalid conversation saving preference.")),
             }
         }
