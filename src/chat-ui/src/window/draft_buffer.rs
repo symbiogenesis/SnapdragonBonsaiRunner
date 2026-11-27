@@ -129,7 +129,7 @@ impl UndoGroup {
         Some((usize::try_from(chars).ok()?, usize::try_from(bytes).ok()?))
     }
 
-    fn try_coalesce(&mut self, next: Self) -> bool {
+    fn try_coalesce(&mut self, next: &Self) -> bool {
         if !self.coalesceable
             || !next.coalesceable
             || self.ops.len() != 1
@@ -285,7 +285,7 @@ impl DraftHistory {
         }
         if let Some(last) = self.undo_stack.back_mut() {
             let prev_cost = last.byte_cost;
-            if last.try_coalesce(group.clone()) {
+            if last.try_coalesce(&group) {
                 let added = last.byte_cost.saturating_sub(prev_cost);
                 self.retained_bytes = self.retained_bytes.saturating_add(added);
                 self.enforce_budget();
@@ -436,11 +436,12 @@ impl<'a> Buffer<'a> {
             (true, text.chars().count())
         };
 
-        let legacy_mode = history_empty && legacy_undoer_populated(&previous);
         let (has_mutating_event, frame_time, input_mode, history_action) =
             inspect_frame_events(ctx, id);
+        let legacy_mode =
+            history_empty && has_mutating_event && legacy_undoer_populated(&previous);
 
-        let undoer = (legacy_mode && has_mutating_event).then(|| previous.undoer());
+        let undoer = legacy_mode.then(|| previous.undoer());
         let mut buffer = Self {
             text,
             limit,
@@ -486,6 +487,15 @@ impl<'a> Buffer<'a> {
                 .store(&output.response.response.ctx, output.response.response.id);
             output.response.response.ctx.request_repaint();
             return true;
+        }
+
+        if !self.was_mutated()
+            && !matches!(
+                self.input_mode,
+                FrameInputMode::ImeCommit | FrameInputMode::ImeCancel
+            )
+        {
+            return false;
         }
 
         let history = Arc::clone(&self.history);
@@ -695,6 +705,9 @@ impl<'a> Buffer<'a> {
         }
         if char_idx >= self.char_count {
             return self.text.len();
+        }
+        if self.text.len() == self.char_count {
+            return char_idx;
         }
         let mid = self.char_count / 2;
         if char_idx <= mid {

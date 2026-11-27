@@ -1,5 +1,67 @@
 //! A single, native status line beneath Settings, with full accessible descriptions.
-use super::{RichText, State, egui};
+use super::{State, egui};
+use std::sync::Arc;
+
+#[derive(Clone)]
+struct SidebarStatusGalleys {
+    model_label: &'static str,
+    font: egui::FontId,
+    text_color: egui::Color32,
+    weak_color: egui::Color32,
+    pixels_per_point_bits: u32,
+    model: Arc<egui::Galley>,
+    history: Arc<egui::Galley>,
+    private: Arc<egui::Galley>,
+}
+
+fn cached_galleys(ui: &egui::Ui, model_label: &'static str) -> SidebarStatusGalleys {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let text_color = ui.visuals().text_color();
+    let weak_color = ui.visuals().weak_text_color();
+    let pixels_per_point_bits = ui.ctx().pixels_per_point().to_bits();
+    let cache_id = egui::Id::unique("sidebar-status-galleys");
+    if let Some(cached) = ui
+        .ctx()
+        .data(|data| data.get_temp::<SidebarStatusGalleys>(cache_id))
+        && cached.font == font
+        && cached.text_color == text_color
+        && cached.weak_color == weak_color
+        && cached.pixels_per_point_bits == pixels_per_point_bits
+    {
+        if cached.model_label == model_label {
+            return cached;
+        }
+        let updated = SidebarStatusGalleys {
+            model_label,
+            model: ui
+                .painter()
+                .layout_no_wrap(model_label.to_owned(), font, text_color),
+            ..cached
+        };
+        let result = updated.clone();
+        ui.ctx().data_mut(|data| data.insert_temp(cache_id, updated));
+        return result;
+    }
+    let created = SidebarStatusGalleys {
+        model_label,
+        model: ui
+            .painter()
+            .layout_no_wrap(model_label.to_owned(), font.clone(), text_color),
+        history: ui
+            .painter()
+            .layout_no_wrap("History".to_owned(), font.clone(), weak_color),
+        private: ui
+            .painter()
+            .layout_no_wrap("Private".to_owned(), font.clone(), weak_color),
+        font,
+        text_color,
+        weak_color,
+        pixels_per_point_bits,
+    };
+    let result = created.clone();
+    ui.ctx().data_mut(|data| data.insert_temp(cache_id, created));
+    result
+}
 
 impl State {
     pub(super) fn sidebar_status(&self, ui: &mut egui::Ui) {
@@ -25,17 +87,11 @@ impl State {
         } else {
             "Conversation saving is off. Conversations stay in this window. Change it in Settings → Privacy."
         };
-        let font = egui::TextStyle::Small.resolve(ui.style());
-        let text_width = |text: &str| {
-            ui.painter()
-                .layout_no_wrap(text.to_owned(), font.clone(), ui.visuals().text_color())
-                .size()
-                .x
-        };
+        let galleys = cached_galleys(ui, model);
         // Include the two icons and their four-point label gaps. Only the gaps
         // between groups tighten on a narrow dock; text keeps its natural width.
         let content_width =
-            text_width(model) + text_width("History") + text_width("Private") + 34.0;
+            galleys.model.size().x + galleys.history.size().x + galleys.private.size().x + 34.0;
         let available = ui.available_width();
         let group_gap = ((available - content_width) * 0.5).clamp(0.0, 14.0);
         let inset = (2.0_f32.mul_add(-group_gap, available - content_width) * 0.5).max(0.0);
@@ -46,20 +102,20 @@ impl State {
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.add_space(inset);
-                    ui.add(egui::Label::new(RichText::new(model).small()).extend())
+                    ui.add(egui::Label::new(Arc::clone(&galleys.model)).extend())
                         .accessible_name(description)
                         .on_hover_text(description);
                     ui.add_space(group_gap);
                     history_indicator(ui, self.save_conversations)
                         .on_hover_text(saving_description);
                     ui.add_space(4.0);
-                    ui.add(egui::Label::new(RichText::new("History").small().weak()).extend())
+                    ui.add(egui::Label::new(Arc::clone(&galleys.history)).extend())
                         .accessible_name(saving_description)
                         .on_hover_text(saving_description);
                     ui.add_space(group_gap);
                     privacy_icon(ui).on_hover_text("Private · On your device");
                     ui.add_space(4.0);
-                    ui.add(egui::Label::new(RichText::new("Private").small().weak()).extend())
+                    ui.add(egui::Label::new(Arc::clone(&galleys.private)).extend())
                         .accessible_name("Private · On your device")
                         .on_hover_text("Private · On your device");
                 },

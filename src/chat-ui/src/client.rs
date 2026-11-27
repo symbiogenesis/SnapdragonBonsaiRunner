@@ -2158,10 +2158,10 @@ fn exchange(
     while let Some(bytes) = body.next_payload()? {
         sse.push(bytes, &mut |text, reasoning| {
             if !text.is_empty() {
-                events.stream(Event::Text(text.into_owned()), commands)?;
+                events.stream_text(text, false, commands)?;
             }
             if !reasoning.is_empty() {
-                events.stream(Event::Reasoning(reasoning.into_owned()), commands)?;
+                events.stream_text(reasoning, true, commands)?;
             }
             Ok(())
         })?;

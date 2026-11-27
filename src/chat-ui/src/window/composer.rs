@@ -181,14 +181,14 @@ impl State {
         self.composer_id = Some(response.id);
         let pending_cursor = self.pending_cursor.take();
         let cursor = pending_cursor.or(output.cursor_range);
-        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
-            if let Some(cursor) = pending_cursor {
+        if let Some(cursor) = pending_cursor {
+            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
                 state.cursor.set_char_range(Some(cursor));
                 state.store(ui.ctx(), response.id);
                 ui.ctx().request_repaint();
-            } else {
-                self.composer_cursor = state.cursor.char_range();
             }
+        } else {
+            self.composer_cursor = output.cursor_range;
         }
         let focus_requested = self.focus_composer
             && !self.show_settings

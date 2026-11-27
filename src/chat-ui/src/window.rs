@@ -160,9 +160,11 @@ fn runtime_description(config: &Config) -> String {
 struct State {
     commands: Sender<Command>,
     events: client::EventReceiver,
+    drained_events: Vec<Event>,
     repaint_ctx: Option<egui::Context>,
     worker: Option<JoinHandle<()>>,
     markdown_image: Option<std::path::PathBuf>,
+    markdown_configured: std::cell::Cell<bool>,
     pending_config: Option<Config>,
     startup_request: Option<crate::startup::Request>,
     startup: Option<crate::startup::Session>,
@@ -340,9 +342,11 @@ impl State {
         Self {
             commands,
             events,
+            drained_events: Vec::new(),
             repaint_ctx: None,
             worker: None,
             markdown_image: None,
+            markdown_configured: std::cell::Cell::new(false),
             pending_config: None,
             startup_request: None,
             startup: None,
@@ -510,9 +514,16 @@ impl State {
         state
     }
 
+    fn configure_markdown_once(&self, ctx: &egui::Context, image: &std::path::Path) {
+        if !self.markdown_configured.get() {
+            crate::markdown_service::Service::configure(ctx, image);
+            self.markdown_configured.set(true);
+        }
+    }
+
     fn markdown_preparing(&self, ctx: &egui::Context) -> bool {
         self.markdown_image.as_ref().is_some_and(|image| {
-            crate::markdown_service::Service::configure(ctx, image);
+            self.configure_markdown_once(ctx, image);
             crate::markdown_service::Service::get(ctx).is_some_and(|service| {
                 service.warm_up()
                     || (!service.unavailable() && self.transcript.presentation_pending(ctx))
@@ -529,8 +540,8 @@ impl State {
             ctx.request_repaint_after(Duration::from_millis(16));
             return;
         }
-        if let Some(image) = &self.markdown_image {
-            crate::markdown_service::Service::configure(ctx, image);
+        if let Some(image) = self.markdown_image.as_deref() {
+            self.configure_markdown_once(ctx, image);
         }
         if let Some(config) = self.pending_config.take()
             && let Err(error) = self.attach_configuration(config, false)
@@ -1302,19 +1313,26 @@ impl State {
             return;
         }
         // Bound per-frame work even when the worker refills the bounded queue.
-        for _ in 0..64 {
-            match self.events.try_recv() {
-                Ok(event) => self.model_event(event),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if !self.preview
-                        && (self.model.ready() || self.model.busy() || self.model.waiting_model())
-                    {
-                        self.fail("The model worker stopped. Close and restart the app.");
-                    }
-                    break;
+        let mut batch = std::mem::take(&mut self.drained_events);
+        let outcome = self.events.drain_into(&mut batch, 64);
+        for event in batch.drain(..) {
+            self.model_event(event);
+        }
+        self.drained_events = batch;
+        match outcome {
+            Ok((true, _)) | Err(mpsc::TryRecvError::Disconnected) => {
+                if !self.preview
+                    && (self.model.ready() || self.model.busy() || self.model.waiting_model())
+                {
+                    self.fail("The model worker stopped. Close and restart the app.");
                 }
             }
+            Ok((false, has_more)) => {
+                if has_more && let Some(ctx) = &self.repaint_ctx {
+                    ctx.request_repaint();
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
         }
     }
 

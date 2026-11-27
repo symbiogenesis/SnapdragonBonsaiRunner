@@ -67,6 +67,14 @@ impl Default for Preferences {
     }
 }
 
+#[derive(Clone, PartialEq)]
+struct AppliedAppearance {
+    theme: Theme,
+    text_size: u16,
+    resolved_theme: egui::Theme,
+    high_contrast: Option<egui::Visuals>,
+}
+
 impl Preferences {
     fn valid(self) -> bool {
         (14..=24).contains(&self.text_size)
@@ -80,14 +88,54 @@ impl Preferences {
     }
 
     pub(super) fn apply(self, ctx: &egui::Context) {
+        let cache_id = egui::Id::unique("applied-appearance");
+        let previous = ctx.data(|data| data.get_temp::<AppliedAppearance>(cache_id));
+        let theme_pref_changed = previous
+            .as_ref()
+            .is_none_or(|prev| prev.theme != self.theme);
+        if theme_pref_changed {
+            ctx.set_theme(self.theme.preference());
+        }
+        let resolved_theme = ctx.theme();
+        let high_contrast = platform::high_contrast_visuals();
+        if let Some(prev) = &previous
+            && prev.theme == self.theme
+            && prev.text_size == self.text_size
+            && prev.resolved_theme == resolved_theme
+            && prev.high_contrast == high_contrast
+        {
+            return;
+        }
+        let visuals_changed = previous.as_ref().is_none_or(|prev| {
+            prev.resolved_theme != resolved_theme || prev.high_contrast != high_contrast
+        });
+        let size_changed = previous
+            .as_ref()
+            .is_none_or(|prev| prev.text_size != self.text_size);
+        if visuals_changed {
+            ctx.set_visuals(
+                high_contrast
+                    .clone()
+                    .unwrap_or_else(|| palette(resolved_theme)),
+            );
+        }
         ctx.data_mut(|data| {
+            if size_changed {
+                data.insert_temp(
+                    egui::Id::unique("reading-text-size"),
+                    f32::from(self.text_size),
+                );
+            }
             data.insert_temp(
-                egui::Id::unique("reading-text-size"),
-                f32::from(self.text_size),
+                cache_id,
+                AppliedAppearance {
+                    theme: self.theme,
+                    text_size: self.text_size,
+                    resolved_theme,
+                    high_contrast,
+                },
             );
         });
-        ctx.set_theme(self.theme.preference());
-        ctx.set_visuals(platform::high_contrast_visuals().unwrap_or_else(|| palette(ctx.theme())));
     }
 }
 

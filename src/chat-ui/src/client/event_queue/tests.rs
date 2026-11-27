@@ -265,25 +265,44 @@ fn event_sender_invokes_repaint_wakeup_on_posted_events_and_drop() -> Result<()>
         .map_err(|()| Failure::Shutdown)?;
     assert_eq!(wakeups.load(Ordering::Relaxed), 1);
 
+    // Subsequent sends before the UI drains reuse the pending edge-triggered wakeup.
     sender
         .send(Event::Text("a".into()))
         .map_err(|()| Failure::Shutdown)?;
-    assert_eq!(wakeups.load(Ordering::Relaxed), 2);
+    assert_eq!(wakeups.load(Ordering::Relaxed), 1);
 
-    // Coalesced text delta must still trigger immediate repaint wakeup.
+    // Coalesced text delta also keeps the single pending wakeup until drained.
     sender
         .send(Event::Text("b".into()))
         .map_err(|()| Failure::Shutdown)?;
-    assert_eq!(wakeups.load(Ordering::Relaxed), 3);
+    assert_eq!(wakeups.load(Ordering::Relaxed), 1);
+
+    // Draining resets the edge trigger so the next send schedules a fresh wakeup.
+    let mut drained = Vec::new();
+    assert_eq!(receiver.drain_into(&mut drained, 64), Ok((false, false)));
+    assert_eq!(drained.len(), 2);
+    assert!(matches!(drained[0], Event::Stage("Thinking…")));
+    assert!(matches!(&drained[1], Event::Text(text) if text == "ab"));
+
+    sender
+        .send(Event::Text("c".into()))
+        .map_err(|()| Failure::Shutdown)?;
+    assert_eq!(wakeups.load(Ordering::Relaxed), 2);
+    assert!(matches!(receiver.try_recv(), Ok(Event::Text(text)) if text == "c"));
 
     // Saturate the stream queue; rejected backpressure send must not spuriously wake.
-    assert!(matches!(receiver.try_recv(), Ok(Event::Stage("Thinking…"))));
-    assert!(matches!(receiver.try_recv(), Ok(Event::Text(text)) if text == "ab"));
+    fill(&sender)?;
+    let mut saturated = Vec::new();
+    assert_eq!(receiver.drain_into(&mut saturated, 64), Ok((false, false)));
+    assert_eq!(saturated.len(), STREAM_EVENTS);
     fill(&sender)?;
     let count_when_full = wakeups.load(Ordering::Relaxed);
     assert_eq!(sender.send(Event::Text("overflow".into())), Err(()));
     assert_eq!(wakeups.load(Ordering::Relaxed), count_when_full);
 
+    // Draining resets the edge trigger before drop so sender shutdown wakes the UI.
+    saturated.clear();
+    assert_eq!(receiver.drain_into(&mut saturated, 64), Ok((false, false)));
     drop(sender);
     assert_eq!(wakeups.load(Ordering::Relaxed), count_when_full + 1);
     drop(receiver);
