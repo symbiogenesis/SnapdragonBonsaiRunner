@@ -11,7 +11,7 @@
 
 #[cfg(all(windows, feature = "rust-qualification"))]
 use bonsai_windows_process::quant_kernels::{
-    self, Arm64QuantCaps, Q8_0ActBlock, Q8_0ActPanel8, Q8_KActBlock,
+    self, Arm64QuantCaps, Q8_0ActBlock, Q8_0ActPanel8, Q8_KActBlock, Q8_KActPanel8,
 };
 use std::sync::OnceLock;
 
@@ -62,11 +62,15 @@ pub(super) struct PreparedBatch {
     #[cfg(all(windows, feature = "rust-qualification"))]
     act_q8_k: Vec<Q8_KActBlock>,
     #[cfg(all(windows, feature = "rust-qualification"))]
+    act_q8_k_panels8: Vec<Q8_KActPanel8>,
+    #[cfg(all(windows, feature = "rust-qualification"))]
     q8_0_ready: bool,
     #[cfg(all(windows, feature = "rust-qualification"))]
     q8_0_panel_count: usize,
     #[cfg(all(windows, feature = "rust-qualification"))]
     q8_k_ready: bool,
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    q8_k_panel_count: usize,
 }
 
 #[inline(always)]
@@ -187,9 +191,11 @@ impl PreparedBatch {
             self.q8_0_ready = false;
             self.q8_0_panel_count = 0;
             self.q8_k_ready = false;
+            self.q8_k_panel_count = 0;
             self.act_q8_0.clear();
             self.act_q8_0_panels8.clear();
             self.act_q8_k.clear();
+            self.act_q8_k_panels8.clear();
             let q8_0_cap = (max_retain / 8).max(64);
             let q8_k_cap = (max_retain / 64).max(16);
             if self.act_q8_0.capacity() > q8_0_cap.saturating_mul(2) {
@@ -201,6 +207,10 @@ impl PreparedBatch {
             }
             if self.act_q8_k.capacity() > q8_k_cap.saturating_mul(2) {
                 self.act_q8_k.shrink_to(q8_k_cap);
+            }
+            let pk8_cap = (q8_k_cap / 8).max(16);
+            if self.act_q8_k_panels8.capacity() > pk8_cap.saturating_mul(2) {
+                self.act_q8_k_panels8.shrink_to(pk8_cap);
             }
         }
     }
@@ -224,6 +234,7 @@ impl PreparedBatch {
             self.q8_0_ready = false;
             self.q8_0_panel_count = 0;
             self.q8_k_ready = false;
+            self.q8_k_panel_count = 0;
         }
     }
 
@@ -994,6 +1005,21 @@ fn run_single_rows_repacked_q4_k(
         let abs_row = start_row + idx;
         let strip_idx = abs_row / 8;
         let lane = abs_row % 8;
+        if lane == 0 && out.len() - idx >= 8 {
+            let strip_count = (out.len() - idx) / 8;
+            let take = strip_count * 8;
+            // RepackedQ4K8 scales are validated finite at load time in decoder.rs and repack_q4_k_8rows.
+            quant_kernels::dot_q4_k_repacked8_finite_scales_strips(
+                caps,
+                data,
+                strip_idx,
+                strip_count,
+                act,
+                &mut out[idx..idx + take],
+            );
+            idx += take;
+            continue;
+        }
         let strip = &data[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
         let vals = quant_kernels::dot_q4_k_repacked8(caps, strip, act);
         let take = (8 - lane).min(out.len() - idx);
@@ -2399,6 +2425,44 @@ fn quantize_batch_activations_flags(
 }
 
 #[cfg(all(windows, feature = "rust-qualification"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared panel-8 activation packing helper for both Q8_0 and Q8_K batch GEMM paths."
+)]
+fn pack_act_panels8<B: Sync, P: Default + Clone + Send>(
+    acts: &[B],
+    blocks: usize,
+    batch: usize,
+    width: usize,
+    workers: usize,
+    caps: Arm64QuantCaps,
+    panels_buf: &mut Vec<P>,
+    pack_fn: impl Fn(&[B], usize, usize, &mut [P]) + Sync,
+) -> usize {
+    const PARALLEL_PACK_WORK: usize = 8_192;
+    let panel_count = batch / 8;
+    if !caps.i8mm || panel_count == 0 || blocks == 0 {
+        return 0;
+    }
+    let needed = panel_count * blocks;
+    panels_buf.resize(needed, P::default());
+    let panels = &mut panels_buf[..needed];
+    let active_workers = workers
+        .clamp(1, crate::threads::MAX_WORKERS)
+        .min(panel_count);
+    if active_workers > 1 && batch.saturating_mul(width) >= PARALLEL_PACK_WORK {
+        row_workers::run_slice_aligned(panels, active_workers, blocks, &|elem_off, panel_slice| {
+            let first_p = elem_off / blocks;
+            let p_here = panel_slice.len() / blocks;
+            pack_fn(&acts[first_p * 8 * blocks..], blocks, p_here, panel_slice);
+        });
+    } else {
+        pack_fn(acts, blocks, panel_count, panels);
+    }
+    panel_count
+}
+
+#[cfg(all(windows, feature = "rust-qualification"))]
 fn quantize_batch_activations_into<'a>(
     prepared: &mut PreparedBatch,
     weights: impl IntoIterator<Item = WeightMatrix<'a>>,
@@ -2407,7 +2471,6 @@ fn quantize_batch_activations_into<'a>(
     width: usize,
     workers: usize,
 ) -> Arm64QuantCaps {
-    const PARALLEL_PACK_WORK: usize = 8_192;
     let (need_q8_0, need_q8_k) = activation_needs(weights);
     let run_q8_0 = need_q8_0 && !prepared.q8_0_ready;
     let run_q8_k = need_q8_k && !prepared.q8_k_ready;
@@ -2422,45 +2485,28 @@ fn quantize_batch_activations_into<'a>(
         &mut prepared.act_q8_k,
     );
     if run_q8_0 {
-        let q8_0_blocks = width / 32;
-        let panel_count = batch / 8;
-        if caps.i8mm && panel_count > 0 && q8_0_blocks > 0 {
-            let needed = panel_count * q8_0_blocks;
-            prepared
-                .act_q8_0_panels8
-                .resize(needed, Q8_0ActPanel8::default());
-            let panels = &mut prepared.act_q8_0_panels8[..needed];
-            let active_workers = workers
-                .clamp(1, crate::threads::MAX_WORKERS)
-                .min(panel_count);
-            if active_workers > 1 && batch.saturating_mul(width) >= PARALLEL_PACK_WORK {
-                row_workers::run_slice_aligned(
-                    panels,
-                    active_workers,
-                    q8_0_blocks,
-                    &|elem_off, panel_slice| {
-                        let first_p = elem_off / q8_0_blocks;
-                        let p_here = panel_slice.len() / q8_0_blocks;
-                        quant_kernels::pack_q8_0_act_panels8(
-                            &prepared.act_q8_0[first_p * 8 * q8_0_blocks..],
-                            q8_0_blocks,
-                            p_here,
-                            panel_slice,
-                        );
-                    },
-                );
-            } else {
-                quant_kernels::pack_q8_0_act_panels8(
-                    &prepared.act_q8_0,
-                    q8_0_blocks,
-                    panel_count,
-                    panels,
-                );
-            }
-            prepared.q8_0_panel_count = panel_count;
-        } else {
-            prepared.q8_0_panel_count = 0;
-        }
+        prepared.q8_0_panel_count = pack_act_panels8(
+            &prepared.act_q8_0,
+            width / 32,
+            batch,
+            width,
+            workers,
+            caps,
+            &mut prepared.act_q8_0_panels8,
+            quant_kernels::pack_q8_0_act_panels8,
+        );
+    }
+    if run_q8_k {
+        prepared.q8_k_panel_count = pack_act_panels8(
+            &prepared.act_q8_k,
+            width / quant_kernels::QK_K,
+            batch,
+            width,
+            workers,
+            caps,
+            &mut prepared.act_q8_k_panels8,
+            quant_kernels::pack_q8_k_act_panels8,
+        );
     }
     if need_q8_0 {
         prepared.q8_0_ready = true;
@@ -2632,6 +2678,10 @@ fn run_batch_rows_quant8<A>(
 }
 
 #[cfg(all(windows, feature = "rust-qualification"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Executes repacked 8-row Q4_K batched GEMM with optional pre-packed Q8_KActPanel8s and tail tiles."
+)]
 fn run_batch_rows_repacked_q4_k(
     caps: Arm64QuantCaps,
     data: &[u8],
@@ -2639,6 +2689,8 @@ fn run_batch_rows_repacked_q4_k(
     start_row: usize,
     batch: usize,
     act: &[Q8_KActBlock],
+    act_q8_k_panels8: &[Q8_KActPanel8],
+    q8_k_panel_count: usize,
     transposed_slice: &mut [f32],
 ) {
     let blocks = width / quant_kernels::QK_K;
@@ -2652,15 +2704,29 @@ fn run_batch_rows_repacked_q4_k(
         let strip = &data[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
         let take = (8 - lane).min(rows_here - row_idx);
         let mut t = 0_usize;
-        while t + 8 <= batch {
-            let acts: [&[Q8_KActBlock]; 8] =
-                std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
-            let tile = quant_kernels::gemm_q4_k_repacked8_8x8(caps, strip, acts);
-            for local_r in 0..take {
-                let dst = &mut transposed_slice[(row_idx + local_r) * batch + t..];
-                dst[..8].copy_from_slice(&tile[lane + local_r]);
+        if q8_k_panel_count > 0 && lane == 0 && take == 8 {
+            let panels = &act_q8_k_panels8[..q8_k_panel_count * blocks];
+            quant_kernels::gemm_q4_k_repacked8_8x_panels(
+                caps,
+                strip,
+                panels,
+                q8_k_panel_count,
+                blocks,
+                &mut transposed_slice[row_idx * batch..],
+                batch,
+            );
+            t = q8_k_panel_count * 8;
+        } else {
+            while t + 8 <= batch {
+                let acts: [&[Q8_KActBlock]; 8] =
+                    std::array::from_fn(|k| &act[(t + k) * blocks..(t + k + 1) * blocks]);
+                let tile = quant_kernels::gemm_q4_k_repacked8_8x8(caps, strip, acts);
+                for local_r in 0..take {
+                    let dst = &mut transposed_slice[(row_idx + local_r) * batch + t..];
+                    dst[..8].copy_from_slice(&tile[lane + local_r]);
+                }
+                t += 8;
             }
-            t += 8;
         }
         if t + 4 <= batch {
             let acts: [&[Q8_KActBlock]; 4] =
@@ -2700,7 +2766,7 @@ fn run_batch_rows_repacked_q4_k(
 #[cfg(all(windows, feature = "rust-qualification"))]
 #[expect(
     clippy::too_many_arguments,
-    reason = "Dispatches ARM64 quantized batch kernels with optional pre-packed Q8_0 SMMLA panels."
+    reason = "Dispatches ARM64 quantized batch kernels with optional pre-packed Q8_0 and Q8_K SMMLA panels."
 )]
 fn batch_rows_quant_arm64(
     caps: Arm64QuantCaps,
@@ -2711,6 +2777,8 @@ fn batch_rows_quant_arm64(
     act_q8_0_panels8: &[Q8_0ActPanel8],
     q8_0_panel_count: usize,
     act_q8_k: &[Q8_KActBlock],
+    act_q8_k_panels8: &[Q8_KActPanel8],
+    q8_k_panel_count: usize,
     transposed_slice: &mut [f32],
 ) {
     let width = weights.input;
@@ -2774,11 +2842,18 @@ fn batch_rows_quant_arm64(
                 start_row,
                 batch,
                 act_q8_k,
+                act_q8_k_panels8,
+                q8_k_panel_count,
                 transposed_slice,
             );
         }
         WeightSlice::Q6K(data) => {
             let blocks = width / 256;
+            let panels = if q8_k_panel_count > 0 {
+                &act_q8_k_panels8[..q8_k_panel_count * blocks]
+            } else {
+                &[]
+            };
             run_batch_rows_quant8(
                 data,
                 start_row,
@@ -2786,8 +2861,18 @@ fn batch_rows_quant_arm64(
                 blocks,
                 batch,
                 act_q8_k,
-                0,
-                |_, _, _| {},
+                q8_k_panel_count,
+                |r, out_rows, stride| {
+                    quant_kernels::gemm_q6_k_8x_panels(
+                        caps,
+                        r,
+                        panels,
+                        q8_k_panel_count,
+                        blocks,
+                        out_rows,
+                        stride,
+                    );
+                },
                 transposed_slice,
                 |r, a| quant_kernels::gemm_q6_k_8x8(caps, r, a),
                 |r, a| quant_kernels::gemm_q6_k_8x4(caps, r, a),
@@ -3123,6 +3208,8 @@ pub(super) fn multiply_batch_prepared_biased_into(
                     &prepared.act_q8_0_panels8,
                     prepared.q8_0_panel_count,
                     &prepared.act_q8_k,
+                    &prepared.act_q8_k_panels8,
+                    prepared.q8_k_panel_count,
                     slice,
                 );
             },
@@ -3222,6 +3309,8 @@ pub(super) fn multiply_batch_channel_major_into(
                 &prepared.act_q8_0_panels8,
                 prepared.q8_0_panel_count,
                 &prepared.act_q8_k,
+                &prepared.act_q8_k_panels8,
+                prepared.q8_k_panel_count,
                 slice,
             );
         });
@@ -3469,6 +3558,8 @@ pub(super) fn multiply_batch_group_biased_into(
                             &prepared.act_q8_0_panels8,
                             prepared.q8_0_panel_count,
                             &prepared.act_q8_k,
+                            &prepared.act_q8_k_panels8,
+                            prepared.q8_k_panel_count,
                             &mut slice[slice_lo..slice_hi],
                         );
                     }
@@ -6311,6 +6402,8 @@ mod tests {
                     0,
                     3,
                     &act_qk,
+                    &[],
+                    0,
                     &mut full_batch,
                 );
                 let mut sub_batch = vec![0.0_f32; 7 * 3];
@@ -6321,6 +6414,8 @@ mod tests {
                     3,
                     3,
                     &act_qk,
+                    &[],
+                    0,
                     &mut sub_batch,
                 );
                 assert_eq!(
