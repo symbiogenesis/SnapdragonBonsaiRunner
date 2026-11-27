@@ -78,8 +78,27 @@ pub(crate) fn run_aligned<F>(
 ) where
     F: Fn(usize, &mut [f32]) + Sync,
 {
+    if out.len() < 4 {
+        compute_slice(0, out);
+        return;
+    }
+    run_slice_aligned(out, worker_count, alignment, compute_slice);
+}
+
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "Share generic aligned slice jobs within the speech crate without exposing the worker module."
+)]
+pub(crate) fn run_slice_aligned<T: Send, F>(
+    out: &mut [T],
+    worker_count: usize,
+    alignment: usize,
+    compute_slice: &F,
+) where
+    F: Fn(usize, &mut [T]) + Sync,
+{
     let requested = worker_count.clamp(1, 18);
-    if requested <= 1 || out.len() < 4 {
+    if requested <= 1 || out.len() < 2 {
         compute_slice(0, out);
         return;
     }
@@ -98,7 +117,7 @@ pub(crate) fn run_aligned<F>(
             return false;
         };
         team.pool
-            .run_aligned(out, requested, alignment, compute_slice);
+            .run_slice_aligned(out, requested, alignment, compute_slice);
         true
     });
     if !completed {

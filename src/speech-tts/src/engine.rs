@@ -1386,13 +1386,12 @@ mod quant_dispatch {
         quantize_row_q8_0, quantize_row_q8_k,
     };
 
-    use super::{LinearProjection, WeightQuantization, run_row_chunks_aligned};
+    use super::{LinearProjection, WeightQuantization, row_workers, run_row_chunks_aligned};
 
     thread_local! {
         static ACT_Q8_0: RefCell<Vec<Q8_0ActBlock>> = const { RefCell::new(Vec::new()) };
         static ACT_Q8_K: RefCell<Vec<Q8_KActBlock>> = const { RefCell::new(Vec::new()) };
         static GROUP_COMBINED: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-        static BATCH_DISPATCH_DUMMY: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     }
 
     fn quantize_batch_parallel<Act: Send>(
@@ -1405,7 +1404,8 @@ mod quant_dispatch {
         quantize_row: impl Fn(&[f32], &mut [Act]) + Sync,
     ) {
         let active = workers.clamp(1, 18).min(seq_len);
-        if active <= 1 || seq_len < 2 || seq_len.saturating_mul(in_dim) < 4096 {
+        if active <= 1 || seq_len < 2 || seq_len.saturating_mul(in_dim) < 4096 || blocks_per_tok == 0
+        {
             for t in 0..seq_len {
                 quantize_row(
                     &inputs[t * in_dim..(t + 1) * in_dim],
@@ -1414,55 +1414,22 @@ mod quant_dispatch {
             }
             return;
         }
-        let chunk_toks = seq_len.div_ceil(active);
-        let act_chunks: Vec<(usize, std::sync::Mutex<&mut [Act]>)> = acts
-            [..seq_len * blocks_per_tok]
-            .chunks_mut(chunk_toks * blocks_per_tok)
-            .enumerate()
-            .map(|(idx, slice)| (idx * chunk_toks, std::sync::Mutex::new(slice)))
-            .collect();
-        let run_with_dummy = |dummy: &mut [f32]| {
-            run_row_chunks_aligned(dummy, active, 4, |elem_off, slice| {
-                let t_start = elem_off / 4;
-                let t_end = t_start + slice.len() / 4;
-                if t_start >= t_end {
-                    return;
+        row_workers::run_slice_aligned(
+            &mut acts[..seq_len * blocks_per_tok],
+            active,
+            blocks_per_tok,
+            &|act_offset, act_slice| {
+                let t_start = act_offset / blocks_per_tok;
+                let t_count = act_slice.len() / blocks_per_tok;
+                for local_t in 0..t_count {
+                    let t = t_start + local_t;
+                    quantize_row(
+                        &inputs[t * in_dim..(t + 1) * in_dim],
+                        &mut act_slice[local_t * blocks_per_tok..(local_t + 1) * blocks_per_tok],
+                    );
                 }
-                let first_c = t_start / chunk_toks;
-                let last_c = (t_end - 1) / chunk_toks;
-                for (c_start, mtx) in &act_chunks[first_c..=last_c] {
-                    let mut guard = mtx
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let c_len = guard.len() / blocks_per_tok;
-                    let c_end = c_start + c_len;
-                    let lo = t_start.max(*c_start);
-                    let hi = t_end.min(c_end);
-                    for t in lo..hi {
-                        let local = t - *c_start;
-                        quantize_row(
-                            &inputs[t * in_dim..(t + 1) * in_dim],
-                            &mut guard[local * blocks_per_tok..(local + 1) * blocks_per_tok],
-                        );
-                    }
-                }
-            });
-        };
-        let needed = seq_len * 4;
-        if needed <= 512 {
-            let mut stack_dummy = [0.0_f32; 512];
-            run_with_dummy(&mut stack_dummy[..needed]);
-        } else {
-            BATCH_DISPATCH_DUMMY.with(|cell| {
-                if let Ok(mut buf) = cell.try_borrow_mut() {
-                    buf.resize(needed, 0.0_f32);
-                    run_with_dummy(&mut buf[..needed]);
-                } else {
-                    let mut fallback = vec![0.0_f32; needed];
-                    run_with_dummy(&mut fallback);
-                }
-            });
-        }
+            },
+        );
     }
 
     fn with_batch_group_workspace<R>(
@@ -4142,6 +4109,52 @@ fn attend_kv_group_range_f16(
     scores: &mut [f32],
     out_chunk: &mut [f32],
 ) {
+    out_chunk.fill(0.0);
+    if gqa_ratio == 2 {
+        for local_kvh in 0..kvh_count {
+            let kvh = kvh_start + local_kvh;
+            let kv_head_off = kvh * head_dim;
+            let qh_base = kvh * 2;
+            let q0 = &q[qh_base * head_dim..(qh_base + 1) * head_dim];
+            let q1 = &q[(qh_base + 1) * head_dim..(qh_base + 2) * head_dim];
+            let mut max_0 = f32::NEG_INFINITY;
+            let mut max_1 = f32::NEG_INFINITY;
+            for t in 0..total_seq {
+                let k_bits =
+                    &kv.k[t * kv_stride + kv_head_off..t * kv_stride + kv_head_off + head_dim];
+                let (d0, d1) =
+                    bonsai_windows_process::quant_kernels::dot_f16_pair_f32(q0, q1, k_bits);
+                let s0 = d0 * scale;
+                let s1 = d1 * scale;
+                scores[t] = s0;
+                scores[total_seq + t] = s1;
+                if s0 > max_0 {
+                    max_0 = s0;
+                }
+                if s1 > max_1 {
+                    max_1 = s1;
+                }
+            }
+            let (inv_0, inv_1) = dispatch!(level, simd => (
+                softmax_row_simd(simd, &mut scores[..total_seq], max_0),
+                softmax_row_simd(simd, &mut scores[total_seq..2 * total_seq], max_1),
+            ));
+            let local_qh0 = local_kvh * 2;
+            let (out_0, out_1) =
+                out_chunk[local_qh0 * head_dim..(local_qh0 + 2) * head_dim].split_at_mut(head_dim);
+            for t in 0..total_seq {
+                let v_bits =
+                    &kv.v[t * kv_stride + kv_head_off..t * kv_stride + kv_head_off + head_dim];
+                let w0 = scores[t] * inv_0;
+                let w1 = scores[total_seq + t] * inv_1;
+                bonsai_windows_process::quant_kernels::axpy_f16_pair_f32(
+                    w0, w1, v_bits, out_0, out_1,
+                );
+            }
+        }
+        return;
+    }
+
     let mut stack_buf = [0.0_f32; 256];
     let mut heap_buf = if head_dim > stack_buf.len() {
         vec![0.0_f32; head_dim]
@@ -4154,7 +4167,6 @@ fn attend_kv_group_range_f16(
         &mut heap_buf[..head_dim]
     };
 
-    out_chunk.fill(0.0);
     if gqa_ratio <= 8 {
         dispatch!(level, simd => {
             for local_kvh in 0..kvh_count {
