@@ -51,7 +51,7 @@ fn failure(
 fn module_name(buffer: &[u16], count: usize) -> Option<String> {
     // A full buffer may be truncated. Reject malformed UTF-16 and names which
     // could expose paths, embed controls, or collapse distinct observations.
-    if count == 0 || count >= buffer.len() {
+    if count == 0 || count >= buffer.len() - 1 {
         return None;
     }
     let name = String::from_utf16(buffer.get(..count)?).ok()?;
@@ -133,7 +133,7 @@ fn module_snapshot(
             let length =
                 unsafe { K32GetModuleFileNameExW(process, *module, stack.as_mut_ptr(), 260) };
             let path = usize::try_from(length).ok().and_then(|length| {
-                let path = if length > 0 && length < stack.len() {
+                let path = if length > 0 && length < stack.len() - 1 {
                     Some(PathBuf::from(OsString::from_wide(&stack[..length])))
                 } else if length >= stack.len() - 1 {
                     let mut heap = vec![0_u16; 32768];
@@ -143,7 +143,7 @@ fn module_snapshot(
                     };
                     usize::try_from(full)
                         .ok()
-                        .filter(|full| *full > 0 && *full < heap.len())
+                        .filter(|full| *full > 0 && *full < heap.len() - 1)
                         .map(|full| PathBuf::from(OsString::from_wide(&heap[..full])))
                 } else {
                     None
@@ -762,9 +762,10 @@ mod tests {
     #[test]
     fn module_snapshots_reject_truncation_paths_controls_and_invalid_utf16() {
         assert_eq!(
-            module_name(&[65, 46, 68, 76, 76, 0], 5),
+            module_name(&[65, 46, 68, 76, 76, 0, 0], 5),
             Some("a.dll".into())
         );
+        assert!(module_name(&[65, 46, 68, 76, 76, 0], 5).is_none());
         for buffer in [
             vec![0],
             vec![65],

@@ -738,7 +738,7 @@ impl ScatterTarget<'_, '_> {
         }
     }
 
-    fn fill_zero(&mut self, tokens: usize) {
+    fn fill_zero(&mut self, tokens: usize) -> bool {
         match self {
             Self::Rows {
                 out_rows,
@@ -747,6 +747,7 @@ impl ScatterTarget<'_, '_> {
                 for r in 0..8 {
                     out_rows[r * *row_stride..r * *row_stride + tokens].fill(0.0);
                 }
+                true
             }
             Self::Scatter {
                 out_tokens,
@@ -758,17 +759,22 @@ impl ScatterTarget<'_, '_> {
                     let off = t * *out_stride;
                     out_tokens[off..off + 8].copy_from_slice(&b);
                 }
+                tokens == 0 || b.iter().all(|v| v.is_finite())
             }
             Self::Band {
                 band,
                 local_col,
                 bias,
             } => {
+                let mut all_finite = true;
                 let zeros = [0.0_f32; 8];
                 let b_ref = bias.as_ref().map(|arr| &arr[..]);
                 for t in 0..tokens {
-                    let _ = band.write_token_slice_biased(t, *local_col, &zeros, b_ref);
+                    if !band.write_token_slice_biased(t, *local_col, &zeros, b_ref) {
+                        all_finite = false;
+                    }
                 }
+                all_finite
             }
         }
     }
@@ -1849,8 +1855,7 @@ fn gemm_q8_0_8x_panels_dispatch<const FINITE_SCALES: bool>(
         return false;
     }
     if blocks == 0 {
-        target.fill_zero(tokens);
-        return true;
+        return target.fill_zero(tokens);
     }
     #[cfg(target_arch = "aarch64")]
     if caps.i8mm && bonsai_neon_dot::has_i8mm() {
@@ -1996,8 +2001,7 @@ fn gemm_repacked_q8_0_8_8x_panels_dispatch(
         return false;
     }
     if blocks == 0 {
-        target.fill_zero(tokens);
-        return true;
+        return target.fill_zero(tokens);
     }
     #[cfg(target_arch = "aarch64")]
     if caps.i8mm && bonsai_neon_dot::has_i8mm() {
@@ -3236,8 +3240,7 @@ fn gemm_q4_k_repacked8_8x_panels_dispatch<const FINITE_SCALES: bool>(
         return false;
     }
     if blocks == 0 {
-        target.fill_zero(tokens);
-        return true;
+        return target.fill_zero(tokens);
     }
     #[cfg(target_arch = "aarch64")]
     if caps.i8mm && bonsai_neon_dot::has_i8mm() {
@@ -3833,8 +3836,7 @@ fn gemm_q6_k_8x_panels_dispatch<const FINITE_SCALES: bool>(
         return false;
     }
     if blocks == 0 {
-        target.fill_zero(tokens);
-        return true;
+        return target.fill_zero(tokens);
     }
     #[cfg(target_arch = "aarch64")]
     if caps.i8mm && bonsai_neon_dot::has_i8mm() {
@@ -4533,5 +4535,41 @@ pub(crate) fn gemm_f32_nonfma_4x16(
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     {
         gemm_f32_nonfma_4x16_portable(rows, act_panel, acc);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scatter_target_fill_zero_reports_bias_finiteness() {
+        let mut out_finite = [0.0_f32; 16];
+        let mut target_finite = ScatterTarget::Scatter {
+            out_tokens: &mut out_finite,
+            out_stride: 8,
+            bias: Some([1.0; 8]),
+        };
+        assert!(target_finite.fill_zero(2));
+
+        let mut out_nan = [0.0_f32; 16];
+        let mut target_nan = ScatterTarget::Scatter {
+            out_tokens: &mut out_nan,
+            out_stride: 8,
+            bias: Some([1.0, 2.0, f32::NAN, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        };
+        assert!(!target_nan.fill_zero(2));
+
+        let mut band_buf = [0.0_f32; 16];
+        let mut bands = split_row_major_bands(&mut band_buf, 2, 8, &[8]);
+        assert!(bands.is_some());
+        if let Some(band) = bands.as_deref_mut().and_then(|list| list.first_mut()) {
+            let mut band_target = ScatterTarget::Band {
+                band,
+                local_col: 0,
+                bias: Some([0.0, f32::INFINITY, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            };
+            assert!(!band_target.fill_zero(2));
+        }
     }
 }
