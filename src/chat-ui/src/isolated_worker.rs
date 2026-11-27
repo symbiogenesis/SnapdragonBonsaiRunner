@@ -345,16 +345,8 @@ where
     };
     let result = relay(host_state);
     // `host_state` (channel endpoints) is dropped before exit/stop so the reader wakes cleanly.
-    let clean = match &result {
-        Ok(_) => process
-            .wait_for_exit(cleanup_limit)
-            .and_then(|code| match code {
-                Some(0) if process.active_processes()? == 0 => Ok(()),
-                _ => Err(io::Error::other(errors.cleanup)),
-            }),
-        Err(_) => process.stop(cleanup_limit),
-    };
-    if clean.is_err() {
+    let teardown = finish_worker_teardown(&result, &process, cleanup_limit);
+    if matches!(teardown, TeardownOutcome::QuarantineNeeded) {
         slot.quarantine(
             Some(launch.source),
             launch.executable,
@@ -370,7 +362,54 @@ where
         slot.close_admission();
         return Err(E::from(errors.cleanup));
     }
-    result
+    match teardown {
+        TeardownOutcome::Confirmed => result,
+        TeardownOutcome::FailedExit => Err(E::from(errors.protocol)),
+        TeardownOutcome::QuarantineNeeded => Err(E::from(errors.cleanup)),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TeardownOutcome {
+    Confirmed,
+    FailedExit,
+    QuarantineNeeded,
+}
+
+fn decide_teardown(
+    relay_ok: bool,
+    wait_clean: bool,
+    stop_process: impl FnOnce() -> bool,
+) -> TeardownOutcome {
+    if !relay_ok {
+        return if stop_process() {
+            TeardownOutcome::Confirmed
+        } else {
+            TeardownOutcome::QuarantineNeeded
+        };
+    }
+    if wait_clean {
+        return TeardownOutcome::Confirmed;
+    }
+    if stop_process() {
+        TeardownOutcome::FailedExit
+    } else {
+        TeardownOutcome::QuarantineNeeded
+    }
+}
+
+fn finish_worker_teardown<R, E>(
+    result: &Result<R, E>,
+    process: &OwnedProcess,
+    cleanup_limit: Duration,
+) -> TeardownOutcome {
+    let relay_ok = result.is_ok();
+    let wait_clean = relay_ok
+        && matches!(
+            process.wait_for_exit(cleanup_limit),
+            Ok(Some(0)) if matches!(process.active_processes(), Ok(0))
+        );
+    decide_teardown(relay_ok, wait_clean, || process.stop(cleanup_limit).is_ok())
 }
 
 /// Polls a bounded worker channel until an item arrives, `deadline` expires, or `cancelled` is set.
@@ -419,4 +458,58 @@ pub(crate) fn le_u64(bytes: &[u8], offset: usize) -> Option<u64> {
         .and_then(|end| bytes.get(offset..end))
         .and_then(|slice| slice.try_into().ok())
         .map(u64::from_le_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TeardownOutcome, decide_teardown};
+
+    #[test]
+    fn teardown_stops_worker_before_deciding_quarantine_on_unclean_exit() {
+        let mut stop_calls = 0_usize;
+        assert_eq!(
+            decide_teardown(true, true, || {
+                stop_calls += 1;
+                true
+            }),
+            TeardownOutcome::Confirmed
+        );
+        assert_eq!(stop_calls, 0);
+
+        assert_eq!(
+            decide_teardown(true, false, || {
+                stop_calls += 1;
+                true
+            }),
+            TeardownOutcome::FailedExit
+        );
+        assert_eq!(stop_calls, 1);
+
+        assert_eq!(
+            decide_teardown(true, false, || {
+                stop_calls += 1;
+                false
+            }),
+            TeardownOutcome::QuarantineNeeded
+        );
+        assert_eq!(stop_calls, 2);
+
+        assert_eq!(
+            decide_teardown(false, false, || {
+                stop_calls += 1;
+                true
+            }),
+            TeardownOutcome::Confirmed
+        );
+        assert_eq!(stop_calls, 3);
+
+        assert_eq!(
+            decide_teardown(false, false, || {
+                stop_calls += 1;
+                false
+            }),
+            TeardownOutcome::QuarantineNeeded
+        );
+        assert_eq!(stop_calls, 4);
+    }
 }

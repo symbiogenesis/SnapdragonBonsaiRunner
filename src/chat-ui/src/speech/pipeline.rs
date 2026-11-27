@@ -1069,9 +1069,11 @@ struct WasapiStream {
 
 impl WasapiStream {
     fn open(sample_rate: u32) -> Result<Self, tts::Failure> {
+        // Declare `event` before `client` so reverse-order local drop on error
+        // releases `IAudioClient` before closing `EventHandle`.
+        let event = EventHandle::new_auto_reset()?;
         let client = activate_default_render_client()?;
         let format = float_wave_format(sample_rate);
-        let event = EventHandle::new_auto_reset()?;
         // SAFETY: `format` is a valid complete `WAVEFORMATEX` descriptor for shared-mode init.
         unsafe {
             client.Initialize(

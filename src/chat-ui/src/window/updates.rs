@@ -4,6 +4,7 @@ use bonsai_windows_credentials::PrivateDirectory;
 use bonsai_windows_process::{OwnedProcess, ToolProcessSpec};
 use eframe::egui;
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
@@ -202,11 +203,95 @@ fn bounded_text(path: &Path) -> io::Result<String> {
     crate::bounded_file::text(path, MAX_OUTPUT, "Update tool output exceeded its limit.")
 }
 
-struct Process(OwnedProcess);
+struct UpdateScratch {
+    directory: Option<PrivateDirectory>,
+    can_cleanup: Cell<bool>,
+}
 
-impl Drop for Process {
+impl UpdateScratch {
+    fn create() -> io::Result<Self> {
+        Ok(Self {
+            directory: Some(PrivateDirectory::create(&std::env::temp_dir())?),
+            can_cleanup: Cell::new(true),
+        })
+    }
+
+    fn path(&self) -> io::Result<&Path> {
+        self.directory
+            .as_ref()
+            .map(PrivateDirectory::path)
+            .ok_or_else(|| io::Error::other("Update scratch directory already released."))
+    }
+
+    fn set_cleanup_allowed(&self, allowed: bool) {
+        self.can_cleanup.set(allowed);
+    }
+
+    fn cleanup(&mut self) {
+        if !self.can_cleanup.get() {
+            return;
+        }
+        let Some(directory) = self.directory.take() else {
+            return;
+        };
+        let path = directory.path().to_owned();
+        for name in ["request.json", "stdout.json", "stderr.txt"] {
+            let entry = path.join(name);
+            if entry.try_exists().unwrap_or(false) {
+                let _removed = fs::remove_file(entry);
+            }
+        }
+        drop(directory);
+        let _removed = fs::remove_dir(path);
+    }
+}
+
+impl Drop for UpdateScratch {
     fn drop(&mut self) {
-        let _stopped = self.0.stop(Duration::from_secs(3));
+        self.cleanup();
+    }
+}
+
+struct Process<'a> {
+    inner: Option<OwnedProcess>,
+    scratch: &'a UpdateScratch,
+}
+
+impl<'a> Process<'a> {
+    fn new(inner: OwnedProcess, scratch: &'a UpdateScratch) -> Self {
+        scratch.set_cleanup_allowed(false);
+        Self {
+            inner: Some(inner),
+            scratch,
+        }
+    }
+
+    fn wait_for_exit(&self, timeout: Duration) -> io::Result<Option<u32>> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Update process already stopped."))?
+            .wait_for_exit(timeout)
+    }
+
+    fn stop(&mut self, timeout: Duration) -> io::Result<()> {
+        let Some(process) = self.inner.take() else {
+            return Ok(());
+        };
+        let result = process.stop(timeout);
+        if result.is_ok() {
+            self.scratch.set_cleanup_allowed(true);
+        }
+        result
+    }
+}
+
+impl Drop for Process<'_> {
+    fn drop(&mut self) {
+        if let Some(process) = self.inner.take()
+            && process.stop(Duration::from_secs(3)).is_ok()
+        {
+            self.scratch.set_cleanup_allowed(true);
+        }
     }
 }
 
@@ -245,9 +330,10 @@ fn execute(
     restart: bool,
     cancelled: &AtomicBool,
 ) -> io::Result<Response> {
-    let directory = PrivateDirectory::create(&std::env::temp_dir())?;
+    let scratch = UpdateScratch::create()?;
+    let directory_path = scratch.path()?.to_owned();
     let request = update_request(installation, operation, version, identity, restart);
-    let path = directory.path().join("request.json");
+    let path = directory_path.join("request.json");
     fs::write(
         &path,
         serde_json::to_vec(&request).map_err(io::Error::other)?,
@@ -259,15 +345,24 @@ fn execute(
             "--request".into(),
             path.into_os_string(),
         ],
-        working_directory: directory.path().into(),
-        stdout: directory.path().join("stdout.json"),
-        stderr: directory.path().join("stderr.txt"),
+        working_directory: directory_path.clone(),
+        stdout: directory_path.join("stdout.json"),
+        stderr: directory_path.join("stderr.txt"),
         environment: BTreeMap::new(),
     };
     if cancelled.load(Ordering::Acquire) {
         return Err(io::Error::other("Update operation cancelled."));
     }
-    let child = Process(OwnedProcess::start_tool(&spec)?);
+    let started_process = match OwnedProcess::start_tool(&spec) {
+        Ok(process) => process,
+        Err(error) => {
+            if bonsai_windows_process::process_start_cleanup_unconfirmed(&error) {
+                scratch.set_cleanup_allowed(false);
+            }
+            return Err(error);
+        }
+    };
+    let mut child = Process::new(started_process, &scratch);
     let started = Instant::now();
     let outcome = (|| loop {
         if cancelled.load(Ordering::Acquire) {
@@ -285,13 +380,12 @@ fn execute(
             return Err(io::Error::other("Update tool output exceeded its limit."));
         }
         if let Some(code) = child
-            .0
             .wait_for_exit(remaining.min(Duration::from_millis(250)))?
         {
             break Ok(code);
         }
     })();
-    child.0.stop(Duration::from_secs(3)).map_err(|error| {
+    child.stop(Duration::from_secs(3)).map_err(|error| {
         io::Error::other(format!(
             "Application update process cleanup could not be confirmed. Close Swift before trying another update. {error}"
         ))
@@ -1990,6 +2084,27 @@ mod tests {
             assert!(harness.query_by_label("Offline").is_none());
             assert!(harness.query_by_label("Swift is up to date.").is_some());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn update_scratch_guard_cleans_up_only_when_process_stop_is_confirmed() -> io::Result<()> {
+        let scratch = UpdateScratch::create()?;
+        let path = scratch.path()?.to_owned();
+        for name in ["request.json", "stdout.json", "stderr.txt"] {
+            fs::write(path.join(name), b"{}")?;
+        }
+        drop(scratch);
+        assert!(!path.exists());
+
+        let retained = UpdateScratch::create()?;
+        let retained_path = retained.path()?.to_owned();
+        fs::write(retained_path.join("request.json"), b"{}")?;
+        retained.set_cleanup_allowed(false);
+        drop(retained);
+        assert!(retained_path.exists());
+        fs::remove_file(retained_path.join("request.json"))?;
+        fs::remove_dir(retained_path)?;
         Ok(())
     }
 }
