@@ -2038,7 +2038,7 @@ mod quant_dispatch {
         dst: &mut [f32],
         workers: usize,
     ) {
-        if workers > 1 && seq_len >= 2 && out_dim.saturating_mul(seq_len) >= 4096 {
+        if workers > 1 && seq_len >= 2 && out_dim.saturating_mul(seq_len) >= 16_384 {
             run_row_chunks_aligned(dst, workers, out_dim, |elem_off, dst_chunk| {
                 let t_start = elem_off / out_dim;
                 let t_count = dst_chunk.len() / out_dim;
@@ -2732,7 +2732,7 @@ fn rms_norm_batch_into(
     }
     decoder_workspace::resize(out, inputs.len())?;
     let level = Level::new();
-    if seq_len > 1 && workers > 1 {
+    if seq_len > 1 && workers > 1 && seq_len.saturating_mul(hidden) >= 16_384 {
         row_workers::run_aligned(out, workers, hidden, &|elem_off, dst_chunk| {
             for (row_in, row_out) in inputs[elem_off..elem_off + dst_chunk.len()]
                 .chunks_exact(hidden)
@@ -3146,16 +3146,30 @@ fn normalize_and_rope_qk_batch(
     let level = Level::new();
     if workers > 1
         && seq_len >= 2
+        && seq_len.saturating_mul(query_width) >= 16_384
+        && head_dim > 0
+        && head_dim.is_multiple_of(2)
+        && q_norm_w.len() == head_dim
+        && k_norm_w.len() == head_dim
+        && q_all.len() == seq_len * query_width
+        && k_all.len() == seq_len * kv_width
         && let Some(res) = with_rope_batch_slices(
             head_dim,
             initial_seq,
             seq_len,
             rope_theta,
             |cos_all, sin_all| {
-                row_workers::run_aligned(q_all, workers, query_width, &|elem_off, q_chunk| {
-                    let t_start = elem_off / query_width;
-                    for (local_t, q_tok) in q_chunk.chunks_exact_mut(query_width).enumerate() {
+                let mut pairs: Vec<(&mut [f32], &mut [f32])> = Vec::with_capacity(seq_len);
+                pairs.extend(
+                    q_all
+                        .chunks_exact_mut(query_width)
+                        .zip(k_all.chunks_exact_mut(kv_width)),
+                );
+                row_workers::run_slice_aligned(&mut pairs, workers, 1, &|t_start, pair_chunk| {
+                    for (local_t, (q_tok, k_tok)) in pair_chunk.iter_mut().enumerate() {
                         let t = t_start + local_t;
+                        let cos = &cos_all[t * half..(t + 1) * half];
+                        let sin = &sin_all[t * half..(t + 1) * half];
                         normalize_heads_in_place_level(
                             level,
                             q_tok,
@@ -3164,20 +3178,6 @@ fn normalize_and_rope_qk_batch(
                             q_norm_w,
                             rms_eps,
                         );
-                        apply_rope_neox_with_tables_level(
-                            level,
-                            q_tok,
-                            num_q_heads,
-                            head_dim,
-                            &cos_all[t * half..(t + 1) * half],
-                            &sin_all[t * half..(t + 1) * half],
-                        );
-                    }
-                });
-                row_workers::run_aligned(k_all, workers, kv_width, &|elem_off, k_chunk| {
-                    let t_start = elem_off / kv_width;
-                    for (local_t, k_tok) in k_chunk.chunks_exact_mut(kv_width).enumerate() {
-                        let t = t_start + local_t;
                         normalize_heads_in_place_level(
                             level,
                             k_tok,
@@ -3188,11 +3188,19 @@ fn normalize_and_rope_qk_batch(
                         );
                         apply_rope_neox_with_tables_level(
                             level,
+                            q_tok,
+                            num_q_heads,
+                            head_dim,
+                            cos,
+                            sin,
+                        );
+                        apply_rope_neox_with_tables_level(
+                            level,
                             k_tok,
                             num_kv_heads,
                             head_dim,
-                            &cos_all[t * half..(t + 1) * half],
-                            &sin_all[t * half..(t + 1) * half],
+                            cos,
+                            sin,
                         );
                     }
                 });
@@ -4535,7 +4543,11 @@ fn attend_batch_f16(
     if seq_len == 0 || num_kv_heads == 0 {
         return Ok(());
     }
-    if workers > 1 && seq_len * num_kv_heads >= 2 && attn_seq.len() == seq_len * query_width {
+    if workers > 1
+        && seq_len * num_kv_heads >= 2
+        && seq_len.saturating_mul(max_seq).saturating_mul(num_q_heads) >= 512
+        && attn_seq.len() == seq_len * query_width
+    {
         let alignment = if workers <= num_kv_heads || seq_len < 4 {
             seq_len * group_width
         } else {
@@ -4593,7 +4605,7 @@ fn attend_batch_f16(
                 });
             });
             let kvh_stride = seq_len * group_width;
-            if seq_len >= 2 && attn_seq.len() >= 4096 {
+            if seq_len >= 2 && attn_seq.len() >= 16_384 {
                 row_workers::run_aligned(attn_seq, workers, query_width, &|elem_off, tok_chunk| {
                     let t_start = elem_off / query_width;
                     for (local_t, tok_out) in tok_chunk.chunks_exact_mut(query_width).enumerate() {
@@ -6889,6 +6901,77 @@ mod tests {
                         },
                     )?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_normalize_and_rope_qk_batch_matches_sequential_bits() -> std::io::Result<()> {
+        for (seq_len, num_q_heads, num_kv_heads, head_dim, initial_seq) in [
+            (2_usize, 16_usize, 8_usize, 128_usize, 0_usize),
+            (16, 8, 4, 128, 17),
+            (21, 16, 8, 128, 5),
+        ] {
+            let query_width = num_q_heads * head_dim;
+            let kv_width = num_kv_heads * head_dim;
+            let q_init: Vec<f32> = (0..seq_len * query_width)
+                .map(|i| f32::from(i16::try_from((i * 13 + 7) % 41).unwrap_or(0) - 20) * 0.05)
+                .collect();
+            let k_init: Vec<f32> = (0..seq_len * kv_width)
+                .map(|i| f32::from(i16::try_from((i * 19 + 3) % 37).unwrap_or(0) - 18) * 0.0625)
+                .collect();
+            let q_norm_w: Vec<f32> = (0..head_dim)
+                .map(|i| 0.75 + f32::from(u8::try_from(i % 11).unwrap_or(0)) * 0.05)
+                .collect();
+            let k_norm_w: Vec<f32> = (0..head_dim)
+                .map(|i| 1.25 - f32::from(u8::try_from(i % 9).unwrap_or(0)) * 0.05)
+                .collect();
+
+            let mut q_seq = q_init.clone();
+            let mut k_seq = k_init.clone();
+            super::normalize_and_rope_qk_batch(
+                &mut q_seq,
+                &mut k_seq,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                &q_norm_w,
+                &k_norm_w,
+                initial_seq,
+                1_000_000.0,
+                1e-6,
+                1,
+            )?;
+
+            for workers in [4_usize, 8] {
+                let mut q_par = q_init.clone();
+                let mut k_par = k_init.clone();
+                super::normalize_and_rope_qk_batch(
+                    &mut q_par,
+                    &mut k_par,
+                    seq_len,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    &q_norm_w,
+                    &k_norm_w,
+                    initial_seq,
+                    1_000_000.0,
+                    1e-6,
+                    workers,
+                )?;
+                assert_eq!(
+                    q_par.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    q_seq.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "Q mismatch seq_len={seq_len} workers={workers}"
+                );
+                assert_eq!(
+                    k_par.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    k_seq.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "K mismatch seq_len={seq_len} workers={workers}"
+                );
             }
         }
         Ok(())
