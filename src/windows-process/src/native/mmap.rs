@@ -76,8 +76,8 @@ pub(crate) fn map_readonly_file_with_prefetch(
         unsafe { CreateFileMappingW(file.as_raw_handle(), null(), PAGE_READONLY, 0, 0, null()) };
     let section = super::owned(raw_section)?;
     // SAFETY: `section` is an owned read-only file mapping handle with offset 0
-    // and length 0 (entire section).
-    let view = unsafe { MapViewOfFile(section.as_raw_handle(), FILE_MAP_READ, 0, 0, 0) };
+    // and length `len` matching the validated file size.
+    let view = unsafe { MapViewOfFile(section.as_raw_handle(), FILE_MAP_READ, 0, 0, len) };
     let Some(ptr) = NonNull::new(view.Value.cast::<u8>()) else {
         return Err(io::Error::last_os_error());
     };

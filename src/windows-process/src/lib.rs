@@ -42,7 +42,16 @@ pub struct MappedFile(native::mmap::NativeMappedFile);
 impl MappedFile {
     /// Map an ordinary non-empty file read-only into memory and prefetch its pages.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = std::fs::File::open(path)?;
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
         Self::from_file(&file)
     }
 
@@ -2490,6 +2499,13 @@ mod storage_budget_tests {
         let opened = fs::File::open(&data_path)?;
         let no_prefetch = MappedFile::from_file_without_prefetch(&opened)?;
         assert_eq!(no_prefetch.as_slice(), payload.as_slice());
+        drop(no_prefetch);
+        drop(opened);
+        drop(mapped);
+
+        let concurrent_writer = fs::OpenOptions::new().write(true).open(&data_path)?;
+        assert!(MappedFile::open(&data_path).is_err());
+        drop(concurrent_writer);
 
         let empty_path = tree.0.join("empty.bin");
         fs::write(&empty_path, b"")?;
