@@ -26,6 +26,7 @@ use std::time::Duration;
 )]
 mod native;
 
+#[cfg(feature = "quant-kernels")]
 pub mod quant_kernels;
 
 /// Internal CLI support for `bonsai-push-recovery`.
@@ -313,6 +314,7 @@ pub fn has_running_process(names: &[&str]) -> io::Result<bool> {
 ///
 /// Downcast `io::Error::get_ref()` to this type to distinguish failed discovery
 /// stages without parsing driver messages or inferring unsupported hardware.
+#[cfg(feature = "vulkan")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanQueryFailure {
     /// Fixed query-stage label; never a driver-provided string or file path.
@@ -333,6 +335,7 @@ pub struct VulkanQueryFailure {
 ///
 /// No adapter array or handles are requested. A failed call leaves its output
 /// count undefined; it cannot prove that the computer has no graphics devices.
+#[cfg(feature = "vulkan")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowsGraphicsAdapterCount {
     /// Fixed stage: existing module, exported entry point, or count query.
@@ -346,6 +349,7 @@ pub struct WindowsGraphicsAdapterCount {
     pub adapter_count: Option<u32>,
 }
 
+#[cfg(feature = "vulkan")]
 impl std::fmt::Display for VulkanQueryFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Vulkan inventory failed at {}", self.stage)?;
@@ -356,9 +360,11 @@ impl std::fmt::Display for VulkanQueryFailure {
     }
 }
 
+#[cfg(feature = "vulkan")]
 impl std::error::Error for VulkanQueryFailure {}
 
 /// Model-free observations from the native system Vulkan loader.
+#[cfg(feature = "vulkan")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanInventory {
     /// Loader-reported packed Vulkan API version, without vendor decoding.
@@ -376,6 +382,7 @@ pub struct VulkanInventory {
 /// Basename snapshots cannot identify attempted or unloaded DLLs, distinguish
 /// files with equal basenames, or establish driver dependencies. Optional paths
 /// are for a separate bounded file observation; they do not identify mapped bytes.
+#[cfg(feature = "vulkan")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanInstanceModules {
     /// Sorted unique basenames before instance creation, or unknown on failure.
@@ -388,6 +395,7 @@ pub struct VulkanInstanceModules {
 }
 
 /// One current-process module whose on-disk file may be observed separately.
+#[cfg(feature = "vulkan")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanModuleFileCandidate {
     /// Observed basename, without directories.
@@ -398,6 +406,7 @@ pub struct VulkanModuleFileCandidate {
 }
 
 /// One supported Vulkan `VK_KHR_cooperative_matrix` multiply-accumulate shape.
+#[cfg(feature = "vulkan")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VulkanCooperativeMatrixShape {
     /// Matrix `M` dimension.
@@ -421,6 +430,7 @@ pub struct VulkanCooperativeMatrixShape {
 }
 
 /// Bounded Vulkan physical-device compute limits relevant to kernel tiling.
+#[cfg(feature = "vulkan")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VulkanComputeLimits {
     /// Maximum total workgroup shared memory in bytes (`maxComputeSharedMemorySize`).
@@ -436,6 +446,7 @@ pub struct VulkanComputeLimits {
 }
 
 /// One Vulkan physical device; observations do not qualify an inference backend.
+#[cfg(feature = "vulkan")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanAdapter {
     /// Driver-reported device name, not an independently established `SoC` SKU.
@@ -493,6 +504,7 @@ pub struct VulkanAdapter {
 /// or Vulkan failures. Installed loader/ICD trust is not established by a query.
 /// Known stages carry a downcastable [`VulkanQueryFailure`]; a failed query does
 /// not establish that the physical device lacks Vulkan support.
+#[cfg(feature = "vulkan")]
 pub fn vulkan_inventory() -> io::Result<VulkanInventory> {
     native::vulkan::query()
 }
@@ -975,6 +987,7 @@ pub struct ProcessSpec {
 /// loopback exception for the authenticated local HTTP service. Loopback access
 /// is not limited to the broker. Required Windows runtime directories are added
 /// by the native boundary; caller profile and data directories are not.
+#[cfg(feature = "containment")]
 #[derive(Debug)]
 pub struct SandboxPolicy {
     /// Exact existing model, credential, executable and runtime library files.
@@ -985,6 +998,7 @@ pub struct SandboxPolicy {
 }
 
 /// Immutable network authority selected before a contained worker starts.
+#[cfg(feature = "containment")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SandboxNetwork {
     /// Existing authenticated HTTP workers may communicate with host services.
@@ -995,9 +1009,11 @@ pub enum SandboxNetwork {
 }
 
 /// Maximum number of explicit read-only sections inherited by a broker-pipe worker.
+#[cfg(feature = "containment")]
 pub const MAX_INHERITED_SECTIONS: usize = 8;
 
 /// Inherited `PAGE_READONLY` Windows section handle granted to a contained broker-pipe child.
+#[cfg(feature = "containment")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InheritedSectionGrant {
     /// Zero-based caller-assigned section slot matching the input slice index.
@@ -1030,6 +1046,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 /// Returns `Unsupported` when the native contract is unavailable, or a native
 /// failure when the host cannot create the required restricted environment, or
 /// `InvalidInput` for recognized ambient credential variables.
+#[cfg(feature = "containment")]
 pub fn native_sandbox_available() -> io::Result<()> {
     validate_sandbox_environment()?;
     native::containment::available(SandboxNetwork::HostLoopback)
@@ -1043,6 +1060,7 @@ pub fn native_sandbox_available() -> io::Result<()> {
 /// # Errors
 /// Returns `Unsupported` when the native contract is unavailable, or a native failure
 /// when the host cannot create an offline restricted security environment.
+#[cfg(feature = "containment")]
 pub fn native_sandbox_offline_available() -> io::Result<()> {
     native::containment::available(SandboxNetwork::Offline)
 }
@@ -1170,6 +1188,7 @@ impl OwnedProcess {
     /// # Errors
     /// Returns invalid launch/grant paths, reparse paths, overlapping read/write
     /// grants, unavailable native PSEC support or failed native creation.
+    #[cfg(feature = "containment")]
     pub fn start_sandboxed(spec: &ProcessSpec, policy: &SandboxPolicy) -> io::Result<Self> {
         Self::validate_sandboxed(spec, std::env::vars_os().map(|(name, _)| name))?;
         let command = command_line(&spec.executable, &spec.arguments)?;
@@ -1195,6 +1214,7 @@ impl OwnedProcess {
     /// # Errors
     /// Returns the same admission errors as [`Self::start_sandboxed`], plus failed
     /// pipe creation or handle-inheritance configuration.
+    #[cfg(feature = "containment")]
     pub fn start_sandboxed_piped(
         spec: &ProcessSpec,
         policy: &SandboxPolicy,
@@ -1226,6 +1246,7 @@ impl OwnedProcess {
     /// Returns the same path, policy, resource, handle and native launch errors as
     /// [`Self::start_sandboxed_piped`], or native Windows-directory lookup and
     /// minimal child-environment admission/encoding failures.
+    #[cfg(feature = "containment")]
     pub fn start_sandboxed_piped_minimal(
         spec: &ProcessSpec,
         policy: &SandboxPolicy,
@@ -1253,6 +1274,7 @@ impl OwnedProcess {
     /// Returns invalid launch/grant paths, reparse paths, overlapping read/write
     /// grants, unavailable offline native PSEC support, AppContainer verification failure,
     /// or failed native creation.
+    #[cfg(feature = "containment")]
     pub fn start_sandboxed_broker_pipe(
         spec: &ProcessSpec,
         policy: &SandboxPolicy,
@@ -1274,6 +1296,7 @@ impl OwnedProcess {
     /// Returns `InvalidInput` if more than [`MAX_INHERITED_SECTIONS`] files are supplied, any
     /// file is empty or not a regular non-reparse file, or launch/policy validation fails;
     /// returns native section creation, containment, or AppContainer verification errors otherwise.
+    #[cfg(feature = "containment")]
     pub fn start_sandboxed_broker_pipe_with_sections(
         spec: &ProcessSpec,
         policy: &SandboxPolicy,
@@ -1298,6 +1321,7 @@ impl OwnedProcess {
         Ok((Self(process), input, output, grants))
     }
 
+    #[cfg(feature = "containment")]
     fn validate_sandboxed(
         spec: &ProcessSpec,
         inherited_names: impl IntoIterator<Item = OsString>,
@@ -1761,6 +1785,7 @@ fn validate_backend_environment_name(name: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 fn validate_sandboxed_environment_names(
     names: impl IntoIterator<Item = OsString>,
 ) -> io::Result<()> {
@@ -1856,6 +1881,7 @@ fn starts_with_ignore_ascii_case(bytes: &[u8], prefix: &[u8]) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
+#[cfg(feature = "containment")]
 fn ends_with_ignore_ascii_case(bytes: &[u8], suffix: &[u8]) -> bool {
     bytes.len().checked_sub(suffix.len()).is_some_and(|start| {
         bytes
@@ -1895,10 +1921,12 @@ fn forbidden_environment_name(name: &OsStr) -> bool {
 ///
 /// # Errors
 /// Returns `InvalidInput` when a recognized credential-shaped name is present.
+#[cfg(feature = "containment")]
 pub fn validate_sandbox_environment() -> io::Result<()> {
     std::env::vars_os().try_for_each(|(name, _)| validate_sandbox_environment_name(&name))
 }
 
+#[cfg(feature = "containment")]
 fn validate_sandbox_environment_name(name: &OsStr) -> io::Result<()> {
     if credential_environment_name(name) {
         return Err(invalid(
@@ -1908,6 +1936,7 @@ fn validate_sandbox_environment_name(name: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 fn credential_environment_name(name: &OsStr) -> bool {
     let bytes = name.as_encoded_bytes();
     [
@@ -2100,6 +2129,7 @@ fn quote(value: &OsStr, output: &mut Vec<u16>) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "containment")]
     #[test]
     fn minimal_worker_admission_excludes_ambient_credentials_and_backend_overrides()
     -> io::Result<()> {
@@ -2262,7 +2292,7 @@ fn failed_start_cleanup_marker_preserves_kind_display_and_source() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "containment"))]
 #[test]
 fn sandbox_environment_classifies_credential_names_without_changing_environment() {
     for name in [

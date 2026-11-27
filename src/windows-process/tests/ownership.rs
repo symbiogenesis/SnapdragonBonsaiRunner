@@ -3,8 +3,12 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read as _, Write as _};
-use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
+use std::io;
+#[cfg(feature = "containment")]
+use std::io::{Read as _, Write as _};
+use std::net::{Ipv4Addr, TcpListener};
+#[cfg(feature = "containment")]
+use std::net::{TcpStream, UdpSocket};
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::process::CommandExt as _;
@@ -13,11 +17,14 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "containment")]
 use bonsai_windows_process::{
     MAX_INHERITED_SECTIONS, MAX_WORKER_PRIVATE_STORAGE_BYTES, MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
-    OwnedProcess, ParentProcess, ProcessSpec, SandboxNetwork, SandboxPolicy, ToolProcessSpec,
-    available_memory_bytes, listener_process_id, native_sandbox_available,
+    ParentProcess, SandboxNetwork, SandboxPolicy, native_sandbox_available,
     native_sandbox_offline_available,
+};
+use bonsai_windows_process::{
+    OwnedProcess, ProcessSpec, ToolProcessSpec, available_memory_bytes, listener_process_id,
 };
 
 // Hosted packages retain the exact probe next to their checked test binaries.
@@ -87,6 +94,7 @@ fn unused_port() -> io::Result<u16> {
         .port())
 }
 
+#[cfg(feature = "containment")]
 #[test]
 fn sandbox_rejects_invalid_grants_before_creating_evidence() -> io::Result<()> {
     let lane = Lane::new("invalid-sandbox")?;
@@ -149,6 +157,7 @@ fn sandbox_rejects_invalid_grants_before_creating_evidence() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 #[test]
 fn piped_sandbox_rejects_process_count_before_creating_streams() -> io::Result<()> {
     let lane = Lane::new("invalid-piped-count")?;
@@ -179,6 +188,7 @@ fn piped_sandbox_rejects_process_count_before_creating_streams() -> io::Result<(
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 #[allow(
     unsafe_code,
     reason = "A disposable inherited-handle sentinel checks the actual launch handle list."
@@ -212,6 +222,7 @@ fn inheritable_file_identity(file: &fs::File) -> io::Result<String> {
     ))
 }
 
+#[cfg(feature = "containment")]
 #[test]
 #[ignore = "Requires native Windows PSEC v1.1; exercises actual offline pipes and kernel authority."]
 fn native_sandbox_offline_pipes_enforce_authority_and_close_without_logs() -> io::Result<()> {
@@ -291,6 +302,7 @@ fn native_sandbox_offline_pipes_enforce_authority_and_close_without_logs() -> io
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 #[test]
 #[ignore = "Requires a native Windows PSEC v1.1 host with host-loopback ingress support."]
 fn native_sandbox_limits_files_and_preserves_loopback_process_identity() -> io::Result<()> {
@@ -380,18 +392,21 @@ fn native_sandbox_limits_files_and_preserves_loopback_process_identity() -> io::
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 #[test]
 #[ignore = "Requires a native Windows PSEC v1.1 host with host-loopback ingress support."]
 fn native_sandbox_stdout_flood_is_capped_and_stopped() -> io::Result<()> {
     sandbox_output_flood("stdout")
 }
 
+#[cfg(feature = "containment")]
 #[test]
 #[ignore = "Requires a native Windows PSEC v1.1 host with host-loopback ingress support."]
 fn native_sandbox_stderr_flood_is_capped_and_stopped() -> io::Result<()> {
     sandbox_output_flood("stderr")
 }
 
+#[cfg(feature = "containment")]
 #[test]
 #[ignore = "Requires a native Windows PSEC v1.1 host with host-loopback ingress support."]
 fn native_sandbox_exit_drains_both_logs_and_releases_capture_files() -> io::Result<()> {
@@ -426,6 +441,7 @@ fn native_sandbox_exit_drains_both_logs_and_releases_capture_files() -> io::Resu
     fs::remove_dir_all(lane.path)
 }
 
+#[cfg(feature = "containment")]
 fn sandbox_output_flood(stream: &str) -> io::Result<()> {
     let lane = Lane::new(&format!("sandbox-{stream}-flood"))?;
     let scratch = lane.path.join("scratch");
@@ -465,6 +481,7 @@ fn sandbox_output_flood(stream: &str) -> io::Result<()> {
     fs::remove_dir_all(lane.path)
 }
 
+#[cfg(feature = "containment")]
 fn assert_other_worker_temp_denied(first_scratch: &std::path::Path) -> io::Result<()> {
     // Windows can replace the requested TEMP/TMP with an OS-managed private
     // AppContainer temp. Prove isolation with a live second worker, rather than
@@ -501,6 +518,7 @@ fn assert_other_worker_temp_denied(first_scratch: &std::path::Path) -> io::Resul
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 #[test]
 #[ignore = "Requires native Windows PSEC v1.1 and an IPv4 non-loopback host route."]
 fn native_sandbox_host_loopback_capability_includes_host_interface_services() -> io::Result<()> {
@@ -549,6 +567,7 @@ fn native_sandbox_host_loopback_capability_includes_host_interface_services() ->
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 #[test]
 #[ignore = "Requires native Windows PSEC v1.1 with networking policy support."]
 fn native_sandbox_denies_external_tcp_connect_by_policy() -> io::Result<()> {
@@ -974,6 +993,7 @@ fn abrupt_owner_death_kills_entire_tree() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 #[test]
 #[ignore = "Requires native Windows PSEC v1.1 with terminate-on-close support."]
 fn native_sandbox_abrupt_owner_death_ends_worker_and_listener() -> io::Result<()> {
@@ -1113,6 +1133,7 @@ fn headless_error_policy_applies_to_root_and_descendants_only() -> io::Result<()
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 #[test]
 #[ignore = "Requires a native Windows PSEC v1.1 host."]
 fn native_sandbox_broker_pipe_enforces_offline_inference_authority() -> io::Result<()> {
@@ -1220,6 +1241,7 @@ fn native_sandbox_broker_pipe_enforces_offline_inference_authority() -> io::Resu
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 #[test]
 #[ignore = "Requires a native Windows PSEC v1.1 host."]
 fn native_sandbox_broker_pipe_private_storage_budget_caps_scratch_and_temp() -> io::Result<()> {
@@ -1285,6 +1307,7 @@ fn native_sandbox_broker_pipe_private_storage_budget_caps_scratch_and_temp() -> 
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 #[test]
 #[ignore = "Requires a native Windows PSEC v1.1 host."]
 fn native_sandbox_broker_pipe_abrupt_owner_death_ends_worker() -> io::Result<()> {
@@ -1351,6 +1374,7 @@ fn native_sandbox_broker_pipe_abrupt_owner_death_ends_worker() -> io::Result<()>
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 #[test]
 fn broker_pipe_with_sections_enforces_bounds_and_file_kinds_before_creating_streams()
 -> io::Result<()> {
@@ -1440,6 +1464,7 @@ fn broker_pipe_with_sections_enforces_bounds_and_file_kinds_before_creating_stre
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 #[test]
 #[ignore = "Requires a native Windows PSEC v1.1 host."]
 fn native_sandbox_broker_pipe_with_sections_inherits_grants_and_stops_cleanly() -> io::Result<()> {

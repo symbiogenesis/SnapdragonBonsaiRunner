@@ -24,6 +24,7 @@ impl StopAttempt {
         stop()
     }
 
+    #[cfg(feature = "containment")]
     pub(super) fn on_drop(&self, stop: impl FnOnce() -> io::Result<()>) {
         if !self.0.swap(true, Ordering::Relaxed) {
             let _stopped = stop();
@@ -31,7 +32,7 @@ impl StopAttempt {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "containment"))]
 mod tests {
     use super::*;
 

@@ -1,6 +1,6 @@
 [package]
 name = "bonsai-windows-process"
-version = "0.1.7"
+version = "0.1.8"
 edition.workspace = true
 rust-version.workspace = true
 publish = ["crates-io"]
@@ -14,15 +14,19 @@ description = "Windows Job ownership and bounded native process lifecycle for Bo
 doctest = false
 
 [target.'cfg(windows)'.dependencies]
-ash.workspace = true
-bonsai-neon-dot.workspace = true
-bonsai-ternary.workspace = true
-flatbuffers = "=25.12.19"
+ash = { workspace = true, optional = true }
+bonsai-neon-dot = { workspace = true, optional = true }
+bonsai-ternary = { workspace = true, optional = true }
+flatbuffers = { version = "=25.12.19", optional = true }
 hex.workspace = true
-mxc-sdk = { version = "=1.0.1", default-features = false }
+mxc-sdk = { version = "=1.0.1", default-features = false, optional = true }
 windows-sys = { workspace = true, features = ["Wdk_Graphics_Direct3D", "Wdk_System_SystemServices", "Wdk_System_Threading", "Win32_Foundation", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_Security_Isolation", "Win32_Security_WinTrust", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Kernel", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Pipes", "Win32_UI_WindowsAndMessaging", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_System_Power", "Win32_System_Performance", "Win32_System_Diagnostics_ToolHelp", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
 
 [features]
+default = []
+containment = ["dep:mxc-sdk", "dep:flatbuffers"]
+vulkan = ["dep:ash"]
+quant-kernels = ["dep:bonsai-neon-dot", "dep:bonsai-ternary"]
 test-probe = ["windows-sys/Win32_System_Diagnostics_Debug"]
 
 [[bin]]

@@ -24,7 +24,7 @@ sha2.workspace = true
 bonsai-windows-credentials.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
-bonsai-windows-process.workspace = true
+bonsai-windows-process = { workspace = true, features = ["containment"] }
 
 [lints]
 workspace = true

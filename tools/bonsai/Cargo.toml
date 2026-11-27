@@ -68,7 +68,7 @@ tar = { version = "=0.4.46", default-features = false }
 toml.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-bonsai-windows-process.workspace = true
+bonsai-windows-process = { workspace = true, features = ["containment", "vulkan"] }
 bonsai-windows-credentials.workspace = true
 # Use Schannel/system trust without compiling a bundled root certificate set.
 ureq = { workspace = true, features = ["native-tls-no-default"] }

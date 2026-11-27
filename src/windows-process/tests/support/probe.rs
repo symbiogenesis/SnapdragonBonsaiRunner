@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use bonsai_windows_process::{OwnedProcess, ProcessSpec, SandboxPolicy, ToolProcessSpec};
+#[cfg(feature = "containment")]
+use bonsai_windows_process::SandboxPolicy;
+use bonsai_windows_process::{OwnedProcess, ProcessSpec, ToolProcessSpec};
 use windows_sys::Win32::Networking::WinSock::WSAEACCES;
 use windows_sys::Win32::System::Diagnostics::Debug::{GetErrorMode, RaiseException, SetErrorMode};
 
@@ -62,6 +64,7 @@ fn main() -> io::Result<()> {
         "sandbox-offline-pipes" => offline_probe(&args)?,
         "sandbox-broker-pipe" => broker_pipe_probe(&args)?,
         "sandbox-broker-pipe-storage" => broker_pipe_storage_probe()?,
+        #[cfg(feature = "containment")]
         "sandbox-broker-pipe-owner" => broker_pipe_owner()?,
         "sandbox-broker-pipe-wait" => broker_pipe_wait()?,
         "sandbox-broker-pipe-temp-denied" => broker_pipe_temp_denied(&args)?,
@@ -119,6 +122,7 @@ fn main() -> io::Result<()> {
             fs::write("commit.txt", "unbounded")?;
         }
         "owner" => plain_owner(&args)?,
+        #[cfg(feature = "containment")]
         "sandbox-owner" => sandbox_owner(&args)?,
         _ => return Err(io::Error::other("unknown probe mode")),
     }
@@ -197,6 +201,7 @@ fn plain_owner(args: &[OsString]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 fn sandbox_owner(args: &[OsString]) -> io::Result<()> {
     let directory = std::env::current_dir()?;
     let scratch = directory.join("scratch");
@@ -435,6 +440,7 @@ fn child_creation_file_time(child: &std::process::Child) -> io::Result<u64> {
     handle_creation_file_time(child.as_handle())
 }
 
+#[cfg(feature = "containment")]
 #[allow(
     unsafe_code,
     reason = "Retain query access to the exact disposable contained worker before reporting its creation identity."
@@ -883,6 +889,7 @@ fn broker_pipe_storage_probe() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 fn broker_pipe_owner() -> io::Result<()> {
     let directory = std::env::current_dir()?;
     let scratch = directory.join("scratch");

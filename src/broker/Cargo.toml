@@ -30,7 +30,7 @@ tokio = { workspace = true, features = ["io-util", "net", "rt", "signal", "sync"
 
 [target.'cfg(windows)'.dependencies]
 bonsai-markdown.workspace = true
-bonsai-windows-process.workspace = true
+bonsai-windows-process = { workspace = true, features = ["containment"] }
 bonsai-windows-credentials.workspace = true
 
 [dev-dependencies]

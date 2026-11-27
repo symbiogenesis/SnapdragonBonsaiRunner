@@ -50,7 +50,7 @@ transcribe-cpp = { version = "=0.4.1", default-features = false, optional = true
 sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-bonsai-windows-process.workspace = true
+bonsai-windows-process = { workspace = true, features = ["quant-kernels"] }
 
 [lints]
 workspace = true

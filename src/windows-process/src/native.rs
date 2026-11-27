@@ -7,6 +7,7 @@ use std::ffi::{OsStr, OsString, c_void};
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+#[cfg(feature = "containment")]
 use std::os::windows::fs::MetadataExt as _;
 use std::os::windows::io::{
     AsRawHandle as _, AsRawSocket as _, AsSocket, FromRawHandle as _, FromRawSocket as _,
@@ -16,11 +17,14 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "containment")]
 use windows_sys::Win32::Foundation::{
-    DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
-    ERROR_NO_MORE_FILES, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    DuplicateHandle, HANDLE_FLAG_INHERIT, LocalFree, SetHandleInformation,
+};
+use windows_sys::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES,
+    FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
@@ -30,16 +34,23 @@ use windows_sys::Win32::Networking::WinSock::{
     SOCKADDR_IN, SOCKET_ERROR, SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
     WSADATA, WSAGetLastError, WSASocketW, WSAStartup, bind, listen, setsockopt,
 };
+#[cfg(feature = "containment")]
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+#[cfg(feature = "containment")]
 use windows_sys::Win32::Security::Isolation::GetAppContainerFolderPath;
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+#[cfg(feature = "containment")]
 use windows_sys::Win32::Security::{
-    GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_QUERY,
-    TokenAppContainerSid, TokenIsAppContainer,
+    GetTokenInformation, TOKEN_APPCONTAINER_INFORMATION, TOKEN_QUERY, TokenAppContainerSid,
+    TokenIsAppContainer,
 };
+#[cfg(feature = "containment")]
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING,
+    CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
+#[cfg(feature = "containment")]
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -53,19 +64,23 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
+#[cfg(feature = "containment")]
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, PAGE_READONLY, SECTION_MAP_READ, SECTION_QUERY,
 };
+#[cfg(feature = "containment")]
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+#[cfg(feature = "containment")]
+use windows_sys::Win32::System::Threading::OpenProcessToken;
 use windows_sys::Win32::System::Threading::{
     BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, GetProcessMitigationPolicy, GetProcessTimes,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
     PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROCESS_INFORMATION, PROCESS_MITIGATION_POLICY,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ProcessExtensionPointDisablePolicy,
@@ -74,10 +89,13 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-use crate::{ProcessMemory, ProcessSpec, SandboxNetwork, SandboxPolicy, ToolProcessSpec, invalid};
+use crate::{ProcessMemory, ProcessSpec, ToolProcessSpec, invalid};
+#[cfg(feature = "containment")]
+use crate::{SandboxNetwork, SandboxPolicy};
 
 pub(super) mod caller;
 mod cleanup;
+#[cfg(feature = "containment")]
 pub(super) mod containment;
 pub(super) mod cpu;
 pub(super) mod devices;
@@ -89,14 +107,17 @@ mod job_probe;
 mod library;
 pub(super) mod mmap;
 pub(super) mod opencl;
+#[cfg(feature = "containment")]
 mod output;
 pub(super) mod power;
 pub(super) mod power_policy;
 pub(super) mod presentation;
+#[cfg(feature = "quant-kernels")]
 pub(super) mod quant_q8;
 pub(super) mod replacement;
 pub(super) mod row_pool;
 pub(super) mod signature;
+#[cfg(feature = "vulkan")]
 pub(super) mod vulkan;
 
 pub(super) struct RegistryKey(pub(super) windows_sys::Win32::System::Registry::HKEY);
@@ -435,22 +456,26 @@ mod parent_tests {
 
 enum PipeMode {
     None,
+    #[cfg(feature = "containment")]
     BinaryStdio {
         input: OwnedHandle,
         output: OwnedHandle,
     },
+    #[cfg(feature = "containment")]
     BrokerStdio {
         input: OwnedHandle,
         output: OwnedHandle,
     },
 }
 
+#[cfg(feature = "containment")]
 struct InheritableReadOnlySection {
     slot: u32,
     handle: OwnedHandle,
     bytes: u64,
 }
 
+#[cfg(feature = "containment")]
 impl InheritableReadOnlySection {
     fn new(slot: u32, file: &std::fs::File) -> io::Result<Self> {
         let metadata = file.metadata()?;
@@ -513,10 +538,12 @@ pub(super) struct NativeProcess {
     process: OwnedHandle,
     id: u32,
     // Drop after the Job and retained root: containment outlives the worker.
+    #[cfg(feature = "containment")]
     containment: Option<containment::Environment>,
     stop_attempt: cleanup::StopAttempt,
     // Capture threads own process handles, never a Job handle that could keep
     // kill-on-close from taking effect after an abrupt owner exit.
+    #[cfg(feature = "containment")]
     captures: Option<output::Captures>,
     private_roots: Vec<PathBuf>,
 }
@@ -531,13 +558,16 @@ impl NativeProcess {
             &LaunchSpec::from_process(spec, profile),
             command,
             None,
+            #[cfg(feature = "containment")]
             None,
             PipeMode::None,
             None,
+            #[cfg(feature = "containment")]
             Vec::new(),
         )
     }
 
+    #[cfg(feature = "containment")]
     pub(super) fn start_sandboxed(
         spec: &ProcessSpec,
         command: Vec<u16>,
@@ -557,6 +587,7 @@ impl NativeProcess {
         )
     }
 
+    #[cfg(feature = "containment")]
     pub(super) fn start_sandboxed_piped(
         spec: &ProcessSpec,
         command: Vec<u16>,
@@ -575,6 +606,7 @@ impl NativeProcess {
         )
     }
 
+    #[cfg(feature = "containment")]
     pub(super) fn start_sandboxed_piped_minimal(
         spec: &ProcessSpec,
         command: Vec<u16>,
@@ -592,6 +624,7 @@ impl NativeProcess {
         )
     }
 
+    #[cfg(feature = "containment")]
     pub(super) fn start_sandboxed_broker_pipe_with_sections(
         spec: &ProcessSpec,
         command: Vec<u16>,
@@ -630,6 +663,7 @@ impl NativeProcess {
         Ok((process, input, output, grants))
     }
 
+    #[cfg(feature = "containment")]
     fn start_sandboxed_piped_inner(
         spec: &ProcessSpec,
         command: Vec<u16>,
@@ -686,9 +720,11 @@ impl NativeProcess {
             },
             command,
             environment,
+            #[cfg(feature = "containment")]
             None,
             PipeMode::None,
             None,
+            #[cfg(feature = "containment")]
             Vec::new(),
         )
     }
@@ -697,32 +733,48 @@ impl NativeProcess {
         spec: &LaunchSpec<'_>,
         mut command: Vec<u16>,
         environment: Option<&[u16]>,
-        containment: Option<containment::Environment>,
+        #[cfg(feature = "containment")] containment: Option<containment::Environment>,
         pipes: PipeMode,
         writable_root: Option<PathBuf>,
-        sections: Vec<InheritableReadOnlySection>,
+        #[cfg(feature = "containment")] sections: Vec<InheritableReadOnlySection>,
     ) -> io::Result<Self> {
         let executable = wide(spec.executable.as_os_str());
         let directory = wide(spec.working_directory.as_os_str());
         let job = launch_job(spec)?;
+        #[cfg(feature = "containment")]
+        let native_containment = containment.is_some();
+        #[cfg(not(feature = "containment"))]
+        let native_containment = false;
+        #[cfg(feature = "containment")]
         let ([input, output, error_output], pending_captures) =
-            standard_streams(spec, pipes, containment.is_some())?;
-        let mut inherited_handles = Vec::with_capacity(3 + sections.len());
+            standard_streams(spec, pipes, native_containment)?;
+        #[cfg(not(feature = "containment"))]
+        let [input, output, error_output] = standard_streams(spec, pipes, native_containment)?;
+        #[cfg(feature = "containment")]
+        let extra_handles = sections.len();
+        #[cfg(not(feature = "containment"))]
+        let extra_handles = 0;
+        let mut inherited_handles = Vec::with_capacity(3 + extra_handles);
         inherited_handles.extend([
             input.as_raw_handle(),
             output.as_raw_handle(),
             error_output.as_raw_handle(),
         ]);
+        #[cfg(feature = "containment")]
         inherited_handles.extend(
             sections
                 .iter()
                 .map(|section| section.handle.as_raw_handle()),
         );
+        #[cfg(feature = "containment")]
+        let containment_raw = containment.as_ref().map(containment::Environment::raw);
+        #[cfg(not(feature = "containment"))]
+        let containment_raw = None;
         let attributes = CreationAttributes::new(
             job.as_raw_handle(),
             inherited_handles,
             spec.mitigation_profile.flags(),
-            containment.as_ref().map(containment::Environment::raw),
+            containment_raw,
         )?;
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = win_size::<STARTUPINFOEXW>();
@@ -758,9 +810,11 @@ impl NativeProcess {
         })?;
         // Attribute list must be deleted before closing the parent handles it referenced.
         drop(attributes);
+        #[cfg(feature = "containment")]
         drop(sections);
         let process = owned(info.hProcess)?;
         let thread = owned(info.hThread)?;
+        #[cfg(feature = "containment")]
         let captures = match pending_captures
             .map(|captures| captures.start(&process))
             .transpose()
@@ -772,6 +826,7 @@ impl NativeProcess {
                 return Err(error);
             }
         };
+        #[cfg(feature = "containment")]
         let appcontainer_folder = match captures
             .as_ref()
             .map_or(Ok(()), output::Captures::check)
@@ -781,7 +836,7 @@ impl NativeProcess {
                     &thread,
                     &job,
                     spec.mitigation_profile,
-                    containment.is_some(),
+                    native_containment,
                 )
             }) {
             Ok(folder) => folder,
@@ -792,6 +847,21 @@ impl NativeProcess {
                 drop([input, output, error_output]);
                 terminate_failed_start(&process, captures.as_ref())
                     .map_err(crate::unconfirmed_start_cleanup)?;
+                return Err(error);
+            }
+        };
+        #[cfg(not(feature = "containment"))]
+        let appcontainer_folder = match resume_owned(
+            &process,
+            &thread,
+            &job,
+            spec.mitigation_profile,
+            native_containment,
+        ) {
+            Ok(folder) => folder,
+            Err(error) => {
+                drop([input, output, error_output]);
+                terminate_failed_start(&process).map_err(crate::unconfirmed_start_cleanup)?;
                 return Err(error);
             }
         };
@@ -806,8 +876,10 @@ impl NativeProcess {
             job,
             process,
             id: info.dwProcessId,
+            #[cfg(feature = "containment")]
             containment,
             stop_attempt: cleanup::StopAttempt::default(),
+            #[cfg(feature = "containment")]
             captures,
             private_roots,
         })
@@ -826,11 +898,13 @@ impl NativeProcess {
     }
 
     pub(super) fn wait_for_exit(&self, timeout: Duration) -> io::Result<Option<u32>> {
+        #[cfg(feature = "containment")]
         let started = Instant::now();
         self.check_captures()?;
         let Some(code) = self.root_wait_for_exit(timeout)? else {
             return Ok(None);
         };
+        #[cfg(feature = "containment")]
         if let Some(captures) = &self.captures {
             let Some(deadline) = started.checked_add(timeout) else {
                 return Ok(None);
@@ -839,16 +913,25 @@ impl NativeProcess {
                 return Ok(None);
             }
         }
+        #[cfg(not(feature = "containment"))]
+        let _ = timeout;
         self.check_captures()?;
         Ok(Some(code))
     }
 
+    #[cfg(feature = "containment")]
     fn captures_finished(&self) -> io::Result<bool> {
         self.captures
             .as_ref()
             .map_or(Ok(true), output::Captures::finished)
     }
 
+    #[cfg(not(feature = "containment"))]
+    const fn captures_finished(&self) -> io::Result<bool> {
+        Ok(true)
+    }
+
+    #[cfg(feature = "containment")]
     fn check_captures(&self) -> io::Result<()> {
         if let Some(captures) = &self.captures
             && let Err(error) = captures.check()
@@ -860,6 +943,11 @@ impl NativeProcess {
             };
             return Err(io::Error::new(error.kind(), format!("{error}; {status}")));
         }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "containment"))]
+    const fn check_captures(&self) -> io::Result<()> {
         Ok(())
     }
 
@@ -1112,8 +1200,10 @@ fn require_mitigation(
     Ok(())
 }
 
+#[cfg(feature = "containment")]
 struct LocalAllocString(*mut u16);
 
+#[cfg(feature = "containment")]
 impl Drop for LocalAllocString {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -1123,8 +1213,10 @@ impl Drop for LocalAllocString {
     }
 }
 
+#[cfg(feature = "containment")]
 struct CoTaskWideString(*mut u16);
 
+#[cfg(feature = "containment")]
 impl Drop for CoTaskWideString {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -1134,6 +1226,7 @@ impl Drop for CoTaskWideString {
     }
 }
 
+#[cfg(feature = "containment")]
 fn verify_appcontainer_and_folder(process: &OwnedHandle) -> io::Result<Option<PathBuf>> {
     const HR_FILE_NOT_FOUND: i32 = i32::from_ne_bytes(0x8007_0002_u32.to_ne_bytes());
     const HR_PATH_NOT_FOUND: i32 = i32::from_ne_bytes(0x8007_0003_u32.to_ne_bytes());
@@ -1283,12 +1376,18 @@ fn resume_owned(
             return Err(io::Error::other("worker did not enter its required Job"));
         }
     }
+    #[cfg(feature = "containment")]
     let appcontainer_folder = if native_containment {
         Some(verify_appcontainer_and_folder(process)?)
     } else {
         None
     }
     .flatten();
+    #[cfg(not(feature = "containment"))]
+    let appcontainer_folder: Option<PathBuf> = {
+        let _ = native_containment;
+        None
+    };
     // Native PSEC's creation broker can omit JOB_LIST. Suspended-root Job
     // assignment above is mandatory; the one-process cap denies child creation
     // for both native and ordinary workers before their first instruction.
@@ -1321,7 +1420,7 @@ fn resume_owned(
 
 fn terminate_failed_start(
     process: &OwnedHandle,
-    captures: Option<&output::Captures>,
+    #[cfg(feature = "containment")] captures: Option<&output::Captures>,
 ) -> io::Result<()> {
     let started = Instant::now();
     // SAFETY: This is the exact newly created root, retained against PID reuse.
@@ -1347,6 +1446,7 @@ fn terminate_failed_start(
     }
     // Closing the parent's child endpoints precedes this call. Captures then
     // drain through EOF and join using the remainder of the same allowance.
+    #[cfg(feature = "containment")]
     if let Some(captures) = captures {
         let Some(deadline) = started.checked_add(Duration::from_secs(10)) else {
             return Err(io::Error::new(
@@ -1366,6 +1466,7 @@ fn terminate_failed_start(
 
 impl Drop for NativeProcess {
     fn drop(&mut self) {
+        #[cfg(feature = "containment")]
         if self.containment.is_some() {
             // Retain PSEC while requesting complete tree termination and waiting
             // for the exact root. Closing the Job remains the final kill guard
@@ -1602,6 +1703,7 @@ fn table_error(code: u32) -> io::Error {
 }
 
 /// Returns (reader, writer), with only the selected child endpoint inheritable.
+#[cfg(feature = "containment")]
 fn anonymous_pipe(child_reads: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
     let security = SECURITY_ATTRIBUTES {
         nLength: win_size::<SECURITY_ATTRIBUTES>(),
@@ -1630,7 +1732,7 @@ fn anonymous_pipe(child_reads: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
     Ok((reader, writer))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "containment"))]
 mod pipe_tests {
     use std::io::{Read as _, Write as _};
 
@@ -1671,6 +1773,7 @@ mod pipe_tests {
     }
 }
 
+#[cfg(feature = "containment")]
 fn standard_streams(
     spec: &LaunchSpec<'_>,
     pipes: PipeMode,
@@ -1722,6 +1825,39 @@ fn standard_streams(
         ],
         None,
     ))
+}
+
+#[cfg(not(feature = "containment"))]
+fn standard_streams(
+    spec: &LaunchSpec<'_>,
+    pipes: PipeMode,
+    bounded_logs: bool,
+) -> io::Result<[OwnedHandle; 3]> {
+    let _ = bounded_logs;
+    match pipes {
+        PipeMode::None => {}
+    }
+    let input = standard_file(
+        OsStr::new("NUL"),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    )?;
+    Ok([
+        input,
+        standard_file(
+            spec.stdout.as_os_str(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ,
+            CREATE_NEW,
+        )?,
+        standard_file(
+            spec.stderr.as_os_str(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ,
+            CREATE_NEW,
+        )?,
+    ])
 }
 
 fn launch_job(spec: &LaunchSpec<'_>) -> io::Result<OwnedHandle> {
@@ -1993,7 +2129,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "containment"))]
 mod section_tests {
     use std::fs::{self, OpenOptions};
     use std::os::windows::fs::OpenOptionsExt as _;
