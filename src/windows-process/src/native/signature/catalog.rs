@@ -28,12 +28,16 @@ struct Catalog<'a> {
 }
 impl Drop for Catalog<'_> {
     fn drop(&mut self) {
-        // SAFETY: This catalog context was obtained from the still-live matching admin.
-        let _ = unsafe { CryptCATAdminReleaseCatalogContext(self.admin.0, self.context, 0) };
+        if self.context != 0 {
+            // SAFETY: This catalog context was obtained from the still-live matching
+            // admin and has not yet been consumed by `CryptCATAdminEnumCatalogFromHash`.
+            let _ = unsafe { CryptCATAdminReleaseCatalogContext(self.admin.0, self.context, 0) };
+        }
     }
 }
 
 pub(super) fn verify(file: &File, filename: &[u16]) -> io::Result<crate::AuthenticodeSigner> {
+    const MAX_CATALOGS: usize = 16;
     let mut admin = 0;
     let subsystem = DRIVER_ACTION_VERIFY;
     let algorithm = windows_sys::core::w!("SHA256");
@@ -64,20 +68,54 @@ pub(super) fn verify(file: &File, filename: &[u16]) -> io::Result<crate::Authent
     if hash_bytes != 32 {
         return Err(super::super::invalid("Catalog SHA-256 length changed."));
     }
-    // SAFETY: The live administrator receives the exact SHA-256 bytes and starts
-    // a fresh enumeration. The single selected context is released by RAII.
-    let context = unsafe {
-        CryptCATAdminEnumCatalogFromHash(admin.0, hash.as_ptr(), hash_bytes, 0, ptr::null_mut())
-    };
-    if context == 0 {
-        return Err(super::super::invalid(
-            "No installed catalog binds the retained file hash.",
-        ));
-    }
-    let catalog = Catalog {
+    let mut member: Vec<u16> = hash[..32]
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 15])
+        .map(|part| u16::from(b"0123456789ABCDEF"[usize::from(part)]))
+        .collect();
+    member.push(0);
+
+    let mut catalog = Catalog {
         admin: &admin,
-        context,
+        context: 0,
     };
+    let mut last_error = None;
+    for _ in 0..MAX_CATALOGS {
+        let mut prev_context = std::mem::replace(&mut catalog.context, 0);
+        // SAFETY: The live administrator receives the exact SHA-256 bytes and either
+        // 0 (fresh search) or the prior context whose ownership transfers to
+        // `CryptCATAdminEnumCatalogFromHash` (which releases it).
+        let context = unsafe {
+            CryptCATAdminEnumCatalogFromHash(
+                admin.0,
+                hash.as_ptr(),
+                hash_bytes,
+                0,
+                &raw mut prev_context,
+            )
+        };
+        if context == 0 {
+            break;
+        }
+        catalog.context = context;
+        match verify_catalog_member(&admin, &catalog, file, filename, &member, &hash, hash_bytes) {
+            Ok(signer) => return Ok(signer),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| super::super::invalid("No installed catalog binds the retained file hash.")))
+}
+
+fn verify_catalog_member(
+    admin: &Admin,
+    catalog: &Catalog<'_>,
+    file: &File,
+    filename: &[u16],
+    member: &[u16],
+    hash: &[u8; 64],
+    hash_bytes: u32,
+) -> io::Result<crate::AuthenticodeSigner> {
     let mut info = CATALOG_INFO {
         cbStruct: super::super::win_size::<CATALOG_INFO>(),
         ..CATALOG_INFO::default()
@@ -89,19 +127,14 @@ pub(super) fn verify(file: &File, filename: &[u16]) -> io::Result<crate::Authent
     if !info.wszCatalogFile.contains(&0) {
         return Err(super::super::invalid("Catalog path was not terminated."));
     }
-    let mut member: Vec<u16> = hash[..32]
-        .iter()
-        .flat_map(|byte| [byte >> 4, byte & 15])
-        .map(|part| u16::from(b"0123456789ABCDEF"[usize::from(part)]))
-        .collect();
-    member.push(0);
+    let mut calc_hash = *hash;
     let mut catalog_info = WINTRUST_CATALOG_INFO {
         cbStruct: super::super::win_size::<WINTRUST_CATALOG_INFO>(),
         pcwszCatalogFilePath: info.wszCatalogFile.as_ptr(),
         pcwszMemberTag: member.as_ptr(),
         pcwszMemberFilePath: filename.as_ptr(),
         hMemberFile: file.as_raw_handle(),
-        pbCalculatedFileHash: hash.as_mut_ptr(),
+        pbCalculatedFileHash: calc_hash.as_mut_ptr(),
         cbCalculatedFileHash: hash_bytes,
         hCatAdmin: admin.0,
         ..WINTRUST_CATALOG_INFO::default()

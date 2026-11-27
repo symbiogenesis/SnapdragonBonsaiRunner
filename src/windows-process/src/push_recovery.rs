@@ -382,7 +382,7 @@ mod native {
             return Err("Checker recovery cleanup escaped temporary storage.".into());
         }
         guard.disarmed = true;
-        let cleanup = fs::remove_dir_all(&scratch)
+        let cleanup = crate::retry_transient_win32(true, || fs::remove_dir_all(&scratch))
             .map_err(|error| format!("Checker recovery capture cleanup failed: {error}"));
         match (result, cleanup) {
             (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),

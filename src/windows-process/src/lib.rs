@@ -197,6 +197,44 @@ pub fn replace_open_file(file: &std::fs::File, target: &Path) -> io::Result<()> 
     native::replacement::replace(file, target)
 }
 
+#[forbid(unsafe_code)]
+fn is_transient_win32_error(error: &io::Error, include_dir_not_empty: bool) -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    const ERROR_DIR_NOT_EMPTY: i32 = 145;
+    matches!(
+        error.raw_os_error(),
+        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+    ) || (include_dir_not_empty && error.raw_os_error() == Some(ERROR_DIR_NOT_EMPTY))
+}
+
+#[forbid(unsafe_code)]
+pub(crate) fn retry_transient_win32<T>(
+    include_dir_not_empty: bool,
+    mut operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    const MAX_ATTEMPTS: usize = 6;
+    const BASE_DELAY_MS: u64 = 5;
+    let mut attempt = 0_usize;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt + 1 < MAX_ATTEMPTS
+                    && is_transient_win32_error(&error, include_dir_not_empty) =>
+            {
+                let shift = u32::try_from(attempt).unwrap_or(u32::MAX);
+                let delay_ms =
+                    BASE_DELAY_MS.saturating_mul(1_u64.checked_shl(shift).unwrap_or(u64::MAX));
+                std::thread::sleep(Duration::from_millis(delay_ms.min(160)));
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Returns this process's creation FILETIME for retained supervision identity.
 ///
 /// # Errors
@@ -2647,6 +2685,52 @@ mod maintenance_tests {
             .ok_or_else(|| io::Error::other("Missing test executable name."))?;
         assert!(has_running_process(&[name])?);
         assert!(has_running_process(&[""]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn retry_transient_win32_retries_transient_codes_and_stops_on_permanent() -> io::Result<()> {
+        for code in [5, 32, 33] {
+            let mut attempts = 0_usize;
+            let result = retry_transient_win32(false, || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(io::Error::from_raw_os_error(code))
+                } else {
+                    Ok(code)
+                }
+            })?;
+            assert_eq!(result, code);
+            assert_eq!(attempts, 3);
+        }
+
+        let mut dir_attempts = 0_usize;
+        let dir_result = retry_transient_win32(true, || {
+            dir_attempts += 1;
+            if dir_attempts < 2 {
+                Err(io::Error::from_raw_os_error(145))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(dir_result.is_ok());
+        assert_eq!(dir_attempts, 2);
+
+        let mut file_145_attempts = 0_usize;
+        let file_145 = retry_transient_win32::<()>(false, || {
+            file_145_attempts += 1;
+            Err(io::Error::from_raw_os_error(145))
+        });
+        assert!(file_145.is_err());
+        assert_eq!(file_145_attempts, 1);
+
+        let mut perm_attempts = 0_usize;
+        let perm = retry_transient_win32::<()>(true, || {
+            perm_attempts += 1;
+            Err(io::Error::from_raw_os_error(2))
+        });
+        assert!(perm.is_err());
+        assert_eq!(perm_attempts, 1);
         Ok(())
     }
 }

@@ -53,20 +53,23 @@ pub(crate) fn replace(file: &File, target: &Path) -> io::Result<()> {
     unsafe { ptr::copy_nonoverlapping(name.as_ptr().cast::<u8>(), destination, encoded_bytes) };
     let required = u32::try_from(required)
         .map_err(|_| super::invalid("Replacement buffer exceeds Windows bounds."))?;
-    // SAFETY: The borrowed File and aligned information buffer remain alive
-    // throughout this synchronous call. FileNameLength counts exactly the
-    // copied UTF-16 path bytes, excluding the explicit terminator; RootDirectory is null for the
-    // absolute path. Windows checks DELETE access and all sharing constraints.
-    if unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FileRenameInfo,
-            information.as_ptr().cast(),
-            required,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    crate::retry_transient_win32(false, || {
+        // SAFETY: The borrowed File and aligned information buffer remain alive
+        // throughout this synchronous call. FileNameLength counts exactly the
+        // copied UTF-16 path bytes, excluding the explicit terminator; RootDirectory is null for the
+        // absolute path. Windows checks DELETE access and all sharing constraints.
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileRenameInfo,
+                information.as_ptr().cast(),
+                required,
+            )
+        } == 0
+        {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
 }

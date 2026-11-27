@@ -9,7 +9,7 @@ use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
+use windows_sys::Win32::Foundation::{ERROR_BAD_LENGTH, ERROR_NO_MORE_FILES};
 use windows_sys::Win32::Security::Cryptography::{
     CERT_NAME_ATTR_TYPE, CERT_SHA1_HASH_PROP_ID, CertGetCertificateContextProperty,
     CertGetNameStringW, szOID_COMMON_NAME,
@@ -174,10 +174,28 @@ pub(crate) fn modules(id: u32, basename: &str) -> io::Result<Vec<PathBuf>> {
     {
         return Err(super::invalid("Invalid process module selection."));
     }
-    // SAFETY: This creates a read-only snapshot for a numeric process identifier.
-    let snapshot = super::owned(unsafe {
-        CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, id)
-    })?;
+    const MAX_ATTEMPTS: usize = 16;
+    let bad_length = i32::try_from(ERROR_BAD_LENGTH).ok();
+    let mut snapshot = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        // SAFETY: This creates a read-only snapshot for a numeric process identifier.
+        match super::owned(unsafe {
+            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, id)
+        }) {
+            Ok(handle) => {
+                snapshot = Some(handle);
+                break;
+            }
+            Err(error) if error.raw_os_error() == bad_length && attempt + 1 < MAX_ATTEMPTS => {
+                let delay_ms = u64::try_from((attempt + 1).min(5)).unwrap_or(5);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let Some(snapshot) = snapshot else {
+        return Err(io::Error::other("Module snapshot retry loop exhausted."));
+    };
     let mut entry = MODULEENTRY32W {
         dwSize: super::win_size::<MODULEENTRY32W>(),
         ..MODULEENTRY32W::default()
