@@ -24,7 +24,7 @@ const SHORT_CLIP_HINT_MAX_SAMPLES: usize = (SAMPLE_RATE * 3) / 2;
 const CHAT_FRAME_TOKENS: usize = 15;
 
 /// Independent arithmetic identity; not the native GGML/flash-attention identity.
-pub const ARITHMETIC_IDENTITY: &str = "rust-asr-sdot-i8mm-v4-f16-kv-minimax-gelu-exp";
+pub const ARITHMETIC_IDENTITY: &str = "rust-asr-sdot-i8mm-v5-f16-kv-minimax-gelu-exp-fma";
 
 /// Borrowed numerical observations for an independently retained replay packet.
 ///
