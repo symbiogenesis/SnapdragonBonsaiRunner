@@ -94,6 +94,26 @@ impl AsyncWrite for BackendStream {
         }
     }
 
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Loopback(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            #[cfg(windows)]
+            Self::Pipe(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Loopback(stream) => stream.is_write_vectored(),
+            #[cfg(windows)]
+            Self::Pipe(stream) => stream.is_write_vectored(),
+        }
+    }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Loopback(stream) => Pin::new(stream).poll_flush(cx),

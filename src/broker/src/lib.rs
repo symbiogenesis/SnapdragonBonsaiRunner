@@ -960,15 +960,28 @@ struct RawContentPart<'a> {
     image_url: Option<Object<RawImageUrl<'a>>>,
 }
 
-const fn base64_sextet(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
+const BASE64_INVALID: u8 = 0xff;
+const BASE64_LUT: [u8; 256] = {
+    let mut table = [BASE64_INVALID; 256];
+    let mut index = 0_usize;
+    while index < 26 {
+        table[65 + index] = index.to_le_bytes()[0];
+        table[97 + index] = (26 + index).to_le_bytes()[0];
+        index += 1;
     }
+    let mut digit = 0_usize;
+    while digit < 10 {
+        table[48 + digit] = (52 + digit).to_le_bytes()[0];
+        digit += 1;
+    }
+    table[43] = 62;
+    table[47] = 63;
+    table
+};
+
+fn base64_sextet(byte: u8) -> Option<u8> {
+    let sextet = BASE64_LUT[usize::from(byte)];
+    (sextet != BASE64_INVALID).then_some(sextet)
 }
 
 fn validate_image_data_url_parts(url: &str) -> Option<(&[u8], usize)> {

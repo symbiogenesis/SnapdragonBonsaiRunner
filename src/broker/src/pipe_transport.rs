@@ -36,6 +36,7 @@ const HANDSHAKE_RESPONSE_MAGIC: &[u8; 8] = b"SB2OKAY1";
 const KEY_HEX_BYTES: usize = 64;
 const FRAME_HEADER_BYTES: usize = 9;
 const MAX_FRAME_PAYLOAD: usize = 16_384;
+const PIPE_BUF_CAPACITY: usize = 64 * 1024;
 const FREE_LIST_CAPACITY: usize = 32;
 const CHANNEL_CAPACITY: usize = 64;
 const MAX_TRACKED_RESETS: usize = 16;
@@ -59,6 +60,7 @@ impl BufferPool {
         buf
     }
 
+    #[cfg(test)]
     fn take_from_slice(&self, bytes: &[u8]) -> Vec<u8> {
         let mut buf = self.take_raw();
         buf.clear();
@@ -644,11 +646,22 @@ impl AsyncRead for PipeStream {
 
 impl AsyncWrite for PipeStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if buf.is_empty() {
+        self.poll_write_vectored(cx, &[io::IoSlice::new(buf)])
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let total_len: usize = bufs
+            .iter()
+            .fold(0_usize, |acc, slice| acc.saturating_add(slice.len()));
+        if total_len == 0 {
             return Poll::Ready(Ok(0));
         }
         if self.eof_sent {
@@ -669,15 +682,32 @@ impl AsyncWrite for PipeStream {
                 state.write_waker = Some(cx.waker().clone());
                 return Poll::Pending;
             }
-            let count = buf.len().min(MAX_FRAME_PAYLOAD);
-            let payload = self.pool.take_from_slice(&buf[..count]);
+            let target = total_len.min(MAX_FRAME_PAYLOAD);
+            let mut payload = self.pool.take_raw();
+            payload.clear();
+            payload.reserve(target);
+            let mut copied = 0_usize;
+            for slice in bufs {
+                if copied >= target {
+                    break;
+                }
+                let take = slice.len().min(target - copied);
+                if take > 0 {
+                    payload.extend_from_slice(&slice[..take]);
+                    copied += take;
+                }
+            }
             let seq = state.push_frame(self.stream_id, KIND_DATA, payload);
             drop(state);
             self.tx.writer_ready.notify_one();
-            (count, seq)
+            (copied, seq)
         };
         self.pending_data_seq = seq;
         Poll::Ready(Ok(count))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -946,13 +976,67 @@ fn handle_reader_frame<R: Read>(
     Ok(())
 }
 
+struct ScrubBufReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+    pos: usize,
+    len: usize,
+}
+
+impl<R> Drop for ScrubBufReader<R> {
+    fn drop(&mut self) {
+        crate::scrub_bytes(&mut self.buf);
+    }
+}
+
+impl<R: Read> ScrubBufReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: vec![0_u8; PIPE_BUF_CAPACITY],
+            pos: 0,
+            len: 0,
+        }
+    }
+
+    fn fill_buf_once(&mut self) -> io::Result<&[u8]> {
+        if self.pos >= self.len {
+            self.pos = 0;
+            // Perform a single underlying read without looping to fill 64 KiB so
+            // streaming SSE tokens incur zero added buffering latency.
+            self.len = loop {
+                match self.inner.read(&mut self.buf) {
+                    Ok(count) => break count,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            };
+        }
+        Ok(&self.buf[self.pos..self.len])
+    }
+}
+
+impl<R: Read> Read for ScrubBufReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let available = self.fill_buf_once()?;
+        let count = available.len().min(out.len());
+        out[..count].copy_from_slice(&available[..count]);
+        self.pos += count;
+        Ok(count)
+    }
+}
+
 fn run_reader<R: Read>(
-    mut reader: R,
+    reader: R,
     tx: &Arc<TxShared>,
     rx_state: &Arc<Mutex<RxState>>,
     ready_tx: &watch::Sender<ReadyState>,
     pool: &BufferPool,
 ) {
+    let mut reader = ScrubBufReader::new(reader);
     let mut ack = [0_u8; HANDSHAKE_RESPONSE_MAGIC.len()];
     if reader.read_exact(&mut ack).is_err() || &ack != HANDSHAKE_RESPONSE_MAGIC {
         fail_transport(tx, rx_state, ready_tx, pool);
@@ -987,6 +1071,13 @@ fn run_reader<R: Read>(
             break;
         }
     }
+}
+
+fn flush_writer_scratch(writer: &mut impl Write, frame_scratch: &mut Vec<u8>) -> io::Result<()> {
+    let result = writer.write_all(frame_scratch);
+    crate::scrub_bytes(frame_scratch);
+    frame_scratch.clear();
+    result
 }
 
 fn run_writer<W: Write>(
@@ -1036,7 +1127,7 @@ fn run_writer<W: Write>(
     }
 
     let mut batch = Vec::new();
-    let mut frame_scratch = Vec::with_capacity(FRAME_HEADER_BYTES + MAX_FRAME_PAYLOAD);
+    let mut frame_scratch = Vec::with_capacity(PIPE_BUF_CAPACITY);
     loop {
         let batch_seq = {
             let mut state = lock_unpoisoned(&tx.state);
@@ -1077,21 +1168,38 @@ fn run_writer<W: Write>(
 
         let mut io_result = Ok(());
         for frame in batch.drain(..) {
-            let write_result = write_raw_frame_into(
-                &mut writer,
-                frame.stream_id,
-                frame.kind,
-                &frame.payload,
-                &mut frame_scratch,
-            );
-            pool.recycle(frame.payload);
-            if let Err(error) = write_result {
+            let Ok(payload_len) = u32::try_from(frame.payload.len()) else {
+                pool.recycle(frame.payload);
+                io_result = Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "broker-pipe frame exceeds u32 bound",
+                ));
+                break;
+            };
+            let frame_bytes = FRAME_HEADER_BYTES + frame.payload.len();
+            if !frame_scratch.is_empty()
+                && frame_scratch.len().saturating_add(frame_bytes) > PIPE_BUF_CAPACITY
+                && let Err(error) = flush_writer_scratch(&mut writer, &mut frame_scratch)
+            {
+                pool.recycle(frame.payload);
                 io_result = Err(error);
                 break;
             }
+            let header = encode_header(frame.stream_id, frame.kind, payload_len);
+            frame_scratch.extend_from_slice(&header);
+            if !frame.payload.is_empty() {
+                frame_scratch.extend_from_slice(&frame.payload);
+            }
+            pool.recycle(frame.payload);
         }
         for frame in batch.drain(..) {
             pool.recycle(frame.payload);
+        }
+        if io_result.is_ok() && !frame_scratch.is_empty() {
+            io_result = flush_writer_scratch(&mut writer, &mut frame_scratch);
+        } else {
+            crate::scrub_bytes(&mut frame_scratch);
+            frame_scratch.clear();
         }
         if io_result.is_ok() {
             io_result = writer.flush();
@@ -1686,6 +1794,101 @@ mod tests {
             read_test_frame_opt(&mut cursor)?,
             Some((7, KIND_DATA, payload.to_vec()))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pipe_stream_write_vectored_all_packs_twelve_slices_into_single_data_frame() -> io::Result<()>
+    {
+        run_async(async {
+            let (backend, mut p_to_c_r, _c_to_p_w) = ready_memory_backend().await?;
+            let mut stream = backend
+                .connect(Instant::now() + Duration::from_secs(1))
+                .await
+                .map_err(|_| io::Error::other("connect failed"))?;
+            assert!(stream.is_write_vectored());
+
+            let parts: [&[u8]; 12] = [
+                b"POST /v1/chat/completions HTTP/1.1\r\n",
+                b"Host: 127.0.0.1:1024\r\n",
+                b"Authorization: Bearer ",
+                b"0123456789abcdef",
+                b"\r\n",
+                b"Content-Type: application/json\r\n",
+                b"Connection: close\r\n",
+                b"Content-Length: ",
+                b"29",
+                b"\r\n\r\n",
+                b"{\"messages\":[{\"role\":\"user\",",
+                b"\"content\":\"hi\"}]}",
+            ];
+            let expected: Vec<u8> = parts.iter().flat_map(|slice| slice.iter().copied()).collect();
+            assert!(expected.len() < MAX_FRAME_PAYLOAD);
+
+            let mut slices: [io::IoSlice<'_>; 12] = parts.map(io::IoSlice::new);
+            crate::wire::write_vectored_all(&mut stream, &mut slices).await?;
+
+            assert_eq!(read_frame(&mut p_to_c_r)?, (1, KIND_OPEN, Vec::new()));
+            assert_eq!(read_frame(&mut p_to_c_r)?, (1, KIND_DATA, expected));
+            assert_eq!(p_to_c_r.buffered_bytes(), 0);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn scrub_buf_reader_decodes_back_to_back_frames_without_blocking() -> io::Result<()> {
+        struct CountingSingleRead {
+            chunks: VecDeque<Vec<u8>>,
+            read_calls: usize,
+        }
+        impl Read for CountingSingleRead {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.read_calls += 1;
+                let Some(mut front) = self.chunks.pop_front() else {
+                    return Ok(0);
+                };
+                let count = front.len().min(buf.len());
+                buf[..count].copy_from_slice(&front[..count]);
+                if count < front.len() {
+                    self.chunks.push_front(front.split_off(count));
+                }
+                Ok(count)
+            }
+        }
+
+        let mut wire = Vec::new();
+        for (stream_id, kind, payload) in [
+            (0_u32, KIND_SERVER_READY, b"".as_slice()),
+            (1, KIND_DATA, b"data: {\"delta\":\"a\"}\n\n"),
+            (1, KIND_DATA, b"data: [DONE]\n\n"),
+            (1, KIND_EOF, b""),
+        ] {
+            write_test_frame(&mut wire, stream_id, kind, payload)?;
+        }
+        assert!(wire.len() < PIPE_BUF_CAPACITY);
+
+        let mut reader = ScrubBufReader::new(CountingSingleRead {
+            chunks: VecDeque::from([wire]),
+            read_calls: 0,
+        });
+        assert_eq!(
+            read_test_frame_opt(&mut reader)?,
+            Some((0, KIND_SERVER_READY, Vec::new()))
+        );
+        assert_eq!(
+            read_test_frame_opt(&mut reader)?,
+            Some((1, KIND_DATA, b"data: {\"delta\":\"a\"}\n\n".to_vec()))
+        );
+        assert_eq!(
+            read_test_frame_opt(&mut reader)?,
+            Some((1, KIND_DATA, b"data: [DONE]\n\n".to_vec()))
+        );
+        assert_eq!(
+            read_test_frame_opt(&mut reader)?,
+            Some((1, KIND_EOF, Vec::new()))
+        );
+        assert_eq!(reader.inner.read_calls, 1);
+        assert_eq!(read_test_frame_opt(&mut reader)?, None);
         Ok(())
     }
 }
