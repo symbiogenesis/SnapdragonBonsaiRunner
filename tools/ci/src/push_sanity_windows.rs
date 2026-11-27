@@ -25,13 +25,23 @@ struct CachedBlob {
     modified_ns: u128,
 }
 
+#[cfg(not(test))]
 const PUSH_CACHE_INCREMENTAL_LIMIT_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+#[cfg(not(test))]
 const PUSH_CACHE_HARD_LIMIT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 struct Work {
     directory: PathBuf,
     started: Instant,
     sequence: usize,
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "Target cache pruning runs only under non-test push sanity checks."
+        )
+    )]
+    pruned_target_cache: bool,
 }
 
 impl Work {
@@ -1119,12 +1129,21 @@ impl Work {
             return Ok(());
         }
         let toolchain = super::super::push_format::toolchain(source)?;
-        let target_dir = std::env::var_os("BONSAI_PUSH_CARGO_TARGET_DIR")
+        let cache_target = std::env::var_os("BONSAI_PUSH_CARGO_TARGET_DIR")
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.directory.join("cargo-target"));
+            .map(PathBuf::from);
+        let cache_enabled = cache_target.is_some();
+        let target_dir = cache_target.unwrap_or_else(|| self.directory.join("cargo-target"));
         fs::create_dir_all(&target_dir).map_err(|error| error.to_string())?;
         let target_dir = super::canonical_path(target_dir)?;
+        if cache_enabled && !self.pruned_target_cache {
+            Self::prune_target_cache(
+                &target_dir,
+                PUSH_CACHE_INCREMENTAL_LIMIT_BYTES,
+                PUSH_CACHE_HARD_LIMIT_BYTES,
+            )?;
+            self.pruned_target_cache = true;
+        }
         let manifest = source.join("Cargo.toml");
         let cargo_env = BTreeMap::from([
             (
@@ -1186,34 +1205,29 @@ impl Work {
                 self.command(source, "cargo.exe", &test_args, cargo_env.clone())?;
             }
 
-            if plan.hexagon_locks
+            let run_hexagon = plan.hexagon_locks
                 || (affected.contains("bonsai-tools")
-                    && paths.iter().any(|path| path.contains("hexagon")))
-            {
-                let mut hex_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
-                hex_args.extend([
-                    "-p".into(),
-                    "bonsai-tools".into(),
-                    "--lib".into(),
-                    "hexagon_tools::public_control".into(),
-                ]);
-                self.command(source, "cargo.exe", &hex_args, cargo_env.clone())?;
-            }
-
-            if affected.contains("bonsai-tools")
+                    && paths.iter().any(|path| path.contains("hexagon")));
+            let run_release = affected.contains("bonsai-tools")
                 && paths.iter().any(|path| {
                     path == "tools/bonsai/src/release_package.rs"
                         || path.starts_with("scripts/release/")
-                })
-            {
-                let mut rel_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
-                rel_args.extend([
+                });
+            if run_hexagon || run_release {
+                let mut tools_args = base_cargo_args("test", "aarch64-pc-windows-msvc");
+                tools_args.extend([
                     "-p".into(),
                     "bonsai-tools".into(),
                     "--lib".into(),
-                    "release_package".into(),
+                    "--".into(),
                 ]);
-                self.command(source, "cargo.exe", &rel_args, cargo_env.clone())?;
+                if run_hexagon {
+                    tools_args.push("hexagon_tools::public_control".into());
+                }
+                if run_release {
+                    tools_args.push("release_package".into());
+                }
+                self.command(source, "cargo.exe", &tools_args, cargo_env.clone())?;
             }
 
             // Always check the complete standard Windows workspace set when any
@@ -1513,6 +1527,7 @@ pub(super) fn check(
             .checked_sub(Duration::from_millis(bootstrap_milliseconds))
             .ok_or("Push bootstrap start predates the monotonic clock.")?,
         sequence: 0,
+        pruned_target_cache: false,
     };
     let result = (|| {
         let mut commits = BTreeMap::<String, BTreeSet<String>>::new();
@@ -1570,13 +1585,6 @@ pub(super) fn check(
             let changed_paths: Vec<String> = paths.iter().cloned().collect();
             if let Some(target_dir) = cache_target.as_ref() {
                 let _cache_lock = work.lock_source_cache(target_dir)?;
-                if number == 0 {
-                    Work::prune_target_cache(
-                        target_dir,
-                        PUSH_CACHE_INCREMENTAL_LIMIT_BYTES,
-                        PUSH_CACHE_HARD_LIMIT_BYTES,
-                    )?;
-                }
                 let stable_source = Work::stable_source_dir(target_dir)?;
                 work.sync_commit(root, commit, number, target_dir, &stable_source)?;
                 work.checks(policy, &stable_source, &changed_paths)?;
@@ -1674,6 +1682,7 @@ mod tests {
                                 directory: shard_dir,
                                 started: Instant::now(),
                                 sequence: 0,
+                                pruned_target_cache: false,
                             };
                             let script_result = work.script(
                                 policy,
@@ -1886,6 +1895,7 @@ mod tests {
             directory: scratch.clone(),
             started: Instant::now(),
             sequence: 0,
+            pruned_target_cache: false,
         };
         let policy = super::super::canonical_path(crate::command::test_workspace_root())?;
         let result = work.script(&policy, &policy, "test_push_snapshot.ps1", &[]);
@@ -1909,6 +1919,7 @@ mod tests {
             directory: scratch.clone(),
             started: Instant::now(),
             sequence: 0,
+            pruned_target_cache: false,
         };
         let result = (|| {
             let policy = super::super::canonical_path(crate::command::test_workspace_root())?;
@@ -1987,6 +1998,7 @@ mod tests {
             directory: scratch.clone(),
             started: Instant::now(),
             sequence: 0,
+            pruned_target_cache: false,
         };
         let result = (|| {
             let policy = super::super::canonical_path(crate::command::test_workspace_root())?;
@@ -2078,6 +2090,7 @@ mod tests {
                                 directory: dir,
                                 started: Instant::now(),
                                 sequence: 0,
+                                pruned_target_cache: false,
                             };
                             sub_work.adapter_checks(
                                 policy_ref,
@@ -2093,6 +2106,7 @@ mod tests {
                     directory: repaired_dir,
                     started: Instant::now(),
                     sequence: 0,
+                    pruned_target_cache: false,
                 };
                 let repaired_res = repaired_work.adapter_checks(
                     &policy,
@@ -2131,6 +2145,7 @@ mod tests {
             directory: scratch.clone(),
             started: Instant::now(),
             sequence: 0,
+            pruned_target_cache: false,
         };
         let result = (|| {
             let root = scratch.join("repository");
