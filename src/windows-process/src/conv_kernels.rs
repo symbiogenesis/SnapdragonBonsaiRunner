@@ -89,11 +89,60 @@ pub fn gemm_f32_fma_16oc_frames(
     crate::native::conv_f32::gemm_f32_fma_16oc_frames(w_ic_16, x_rows, in_c, acc_tile);
 }
 
+/// Streams a packed `[in_c, 16]` weight tile across `frames` rows starting at `x_base`,
+/// spaced by `x_frame_stride` elements per frame, into `acc_tile[..frames]` using single-pass
+/// `16oc x 6f` and `16oc x {4,3,2,1}f` NEON FMA micro-kernels in exact sequential `ic` order.
+///
+/// No-ops if `frames == 0`, `in_c == 0`, or any slice is shorter than required.
+pub fn gemm_f32_fma_16oc_strided(
+    w_ic_16: &[f32],
+    x_base: &[f32],
+    x_frame_stride: usize,
+    in_c: usize,
+    frames: usize,
+    acc_tile: &mut [[f32; 16]],
+) {
+    crate::native::conv_f32::gemm_f32_fma_16oc_strided(
+        w_ic_16,
+        x_base,
+        x_frame_stride,
+        in_c,
+        frames,
+        acc_tile,
+    );
+}
+
+/// Accumulates a strided/dilated 1D convolution tile (`[kernel, in_c, 16]` packed weights) over
+/// `frames` output frames starting at `ext`, keeping accumulators in NEON registers across
+/// `k in 0..kernel` and `ic in 0..in_c` in exact sequential `(k, ic)` FMA order.
+///
+/// No-ops if `frames == 0`, `in_c == 0`, `kernel == 0`, or any slice is shorter than required.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Explicit convolution geometry parameters avoid heap wrappers on the hot path."
+)]
+pub fn conv1d_f32_fma_16oc_strided(
+    w_blk: &[f32],
+    ext: &[f32],
+    in_c: usize,
+    kernel: usize,
+    stride: usize,
+    dilation: usize,
+    frames: usize,
+    acc_tile: &mut [[f32; 16]],
+) {
+    crate::native::conv_f32::conv1d_f32_fma_16oc_strided(
+        w_blk, ext, in_c, kernel, stride, dilation, frames, acc_tile,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::native::conv_f32::{
-        gemm_f32_fma_8oc_8f_portable, gemm_f32_fma_16oc_frames_portable, gemm_f32_fma_16oc_portable,
+        conv1d_f32_fma_16oc_strided_portable, gemm_f32_fma_8oc_8f_portable,
+        gemm_f32_fma_16oc_frames_portable, gemm_f32_fma_16oc_portable,
+        gemm_f32_fma_16oc_strided_portable,
     };
 
     fn make_edge_f32(len: usize, seed: usize) -> Vec<f32> {
@@ -311,6 +360,188 @@ mod tests {
         assert_eq!(
             guard.map(|r| r.map(f32::to_bits)),
             [[2.5_f32.to_bits(); 16]; 2]
+        );
+    }
+
+    #[test]
+    fn gemm_f32_fma_16oc_strided_matches_portable_scalar_fma_bit_exact() {
+        const IN_CS: [usize; 9] = [1, 3, 4, 7, 16, 128, 129, 256, 512];
+
+        for (c_idx, &in_c) in IN_CS.iter().enumerate() {
+            for frames in 1_usize..=67 {
+                // Exercise packed (`stride == in_c`) and padded (`stride > in_c`) layouts.
+                let x_frame_stride = if (frames + c_idx) % 2 == 0 {
+                    in_c
+                } else {
+                    in_c + 5
+                };
+                let seed = c_idx * 101 + frames * 17 + 9;
+                let w = make_edge_f32(in_c * 16, seed + 1);
+                let x_len = (frames - 1) * x_frame_stride + in_c;
+                let x_base = make_edge_f32(x_len, seed + 23);
+                let init: Vec<[f32; 16]> = (0..frames)
+                    .map(|f| {
+                        let v = make_edge_f32(16, seed + 300 + f);
+                        std::array::from_fn(|oc| v[oc])
+                    })
+                    .collect();
+                let mut acc_nat = init.clone();
+                let mut acc_prt = init;
+                gemm_f32_fma_16oc_strided(&w, &x_base, x_frame_stride, in_c, frames, &mut acc_nat);
+                gemm_f32_fma_16oc_strided_portable(
+                    &w,
+                    &x_base,
+                    x_frame_stride,
+                    in_c,
+                    frames,
+                    &mut acc_prt,
+                );
+                for f in 0..frames {
+                    assert_eq!(
+                        acc_nat[f].map(f32::to_bits),
+                        acc_prt[f].map(f32::to_bits),
+                        "16oc_strided 0-ULP mismatch in_c={in_c} stride={x_frame_stride} frames={frames} f={f}"
+                    );
+                }
+            }
+        }
+
+        // Zero / short / overflow bounds no-op safely.
+        let w = make_edge_f32(17 * 16, 55);
+        let x = make_edge_f32(3 * 20, 77);
+        let mut guard = [[3.25_f32; 16]; 3];
+        gemm_f32_fma_16oc_strided(&w, &x, 20, 17, 0, &mut guard);
+        gemm_f32_fma_16oc_strided(&w, &x, 20, 0, 3, &mut guard);
+        gemm_f32_fma_16oc_strided(&w[..w.len() - 1], &x, 20, 17, 3, &mut guard);
+        gemm_f32_fma_16oc_strided(&w, &x[..2 * 20 + 16], 20, 17, 3, &mut guard);
+        gemm_f32_fma_16oc_strided(&w, &x, 20, 17, 3, &mut guard[..2]);
+        gemm_f32_fma_16oc_strided(&w, &x, usize::MAX, 17, 2, &mut guard);
+        assert_eq!(
+            guard.map(|r| r.map(f32::to_bits)),
+            [[3.25_f32.to_bits(); 16]; 3]
+        );
+    }
+
+    #[test]
+    fn conv1d_f32_fma_16oc_strided_matches_portable_scalar_fma_bit_exact() {
+        const IN_CS: [usize; 9] = [1, 3, 4, 7, 16, 128, 129, 256, 512];
+        const KERNELS: [usize; 3] = [1, 3, 7];
+        const STRIDES: [usize; 2] = [1, 2];
+        const DILATIONS: [usize; 3] = [1, 3, 9];
+
+        // Full frames = 1..=67 coverage across representative channel/kernel/stride/dilation configs.
+        for frames in 1_usize..=67 {
+            let in_c = IN_CS[frames % IN_CS.len()];
+            let kernel = KERNELS[(frames / 3) % KERNELS.len()];
+            let stride = STRIDES[frames % STRIDES.len()];
+            let dilation = DILATIONS[(frames / 2) % DILATIONS.len()];
+            let seed = frames * 37 + in_c * 13 + kernel * 7;
+            let w = make_edge_f32(kernel * in_c * 16, seed + 1);
+            let ext_frames = (frames - 1) * stride + (kernel - 1) * dilation + 1;
+            let ext = make_edge_f32(ext_frames * in_c, seed + 19);
+            let init: Vec<[f32; 16]> = (0..frames)
+                .map(|f| {
+                    let v = make_edge_f32(16, seed + 400 + f);
+                    std::array::from_fn(|oc| v[oc])
+                })
+                .collect();
+            let mut acc_nat = init.clone();
+            let mut acc_prt = init;
+            conv1d_f32_fma_16oc_strided(
+                &w,
+                &ext,
+                in_c,
+                kernel,
+                stride,
+                dilation,
+                frames,
+                &mut acc_nat,
+            );
+            conv1d_f32_fma_16oc_strided_portable(
+                &w,
+                &ext,
+                in_c,
+                kernel,
+                stride,
+                dilation,
+                frames,
+                &mut acc_prt,
+            );
+            for f in 0..frames {
+                assert_eq!(
+                    acc_nat[f].map(f32::to_bits),
+                    acc_prt[f].map(f32::to_bits),
+                    "conv1d_strided sweep 0-ULP mismatch frames={frames} in_c={in_c} k={kernel} s={stride} d={dilation} f={f}"
+                );
+            }
+        }
+
+        // Cross-product across all in_c, kernel, stride, dilation with 6f + tail frames (1, 5, 6, 7, 13, 48).
+        for (c_idx, &in_c) in IN_CS.iter().enumerate() {
+            for &kernel in &KERNELS {
+                for &stride in &STRIDES {
+                    for &dilation in &DILATIONS {
+                        let frames =
+                            [1_usize, 5, 6, 7, 13, 48][(c_idx + kernel + stride + dilation) % 6];
+                        let seed = c_idx * 53 + kernel * 11 + stride * 3 + dilation;
+                        let w = make_edge_f32(kernel * in_c * 16, seed + 2);
+                        let ext_frames = (frames - 1) * stride + (kernel - 1) * dilation + 1;
+                        let ext = make_edge_f32(ext_frames * in_c, seed + 29);
+                        let init: Vec<[f32; 16]> = (0..frames)
+                            .map(|f| {
+                                let v = make_edge_f32(16, seed + 500 + f);
+                                std::array::from_fn(|oc| v[oc])
+                            })
+                            .collect();
+                        let mut acc_nat = init.clone();
+                        let mut acc_prt = init;
+                        conv1d_f32_fma_16oc_strided(
+                            &w,
+                            &ext,
+                            in_c,
+                            kernel,
+                            stride,
+                            dilation,
+                            frames,
+                            &mut acc_nat,
+                        );
+                        conv1d_f32_fma_16oc_strided_portable(
+                            &w,
+                            &ext,
+                            in_c,
+                            kernel,
+                            stride,
+                            dilation,
+                            frames,
+                            &mut acc_prt,
+                        );
+                        for f in 0..frames {
+                            assert_eq!(
+                                acc_nat[f].map(f32::to_bits),
+                                acc_prt[f].map(f32::to_bits),
+                                "conv1d_strided matrix 0-ULP mismatch in_c={in_c} k={kernel} s={stride} d={dilation} frames={frames} f={f}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Zero / short / overflow bounds no-op safely.
+        let w = make_edge_f32(3 * 17 * 16, 88);
+        let ext = make_edge_f32(15 * 17, 99);
+        let mut guard = [[-1.75_f32; 16]; 4];
+        conv1d_f32_fma_16oc_strided(&w, &ext, 17, 3, 2, 3, 0, &mut guard);
+        conv1d_f32_fma_16oc_strided(&w, &ext, 0, 3, 2, 3, 4, &mut guard);
+        conv1d_f32_fma_16oc_strided(&w, &ext, 17, 0, 2, 3, 4, &mut guard);
+        conv1d_f32_fma_16oc_strided(&w[..w.len() - 1], &ext, 17, 3, 2, 3, 4, &mut guard);
+        // Needed ext frames = (4 - 1)*2 + (3 - 1)*3 + 1 = 13 -> 13 * 17 = 221.
+        conv1d_f32_fma_16oc_strided(&w, &ext[..220], 17, 3, 2, 3, 4, &mut guard);
+        conv1d_f32_fma_16oc_strided(&w, &ext, 17, 3, 2, 3, 4, &mut guard[..3]);
+        conv1d_f32_fma_16oc_strided(&w, &ext, 17, 3, usize::MAX, 3, 4, &mut guard);
+        assert_eq!(
+            guard.map(|r| r.map(f32::to_bits)),
+            [[(-1.75_f32).to_bits(); 16]; 4]
         );
     }
 }

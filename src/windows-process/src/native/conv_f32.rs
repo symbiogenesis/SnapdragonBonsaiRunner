@@ -499,3 +499,474 @@ pub(crate) fn gemm_f32_fma_16oc_frames(
 ) {
     gemm_f32_fma_16oc_frames_portable(w_ic_16, x_rows, in_c, acc_tile);
 }
+
+#[cfg(any(not(target_arch = "aarch64"), test))]
+pub(crate) fn gemm_f32_fma_16oc_strided_portable(
+    w_ic_16: &[f32],
+    x_base: &[f32],
+    x_frame_stride: usize,
+    in_c: usize,
+    frames: usize,
+    acc_tile: &mut [[f32; 16]],
+) {
+    let Some(expected_w) = in_c.checked_mul(16) else {
+        return;
+    };
+    let Some(last_off) = frames
+        .checked_sub(1)
+        .and_then(|last| last.checked_mul(x_frame_stride))
+    else {
+        return;
+    };
+    let Some(needed_x) = last_off.checked_add(in_c) else {
+        return;
+    };
+    if in_c == 0 || acc_tile.len() < frames || w_ic_16.len() < expected_w || x_base.len() < needed_x
+    {
+        return;
+    }
+    let (w_steps, _) = w_ic_16[..expected_w].as_chunks::<16>();
+    for (f, acc_row) in acc_tile[..frames].iter_mut().enumerate() {
+        let x_off = f * x_frame_stride;
+        let x_row = &x_base[x_off..x_off + in_c];
+        for (ic, w_16) in w_steps.iter().enumerate() {
+            let x_val = x_row[ic];
+            for (oc, &w_val) in w_16.iter().enumerate() {
+                acc_row[oc] = x_val.mul_add(w_val, acc_row[oc]);
+            }
+        }
+    }
+}
+
+#[cfg(any(not(target_arch = "aarch64"), test))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Strided 1D convolution micro-kernel mirrors public safe entry point signature."
+)]
+pub(crate) fn conv1d_f32_fma_16oc_strided_portable(
+    w_blk: &[f32],
+    ext: &[f32],
+    in_c: usize,
+    kernel: usize,
+    stride: usize,
+    dilation: usize,
+    frames: usize,
+    acc_tile: &mut [[f32; 16]],
+) {
+    let Some(k_in_c) = kernel.checked_mul(in_c) else {
+        return;
+    };
+    let Some(expected_w) = k_in_c.checked_mul(16) else {
+        return;
+    };
+    let Some(max_f) = frames.checked_sub(1).and_then(|f| f.checked_mul(stride)) else {
+        return;
+    };
+    let Some(max_k) = kernel.checked_sub(1).and_then(|k| k.checked_mul(dilation)) else {
+        return;
+    };
+    let Some(needed_ext) = max_f
+        .checked_add(max_k)
+        .and_then(|p| p.checked_add(1))
+        .and_then(|p| p.checked_mul(in_c))
+    else {
+        return;
+    };
+    if in_c == 0 || acc_tile.len() < frames || w_blk.len() < expected_w || ext.len() < needed_ext {
+        return;
+    }
+    let w_step_stride = in_c * 16;
+    for (f, acc_row) in acc_tile[..frames].iter_mut().enumerate() {
+        let f_off = f * stride;
+        for k in 0..kernel {
+            let w_k = &w_blk[k * w_step_stride..(k + 1) * w_step_stride];
+            let x_off = (f_off + k * dilation) * in_c;
+            let x_row = &ext[x_off..x_off + in_c];
+            let (w_steps, _) = w_k.as_chunks::<16>();
+            for (ic, w_16) in w_steps.iter().enumerate() {
+                let x_val = x_row[ic];
+                for (oc, &w_val) in w_16.iter().enumerate() {
+                    acc_row[oc] = x_val.mul_add(w_val, acc_row[oc]);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[expect(
+    clippy::inline_always,
+    reason = "Const lane index and frame count must inline so 16oc x F accumulators stay in NEON registers."
+)]
+#[inline(always)]
+fn step_16oc_lane<const F: usize, const LANE: i32>(
+    a: &mut [[float32x4_t; 4]; F],
+    w_step: &[f32; 16],
+    xv: &[float32x4_t; F],
+) {
+    let (wq, _) = w_step.as_chunks::<4>();
+    let w0 = load_f32x4(&wq[0]);
+    let w1 = load_f32x4(&wq[1]);
+    for f in 0..F {
+        a[f][0] = fma_lane_f32::<LANE>(a[f][0], w0, xv[f]);
+        a[f][1] = fma_lane_f32::<LANE>(a[f][1], w1, xv[f]);
+    }
+    let w2 = load_f32x4(&wq[2]);
+    let w3 = load_f32x4(&wq[3]);
+    for f in 0..F {
+        a[f][2] = fma_lane_f32::<LANE>(a[f][2], w2, xv[f]);
+        a[f][3] = fma_lane_f32::<LANE>(a[f][3], w3, xv[f]);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[expect(
+    clippy::inline_always,
+    reason = "Single-pass outer-product FMA accumulation must inline into caller to keep accumulators in NEON registers."
+)]
+#[inline(always)]
+fn accum_16oc_strided<const F: usize>(
+    a: &mut [[float32x4_t; 4]; F],
+    w_ic_16: &[f32],
+    x_base: &[f32],
+    x_frame_stride: usize,
+    in_c: usize,
+) {
+    let expected_w = in_c * 16;
+    let w_used = &w_ic_16[..expected_w];
+    let (w_quad_ics, w_tail_ics) = w_used.as_chunks::<64>();
+    let quad_len = w_quad_ics.len();
+    let x_quad_ics: [&[[f32; 4]]; F] = core::array::from_fn(|f| {
+        let start = f * x_frame_stride;
+        x_base[start..start + in_c].as_chunks::<4>().0
+    });
+
+    for (idx, w_64) in w_quad_ics.iter().enumerate() {
+        if idx + 2 < quad_len {
+            let next_w = &w_quad_ics[idx + 2];
+            prefetch_l1(next_w[0..].as_ptr().cast::<u8>());
+            prefetch_l1(next_w[16..].as_ptr().cast::<u8>());
+            prefetch_l1(next_w[32..].as_ptr().cast::<u8>());
+            prefetch_l1(next_w[48..].as_ptr().cast::<u8>());
+        }
+        let xv: [float32x4_t; F] = core::array::from_fn(|f| load_f32x4(&x_quad_ics[f][idx]));
+        let (w_steps, _) = w_64.as_chunks::<16>();
+        step_16oc_lane::<F, 0>(a, &w_steps[0], &xv);
+        step_16oc_lane::<F, 1>(a, &w_steps[1], &xv);
+        step_16oc_lane::<F, 2>(a, &w_steps[2], &xv);
+        step_16oc_lane::<F, 3>(a, &w_steps[3], &xv);
+    }
+
+    let tail_base = quad_len * 4;
+    let (w_tail_steps, _) = w_tail_ics.as_chunks::<16>();
+    for (t_idx, w_16) in w_tail_steps.iter().enumerate() {
+        let (wq, _) = w_16.as_chunks::<4>();
+        let w0 = load_f32x4(&wq[0]);
+        let w1 = load_f32x4(&wq[1]);
+        for f in 0..F {
+            let x_val = x_base[f * x_frame_stride + tail_base + t_idx];
+            a[f][0] = fma_n_f32(a[f][0], w0, x_val);
+            a[f][1] = fma_n_f32(a[f][1], w1, x_val);
+        }
+        let w2 = load_f32x4(&wq[2]);
+        let w3 = load_f32x4(&wq[3]);
+        for f in 0..F {
+            let x_val = x_base[f * x_frame_stride + tail_base + t_idx];
+            a[f][2] = fma_n_f32(a[f][2], w2, x_val);
+            a[f][3] = fma_n_f32(a[f][3], w3, x_val);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn load_acc_16oc<const F: usize>(acc: &[[f32; 16]; F]) -> [[float32x4_t; 4]; F] {
+    core::array::from_fn(|f| {
+        let (quads, _) = acc[f].as_chunks::<4>();
+        [
+            load_f32x4(&quads[0]),
+            load_f32x4(&quads[1]),
+            load_f32x4(&quads[2]),
+            load_f32x4(&quads[3]),
+        ]
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn store_acc_16oc<const F: usize>(a: &[[float32x4_t; 4]; F], acc: &mut [[f32; 16]; F]) {
+    for f in 0..F {
+        let (quads, _) = acc[f].as_chunks_mut::<4>();
+        store_f32x4(a[f][0], &mut quads[0]);
+        store_f32x4(a[f][1], &mut quads[1]);
+        store_f32x4(a[f][2], &mut quads[2]);
+        store_f32x4(a[f][3], &mut quads[3]);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn gemm_f32_fma_16oc_strided_chunk<const F: usize>(
+    w_used: &[f32],
+    x_base: &[f32],
+    x_frame_stride: usize,
+    in_c: usize,
+    acc: &mut [[f32; 16]; F],
+) {
+    let mut a = load_acc_16oc(acc);
+    accum_16oc_strided::<F>(&mut a, w_used, x_base, x_frame_stride, in_c);
+    store_acc_16oc(&a, acc);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn conv1d_f32_fma_16oc_strided_chunk<const F: usize>(
+    w_used: &[f32],
+    ext: &[f32],
+    in_c: usize,
+    kernel: usize,
+    stride: usize,
+    dilation: usize,
+    acc: &mut [[f32; 16]; F],
+) {
+    let mut a = load_acc_16oc(acc);
+    let w_k_stride = in_c * 16;
+    let x_frame_stride = stride * in_c;
+    for k in 0..kernel {
+        let w_k = &w_used[k * w_k_stride..(k + 1) * w_k_stride];
+        let ext_k = &ext[k * dilation * in_c..];
+        accum_16oc_strided::<F>(&mut a, w_k, ext_k, x_frame_stride, in_c);
+    }
+    store_acc_16oc(&a, acc);
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn gemm_f32_fma_16oc_strided(
+    w_ic_16: &[f32],
+    x_base: &[f32],
+    x_frame_stride: usize,
+    in_c: usize,
+    frames: usize,
+    acc_tile: &mut [[f32; 16]],
+) {
+    let Some(expected_w) = in_c.checked_mul(16) else {
+        return;
+    };
+    let Some(last_off) = frames
+        .checked_sub(1)
+        .and_then(|last| last.checked_mul(x_frame_stride))
+    else {
+        return;
+    };
+    let Some(needed_x) = last_off.checked_add(in_c) else {
+        return;
+    };
+    if in_c == 0 || acc_tile.len() < frames || w_ic_16.len() < expected_w || x_base.len() < needed_x
+    {
+        return;
+    }
+
+    let w_used = &w_ic_16[..expected_w];
+    let acc_used = &mut acc_tile[..frames];
+    let (acc_chunks6, acc_rem6) = acc_used.as_chunks_mut::<6>();
+    for (chunk_idx, acc6) in acc_chunks6.iter_mut().enumerate() {
+        let f_off = chunk_idx * 6 * x_frame_stride;
+        gemm_f32_fma_16oc_strided_chunk::<6>(w_used, &x_base[f_off..], x_frame_stride, in_c, acc6);
+    }
+
+    let f_rem6 = acc_chunks6.len() * 6;
+    let (acc_chunks4, acc_rem4) = acc_rem6.as_chunks_mut::<4>();
+    if let Some(acc4) = acc_chunks4.first_mut() {
+        gemm_f32_fma_16oc_strided_chunk::<4>(
+            w_used,
+            &x_base[f_rem6 * x_frame_stride..],
+            x_frame_stride,
+            in_c,
+            acc4,
+        );
+    }
+
+    let f_rem4 = f_rem6 + acc_chunks4.len() * 4;
+    match acc_rem4.len() {
+        3 => {
+            if let Some(acc3) = acc_rem4.first_chunk_mut::<3>() {
+                gemm_f32_fma_16oc_strided_chunk::<3>(
+                    w_used,
+                    &x_base[f_rem4 * x_frame_stride..],
+                    x_frame_stride,
+                    in_c,
+                    acc3,
+                );
+            }
+        }
+        2 => {
+            if let Some(acc2) = acc_rem4.first_chunk_mut::<2>() {
+                gemm_f32_fma_16oc_strided_chunk::<2>(
+                    w_used,
+                    &x_base[f_rem4 * x_frame_stride..],
+                    x_frame_stride,
+                    in_c,
+                    acc2,
+                );
+            }
+        }
+        1 => {
+            if let Some(acc1) = acc_rem4.first_chunk_mut::<1>() {
+                gemm_f32_fma_16oc_strided_chunk::<1>(
+                    w_used,
+                    &x_base[f_rem4 * x_frame_stride..],
+                    x_frame_stride,
+                    in_c,
+                    acc1,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) fn gemm_f32_fma_16oc_strided(
+    w_ic_16: &[f32],
+    x_base: &[f32],
+    x_frame_stride: usize,
+    in_c: usize,
+    frames: usize,
+    acc_tile: &mut [[f32; 16]],
+) {
+    gemm_f32_fma_16oc_strided_portable(w_ic_16, x_base, x_frame_stride, in_c, frames, acc_tile);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Strided 1D convolution micro-kernel mirrors public safe entry point signature."
+)]
+pub(crate) fn conv1d_f32_fma_16oc_strided(
+    w_blk: &[f32],
+    ext: &[f32],
+    in_c: usize,
+    kernel: usize,
+    stride: usize,
+    dilation: usize,
+    frames: usize,
+    acc_tile: &mut [[f32; 16]],
+) {
+    let Some(k_in_c) = kernel.checked_mul(in_c) else {
+        return;
+    };
+    let Some(expected_w) = k_in_c.checked_mul(16) else {
+        return;
+    };
+    let Some(max_f) = frames.checked_sub(1).and_then(|f| f.checked_mul(stride)) else {
+        return;
+    };
+    let Some(max_k) = kernel.checked_sub(1).and_then(|k| k.checked_mul(dilation)) else {
+        return;
+    };
+    let Some(needed_ext) = max_f
+        .checked_add(max_k)
+        .and_then(|p| p.checked_add(1))
+        .and_then(|p| p.checked_mul(in_c))
+    else {
+        return;
+    };
+    if in_c == 0 || acc_tile.len() < frames || w_blk.len() < expected_w || ext.len() < needed_ext {
+        return;
+    }
+
+    let w_used = &w_blk[..expected_w];
+    let acc_used = &mut acc_tile[..frames];
+    let frame_step = stride * in_c;
+    let (acc_chunks6, acc_rem6) = acc_used.as_chunks_mut::<6>();
+    for (chunk_idx, acc6) in acc_chunks6.iter_mut().enumerate() {
+        let ext_off = chunk_idx * 6 * frame_step;
+        conv1d_f32_fma_16oc_strided_chunk::<6>(
+            w_used,
+            &ext[ext_off..],
+            in_c,
+            kernel,
+            stride,
+            dilation,
+            acc6,
+        );
+    }
+
+    let f_rem6 = acc_chunks6.len() * 6;
+    let (acc_chunks4, acc_rem4) = acc_rem6.as_chunks_mut::<4>();
+    if let Some(acc4) = acc_chunks4.first_mut() {
+        conv1d_f32_fma_16oc_strided_chunk::<4>(
+            w_used,
+            &ext[f_rem6 * frame_step..],
+            in_c,
+            kernel,
+            stride,
+            dilation,
+            acc4,
+        );
+    }
+
+    let f_rem4 = f_rem6 + acc_chunks4.len() * 4;
+    match acc_rem4.len() {
+        3 => {
+            if let Some(acc3) = acc_rem4.first_chunk_mut::<3>() {
+                conv1d_f32_fma_16oc_strided_chunk::<3>(
+                    w_used,
+                    &ext[f_rem4 * frame_step..],
+                    in_c,
+                    kernel,
+                    stride,
+                    dilation,
+                    acc3,
+                );
+            }
+        }
+        2 => {
+            if let Some(acc2) = acc_rem4.first_chunk_mut::<2>() {
+                conv1d_f32_fma_16oc_strided_chunk::<2>(
+                    w_used,
+                    &ext[f_rem4 * frame_step..],
+                    in_c,
+                    kernel,
+                    stride,
+                    dilation,
+                    acc2,
+                );
+            }
+        }
+        1 => {
+            if let Some(acc1) = acc_rem4.first_chunk_mut::<1>() {
+                conv1d_f32_fma_16oc_strided_chunk::<1>(
+                    w_used,
+                    &ext[f_rem4 * frame_step..],
+                    in_c,
+                    kernel,
+                    stride,
+                    dilation,
+                    acc1,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Strided 1D convolution micro-kernel mirrors public safe entry point signature."
+)]
+pub(crate) fn conv1d_f32_fma_16oc_strided(
+    w_blk: &[f32],
+    ext: &[f32],
+    in_c: usize,
+    kernel: usize,
+    stride: usize,
+    dilation: usize,
+    frames: usize,
+    acc_tile: &mut [[f32; 16]],
+) {
+    conv1d_f32_fma_16oc_strided_portable(
+        w_blk, ext, in_c, kernel, stride, dilation, frames, acc_tile,
+    );
+}
