@@ -96,11 +96,12 @@ fn load_codebook_pair(
         hidden,
         cp_vocab,
     )?;
-    let head = weights.projection_repacked_q4_k(
+    let mut head = weights.projection_repacked_q4_k(
         &format!("code_pred.lm_head.{codebook}.weight"),
         cp_hidden,
         cp_vocab,
     )?;
+    head.repack_q8_0_if_aligned();
     Ok((embd, head))
 }
 
@@ -114,7 +115,7 @@ impl Geometry {
         let q = self.heads * self.head_dim;
         let kv = self.kv_heads * self.head_dim;
         let name = format!("{prefix}.blk.{index}");
-        Ok(QwenDecoderLayer {
+        let mut layer = QwenDecoderLayer {
             attn_norm_w: weights.tensor_f32(&format!("{name}.attn_norm.weight"), &[self.hidden])?,
             q_proj: weights.projection_repacked_q4_k(
                 &format!("{name}.attn_q.weight"),
@@ -156,7 +157,21 @@ impl Geometry {
                 self.intermediate,
                 self.hidden,
             )?,
-        })
+        };
+        if prefix == "code_pred" {
+            for proj in [
+                &mut layer.q_proj,
+                &mut layer.k_proj,
+                &mut layer.v_proj,
+                &mut layer.o_proj,
+                &mut layer.gate_proj,
+                &mut layer.up_proj,
+                &mut layer.down_proj,
+            ] {
+                proj.repack_q8_0_if_aligned();
+            }
+        }
+        Ok(layer)
     }
 }
 
@@ -496,6 +511,7 @@ impl Talker {
                         geometry.hidden,
                         predictor_geometry.hidden,
                     )?;
+                    projection.repack_q8_0_if_aligned();
                     projection.bias = Some(
                         weights
                             .tensor_f32("code_pred.mtp_proj.bias", &[predictor_geometry.hidden])?,

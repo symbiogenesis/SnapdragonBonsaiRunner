@@ -256,6 +256,11 @@ pub enum WeightQuantization {
         /// Repacked 8-row `Q4_K` superblock strips (`1184` bytes per 8x256 tile).
         bytes: Vec<u8>,
     },
+    /// 8-row repacked finite-scale `Q8_0` matrix tuned for `SDOT` / `I8MM` kernels (`out_dim % 8 == 0`).
+    RepackedQ8_0_8 {
+        /// Repacked 8-row `Q8_0` block strips (`272` bytes per 8x32 tile).
+        bytes: Vec<u8>,
+    },
     /// 32-element block-quantized `Q8_0` weights.
     Q8_0 {
         /// Quantized 32-weight blocks.
@@ -909,9 +914,9 @@ impl LinearProjection {
             WeightQuantization::F32(_)
             | WeightQuantization::Q8_0 { .. }
             | WeightQuantization::Packed { .. } => None,
-            WeightQuantization::MappedPacked { .. } | WeightQuantization::RepackedQ4K8 { .. } => {
-                None
-            }
+            WeightQuantization::MappedPacked { .. }
+            | WeightQuantization::RepackedQ4K8 { .. }
+            | WeightQuantization::RepackedQ8_0_8 { .. } => None,
         }
     }
 
@@ -1036,6 +1041,21 @@ impl LinearProjection {
                         return Err(io::Error::new(
                             io::ErrorKind::Unsupported,
                             "Repacked Q4_K weights require ARM64 dotprod support.",
+                        ));
+                    }
+                }
+                WeightQuantization::RepackedQ8_0_8 { bytes } => {
+                    if !dispatch_repacked_q8_0_8(
+                        bytes,
+                        self.in_dim,
+                        input,
+                        self.bias.as_deref(),
+                        worker_count,
+                        out,
+                    ) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "Repacked Q8_0 weights require ARM64 dotprod support.",
                         ));
                     }
                 }
@@ -1171,6 +1191,29 @@ impl LinearProjection {
             self.out_dim,
         ) {
             self.weight = WeightQuantization::RepackedQ4K8 { bytes: repacked };
+        }
+    }
+
+    /// Convert eligible finite-scale `Q8_0` projections (`out_dim % 8 == 0`, `in_dim % 32 == 0`)
+    /// to interleaved 8-row layout tuned for ARM64 `SDOT` / `I8MM` kernels.
+    ///
+    /// Leaves the projection untouched if any `binary16` scale is non-finite.
+    pub fn repack_q8_0_if_aligned(&mut self) {
+        if !bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect().dotprod
+            || !self.out_dim.is_multiple_of(8)
+            || !self.in_dim.is_multiple_of(32)
+        {
+            return;
+        }
+        let Some((8, bytes)) = self.weight.packed_slice() else {
+            return;
+        };
+        if let Some(repacked) = bonsai_windows_process::quant_kernels::repack_q8_0_8rows(
+            bytes,
+            self.in_dim,
+            self.out_dim,
+        ) {
+            self.weight = WeightQuantization::RepackedQ8_0_8 { bytes: repacked };
         }
     }
 
@@ -1380,14 +1423,17 @@ mod quant_dispatch {
     use bonsai_windows_process::quant_kernels::{
         Arm64QuantCaps, Q4_K_BLOCK_BYTES, Q4_K_REPACK8_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
         Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, Q8_0ActBlock, Q8_0ActPanel8, Q8_KActBlock,
-        Q8_KActPanel8, QK_K, dot_q4_k_4rows, dot_q4_k_repacked8,
+        Q8_KActPanel8, QK_K, REPACKED_Q8_0_8_BLOCK_BYTES, dot_q4_k_4rows, dot_q4_k_repacked8,
         dot_q4_k_repacked8_finite_scales_strips, dot_q4_k_row, dot_q6_k_4rows, dot_q6_k_8rows,
         dot_q6_k_row, dot_q8_0_4rows, dot_q8_0_8rows, dot_q8_0_8rows_finite_scales_strips,
-        dot_q8_0_row, gemm_q4_k_4x2, gemm_q4_k_repacked8_8x_panels, gemm_q4_k_repacked8_8x2,
-        gemm_q4_k_repacked8_8x4, gemm_q4_k_repacked8_8x8, gemm_q6_k_4x2, gemm_q6_k_8x_panels,
-        gemm_q6_k_8x2, gemm_q6_k_8x4, gemm_q6_k_8x8, gemm_q8_0_4x2, gemm_q8_0_8x_panels,
-        gemm_q8_0_8x2, gemm_q8_0_8x4, gemm_q8_0_8x8, pack_q8_0_act_panels8, pack_q8_k_act_panels8,
-        quantize_row_q8_0, quantize_row_q8_k,
+        dot_q8_0_row, dot_repacked_q8_0_8_finite_scales, dot_repacked_q8_0_8_finite_scales_strips,
+        gemm_q4_k_4x2, gemm_q4_k_repacked8_8x_panels_finite_scales, gemm_q4_k_repacked8_8x2,
+        gemm_q4_k_repacked8_8x4, gemm_q4_k_repacked8_8x8, gemm_q6_k_4x2,
+        gemm_q6_k_8x_panels_finite_scales, gemm_q6_k_8x2, gemm_q6_k_8x4, gemm_q6_k_8x8,
+        gemm_q8_0_4x2, gemm_q8_0_8x_panels_finite_scales, gemm_q8_0_8x2, gemm_q8_0_8x4,
+        gemm_q8_0_8x8, gemm_repacked_q8_0_8_8x_panels_finite_scales, gemm_repacked_q8_0_8_8x2,
+        gemm_repacked_q8_0_8_8x4, gemm_repacked_q8_0_8_8x8, pack_q8_0_act_panels8,
+        pack_q8_k_act_panels8, quantize_row_q8_0, quantize_row_q8_k,
     };
 
     use super::{
@@ -1791,16 +1837,19 @@ mod quant_dispatch {
         true
     }
 
-    pub(super) fn add_repacked_rows(
+    fn add_repacked_strip_rows<Act>(
         bytes: &[u8],
         in_dim: usize,
-        caps: Arm64QuantCaps,
-        qk_act: &[Q8_KActBlock],
+        block_elems: usize,
+        strip_block_bytes: usize,
+        act: &[Act],
         bias: Option<&[f32]>,
         start_row: usize,
         dst: &mut [f32],
+        dot_strips: impl Fn(&[u8], usize, usize, &[Act], &mut [f32]),
+        dot_strip: impl Fn(&[u8], &[Act]) -> [f32; 8],
     ) {
-        let strip_bytes = (in_dim / QK_K) * Q4_K_REPACK8_BLOCK_BYTES;
+        let strip_bytes = (in_dim / block_elems) * strip_block_bytes;
         let mut idx = 0_usize;
         while idx < dst.len() {
             let abs_row = start_row + idx;
@@ -1809,13 +1858,11 @@ mod quant_dispatch {
             if lane == 0 && dst.len() - idx >= 8 {
                 let strip_count = (dst.len() - idx) / 8;
                 let take = strip_count * 8;
-                // RepackedQ4K8 scales are validated finite at load time via repack_q4_k_8rows.
-                dot_q4_k_repacked8_finite_scales_strips(
-                    caps,
+                dot_strips(
                     bytes,
                     strip_idx,
                     strip_count,
-                    qk_act,
+                    act,
                     &mut dst[idx..idx + take],
                 );
                 if let Some(b_slice) = bias {
@@ -1830,7 +1877,7 @@ mod quant_dispatch {
                 continue;
             }
             let strip = &bytes[strip_idx * strip_bytes..(strip_idx + 1) * strip_bytes];
-            let vals = dot_q4_k_repacked8(caps, strip, qk_act);
+            let vals = dot_strip(strip, act);
             let take = (8 - lane).min(dst.len() - idx);
             if let Some(b_slice) = bias {
                 for k in 0..take {
@@ -1841,6 +1888,72 @@ mod quant_dispatch {
             }
             idx += take;
         }
+    }
+
+    pub(super) fn add_repacked_rows(
+        bytes: &[u8],
+        in_dim: usize,
+        caps: Arm64QuantCaps,
+        qk_act: &[Q8_KActBlock],
+        bias: Option<&[f32]>,
+        start_row: usize,
+        dst: &mut [f32],
+    ) {
+        // RepackedQ4K8 scales are validated finite at load time via repack_q4_k_8rows.
+        add_repacked_strip_rows(
+            bytes,
+            in_dim,
+            QK_K,
+            Q4_K_REPACK8_BLOCK_BYTES,
+            qk_act,
+            bias,
+            start_row,
+            dst,
+            |data, strip_idx, strip_count, act, out| {
+                dot_q4_k_repacked8_finite_scales_strips(
+                    caps,
+                    data,
+                    strip_idx,
+                    strip_count,
+                    act,
+                    out,
+                );
+            },
+            |strip, act| dot_q4_k_repacked8(caps, strip, act),
+        );
+    }
+
+    pub(super) fn add_repacked_q8_0_8_rows(
+        bytes: &[u8],
+        in_dim: usize,
+        caps: Arm64QuantCaps,
+        q8_act: &[Q8_0ActBlock],
+        bias: Option<&[f32]>,
+        start_row: usize,
+        dst: &mut [f32],
+    ) {
+        // RepackedQ8_0_8 scales are validated finite at repack time via repack_q8_0_8rows.
+        add_repacked_strip_rows(
+            bytes,
+            in_dim,
+            Q8_0_BLOCK_ELEMENTS,
+            REPACKED_Q8_0_8_BLOCK_BYTES,
+            q8_act,
+            bias,
+            start_row,
+            dst,
+            |data, strip_idx, strip_count, act, out| {
+                dot_repacked_q8_0_8_finite_scales_strips(
+                    caps,
+                    data,
+                    strip_idx,
+                    strip_count,
+                    act,
+                    out,
+                );
+            },
+            |strip, act| dot_repacked_q8_0_8_finite_scales(caps, strip, act),
+        );
     }
 
     pub(super) fn dispatch_repacked_q4_k(
@@ -1864,10 +1977,32 @@ mod quant_dispatch {
         true
     }
 
+    pub(super) fn dispatch_repacked_q8_0_8(
+        bytes: &[u8],
+        in_dim: usize,
+        input: &[f32],
+        bias: Option<&[f32]>,
+        worker_count: usize,
+        out: &mut [f32],
+    ) -> bool {
+        let caps = Arm64QuantCaps::detect();
+        if !caps.dotprod {
+            return false;
+        }
+        with_q8_0_act(input, |act| {
+            run_row_chunks_aligned(out, worker_count, 8, |start_row, dst| {
+                let b_slice = bias.map(|b| &b[start_row..start_row + dst.len()]);
+                add_repacked_q8_0_8_rows(bytes, in_dim, caps, act, b_slice, start_row, dst);
+            });
+        });
+        true
+    }
+
     #[derive(Clone, Copy)]
     pub(super) enum GroupKind<'a> {
         Packed { ggml_type: u32, bytes: &'a [u8] },
-        Repacked(&'a [u8]),
+        RepackedQ4K8(&'a [u8]),
+        RepackedQ8_0_8(&'a [u8]),
     }
 
     pub(super) fn classify_group_proj(proj: &LinearProjection) -> Option<GroupKind<'_>> {
@@ -1876,10 +2011,11 @@ mod quant_dispatch {
         {
             return Some(GroupKind::Packed { ggml_type, bytes });
         }
-        if let WeightQuantization::RepackedQ4K8 { bytes } = &proj.weight {
-            return Some(GroupKind::Repacked(bytes));
+        match &proj.weight {
+            WeightQuantization::RepackedQ4K8 { bytes } => Some(GroupKind::RepackedQ4K8(bytes)),
+            WeightQuantization::RepackedQ8_0_8 { bytes } => Some(GroupKind::RepackedQ8_0_8(bytes)),
+            _ => None,
         }
-        None
     }
 
     #[expect(
@@ -1957,9 +2093,9 @@ mod quant_dispatch {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "Executes repacked 8-row Q4_K batched GEMM with optional Q8_KActPanel8s over an arbitrary row sub-range."
+        reason = "Executes repacked 8-row strip batched GEMM with optional 8-token panels over an arbitrary row sub-range."
     )]
-    fn add_batch_repacked_gemm(
+    fn add_batch_repacked_strip_gemm<Act, Panel>(
         dst: &mut [f32],
         bytes: &[u8],
         bias: Option<&[f32]>,
@@ -1967,13 +2103,19 @@ mod quant_dispatch {
         seq_len: usize,
         local_row_start: usize,
         rows_here: usize,
-        caps: Arm64QuantCaps,
-        acts: &[Q8_KActBlock],
-        qk_panels: &[Q8_KActPanel8],
+        block_elems: usize,
+        strip_block_bytes: usize,
+        acts: &[Act],
+        panels: &[Panel],
         panel_count: usize,
+        gemm_panels: impl Fn(&[u8], &[Panel], usize, usize, &mut [f32], usize),
+        gemm_8x8: impl Fn(&[u8], [&[Act]; 8]) -> [[f32; 8]; 8],
+        gemm_8x4: impl Fn(&[u8], [&[Act]; 4]) -> [[f32; 4]; 8],
+        gemm_8x2: impl Fn(&[u8], [&[Act]; 2]) -> [[f32; 2]; 8],
+        dot_8rows: impl Fn(&[u8], &[Act]) -> [f32; 8],
     ) {
-        let blocks_per_tok = in_dim / QK_K;
-        let strip_bytes = blocks_per_tok * Q4_K_REPACK8_BLOCK_BYTES;
+        let blocks_per_tok = in_dim / block_elems;
+        let strip_bytes = blocks_per_tok * strip_block_bytes;
         let mut idx = 0_usize;
         while idx < rows_here {
             let abs_row = local_row_start + idx;
@@ -1984,10 +2126,9 @@ mod quant_dispatch {
             let mut t = 0_usize;
             if panel_count > 0 && lane == 0 && take == 8 {
                 let tokens = panel_count * 8;
-                gemm_q4_k_repacked8_8x_panels(
-                    caps,
+                gemm_panels(
                     strip,
-                    qk_panels,
+                    panels,
                     panel_count,
                     blocks_per_tok,
                     &mut dst[idx * seq_len..],
@@ -2005,10 +2146,10 @@ mod quant_dispatch {
                 t = tokens;
             } else {
                 while t + 8 <= seq_len {
-                    let acts: [&[Q8_KActBlock]; 8] = std::array::from_fn(|k| {
+                    let tile_acts: [&[Act]; 8] = std::array::from_fn(|k| {
                         &acts[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
                     });
-                    let tile = gemm_q4_k_repacked8_8x8(caps, strip, acts);
+                    let tile = gemm_8x8(strip, tile_acts);
                     for k in 0..take {
                         let base = (idx + k) * seq_len + t;
                         if let Some(b_slice) = bias {
@@ -2024,10 +2165,10 @@ mod quant_dispatch {
                 }
             }
             if t + 4 <= seq_len {
-                let acts: [&[Q8_KActBlock]; 4] = std::array::from_fn(|k| {
+                let tile_acts: [&[Act]; 4] = std::array::from_fn(|k| {
                     &acts[(t + k) * blocks_per_tok..(t + k + 1) * blocks_per_tok]
                 });
-                let tile = gemm_q4_k_repacked8_8x4(caps, strip, acts);
+                let tile = gemm_8x4(strip, tile_acts);
                 for k in 0..take {
                     let base = (idx + k) * seq_len + t;
                     if let Some(b_slice) = bias {
@@ -2044,7 +2185,7 @@ mod quant_dispatch {
             if t + 2 <= seq_len {
                 let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
                 let a1 = &acts[(t + 1) * blocks_per_tok..(t + 2) * blocks_per_tok];
-                let tile = gemm_q4_k_repacked8_8x2(caps, strip, a0, a1);
+                let tile = gemm_8x2(strip, [a0, a1]);
                 for k in 0..take {
                     let base = (idx + k) * seq_len + t;
                     if let Some(b_slice) = bias {
@@ -2060,7 +2201,7 @@ mod quant_dispatch {
             }
             if t < seq_len {
                 let a0 = &acts[t * blocks_per_tok..(t + 1) * blocks_per_tok];
-                let col = dot_q4_k_repacked8(caps, strip, a0);
+                let col = dot_8rows(strip, a0);
                 for k in 0..take {
                     let val = col[lane + k];
                     dst[(idx + k) * seq_len + t] = if let Some(b_slice) = bias {
@@ -2325,7 +2466,8 @@ mod quant_dispatch {
                     q8_act,
                     q8_panel_count,
                     |r, out_rows, stride| {
-                        gemm_q8_0_8x_panels(
+                        // Q8_0 scales are validated finite at load time via weights::validate_packed_parallel.
+                        gemm_q8_0_8x_panels_finite_scales(
                             caps,
                             r,
                             q8_panels,
@@ -2377,7 +2519,8 @@ mod quant_dispatch {
                     qk_act,
                     qk_panel_count,
                     |r, out_rows, stride| {
-                        gemm_q6_k_8x_panels(
+                        // Q6_K scales are validated finite at load time via weights::validate_packed_parallel.
+                        gemm_q6_k_8x_panels_finite_scales(
                             caps,
                             r,
                             qk_panels,
@@ -2396,7 +2539,7 @@ mod quant_dispatch {
                     |r, a0| dot_q6_k_row(caps, r, a0),
                 );
             }
-            GroupKind::Repacked(bytes) => add_batch_repacked_gemm(
+            GroupKind::RepackedQ4K8(bytes) => add_batch_repacked_strip_gemm(
                 dst,
                 bytes,
                 bias,
@@ -2404,10 +2547,43 @@ mod quant_dispatch {
                 seq_len,
                 local_row,
                 rows_here,
-                caps,
+                QK_K,
+                Q4_K_REPACK8_BLOCK_BYTES,
                 qk_act,
                 qk_panels,
                 qk_panel_count,
+                |strip, panels, pc, blocks, out_rows, stride| {
+                    gemm_q4_k_repacked8_8x_panels_finite_scales(
+                        caps, strip, panels, pc, blocks, out_rows, stride,
+                    );
+                },
+                |strip, a| gemm_q4_k_repacked8_8x8(caps, strip, a),
+                |strip, a| gemm_q4_k_repacked8_8x4(caps, strip, a),
+                |strip, [a0, a1]| gemm_q4_k_repacked8_8x2(caps, strip, a0, a1),
+                |strip, a| dot_q4_k_repacked8(caps, strip, a),
+            ),
+            GroupKind::RepackedQ8_0_8(bytes) => add_batch_repacked_strip_gemm(
+                dst,
+                bytes,
+                bias,
+                in_dim,
+                seq_len,
+                local_row,
+                rows_here,
+                Q8_0_BLOCK_ELEMENTS,
+                REPACKED_Q8_0_8_BLOCK_BYTES,
+                q8_act,
+                q8_panels,
+                q8_panel_count,
+                |strip, panels, pc, blocks, out_rows, stride| {
+                    gemm_repacked_q8_0_8_8x_panels_finite_scales(
+                        caps, strip, panels, pc, blocks, out_rows, stride,
+                    );
+                },
+                |strip, a| gemm_repacked_q8_0_8_8x8(caps, strip, a),
+                |strip, a| gemm_repacked_q8_0_8_8x4(caps, strip, a),
+                |strip, a| gemm_repacked_q8_0_8_8x2(caps, strip, a),
+                |strip, a| dot_repacked_q8_0_8_finite_scales(caps, strip, a),
             ),
         }
     }
@@ -2446,13 +2622,13 @@ mod quant_dispatch {
                 return false;
             };
             match kind {
-                GroupKind::Packed { ggml_type: 8, .. } => {
+                GroupKind::Packed { ggml_type: 8, .. } | GroupKind::RepackedQ8_0_8(_) => {
                     need_q8 = true;
                     if caps.i8mm && panel_count > 0 && proj.out_dim >= 8 {
                         need_q8_panels = true;
                     }
                 }
-                GroupKind::Repacked(_) | GroupKind::Packed { ggml_type: 14, .. } => {
+                GroupKind::RepackedQ4K8(_) | GroupKind::Packed { ggml_type: 14, .. } => {
                     need_qk = true;
                     if caps.i8mm && panel_count > 0 && proj.out_dim >= 8 {
                         need_qk_panels = true;
@@ -2627,7 +2803,10 @@ mod quant_dispatch {
         let in_dim = proj.in_dim;
         let out_dim = proj.out_dim;
         let bias = proj.bias.as_deref();
-        let is_q8 = matches!(kind, GroupKind::Packed { ggml_type: 8, .. });
+        let is_q8 = matches!(
+            kind,
+            GroupKind::Packed { ggml_type: 8, .. } | GroupKind::RepackedQ8_0_8(_)
+        );
         let q8_blocks_per_tok = in_dim / Q8_0_BLOCK_ELEMENTS;
         let qk_blocks_per_tok = in_dim / QK_K;
         let panel_count = seq_len / 8;
@@ -2649,7 +2828,7 @@ mod quant_dispatch {
             };
         let qk_panel_count = if matches!(
             kind,
-            GroupKind::Repacked(_) | GroupKind::Packed { ggml_type: 14, .. }
+            GroupKind::RepackedQ4K8(_) | GroupKind::Packed { ggml_type: 14, .. }
         ) && caps.i8mm
             && panel_count > 0
             && out_dim >= 8
@@ -2664,7 +2843,8 @@ mod quant_dispatch {
         let effective_workers = batch_worker_budget(worker_count, out_dim);
         let row_workers_active = effective_workers.min(out_dim.max(1));
         let row_align = match kind {
-            GroupKind::Repacked(_)
+            GroupKind::RepackedQ4K8(_)
+            | GroupKind::RepackedQ8_0_8(_)
             | GroupKind::Packed {
                 ggml_type: 8 | 14, ..
             } => 8,
@@ -2767,6 +2947,7 @@ mod quant_dispatch {
 
 use quant_dispatch::{
     dispatch_batch_quant_kernels, dispatch_packed_quant_kernels, dispatch_repacked_q4_k,
+    dispatch_repacked_q8_0_8,
 };
 
 const TALKER_DECODE_AUTO_CAP: usize = 8;
@@ -2831,9 +3012,9 @@ fn with_code_predictor_scope<R>(body: impl FnOnce() -> R) -> R {
 fn projection_weight_bytes(weight: &WeightQuantization) -> usize {
     match weight {
         WeightQuantization::F32(w) => w.len().saturating_mul(size_of::<f32>()),
-        WeightQuantization::Packed { bytes, .. } | WeightQuantization::RepackedQ4K8 { bytes } => {
-            bytes.len()
-        }
+        WeightQuantization::Packed { bytes, .. }
+        | WeightQuantization::RepackedQ4K8 { bytes }
+        | WeightQuantization::RepackedQ8_0_8 { bytes } => bytes.len(),
         WeightQuantization::MappedPacked { bytes, .. } => bytes.as_slice().len(),
         WeightQuantization::Q8_0 { blocks } => blocks.len().saturating_mul(size_of::<Q8Block>()),
         WeightQuantization::PQ2_0 {
@@ -2981,7 +3162,8 @@ fn forward_group_into(
                     break;
                 };
                 match kind {
-                    quant_dispatch::GroupKind::Packed { ggml_type: 8, .. } => need_q8 = true,
+                    quant_dispatch::GroupKind::Packed { ggml_type: 8, .. }
+                    | quant_dispatch::GroupKind::RepackedQ8_0_8(_) => need_q8 = true,
                     _ => need_qk = true,
                 }
                 segments[seg_count] = Some(Segment {
@@ -3043,9 +3225,15 @@ fn forward_group_into(
                                                 qk_slice, bias_slice, local_row, dst_slice,
                                             );
                                         }
-                                        quant_dispatch::GroupKind::Repacked(bytes) => {
+                                        quant_dispatch::GroupKind::RepackedQ4K8(bytes) => {
                                             quant_dispatch::add_repacked_rows(
                                                 bytes, seg.in_dim, caps, qk_slice, bias_slice,
+                                                local_row, dst_slice,
+                                            );
+                                        }
+                                        quant_dispatch::GroupKind::RepackedQ8_0_8(bytes) => {
+                                            quant_dispatch::add_repacked_q8_0_8_rows(
+                                                bytes, seg.in_dim, caps, q8_slice, bias_slice,
                                                 local_row, dst_slice,
                                             );
                                         }
@@ -7526,6 +7714,134 @@ mod tests {
                         proj.name
                     );
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn repacked_q8_0_8_matches_packed_q8_0_bit_exact_and_rejects_non_finite() -> std::io::Result<()>
+    {
+        let in_dim = 128_usize;
+        let out_dim = 24_usize;
+        let p_packed = make_packed_test_proj(
+            "code_pred.blk.0.attn_q.weight",
+            8,
+            in_dim,
+            out_dim,
+            19,
+            Some(
+                (0..out_dim)
+                    .map(|i| -0.025 * super::usize_to_f32((i % 7) + 1))
+                    .collect(),
+            ),
+        )?;
+        let mut p_repacked = p_packed.clone();
+        p_repacked.repack_q8_0_if_aligned();
+        if bonsai_windows_process::quant_kernels::Arm64QuantCaps::detect().dotprod {
+            assert!(matches!(
+                p_repacked.weight,
+                WeightQuantization::RepackedQ8_0_8 { .. }
+            ));
+        }
+
+        // Non-finite F16 scale must leave the projection as Packed instead of repacking.
+        let mut bad_bytes = match &p_packed.weight {
+            WeightQuantization::Packed { bytes, .. } => bytes.clone(),
+            _ => Vec::new(),
+        };
+        bad_bytes[0..2].copy_from_slice(&0x7e00_u16.to_le_bytes());
+        let mut p_bad = LinearProjection {
+            name: "bad.q8_0".to_string(),
+            in_dim,
+            out_dim,
+            weight: WeightQuantization::Packed {
+                ggml_type: 8,
+                bytes: bad_bytes,
+            },
+            bias: None,
+        };
+        p_bad.repack_q8_0_if_aligned();
+        assert!(matches!(p_bad.weight, WeightQuantization::Packed { .. }));
+
+        // Bit-exact 0-ULP parity across batch = 1, 2, 8 (and grouped dispatch) across worker counts.
+        let p_q8_nobias =
+            make_packed_test_proj("code_pred.blk.0.attn_k.weight", 8, in_dim, 16, 31, None)?;
+        let mut p_rep_nobias = p_q8_nobias.clone();
+        p_rep_nobias.repack_q8_0_if_aligned();
+
+        for batch in [1_usize, 2, 8] {
+            let inputs: Vec<f32> = (0..batch * in_dim)
+                .map(|i| f32::from(i16::try_from((i * 11 + 5) % 43).unwrap_or(0) - 21) * 0.03)
+                .collect();
+            for threads in [1_usize, 4] {
+                let mut want = Vec::new();
+                let mut got = Vec::new();
+                if batch == 1 {
+                    p_packed.forward_vec_into(&inputs, None, None, threads, &mut want)?;
+                    p_repacked.forward_vec_into(&inputs, None, None, threads, &mut got)?;
+                } else {
+                    p_packed.forward_batch_into(&inputs, batch, None, threads, &mut want)?;
+                    p_repacked.forward_batch_into(&inputs, batch, None, threads, &mut got)?;
+                }
+                assert_eq!(
+                    got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "RepackedQ8_0_8 single parity batch={batch} threads={threads}"
+                );
+
+                // Grouped dispatch parity across (RepackedQ8_0_8 + bias) and (RepackedQ8_0_8 no bias)
+                let mut want_a = Vec::new();
+                let mut want_b = Vec::new();
+                let mut got_a = Vec::new();
+                let mut got_b = Vec::new();
+                if batch == 1 {
+                    super::forward_group_into(
+                        &mut [
+                            (&p_packed, None, &mut want_a),
+                            (&p_q8_nobias, None, &mut want_b),
+                        ],
+                        &inputs,
+                        threads,
+                    )?;
+                    super::forward_group_into(
+                        &mut [
+                            (&p_repacked, None, &mut got_a),
+                            (&p_rep_nobias, None, &mut got_b),
+                        ],
+                        &inputs,
+                        threads,
+                    )?;
+                } else {
+                    LinearProjection::forward_batch_group_into(
+                        &mut [
+                            (&p_packed, None, &mut want_a),
+                            (&p_q8_nobias, None, &mut want_b),
+                        ],
+                        &inputs,
+                        batch,
+                        threads,
+                    )?;
+                    LinearProjection::forward_batch_group_into(
+                        &mut [
+                            (&p_repacked, None, &mut got_a),
+                            (&p_rep_nobias, None, &mut got_b),
+                        ],
+                        &inputs,
+                        batch,
+                        threads,
+                    )?;
+                }
+                assert_eq!(
+                    got_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "RepackedQ8_0_8 group_a parity batch={batch} threads={threads}"
+                );
+                assert_eq!(
+                    got_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "RepackedQ8_0_8 group_b parity batch={batch} threads={threads}"
+                );
             }
         }
         Ok(())

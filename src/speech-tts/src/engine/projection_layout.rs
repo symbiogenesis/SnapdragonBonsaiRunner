@@ -121,6 +121,22 @@ pub(super) fn validate(
                 bytes_per_row: strip_bytes,
             })
         }
+        WeightQuantization::RepackedQ8_0_8 { bytes } => {
+            let message = "Invalid 8-row repacked Q8_0 projection size.";
+            if !output.is_multiple_of(8) || !input.is_multiple_of(32) {
+                return Err(invalid(message));
+            }
+            let strips = output / 8;
+            let blocks_per_row = input / 32;
+            let strip_bytes = blocks_per_row
+                .checked_mul(bonsai_windows_process::quant_kernels::REPACKED_Q8_0_8_BLOCK_BYTES)
+                .ok_or_else(|| invalid(message))?;
+            rows(strip_bytes, strips, bytes.len(), message)?;
+            Ok(Layout {
+                groups_per_row: blocks_per_row,
+                bytes_per_row: strip_bytes,
+            })
+        }
         WeightQuantization::PQ2_0 {
             group_size,
             scales,

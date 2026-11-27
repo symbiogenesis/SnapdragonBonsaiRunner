@@ -259,6 +259,22 @@ impl TransformerLayer {
             gate.repack_q4_k_if_aligned();
         }
     }
+
+    fn repack_q8_0_if_aligned(&mut self) {
+        for proj in [
+            &mut self.q,
+            &mut self.k,
+            &mut self.v,
+            &mut self.output,
+            &mut self.up,
+            &mut self.down,
+        ] {
+            proj.repack_q8_0_if_aligned();
+        }
+        if let Some(gate) = &mut self.gate {
+            gate.repack_q8_0_if_aligned();
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -576,6 +592,7 @@ fn load_transformer_layer<S: CodecSource + ?Sized>(
         ffn_scale: weights.tensor_f32(&format!("{name}.ffn_scale"), &[hidden])?,
     };
     layer.repack_q4_k_if_aligned();
+    layer.repack_q8_0_if_aligned();
     Ok(layer)
 }
 
@@ -664,6 +681,7 @@ impl Transformer {
                 geom.hidden,
             )?;
             input_proj.repack_q4_k_if_aligned();
+            input_proj.repack_q8_0_if_aligned();
             let mut output_proj = biased_projection(
                 weights,
                 &format!("{}.output_proj", geom.prefix),
@@ -671,6 +689,7 @@ impl Transformer {
                 latent,
             )?;
             output_proj.repack_q4_k_if_aligned();
+            output_proj.repack_q8_0_if_aligned();
             Ok((
                 Some(input_proj),
                 Some(output_proj),
