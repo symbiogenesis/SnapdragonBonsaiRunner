@@ -3,8 +3,8 @@
 
 pub use bonsai_neon_dot::kquants::{
     Arm64QuantCaps, Q4_K_BLOCK_BYTES, Q4_K_REPACK8_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES,
-    Q8_0_BLOCK_ELEMENTS, Q8_0ActBlock, Q8_KActBlock, QK_K, dot_q4_k_4rows, dot_q4_k_repacked8,
-    dot_q4_k_row, dot_q6_k_4rows, dot_q6_k_row, dot_q8_0_4rows, dot_q8_0_row, gemm_q4_k_4x2,
+    Q8_0_BLOCK_ELEMENTS, Q8_0ActBlock, Q8_KActBlock, QK_K, dot_q4_k_4rows, dot_q4_k_row,
+    dot_q6_k_4rows, dot_q6_k_row, dot_q8_0_4rows, dot_q8_0_row, gemm_q4_k_4x2,
     gemm_q4_k_repacked8_8x2, gemm_q6_k_4x2, gemm_q8_0_4x2, quantize_row_q8_0, quantize_row_q8_k,
     repack_q4_k_8rows,
 };
@@ -13,6 +13,12 @@ pub use bonsai_neon_dot::{
     widen_f16_slice,
 };
 pub use bonsai_ternary::{checked_float_to_half, float_to_half, unpack_q4_k_scale_min};
+
+/// Computes an 8-row repacked `Q4_K` strip dot product (`0-ULP` vs `dot_q4_k_row`).
+#[must_use]
+pub fn dot_q4_k_repacked8(caps: Arm64QuantCaps, strip: &[u8], act: &[Q8_KActBlock]) -> [f32; 8] {
+    crate::native::quant_q8::dot_q4_k_repacked8(caps, strip, act)
+}
 
 /// Computes eight `Q8_0` row dot products while sharing activations per block (`0-ULP` vs `dot_q8_0_row`).
 #[must_use]
@@ -104,6 +110,30 @@ pub fn gemm_q6_k_8x2(
     acts: [&[Q8_KActBlock]; 2],
 ) -> [[f32; 2]; 8] {
     crate::native::quant_q8::gemm_q6_k_8x2(caps, rows, acts)
+}
+
+/// Computes `(dot(q0, k), dot(q1, k))` from a shared `binary16` key vector `k_f16`
+/// using baseline ARM64 `FCVTL`/`FCVTL2` widening and the exact 2-accumulator FMA +
+/// pair-lane reduction order of `speech-tts/src/numerics.rs`.
+///
+/// Returns `(0.0, 0.0)` when slice lengths do not match.
+#[must_use]
+pub fn dot_f16_pair_f32(q0: &[f32], q1: &[f32], k_f16: &[u16]) -> (f32, f32) {
+    crate::native::quant_q8::dot_f16_pair_f32(q0, q1, k_f16)
+}
+
+/// Accumulates `out0 += w0 * v` and `out1 += w1 * v` from a shared `binary16` value vector `v_f16`
+/// using baseline ARM64 `FCVTL`/`FCVTL2` widening and exact per-lane/tail `fma` rounding.
+///
+/// No-ops when slice lengths do not match.
+pub fn axpy_f16_pair_f32(
+    w0: f32,
+    w1: f32,
+    v_f16: &[u16],
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    crate::native::quant_q8::axpy_f16_pair_f32(w0, w1, v_f16, out0, out1);
 }
 
 #[cfg(test)]
@@ -811,5 +841,190 @@ mod tests {
             .map(|r| r.map(f32::to_bits)),
             [[0_u32; 8]; 8]
         );
+    }
+
+    #[test]
+    fn dot_q4_k_repacked8_shadow_matches_row_and_portable_edge_cases_bit_exact() {
+        let caps = Arm64QuantCaps::detect();
+        let port = Arm64QuantCaps::portable();
+
+        for blocks in [0_usize, 1, 2, 3, 5] {
+            let in_dim = blocks * QK_K;
+            let q4_rows: Vec<Vec<u8>> = (0..8).map(|r| make_q4_k_row(blocks, r + 5)).collect();
+            let flat_q4: Vec<u8> = q4_rows.iter().flat_map(|r| r.iter().copied()).collect();
+            let repacked = if blocks == 0 {
+                Vec::new()
+            } else {
+                repack_q4_k_8rows(&flat_q4, in_dim, 8).unwrap_or_default()
+            };
+            assert_eq!(repacked.len(), blocks * Q4_K_REPACK8_BLOCK_BYTES);
+
+            for t in 0..4 {
+                let act = make_edge_q8_k_act(blocks, t);
+                let nat = dot_q4_k_repacked8(caps, &repacked, &act);
+                let prt = dot_q4_k_repacked8(port, &repacked, &act);
+                assert_eq!(nat.map(f32::to_bits), prt.map(f32::to_bits));
+                for r in 0..8 {
+                    assert_eq!(
+                        nat[r].to_bits(),
+                        dot_q4_k_row(port, &q4_rows[r], &act).to_bits()
+                    );
+                }
+            }
+        }
+
+        let valid_strip = vec![0_u8; 2 * Q4_K_REPACK8_BLOCK_BYTES];
+        let act = make_edge_q8_k_act(2, 1);
+        assert_eq!(
+            dot_q4_k_repacked8(caps, &valid_strip[..valid_strip.len() - 1], &act).map(f32::to_bits),
+            [0_u32; 8]
+        );
+    }
+
+    #[test]
+    fn f16_kv_pair_dot_and_axpy_match_portable_and_numerics_order_bit_exact() {
+        let fma_dot_cases: &[(&[f32], &[f32], &[u16], f32)] = &[
+            (&[], &[], &[], 0.0),
+            (
+                &[
+                    16_777_216.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    -16_777_216.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.25,
+                ],
+                &[
+                    16_777_216.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    -16_777_216.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.25,
+                ],
+                &[0x3c00; 13],
+                0.25,
+            ),
+            (
+                &[16_777_216.0, 1.0, -16_777_216.0, 1.0],
+                &[16_777_216.0, 1.0, -16_777_216.0, 1.0],
+                &[0x3c00; 4],
+                1.0,
+            ),
+            (
+                &[1.0, 0.0, 0.0, 0.0, f32::from_bits(0x3f80_0001)],
+                &[1.0, 0.0, 0.0, 0.0, f32::from_bits(0x3f80_0001)],
+                &[0xbc00, 0x0000, 0x0000, 0x0000, 0x3bff],
+                f32::from_bits(0xb9ff_f002),
+            ),
+        ];
+        for &(q0, q1, k_f16, expected) in fma_dot_cases {
+            let nat = dot_f16_pair_f32(q0, q1, k_f16);
+            let prt = crate::native::quant_q8::dot_f16_pair_f32_portable(q0, q1, k_f16);
+            assert_eq!(nat.0.to_bits(), prt.0.to_bits());
+            assert_eq!(nat.1.to_bits(), prt.1.to_bits());
+            assert_eq!(nat.0.to_bits(), expected.to_bits());
+        }
+
+        const EDGE_F16: [u16; 12] = [
+            0x0000, // +0.0
+            0x8000, // -0.0
+            0x0001, // min positive subnormal
+            0x8001, // min negative subnormal
+            0x3c00, // 1.0
+            0xbc00, // -1.0
+            0x3bff, // 1 - 2^-11
+            0x3c01, // 1 + 2^-10
+            0x7bff, // max finite
+            0xfbff, // min finite
+            0x3555, // ~0.33325
+            0xb557, // ~-0.33374
+        ];
+
+        for len in 0..=35_usize {
+            let k_f16: Vec<u16> = (0..len)
+                .map(|i| EDGE_F16[(i * 5 + len) % EDGE_F16.len()])
+                .collect();
+            let q0: Vec<f32> = (0..len)
+                .map(|i| f32::from(i16::try_from((i * 13 + 3) % 41).unwrap_or(0) - 20) * 0.125)
+                .collect();
+            let q1: Vec<f32> = (0..len)
+                .map(|i| f32::from(i16::try_from((i * 7 + 11) % 37).unwrap_or(0) - 18) * 0.1875)
+                .collect();
+
+            let nat_dot = dot_f16_pair_f32(&q0, &q1, &k_f16);
+            let prt_dot = crate::native::quant_q8::dot_f16_pair_f32_portable(&q0, &q1, &k_f16);
+            assert_eq!(nat_dot.0.to_bits(), prt_dot.0.to_bits(), "len={len} dot0");
+            assert_eq!(nat_dot.1.to_bits(), prt_dot.1.to_bits(), "len={len} dot1");
+
+            let w0 = f32::from_bits(0x3f80_0001);
+            let w1 = -0.375_f32;
+            let mut out0_nat: Vec<f32> = (0..len).map(|i| -1.0 + f32::from(u8::try_from(i).unwrap_or(0)) * 0.0625).collect();
+            let mut out1_nat: Vec<f32> = (0..len).map(|i| 0.5 - f32::from(u8::try_from(i).unwrap_or(0)) * 0.03125).collect();
+            let mut out0_prt = out0_nat.clone();
+            let mut out1_prt = out1_nat.clone();
+
+            axpy_f16_pair_f32(w0, w1, &k_f16, &mut out0_nat, &mut out1_nat);
+            crate::native::quant_q8::axpy_f16_pair_f32_portable(
+                w0,
+                w1,
+                &k_f16,
+                &mut out0_prt,
+                &mut out1_prt,
+            );
+            assert_eq!(
+                out0_nat.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                out0_prt.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                "len={len} axpy0"
+            );
+            assert_eq!(
+                out1_nat.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                out1_prt.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+                "len={len} axpy1"
+            );
+        }
+
+        // Exceptional / NaN inputs preserve exact portable NaN payload and bit parity.
+        let special_k = [0x7c01_u16, 0xfc01, 0x7e00, 0x3c00, 0x7c00, 0xfc00, 0x0001, 0x8000, 0x7c01];
+        let sq0 = [1.0_f32; 9];
+        let sq1 = [2.0_f32; 9];
+        let nat_s = dot_f16_pair_f32(&sq0, &sq1, &special_k);
+        let prt_s = crate::native::quant_q8::dot_f16_pair_f32_portable(&sq0, &sq1, &special_k);
+        assert_eq!(nat_s.0.is_nan(), prt_s.0.is_nan());
+        assert_eq!(nat_s.1.is_nan(), prt_s.1.is_nan());
+
+        let mut ao0 = [0.0_f32; 9];
+        let mut ao1 = [0.0_f32; 9];
+        let mut po0 = [0.0_f32; 9];
+        let mut po1 = [0.0_f32; 9];
+        axpy_f16_pair_f32(1.0, 2.0, &special_k, &mut ao0, &mut ao1);
+        crate::native::quant_q8::axpy_f16_pair_f32_portable(1.0, 2.0, &special_k, &mut po0, &mut po1);
+        assert_eq!(ao0.map(f32::to_bits), po0.map(f32::to_bits));
+        assert_eq!(ao1.map(f32::to_bits), po1.map(f32::to_bits));
+
+        // Length mismatch returns zeros / no-ops.
+        assert_eq!(
+            dot_f16_pair_f32(&[1.0, 2.0], &[1.0], &[0x3c00, 0x3c00]),
+            (0.0, 0.0)
+        );
+        let mut untouched0 = [7.0_f32; 2];
+        let mut untouched1 = [9.0_f32; 1];
+        axpy_f16_pair_f32(1.0, 1.0, &[0x3c00, 0x3c00], &mut untouched0, &mut untouched1);
+        assert_eq!(untouched0.map(f32::to_bits), [7.0_f32.to_bits(); 2]);
+        assert_eq!(untouched1.map(f32::to_bits), [9.0_f32.to_bits(); 1]);
     }
 }
