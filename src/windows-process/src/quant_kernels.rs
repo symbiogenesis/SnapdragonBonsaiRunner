@@ -1,7 +1,9 @@
 //! Safe public boundary for ARM64 `SDOT` / `I8MM` / `FCVTL` / `FCVTN` quantized
 //! kernels with runtime CPU feature detection and exact portable fallbacks.
 
-pub use crate::native::quant_q8::{Q8_0ActPanel8, Q8_KActPanel8};
+pub use crate::native::quant_q8::{
+    Q8_0ActPanel8, Q8_KActPanel8, REPACKED_Q8_0_8_BLOCK_BYTES, RowMajorBand,
+};
 pub use bonsai_neon_dot::kquants::{
     Arm64QuantCaps, Q4_K_BLOCK_BYTES, Q4_K_REPACK8_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES,
     Q8_0_BLOCK_ELEMENTS, Q8_0ActBlock, Q8_KActBlock, QK_K, dot_q4_k_4rows, dot_q4_k_row,
@@ -275,6 +277,417 @@ pub fn axpy_f16_pair_f32(w0: f32, w1: f32, v_f16: &[u16], out0: &mut [f32], out1
 /// using ARM64 NEON `vmulq_laneq_f32` + `vaddq_f32` (`0-ULP` vs scalar).
 pub fn gemm_f32_nonfma_4x16(rows: [&[f32]; 4], act_panel: &[[f32; 16]], acc: &mut [[f32; 16]; 4]) {
     crate::native::quant_q8::gemm_f32_nonfma_4x16(rows, act_panel, acc);
+}
+
+/// Partitions a `[batch, output]` row-major output slice into disjoint mutable column bands.
+///
+/// Returns `None` if `out.len() != batch * output` or `band_cols.iter().sum() != output`.
+#[must_use]
+pub fn split_row_major_bands<'a>(
+    out: &'a mut [f32],
+    batch: usize,
+    output: usize,
+    band_cols: &[usize],
+) -> Option<Vec<RowMajorBand<'a>>> {
+    crate::native::quant_q8::split_row_major_bands(out, batch, output, band_cols)
+}
+
+/// Repacks an 8-row-aligned `Q8_0` weight matrix (`out_dim % 8 == 0`, `in_dim % 32 == 0`)
+/// into contiguous 8-row strip blocks (`REPACKED_Q8_0_8_BLOCK_BYTES = 272` bytes each).
+///
+/// Returns `None` if dimensions are unaligned, `src.len()` mismatches, or any `binary16`
+/// block scale is non-finite.
+#[must_use]
+pub fn repack_q8_0_8rows(src: &[u8], in_dim: usize, out_dim: usize) -> Option<Vec<u8>> {
+    crate::native::quant_q8::repack_q8_0_8rows(src, in_dim, out_dim)
+}
+
+/// Computes an 8-row repacked finite-scale `Q8_0` strip dot product (`0-ULP` vs `dot_q8_0_row`).
+#[must_use]
+pub fn dot_repacked_q8_0_8_finite_scales(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    act: &[Q8_0ActBlock],
+) -> [f32; 8] {
+    crate::native::quant_q8::dot_repacked_q8_0_8_finite_scales(caps, strip, act)
+}
+
+/// Computes `strip_count` contiguous 8-row repacked finite-scale `Q8_0` strips starting at
+/// `start_strip` with cross-strip linear prefetching (`0-ULP` vs `dot_q8_0_row`).
+pub fn dot_repacked_q8_0_8_finite_scales_strips(
+    caps: Arm64QuantCaps,
+    data: &[u8],
+    start_strip: usize,
+    strip_count: usize,
+    act: &[Q8_0ActBlock],
+    out: &mut [f32],
+) {
+    crate::native::quant_q8::dot_repacked_q8_0_8_finite_scales_strips(
+        caps,
+        data,
+        start_strip,
+        strip_count,
+        act,
+        out,
+    );
+}
+
+/// Computes an 8-row by 8-token repacked `Q8_0` strip tile (`I8MM` `SMMLA` or exact fallback).
+#[must_use]
+pub fn gemm_repacked_q8_0_8_8x8(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    acts: [&[Q8_0ActBlock]; 8],
+) -> [[f32; 8]; 8] {
+    crate::native::quant_q8::gemm_repacked_q8_0_8_8x8(caps, strip, acts)
+}
+
+/// Computes an 8-row by 4-token repacked `Q8_0` strip tile (`I8MM` `SMMLA` or exact fallback).
+#[must_use]
+pub fn gemm_repacked_q8_0_8_8x4(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    acts: [&[Q8_0ActBlock]; 4],
+) -> [[f32; 4]; 8] {
+    crate::native::quant_q8::gemm_repacked_q8_0_8_8x4(caps, strip, acts)
+}
+
+/// Computes an 8-row by 2-token repacked `Q8_0` strip tile (`I8MM` `SMMLA` or exact fallback).
+#[must_use]
+pub fn gemm_repacked_q8_0_8_8x2(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    acts: [&[Q8_0ActBlock]; 2],
+) -> [[f32; 2]; 8] {
+    crate::native::quant_q8::gemm_repacked_q8_0_8_8x2(caps, strip, acts)
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token finite-scale `Q8_0` GEMM over pre-packed
+/// `Q8_0ActPanel8`s (`0-ULP` vs `dot_q8_0_row`).
+pub fn gemm_q8_0_8x_panels_finite_scales(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    panels: &[Q8_0ActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_rows: &mut [f32],
+    row_stride: usize,
+) {
+    crate::native::quant_q8::gemm_q8_0_8x_panels_finite_scales(
+        caps,
+        rows,
+        panels,
+        panel_count,
+        blocks,
+        out_rows,
+        row_stride,
+    );
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token `Q8_0` panel GEMM, scattering directly
+/// into `[token * out_stride .. token * out_stride + 8]` with optional bias addition.
+///
+/// Returns `true` when every written output element is finite.
+pub fn gemm_q8_0_8x_panels_scatter_biased<const FINITE_SCALES: bool>(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    panels: &[Q8_0ActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_tokens: &mut [f32],
+    out_stride: usize,
+    bias: Option<[f32; 8]>,
+) -> bool {
+    crate::native::quant_q8::gemm_q8_0_8x_panels_scatter_biased::<FINITE_SCALES>(
+        caps,
+        rows,
+        panels,
+        panel_count,
+        blocks,
+        out_tokens,
+        out_stride,
+        bias,
+    )
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token `Q8_0` panel GEMM into a disjoint
+/// `RowMajorBand` slice at `local_col` with optional bias addition.
+///
+/// Returns `true` when every written output element is finite.
+pub fn gemm_q8_0_8x_panels_into_band<const FINITE_SCALES: bool>(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    panels: &[Q8_0ActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    band: &mut RowMajorBand<'_>,
+    local_col: usize,
+    bias: Option<[f32; 8]>,
+) -> bool {
+    crate::native::quant_q8::gemm_q8_0_8x_panels_into_band::<FINITE_SCALES>(
+        caps,
+        rows,
+        panels,
+        panel_count,
+        blocks,
+        band,
+        local_col,
+        bias,
+    )
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token repacked finite-scale `Q8_0` GEMM
+/// over pre-packed `Q8_0ActPanel8`s (`0-ULP` vs `dot_q8_0_row`).
+pub fn gemm_repacked_q8_0_8_8x_panels_finite_scales(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    panels: &[Q8_0ActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_rows: &mut [f32],
+    row_stride: usize,
+) {
+    crate::native::quant_q8::gemm_repacked_q8_0_8_8x_panels_finite_scales(
+        caps,
+        strip,
+        panels,
+        panel_count,
+        blocks,
+        out_rows,
+        row_stride,
+    );
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token repacked finite-scale `Q8_0` GEMM,
+/// scattering directly into `[token * out_stride .. token * out_stride + 8]` with optional bias.
+///
+/// Returns `true` when every written output element is finite.
+pub fn gemm_repacked_q8_0_8_8x_panels_finite_scales_scatter_biased(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    panels: &[Q8_0ActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_tokens: &mut [f32],
+    out_stride: usize,
+    bias: Option<[f32; 8]>,
+) -> bool {
+    crate::native::quant_q8::gemm_repacked_q8_0_8_8x_panels_finite_scales_scatter_biased(
+        caps,
+        strip,
+        panels,
+        panel_count,
+        blocks,
+        out_tokens,
+        out_stride,
+        bias,
+    )
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token repacked finite-scale `Q8_0` GEMM
+/// into a disjoint `RowMajorBand` slice at `local_col` with optional bias.
+///
+/// Returns `true` when every written output element is finite.
+pub fn gemm_repacked_q8_0_8_8x_panels_finite_scales_into_band(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    panels: &[Q8_0ActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    band: &mut RowMajorBand<'_>,
+    local_col: usize,
+    bias: Option<[f32; 8]>,
+) -> bool {
+    crate::native::quant_q8::gemm_repacked_q8_0_8_8x_panels_finite_scales_into_band(
+        caps,
+        strip,
+        panels,
+        panel_count,
+        blocks,
+        band,
+        local_col,
+        bias,
+    )
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token repacked finite-scale `Q4_K` strip GEMM
+/// over pre-packed `Q8_KActPanel8`s (`0-ULP` vs `dot_q4_k_row`).
+pub fn gemm_q4_k_repacked8_8x_panels_finite_scales(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    panels: &[Q8_KActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_rows: &mut [f32],
+    row_stride: usize,
+) {
+    crate::native::quant_q8::gemm_q4_k_repacked8_8x_panels_finite_scales(
+        caps,
+        strip,
+        panels,
+        panel_count,
+        blocks,
+        out_rows,
+        row_stride,
+    );
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token repacked `Q4_K` strip GEMM, scattering directly
+/// into `[token * out_stride .. token * out_stride + 8]` with optional bias addition.
+///
+/// Returns `true` when every written output element is finite.
+pub fn gemm_q4_k_repacked8_8x_panels_scatter_biased<const FINITE_SCALES: bool>(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    panels: &[Q8_KActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_tokens: &mut [f32],
+    out_stride: usize,
+    bias: Option<[f32; 8]>,
+) -> bool {
+    crate::native::quant_q8::gemm_q4_k_repacked8_8x_panels_scatter_biased::<FINITE_SCALES>(
+        caps,
+        strip,
+        panels,
+        panel_count,
+        blocks,
+        out_tokens,
+        out_stride,
+        bias,
+    )
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token repacked `Q4_K` strip GEMM into a disjoint
+/// `RowMajorBand` slice at `local_col` with optional bias addition.
+///
+/// Returns `true` when every written output element is finite.
+pub fn gemm_q4_k_repacked8_8x_panels_into_band<const FINITE_SCALES: bool>(
+    caps: Arm64QuantCaps,
+    strip: &[u8],
+    panels: &[Q8_KActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    band: &mut RowMajorBand<'_>,
+    local_col: usize,
+    bias: Option<[f32; 8]>,
+) -> bool {
+    crate::native::quant_q8::gemm_q4_k_repacked8_8x_panels_into_band::<FINITE_SCALES>(
+        caps,
+        strip,
+        panels,
+        panel_count,
+        blocks,
+        band,
+        local_col,
+        bias,
+    )
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token finite-scale `Q6_K` GEMM over pre-packed
+/// `Q8_KActPanel8`s (`0-ULP` vs `dot_q6_k_row`).
+pub fn gemm_q6_k_8x_panels_finite_scales(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    panels: &[Q8_KActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_rows: &mut [f32],
+    row_stride: usize,
+) {
+    crate::native::quant_q8::gemm_q6_k_8x_panels_finite_scales(
+        caps,
+        rows,
+        panels,
+        panel_count,
+        blocks,
+        out_rows,
+        row_stride,
+    );
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token `Q6_K` panel GEMM, scattering directly
+/// into `[token * out_stride .. token * out_stride + 8]` with optional bias addition.
+///
+/// Returns `true` when every written output element is finite.
+pub fn gemm_q6_k_8x_panels_scatter_biased<const FINITE_SCALES: bool>(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    panels: &[Q8_KActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    out_tokens: &mut [f32],
+    out_stride: usize,
+    bias: Option<[f32; 8]>,
+) -> bool {
+    crate::native::quant_q8::gemm_q6_k_8x_panels_scatter_biased::<FINITE_SCALES>(
+        caps,
+        rows,
+        panels,
+        panel_count,
+        blocks,
+        out_tokens,
+        out_stride,
+        bias,
+    )
+}
+
+/// Computes an 8-row by `(panel_count * 8)`-token `Q6_K` panel GEMM into a disjoint
+/// `RowMajorBand` slice at `local_col` with optional bias addition.
+///
+/// Returns `true` when every written output element is finite.
+pub fn gemm_q6_k_8x_panels_into_band<const FINITE_SCALES: bool>(
+    caps: Arm64QuantCaps,
+    rows: [&[u8]; 8],
+    panels: &[Q8_KActPanel8],
+    panel_count: usize,
+    blocks: usize,
+    band: &mut RowMajorBand<'_>,
+    local_col: usize,
+    bias: Option<[f32; 8]>,
+) -> bool {
+    crate::native::quant_q8::gemm_q6_k_8x_panels_into_band::<FINITE_SCALES>(
+        caps,
+        rows,
+        panels,
+        panel_count,
+        blocks,
+        band,
+        local_col,
+        bias,
+    )
+}
+
+/// Computes `(dot(q0, k), dot(q1, k))` from a shared load-validated finite `binary16` key
+/// vector `k_f16`, skipping per-iteration non-finite lane guards (`0-ULP` vs `dot_f16_pair_f32`).
+#[must_use]
+pub fn dot_f16_pair_f32_finite(q0: &[f32], q1: &[f32], k_f16: &[u16]) -> (f32, f32) {
+    crate::native::quant_q8::dot_f16_pair_f32_finite(q0, q1, k_f16)
+}
+
+/// Accumulates `out0 += w0 * v` and `out1 += w1 * v` from a shared load-validated finite `binary16`
+/// value vector `v_f16`, skipping per-iteration non-finite lane guards (`0-ULP` vs `axpy_f16_pair_f32`).
+pub fn axpy_f16_pair_f32_finite(
+    w0: f32,
+    w1: f32,
+    v_f16: &[u16],
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    crate::native::quant_q8::axpy_f16_pair_f32_finite(w0, w1, v_f16, out0, out1);
+}
+
+/// Computes a 4-query by 4-key scaled dot-product tile `scores[qi][ki] = dot(q[qi], k[ki]) / divisor`
+/// using ARM64 NEON FMA (`0-ULP` vs scalar FMA).
+#[must_use]
+pub fn dot_4x4_f32_fma(q: [&[f32]; 4], k: [&[f32]; 4], divisor: f32) -> [[f32; 4]; 4] {
+    crate::native::quant_q8::dot_4x4_f32_fma(q, k, divisor)
+}
+
+/// Accumulates a 4-group by 4-value AXPY tile `out[g] += sum_t weights[g][t] * v[t]`
+/// using ARM64 NEON FMA (`0-ULP` vs scalar FMA).
+pub fn axpy_4x4_f32_fma(out: &mut [&mut [f32]; 4], v: [&[f32]; 4], weights: [[f32; 4]; 4]) {
+    crate::native::quant_q8::axpy_4x4_f32_fma(out, v, weights);
 }
 
 #[cfg(test)]
@@ -1578,6 +1991,547 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    fn make_q8_0_rows(out_dim: usize, blocks: usize, seed: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(out_dim * blocks * Q8_0_BLOCK_BYTES);
+        for r in 0..out_dim {
+            out.extend_from_slice(&make_q8_0_row(blocks, seed + r * 3));
+        }
+        out
+    }
+
+    fn make_q8_0_act(blocks: usize, seed: usize) -> Vec<Q8_0ActBlock> {
+        let mut x = Vec::with_capacity(blocks * Q8_0_BLOCK_ELEMENTS);
+        for i in 0..(blocks * Q8_0_BLOCK_ELEMENTS) {
+            let v = f32::from(
+                i16::try_from(isize::try_from((seed * 19 + i * 29) % 211).unwrap_or(0) - 105)
+                    .unwrap_or(0),
+            ) * 0.031_25_f32;
+            x.push(v);
+        }
+        let mut out = vec![Q8_0ActBlock::default(); blocks];
+        quantize_row_q8_0(&x, &mut out);
+        out
+    }
+
+    #[test]
+    fn repacked_q8_0_8_validates_scales_and_matches_dot_q8_0_row_bit_exact() {
+        let port = Arm64QuantCaps::portable();
+        let dot = Arm64QuantCaps {
+            dotprod: true,
+            i8mm: false,
+        };
+        let i8mm = Arm64QuantCaps {
+            dotprod: true,
+            i8mm: true,
+        };
+        let modes = [("portable", port), ("dotprod", dot), ("i8mm", i8mm)];
+
+        // Non-finite scales (NaN, +Inf, -Inf) must be rejected by repack_q8_0_8rows.
+        for bad_bits in [0x7e00_u16, 0x7c00_u16, 0xfc00_u16] {
+            let mut src = make_q8_0_rows(8, 2, 11);
+            let bad = bad_bits.to_le_bytes();
+            let row_bytes = 2 * Q8_0_BLOCK_BYTES;
+            src[5 * row_bytes + Q8_0_BLOCK_BYTES..5 * row_bytes + Q8_0_BLOCK_BYTES + 2]
+                .copy_from_slice(&bad);
+            assert!(repack_q8_0_8rows(&src, 64, 8).is_none());
+        }
+
+        // Edge scales (0.0, -0.0, subnormals, max finite) are finite and accepted.
+        let edge_scales = [
+            0x0000_u16, 0x8000_u16, 0x0001_u16, 0x8001_u16, 0x03ff_u16, 0x7bff_u16, 0xfbff_u16,
+            0x3c00_u16,
+        ];
+        for blocks in [1_usize, 31, 32, 33, 64, 65] {
+            let in_dim = blocks * Q8_0_BLOCK_ELEMENTS;
+            let out_dim = 32_usize; // 4 strips
+            let mut src = make_q8_0_rows(out_dim, blocks, 17);
+            let row_bytes = blocks * Q8_0_BLOCK_BYTES;
+            for r in 0..8 {
+                let d_bytes = edge_scales[r].to_le_bytes();
+                src[r * row_bytes..r * row_bytes + 2].copy_from_slice(&d_bytes);
+            }
+            let Some(repacked) = repack_q8_0_8rows(&src, in_dim, out_dim) else {
+                assert!(false, "finite edge scales must repack cleanly");
+                return;
+            };
+            assert_eq!(
+                repacked.len(),
+                (out_dim / 8) * blocks * REPACKED_Q8_0_8_BLOCK_BYTES
+            );
+
+            let act = make_q8_0_act(blocks, 77);
+            let strip_bytes = blocks * REPACKED_Q8_0_8_BLOCK_BYTES;
+            for (mode_name, caps) in modes {
+                let first_strip =
+                    dot_repacked_q8_0_8_finite_scales(caps, &repacked[..strip_bytes], &act);
+                let mut all_out = vec![0.0_f32; out_dim];
+                dot_repacked_q8_0_8_finite_scales_strips(caps, &repacked, 0, 4, &act, &mut all_out);
+                for r in 0..8 {
+                    let row = &src[r * row_bytes..(r + 1) * row_bytes];
+                    let want = dot_q8_0_row(port, row, &act).to_bits();
+                    assert_eq!(
+                        first_strip[r].to_bits(),
+                        want,
+                        "repacked dot mismatch mode={mode_name} blocks={blocks} r={r}"
+                    );
+                }
+                for r in 0..out_dim {
+                    let row = &src[r * row_bytes..(r + 1) * row_bytes];
+                    let want = dot_q8_0_row(port, row, &act).to_bits();
+                    assert_eq!(
+                        all_out[r].to_bits(),
+                        want,
+                        "repacked strips mismatch mode={mode_name} blocks={blocks} r={r}"
+                    );
+                }
+            }
+
+            let acts: Vec<Vec<Q8_0ActBlock>> =
+                (0..8).map(|t| make_q8_0_act(blocks, 100 + t)).collect();
+            let act8: [&[Q8_0ActBlock]; 8] = [
+                &acts[0], &acts[1], &acts[2], &acts[3], &acts[4], &acts[5], &acts[6], &acts[7],
+            ];
+            let act4: [&[Q8_0ActBlock]; 4] = [&acts[0], &acts[1], &acts[2], &acts[3]];
+            let act2: [&[Q8_0ActBlock]; 2] = [&acts[0], &acts[1]];
+            for (mode_name, caps) in modes {
+                let got8 = gemm_repacked_q8_0_8_8x8(caps, &repacked[..strip_bytes], act8);
+                let got4 = gemm_repacked_q8_0_8_8x4(caps, &repacked[..strip_bytes], act4);
+                let got2 = gemm_repacked_q8_0_8_8x2(caps, &repacked[..strip_bytes], act2);
+                for r in 0..8 {
+                    let row = &src[r * row_bytes..(r + 1) * row_bytes];
+                    for t in 0..8 {
+                        let want = dot_q8_0_row(port, row, act8[t]).to_bits();
+                        assert_eq!(got8[r][t].to_bits(), want, "8x8 {mode_name} b={blocks}");
+                        if t < 4 {
+                            assert_eq!(got4[r][t].to_bits(), want, "8x4 {mode_name} b={blocks}");
+                        }
+                        if t < 2 {
+                            assert_eq!(got2[r][t].to_bits(), want, "8x2 {mode_name} b={blocks}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn panel_gemms_finite_scatter_and_bands_match_scalar_bit_exact() {
+        let port = Arm64QuantCaps::portable();
+        let dot = Arm64QuantCaps {
+            dotprod: true,
+            i8mm: false,
+        };
+        let i8mm = Arm64QuantCaps {
+            dotprod: true,
+            i8mm: true,
+        };
+        let modes = [("portable", port), ("dotprod", dot), ("i8mm", i8mm)];
+        let bias = [0.25_f32, -1.5, 0.125, 3.0, -0.75, 2.5, 0.0, -4.25];
+
+        for blocks in [1_usize, 31, 32, 33, 64, 65] {
+            // 1. Q8_0 and RepackedQ8_0_8
+            let q8_raw = make_q8_0_rows(8, blocks, 23);
+            let q8_row_bytes = blocks * Q8_0_BLOCK_BYTES;
+            let q8_refs: [&[u8]; 8] = [
+                &q8_raw[0..q8_row_bytes],
+                &q8_raw[q8_row_bytes..2 * q8_row_bytes],
+                &q8_raw[2 * q8_row_bytes..3 * q8_row_bytes],
+                &q8_raw[3 * q8_row_bytes..4 * q8_row_bytes],
+                &q8_raw[4 * q8_row_bytes..5 * q8_row_bytes],
+                &q8_raw[5 * q8_row_bytes..6 * q8_row_bytes],
+                &q8_raw[6 * q8_row_bytes..7 * q8_row_bytes],
+                &q8_raw[7 * q8_row_bytes..8 * q8_row_bytes],
+            ];
+            let Some(q8_repacked) = repack_q8_0_8rows(&q8_raw, blocks * Q8_0_BLOCK_ELEMENTS, 8)
+            else {
+                assert!(false, "repack_q8_0_8rows should succeed");
+                return;
+            };
+
+            // 2. Q4_K repacked and Q6_K
+            let q4_rows: Vec<Vec<u8>> = (0..8).map(|r| make_q4_k_row(blocks, 500 + r)).collect();
+            let q4_refs: [&[u8]; 8] = [
+                &q4_rows[0],
+                &q4_rows[1],
+                &q4_rows[2],
+                &q4_rows[3],
+                &q4_rows[4],
+                &q4_rows[5],
+                &q4_rows[6],
+                &q4_rows[7],
+            ];
+            let flat_q4: Vec<u8> = q4_rows.iter().flat_map(|r| r.iter().copied()).collect();
+            let Some(q4_repacked) = repack_q4_k_8rows(&flat_q4, blocks * QK_K, 8) else {
+                assert!(false, "repack_q4_k_8rows should succeed");
+                return;
+            };
+            let q6_rows: Vec<Vec<u8>> = (0..8).map(|r| make_q6_k_row(blocks, 900 + r)).collect();
+            let q6_refs: [&[u8]; 8] = [
+                &q6_rows[0],
+                &q6_rows[1],
+                &q6_rows[2],
+                &q6_rows[3],
+                &q6_rows[4],
+                &q6_rows[5],
+                &q6_rows[6],
+                &q6_rows[7],
+            ];
+
+            for panel_count in [1_usize, 7, 8, 9, 40, 42, 50] {
+                let tokens = panel_count * 8;
+                let mut flat_q8 = Vec::with_capacity(tokens * blocks);
+                let mut flat_qk = Vec::with_capacity(tokens * blocks);
+                for t in 0..tokens {
+                    flat_q8.extend_from_slice(&make_q8_0_act(blocks, 1_000 + t));
+                    flat_qk.extend(make_edge_q8_k_act(blocks, 2_000 + t));
+                }
+                let mut panels_q8 = vec![Q8_0ActPanel8::default(); panel_count * blocks];
+                pack_q8_0_act_panels8(&flat_q8, blocks, panel_count, &mut panels_q8);
+                let mut panels_qk = vec![Q8_KActPanel8::default(); panel_count * blocks];
+                pack_q8_k_act_panels8(&flat_qk, blocks, panel_count, &mut panels_qk);
+
+                // Precompute expected 0-ULP scalar outputs across all 8 rows and tokens.
+                let mut want_q8 = vec![0_u32; 8 * tokens];
+                let mut want_q4 = vec![0_u32; 8 * tokens];
+                let mut want_q6 = vec![0_u32; 8 * tokens];
+                for r in 0..8 {
+                    for t in 0..tokens {
+                        let a8 = &flat_q8[t * blocks..(t + 1) * blocks];
+                        let ak = &flat_qk[t * blocks..(t + 1) * blocks];
+                        want_q8[r * tokens + t] = dot_q8_0_row(port, q8_refs[r], a8).to_bits();
+                        want_q4[r * tokens + t] = dot_q4_k_row(port, q4_refs[r], ak).to_bits();
+                        want_q6[r * tokens + t] = dot_q6_k_row(port, q6_refs[r], ak).to_bits();
+                    }
+                }
+
+                let row_stride = tokens + 5;
+                let scatter_stride = 16_usize;
+                for (mode_name, caps) in modes {
+                    let mut rows_q8 = vec![0.0_f32; 8 * row_stride];
+                    let mut rows_rep8 = vec![0.0_f32; 8 * row_stride];
+                    let mut rows_q4 = vec![0.0_f32; 8 * row_stride];
+                    let mut rows_q6 = vec![0.0_f32; 8 * row_stride];
+
+                    gemm_q8_0_8x_panels_finite_scales(
+                        caps,
+                        q8_refs,
+                        &panels_q8,
+                        panel_count,
+                        blocks,
+                        &mut rows_q8,
+                        row_stride,
+                    );
+                    gemm_repacked_q8_0_8_8x_panels_finite_scales(
+                        caps,
+                        &q8_repacked,
+                        &panels_q8,
+                        panel_count,
+                        blocks,
+                        &mut rows_rep8,
+                        row_stride,
+                    );
+                    gemm_q4_k_repacked8_8x_panels_finite_scales(
+                        caps,
+                        &q4_repacked,
+                        &panels_qk,
+                        panel_count,
+                        blocks,
+                        &mut rows_q4,
+                        row_stride,
+                    );
+                    gemm_q6_k_8x_panels_finite_scales(
+                        caps,
+                        q6_refs,
+                        &panels_qk,
+                        panel_count,
+                        blocks,
+                        &mut rows_q6,
+                        row_stride,
+                    );
+
+                    let mut scat_q8 = vec![0.0_f32; tokens * scatter_stride];
+                    let mut scat_rep8 = vec![0.0_f32; tokens * scatter_stride];
+                    let mut scat_q4 = vec![0.0_f32; tokens * scatter_stride];
+                    let mut scat_q6 = vec![0.0_f32; tokens * scatter_stride];
+
+                    assert!(gemm_q8_0_8x_panels_scatter_biased::<true>(
+                        caps,
+                        q8_refs,
+                        &panels_q8,
+                        panel_count,
+                        blocks,
+                        &mut scat_q8[4..],
+                        scatter_stride,
+                        Some(bias),
+                    ));
+                    assert!(gemm_repacked_q8_0_8_8x_panels_finite_scales_scatter_biased(
+                        caps,
+                        &q8_repacked,
+                        &panels_q8,
+                        panel_count,
+                        blocks,
+                        &mut scat_rep8[4..],
+                        scatter_stride,
+                        Some(bias),
+                    ));
+                    assert!(gemm_q4_k_repacked8_8x_panels_scatter_biased::<true>(
+                        caps,
+                        &q4_repacked,
+                        &panels_qk,
+                        panel_count,
+                        blocks,
+                        &mut scat_q4[4..],
+                        scatter_stride,
+                        Some(bias),
+                    ));
+                    assert!(gemm_q6_k_8x_panels_scatter_biased::<true>(
+                        caps,
+                        q6_refs,
+                        &panels_qk,
+                        panel_count,
+                        blocks,
+                        &mut scat_q6[4..],
+                        scatter_stride,
+                        Some(bias),
+                    ));
+
+                    // Multi-band RowMajorBand epilogue test (split 16 cols into [8, 8], write second band).
+                    let mut band_buf = vec![0.0_f32; tokens * scatter_stride];
+                    if let Some(mut bands) =
+                        split_row_major_bands(&mut band_buf, tokens, scatter_stride, &[8, 8])
+                    {
+                        assert!(gemm_q8_0_8x_panels_into_band::<false>(
+                            caps,
+                            q8_refs,
+                            &panels_q8,
+                            panel_count,
+                            blocks,
+                            &mut bands[0],
+                            0,
+                            Some(bias),
+                        ));
+                        assert!(gemm_q4_k_repacked8_8x_panels_into_band::<false>(
+                            caps,
+                            &q4_repacked,
+                            &panels_qk,
+                            panel_count,
+                            blocks,
+                            &mut bands[1],
+                            0,
+                            None,
+                        ));
+                    } else {
+                        assert!(false, "split_row_major_bands must succeed");
+                    }
+
+                    for r in 0..8 {
+                        for t in 0..tokens {
+                            let ridx = r * row_stride + t;
+                            let w8 = want_q8[r * tokens + t];
+                            let w4 = want_q4[r * tokens + t];
+                            let w6 = want_q6[r * tokens + t];
+                            assert_eq!(
+                                rows_q8[ridx].to_bits(),
+                                w8,
+                                "q8 finite {mode_name} b={blocks} p={panel_count} r={r} t={t}"
+                            );
+                            assert_eq!(
+                                rows_rep8[ridx].to_bits(),
+                                w8,
+                                "rep8 finite {mode_name} b={blocks} p={panel_count} r={r} t={t}"
+                            );
+                            assert_eq!(
+                                rows_q4[ridx].to_bits(),
+                                w4,
+                                "q4 finite {mode_name} b={blocks} p={panel_count} r={r} t={t}"
+                            );
+                            assert_eq!(
+                                rows_q6[ridx].to_bits(),
+                                w6,
+                                "q6 finite {mode_name} b={blocks} p={panel_count} r={r} t={t}"
+                            );
+
+                            let sidx = t * scatter_stride + 4 + r;
+                            let b8 = (f32::from_bits(w8) + bias[r]).to_bits();
+                            let b4 = (f32::from_bits(w4) + bias[r]).to_bits();
+                            let b6 = (f32::from_bits(w6) + bias[r]).to_bits();
+                            assert_eq!(scat_q8[sidx].to_bits(), b8, "scatter q8 {mode_name}");
+                            assert_eq!(scat_rep8[sidx].to_bits(), b8, "scatter rep8 {mode_name}");
+                            assert_eq!(scat_q4[sidx].to_bits(), b4, "scatter q4 {mode_name}");
+                            assert_eq!(scat_q6[sidx].to_bits(), b6, "scatter q6 {mode_name}");
+
+                            assert_eq!(
+                                band_buf[t * scatter_stride + r].to_bits(),
+                                b8,
+                                "band0 q8 {mode_name}"
+                            );
+                            assert_eq!(
+                                band_buf[t * scatter_stride + 8 + r].to_bits(),
+                                w4,
+                                "band1 q4 {mode_name}"
+                            );
+                        }
+                    }
+
+                    // Also test repacked Q8 band writer and Q6_K band writer + non-finite bias rejection.
+                    let mut band_buf2 = vec![0.0_f32; tokens * scatter_stride];
+                    if let Some(mut bands2) =
+                        split_row_major_bands(&mut band_buf2, tokens, scatter_stride, &[8, 8])
+                    {
+                        assert!(gemm_repacked_q8_0_8_8x_panels_finite_scales_into_band(
+                            caps,
+                            &q8_repacked,
+                            &panels_q8,
+                            panel_count,
+                            blocks,
+                            &mut bands2[0],
+                            0,
+                            None,
+                        ));
+                        let mut bad_bias = bias;
+                        bad_bias[3] = f32::NAN;
+                        assert!(!gemm_q6_k_8x_panels_into_band::<true>(
+                            caps,
+                            q6_refs,
+                            &panels_qk,
+                            panel_count,
+                            blocks,
+                            &mut bands2[1],
+                            0,
+                            Some(bad_bias),
+                        ));
+                    }
+                    for t in 0..tokens {
+                        for r in 0..8 {
+                            assert_eq!(
+                                band_buf2[t * scatter_stride + r].to_bits(),
+                                want_q8[r * tokens + t]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn f16_finite_pair_and_4x4_fma_attention_helpers_match_scalar_bit_exact() {
+        let f16_edge = [
+            0x0000_u16, 0x8000, 0x0001, 0x8001, 0x3c00, 0xbc00, 0x3555, 0x7bff, 0xfbff,
+        ];
+        for len in [0_usize, 1, 7, 8, 15, 16, 64, 128, 129] {
+            let mut q0 = Vec::with_capacity(len);
+            let mut q1 = Vec::with_capacity(len);
+            let mut kv_f16 = Vec::with_capacity(len);
+            for i in 0..len {
+                let idx_f = f32::from(u16::try_from(i).unwrap_or(0));
+                q0.push(((idx_f * 0.13).sin()) * 2.0);
+                q1.push(((idx_f * 0.29).cos()) * -1.75);
+                let val = ((idx_f * 0.41).sin()) * 1.5;
+                let bits = if i < f16_edge.len() {
+                    f16_edge[i]
+                } else {
+                    float_to_half(val)
+                };
+                kv_f16.push(bits);
+            }
+
+            let got_dot = dot_f16_pair_f32_finite(&q0, &q1, &kv_f16);
+            let want_dot = dot_f16_pair_f32(&q0, &q1, &kv_f16);
+            assert_eq!(got_dot.0.to_bits(), want_dot.0.to_bits(), "len={len} d0");
+            assert_eq!(got_dot.1.to_bits(), want_dot.1.to_bits(), "len={len} d1");
+
+            let mut out0_got = vec![0.5_f32; len];
+            let mut out1_got = vec![-0.25_f32; len];
+            let mut out0_want = out0_got.clone();
+            let mut out1_want = out1_got.clone();
+            axpy_f16_pair_f32_finite(0.375, -0.625, &kv_f16, &mut out0_got, &mut out1_got);
+            axpy_f16_pair_f32(0.375, -0.625, &kv_f16, &mut out0_want, &mut out1_want);
+            for i in 0..len {
+                assert_eq!(
+                    out0_got[i].to_bits(),
+                    out0_want[i].to_bits(),
+                    "len={len} axpy0 i={i}"
+                );
+                assert_eq!(
+                    out1_got[i].to_bits(),
+                    out1_want[i].to_bits(),
+                    "len={len} axpy1 i={i}"
+                );
+            }
+
+            // 4x4 FMA dot & axpy vs portable scalar FMA reference.
+            let mut q_vecs: [Vec<f32>; 4] = std::array::from_fn(|_| Vec::with_capacity(len));
+            let mut k_vecs: [Vec<f32>; 4] = std::array::from_fn(|_| Vec::with_capacity(len));
+            let mut v_vecs: [Vec<f32>; 4] = std::array::from_fn(|_| Vec::with_capacity(len));
+            for i in 0..len {
+                let idx_f = f32::from(u16::try_from(i).unwrap_or(0));
+                for g in 0..4 {
+                    let gf = f32::from(u8::try_from(g + 1).unwrap_or(1));
+                    q_vecs[g].push((idx_f * 0.17 * gf).sin() * 1.25);
+                    k_vecs[g].push((idx_f * 0.23 * gf).cos() * 0.875);
+                    v_vecs[g].push((idx_f * 0.31 + gf).sin() * 2.5);
+                }
+            }
+            let q_refs: [&[f32]; 4] = [&q_vecs[0], &q_vecs[1], &q_vecs[2], &q_vecs[3]];
+            let k_refs: [&[f32]; 4] = [&k_vecs[0], &k_vecs[1], &k_vecs[2], &k_vecs[3]];
+            let divisor = 11.313_708_f32;
+            let got_4x4 = dot_4x4_f32_fma(q_refs, k_refs, divisor);
+            let want_4x4 =
+                crate::native::quant_q8::dot_4x4_f32_fma_portable(q_refs, k_refs, divisor);
+            for qi in 0..4 {
+                for ki in 0..4 {
+                    assert_eq!(
+                        got_4x4[qi][ki].to_bits(),
+                        want_4x4[qi][ki].to_bits(),
+                        "dot_4x4 len={len} qi={qi} ki={ki}"
+                    );
+                }
+            }
+
+            let v_refs: [&[f32]; 4] = [&v_vecs[0], &v_vecs[1], &v_vecs[2], &v_vecs[3]];
+            let weights = [
+                [0.125_f32, 0.25, 0.5, 0.125],
+                [0.4_f32, 0.3, 0.2, 0.1],
+                [0.0_f32, 0.5, 0.25, 0.25],
+                [0.75_f32, 0.125, 0.0625, 0.0625],
+            ];
+            let mut out_got: [Vec<f32>; 4] = std::array::from_fn(|g| {
+                vec![f32::from(u8::try_from(g).unwrap_or(0)) * 0.1 - 0.2; len]
+            });
+            let mut out_want = out_got.clone();
+            {
+                let [o0, o1, o2, o3] = &mut out_got;
+                let mut refs = [
+                    o0.as_mut_slice(),
+                    o1.as_mut_slice(),
+                    o2.as_mut_slice(),
+                    o3.as_mut_slice(),
+                ];
+                axpy_4x4_f32_fma(&mut refs, v_refs, weights);
+            }
+            {
+                let [o0, o1, o2, o3] = &mut out_want;
+                let mut refs = [
+                    o0.as_mut_slice(),
+                    o1.as_mut_slice(),
+                    o2.as_mut_slice(),
+                    o3.as_mut_slice(),
+                ];
+                crate::native::quant_q8::axpy_4x4_f32_fma_portable(&mut refs, v_refs, weights);
+            }
+            for g in 0..4 {
+                for i in 0..len {
+                    assert_eq!(
+                        out_got[g][i].to_bits(),
+                        out_want[g][i].to_bits(),
+                        "axpy_4x4 len={len} g={g} i={i}"
+                    );
                 }
             }
         }
