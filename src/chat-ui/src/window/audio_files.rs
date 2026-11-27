@@ -104,7 +104,7 @@ impl State {
             self.microphone_generation = Some(generation);
             self.dictation_requested = true;
             self.dictation_finishing = true;
-            "Choose an audio file. Its transcript is inserted at the cursor and sent with your draft when the model is ready; otherwise it stays in the draft. Cancel or Escape stops import."
+            "Choose an audio file. Its transcript is inserted at the cursor for review before sending. Cancel or Escape stops import."
                 .clone_into(&mut self.speech_status);
             self.focus_composer = true;
         } else {
@@ -161,8 +161,7 @@ impl State {
                 // decoding rejection and failed speech-worker handoff.
                 self.audio_file_transcript.clear();
                 self.show_audio_transcript = false;
-                self.audio_file_review_required = false;
-                "Loading the speech model and transcribing audio. When finished, the transcript is inserted at the cursor and sent with your draft if the model is ready. Cancel or Escape stops transcription."
+                "Loading the speech model and transcribing audio. When finished, the transcript is inserted at the cursor for review before sending. Cancel or Escape stops transcription."
                     .clone_into(&mut self.speech_status);
             }
             Ok(None) => {
@@ -241,7 +240,7 @@ impl State {
         }
         if self.audio_file_fits_composer(&self.audio_file_transcript) {
             // Use the existing deferred insertion path so same-frame Escape,
-            // conversation changes and composer input settle before submission.
+            // conversation changes and composer input settle before draft insertion.
             self.pending_voice_transcript = Some((generation, self.audio_file_transcript.clone()));
         } else {
             self.release_completed_input();
@@ -391,9 +390,7 @@ impl State {
         if self.audio_file_active {
             notice_frame(ui).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(
-                    "Still transcribing. If it finishes here, review the draft before sending.",
-                );
+                ui.label("Still transcribing. When finished, review the draft before sending.");
             });
         }
         ui.add_space(4.0);
@@ -532,7 +529,8 @@ mod tests {
     }
 
     #[test]
-    fn audio_file_without_microphone_transcribes_and_submits_one_text_prompt() -> io::Result<()> {
+    fn audio_file_without_microphone_transcribes_into_editable_draft_before_send() -> io::Result<()>
+    {
         let (mut state, speech_commands, requests) = fixture()?;
         assert!(state.audio_file_input && !state.speech_input && state.microphone.is_none());
         state.model = ModelLifecycle::Ready;
@@ -550,13 +548,26 @@ mod tests {
             generation: 1_u64 << 63,
         });
         state.flush_voice_transcript(&egui::Context::default());
-        assert!(
-            matches!(requests.try_recv(), Ok(client::Command::Send { text, .. }) if text == "Explain this recording")
-        );
-        assert!(!state.audio_file_active);
-        assert_eq!(state.speech_status, "Audio file transcribed and sent.");
-        state.accept_transcript(1_u64 << 63, "Late duplicate");
         assert!(requests.try_recv().is_err());
+        assert_eq!(state.input, "Explain this recording");
+        assert!(!state.audio_file_active);
+        assert!(state.focus_composer);
+        assert_eq!(
+            state.speech_status,
+            "Audio file transcribed. Review the draft, then select Send."
+        );
+        assert_eq!(
+            state.audio_file_notice.as_deref(),
+            Some("Audio file transcribed. Review the draft, then select Send.")
+        );
+        state.accept_transcript(1_u64 << 63, "Late duplicate");
+        assert_eq!(state.input, "Explain this recording");
+        assert!(requests.try_recv().is_err());
+        state.input.push_str(" briefly");
+        state.submit();
+        assert!(
+            matches!(requests.try_recv(), Ok(client::Command::Send { text, .. }) if text == "Explain this recording briefly")
+        );
         Ok(())
     }
 
@@ -579,12 +590,10 @@ mod tests {
             state.audio_file_active = from_file;
             state.model = ModelLifecycle::Ready;
             state.accept_transcript(1_u64 << 63, "Next question");
-            if !from_file {
-                assert_eq!(state.input, "Next question");
-                assert!(requests.try_recv().is_err());
-                assert!(commands.try_recv().is_err());
-                state.submit();
-            }
+            assert_eq!(state.input, "Next question");
+            assert!(requests.try_recv().is_err());
+            assert!(commands.try_recv().is_err());
+            state.submit();
             assert!(matches!(
                 requests.try_recv(),
                 Ok(client::Command::Send { text, .. }) if text == "Next question"

@@ -416,9 +416,9 @@ File input needs no microphone permission. A native composer card shows Cancel,
 persistent actionable failures and the current segment range against an estimated
 total duration. Its completed-audio bar appears only when the duration estimate
 supports it; this is no wall-time estimate. Imports use authenticated Qwen3-ASR
-and the ordinary prompt path, inserting at the draft selection/cursor and sending
-once if Swift is ready. Otherwise the draft waits for explicit Send, including
-completion while the transcript viewer is open; readiness never sends it later.
+and insert at the draft selection/cursor, leaving the text in the draft for
+review, editing and explicit Send with no automatic submission. Model readiness
+or closing the transcript viewer never sends it later.
 The centered native transcript modal has read-only selectable scrolling text,
 copy feedback and background shortcut blocking. Escape closes the viewer.
 Full/partial transcripts stay viewable and copyable until dismissed or a new

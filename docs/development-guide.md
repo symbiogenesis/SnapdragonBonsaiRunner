@@ -502,10 +502,9 @@ memory admission and decoder teardown.
 
 Import uses the same
 Qwen3-ASR 1.7B transcription path as microphone input. Transcripts replace the
-composer selection or insert at its cursor and count as ordinary text prompts:
-the app sends once when Swift is ready, or leaves a draft for explicit Send otherwise.
-If transcription finishes while its viewer is open, the result stays in the draft
-for explicit Send. Later readiness or closing the viewer never sends that draft.
+composer selection or insert at its cursor and remain in the draft for review,
+editing and explicit Send; completion, model readiness or closing the transcript
+viewer never sends that draft automatically.
 A transcript that exceeds the chat prompt size stays complete in the separate
 transcript view; it never truncates the recording or modifies the existing draft.
 The composer's audio card shows the current segment range, estimated total duration

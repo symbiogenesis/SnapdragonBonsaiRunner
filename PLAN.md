@@ -308,7 +308,7 @@ adoption decisions without displacing native daily-use acceptance.
   transcript parity and matched microphone/file latency.
 - [ ] Qualify audio-file picker/paste, supported Windows decoders, rate/channel
   conversion, long files, unknown/changing-memory admission, full transcripts,
-  draft insertion, exactly-once ordinary submission and preserved drafts without
+  draft insertion, editable-draft review, explicit ordinary submission and preserved drafts without
   deferred Send under the
   [audio contract](docs/streaming-resources.md).
 - [ ] Qualify persistent sequential Media Foundation decoding, one-segment

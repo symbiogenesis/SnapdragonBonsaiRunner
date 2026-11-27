@@ -256,7 +256,6 @@ struct State {
     audio_file_active: bool,
     audio_file_notice: Option<String>,
     audio_file_progress: Option<speech::FileProgress>,
-    audio_file_review_required: bool,
     audio_file_transcript: String,
     audio_file_error: bool,
     show_audio_transcript: bool,
@@ -438,7 +437,6 @@ impl State {
             audio_file_active: false,
             audio_file_notice: None,
             audio_file_progress: None,
-            audio_file_review_required: false,
             audio_file_transcript: String::new(),
             audio_file_error: false,
             show_audio_transcript: false,
@@ -1886,12 +1884,7 @@ impl State {
                 progress,
             } => self.update_audio_file_progress(generation, progress),
             speech::Event::FilePart { generation, text } => self.audio_file_part(generation, &text),
-            speech::Event::FileFinished { generation } => {
-                if self.audio_file_active && self.microphone_generation == Some(generation) {
-                    self.audio_file_review_required |= self.show_audio_transcript;
-                }
-                self.finish_audio_file(generation);
-            }
+            speech::Event::FileFinished { generation } => self.finish_audio_file(generation),
             speech::Event::Recognized { generation, text } => {
                 if self.dictation_requested
                     && self.dictation_finishing
@@ -2024,22 +2017,6 @@ impl State {
         if !complete {
             "Voice message exceeds the prompt limit. Your draft was kept; no message was sent."
                 .clone_into(&mut self.speech_status);
-        } else if from_file
-            && self.model.ready()
-            && !self.composing
-            && self.rename_conversation.is_none()
-            && self.delete_conversation.is_none()
-            && self.edit_message.is_none()
-            && self.branch_comparison.is_none()
-            && !self.show_settings
-            && !self.show_audio_transcript
-            && self.alerts.details.is_none()
-            && !self.audio_file_review_required
-        {
-            self.submit();
-            if self.model.busy() {
-                "Audio file transcribed and sent.".clone_into(&mut self.speech_status);
-            }
         } else {
             if from_file && self.model.ready() {
                 "Audio file transcribed. Review the draft, then select Send."
@@ -2059,12 +2036,6 @@ impl State {
     }
 
     fn flush_voice_transcript(&mut self, ctx: &egui::Context) {
-        if self.audio_file_active
-            && self.show_audio_transcript
-            && self.pending_voice_transcript.is_some()
-        {
-            self.audio_file_review_required = true;
-        }
         // A press can become a Cancel or conversation switch on release. Leave
         // the transcript staged until the native widgets have handled that click.
         if ctx.input(|input| input.pointer.any_down()) {

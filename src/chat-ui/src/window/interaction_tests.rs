@@ -2232,3 +2232,49 @@ fn media_attachments_require_vision_capability_to_send_and_open_lightbox() -> io
     assert!(chat.get_by_label("Attachment preview").rect().is_positive());
     Ok(())
 }
+
+#[test]
+fn audio_file_completion_leaves_editable_prompt_in_composer_before_send() {
+    let mut chat = harness([1180.0, 860.0], false);
+    {
+        let app = &mut chat.state_mut().app;
+        app.audio_file_active = true;
+        app.dictation_requested = true;
+        app.dictation_finishing = true;
+        app.microphone_generation = Some(7);
+    }
+    // The active transcription spinner deliberately keeps requesting frames.
+    chat.run_steps(2);
+
+    let ctx = chat.ctx.clone();
+    {
+        let app = &mut chat.state_mut().app;
+        app.speech_event(speech::Event::FilePart {
+            generation: 7,
+            text: "Draft from audio".into(),
+        });
+        app.speech_event(speech::Event::FileFinished { generation: 7 });
+        app.flush_voice_transcript(&ctx);
+    }
+    chat.run();
+
+    assert!(chat.state().commands.try_recv().is_err());
+    assert!(!chat.state().app.audio_file_active);
+    assert_eq!(chat.state().app.input, "Draft from audio");
+
+    let composer = chat.get_by_role_and_label(egui::Role::MultilineTextInput, "Message");
+    assert!(composer.is_focused());
+    composer.type_text(" with edits");
+    chat.run();
+
+    assert_eq!(chat.state().app.input, "Draft from audio with edits");
+    assert!(chat.state().commands.try_recv().is_err());
+
+    chat.key_press(egui::Key::Enter);
+    chat.run_steps(4);
+
+    assert!(matches!(
+        chat.state().commands.try_recv(),
+        Ok(Command::Send { text, .. }) if text == "Draft from audio with edits"
+    ));
+}
