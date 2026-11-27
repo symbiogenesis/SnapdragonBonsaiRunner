@@ -50,8 +50,11 @@ pub(super) struct PreparedBatch {
     input: usize,
     batch: usize,
     num_quads: usize,
+    num_panels16: usize,
     quads: Vec<[f32; 4]>,
+    panels16: Vec<[f32; 16]>,
     quads_ready: bool,
+    panels16_ready: bool,
     #[cfg(all(windows, feature = "rust-qualification"))]
     act_q8_0: Vec<Q8_0ActBlock>,
     #[cfg(all(windows, feature = "rust-qualification"))]
@@ -167,10 +170,17 @@ impl PreparedBatch {
         self.input = 0;
         self.batch = 0;
         self.num_quads = 0;
+        self.num_panels16 = 0;
         self.quads_ready = false;
+        self.panels16_ready = false;
         self.quads.clear();
+        self.panels16.clear();
         if self.quads.capacity() > max_retain.saturating_mul(2) {
             self.quads.shrink_to(max_retain);
+        }
+        let p16_cap = (max_retain / 4).max(16);
+        if self.panels16.capacity() > p16_cap.saturating_mul(2) {
+            self.panels16.shrink_to(p16_cap);
         }
         #[cfg(all(windows, feature = "rust-qualification"))]
         {
@@ -206,7 +216,9 @@ impl PreparedBatch {
         self.input = input;
         self.batch = batch;
         self.num_quads = batch.div_ceil(4);
+        self.num_panels16 = batch.div_ceil(16);
         self.quads_ready = false;
+        self.panels16_ready = false;
         #[cfg(all(windows, feature = "rust-qualification"))]
         {
             self.q8_0_ready = false;
@@ -215,34 +227,34 @@ impl PreparedBatch {
         }
     }
 
-    /// Populate four-position-packed `quads` directly via `fill_quads(first_quad, dst_quads)`
-    /// without building an intermediate `[batch, input]` matrix.
-    pub(super) fn prepare_quads_direct(
+    /// Populate 16-position-packed `panels16` (`[num_p16][input][16]`) directly via
+    /// `fill_panels16(first_p16, dst_panels)` without an intermediate `[batch, input]` matrix.
+    pub(super) fn prepare_panels16_direct(
         &mut self,
         batch: usize,
         input: usize,
         workers: usize,
-        fill_quads: &(impl Fn(usize, &mut [[f32; 4]]) + Sync),
+        fill_panels16: &(impl Fn(usize, &mut [[f32; 16]]) + Sync),
     ) {
         self.prepare_meta(batch, input);
-        if self.num_quads == 0 || self.input == 0 {
-            self.quads.clear();
-            self.quads_ready = true;
+        if self.num_panels16 == 0 || self.input == 0 {
+            self.panels16.clear();
+            self.panels16_ready = true;
             return;
         }
-        let needed = self.num_quads * self.input;
-        self.quads.resize(needed, [0.0; 4]);
-        let flat = self.quads.as_flattened_mut();
-        if workers > 1 && self.num_quads >= 2 && flat.len() >= 8_192 {
-            row_workers::run_aligned(flat, workers, 4 * input, &|elem_off, slice| {
-                let first_quad = elem_off / (4 * input);
-                let (quads_mut, _) = slice.as_chunks_mut::<4>();
-                fill_quads(first_quad, quads_mut);
+        let needed = self.num_panels16 * self.input;
+        self.panels16.resize(needed, [0.0; 16]);
+        let flat = self.panels16.as_flattened_mut();
+        if workers > 1 && self.num_panels16 >= 2 && flat.len() >= 8_192 {
+            row_workers::run_aligned(flat, workers, 16 * input, &|elem_off, slice| {
+                let first_p16 = elem_off / (16 * input);
+                let (panels_mut, _) = slice.as_chunks_mut::<16>();
+                fill_panels16(first_p16, panels_mut);
             });
         } else {
-            fill_quads(0, &mut self.quads[..needed]);
+            fill_panels16(0, &mut self.panels16[..needed]);
         }
-        self.quads_ready = true;
+        self.panels16_ready = true;
     }
 
     /// Populate four-position-packed `quads` on demand using parallel SIMD 4x4 transpose.
@@ -1436,6 +1448,121 @@ fn batch_f32_1row<S: Simd>(
     }
     if q < num_quads {
         batch_f32_1row_quads::<S, 1>(simd, row, quads, q, transposed_row);
+    }
+}
+
+#[cfg(not(all(windows, feature = "rust-qualification")))]
+fn batch_f32_nonfma_4x16_fallback(
+    rows: [&[f32]; 4],
+    act_panel: &[[f32; 16]],
+    acc: &mut [[f32; 16]; 4],
+) {
+    for (k, panel_k) in act_panel.iter().enumerate() {
+        for r in 0..4 {
+            let w = rows[r][k];
+            for (dst, &a) in acc[r].iter_mut().zip(panel_k.iter()) {
+                *dst += w * a;
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn batch_f32_1row_panels16<S: Simd>(
+    simd: S,
+    row: &[f32],
+    panels16: &[[f32; 16]],
+    num_p16: usize,
+    out_row: &mut [f32],
+) {
+    let width = row.len();
+    for p_idx in 0..num_p16 {
+        let panel = &panels16[p_idx * width..(p_idx + 1) * width];
+        let mut acc = [f32x4::splat(simd, 0.0_f32); 4];
+        for (k, &weight) in row.iter().enumerate() {
+            let w = f32x4::splat(simd, weight);
+            let pk = &panel[k];
+            acc[0] += w * f32x4::from_slice(simd, &pk[0..4]);
+            acc[1] += w * f32x4::from_slice(simd, &pk[4..8]);
+            acc[2] += w * f32x4::from_slice(simd, &pk[8..12]);
+            acc[3] += w * f32x4::from_slice(simd, &pk[12..16]);
+        }
+        let base = p_idx * 16;
+        for (q, vec) in acc.into_iter().enumerate() {
+            vec.store_slice(&mut out_row[base + q * 4..base + q * 4 + 4]);
+        }
+    }
+}
+
+#[inline(always)]
+fn batch_f32_panels16<S: Simd>(
+    simd: S,
+    data: &[f32],
+    start_row: usize,
+    width: usize,
+    panels16: &[[f32; 16]],
+    num_p16: usize,
+    out_slice: &mut [f32],
+) {
+    const STRIP_TILE: usize = 8;
+    const P16_TILE: usize = 2;
+    const K_BLOCK: usize = 256;
+
+    let row_stride = num_p16 * 16;
+    let rows_here = out_slice.len() / row_stride;
+    let full_strips = rows_here / 4;
+    let mut acc = [[[[0.0_f32; 16]; 4]; P16_TILE]; STRIP_TILE];
+
+    for p_base in (0..num_p16).step_by(P16_TILE) {
+        let p_len = (num_p16 - p_base).min(P16_TILE);
+        for s_base in (0..full_strips).step_by(STRIP_TILE) {
+            let s_len = (full_strips - s_base).min(STRIP_TILE);
+            for s_acc in &mut acc[..s_len] {
+                for p_acc in &mut s_acc[..p_len] {
+                    *p_acc = [[0.0_f32; 16]; 4];
+                }
+            }
+            for k_base in (0..width).step_by(K_BLOCK) {
+                let k_end = (k_base + K_BLOCK).min(width);
+                for p_local in 0..p_len {
+                    let p_idx = p_base + p_local;
+                    let panel_k = &panels16[p_idx * width + k_base..p_idx * width + k_end];
+                    for s_local in 0..s_len {
+                        let r0 = start_row + (s_base + s_local) * 4;
+                        let rows4 = [
+                            &data[r0 * width + k_base..r0 * width + k_end],
+                            &data[(r0 + 1) * width + k_base..(r0 + 1) * width + k_end],
+                            &data[(r0 + 2) * width + k_base..(r0 + 2) * width + k_end],
+                            &data[(r0 + 3) * width + k_base..(r0 + 3) * width + k_end],
+                        ];
+                        #[cfg(all(windows, feature = "rust-qualification"))]
+                        quant_kernels::gemm_f32_nonfma_4x16(
+                            rows4,
+                            panel_k,
+                            &mut acc[s_local][p_local],
+                        );
+                        #[cfg(not(all(windows, feature = "rust-qualification")))]
+                        batch_f32_nonfma_4x16_fallback(rows4, panel_k, &mut acc[s_local][p_local]);
+                    }
+                }
+            }
+            for (s_local, s_acc) in acc[..s_len].iter().enumerate() {
+                let out_row_base = (s_base + s_local) * 4;
+                for (p_local, p_acc) in s_acc[..p_len].iter().enumerate() {
+                    let p_off = (p_base + p_local) * 16;
+                    for (r, row_vals) in p_acc.iter().enumerate() {
+                        let dst_off = (out_row_base + r) * row_stride + p_off;
+                        out_slice[dst_off..dst_off + 16].copy_from_slice(row_vals);
+                    }
+                }
+            }
+        }
+    }
+
+    for local_r in (full_strips * 4)..rows_here {
+        let w_row = &data[(start_row + local_r) * width..(start_row + local_r + 1) * width];
+        let out_row = &mut out_slice[local_r * row_stride..(local_r + 1) * row_stride];
+        batch_f32_1row_panels16(simd, w_row, panels16, num_p16, out_row);
     }
 }
 
@@ -3098,6 +3225,69 @@ pub(super) fn multiply_batch_channel_major_into(
                 slice,
             );
         });
+        return;
+    }
+
+    if let WeightSlice::Float(data) = weights.data
+        && prepared.panels16_ready
+    {
+        let num_p16 = prepared.num_panels16;
+        let level = simd_level();
+        if num_p16 > 0 && output > 0 {
+            let row_stride = num_p16 * 16;
+            if row_stride == batch {
+                row_workers::run_aligned(out, workers, 4 * batch, &|elem_off, slice| {
+                    let start_row = elem_off / batch;
+                    dispatch!(
+                        level,
+                        simd => batch_f32_panels16(
+                            simd,
+                            data,
+                            start_row,
+                            weights.input,
+                            &prepared.panels16,
+                            num_p16,
+                            slice,
+                        )
+                    );
+                });
+                return;
+            }
+            let needed = output * row_stride;
+            if transposed_scratch.len() < needed {
+                transposed_scratch.resize(needed, 0.0);
+            }
+            let transposed = &mut transposed_scratch[..needed];
+            row_workers::run_aligned(transposed, workers, 4 * row_stride, &|elem_off, slice| {
+                let start_row = elem_off / row_stride;
+                dispatch!(
+                    level,
+                    simd => batch_f32_panels16(
+                        simd,
+                        data,
+                        start_row,
+                        weights.input,
+                        &prepared.panels16,
+                        num_p16,
+                        slice,
+                    )
+                );
+            });
+            if workers > 1 && out.len() >= 8_192 {
+                row_workers::run_aligned(out, workers, batch, &|elem_off, dst_slice| {
+                    let first_row = elem_off / batch;
+                    for (local_r, dst_row) in dst_slice.chunks_exact_mut(batch).enumerate() {
+                        let src_off = (first_row + local_r) * row_stride;
+                        dst_row.copy_from_slice(&transposed[src_off..src_off + batch]);
+                    }
+                });
+            } else {
+                for (r, dst_row) in out.chunks_exact_mut(batch).enumerate() {
+                    let src_off = r * row_stride;
+                    dst_row.copy_from_slice(&transposed[src_off..src_off + batch]);
+                }
+            }
+        }
         return;
     }
 

@@ -465,27 +465,39 @@ impl Encoder {
             ensure_buffer(&mut flat_in, layout.audio_rows * flat_dim)?;
         }
         let mut row_offset = 0;
-        for chunk in 0..layout.chunks {
+        let per_chunk_conv_work =
+            (c.channels * c.mel_bins.div_ceil(2) * layout.mel_per_chunk.div_ceil(2))
+                .max(9 * c.channels * c.mel_bins.div_ceil(4) * layout.mel_per_chunk.div_ceil(4));
+        let chunk_batch = (28_000_000 / per_chunk_conv_work.max(1))
+            .clamp(1, 8)
+            .min(layout.chunks);
+        for chunk_start in (0..layout.chunks).step_by(chunk_batch) {
             check(cancel)?;
-            let real = if chunk + 1 == layout.chunks {
-                layout.last_chunk_mel
-            } else {
-                layout.mel_per_chunk
-            };
-            ensure_buffer(&mut image_a, c.mel_bins * layout.mel_per_chunk)?;
-            for frequency in 0..c.mel_bins {
-                let start = frequency * frames + chunk * layout.mel_per_chunk;
-                let dst_start = frequency * layout.mel_per_chunk;
-                image_a[dst_start..dst_start + real].copy_from_slice(&mel[start..start + real]);
-                if real < layout.mel_per_chunk {
-                    image_a[dst_start + real..dst_start + layout.mel_per_chunk].fill(0.0);
+            let g_chunks = (layout.chunks - chunk_start).min(chunk_batch);
+            ensure_buffer(&mut image_a, g_chunks * c.mel_bins * layout.mel_per_chunk)?;
+            for g in 0..g_chunks {
+                let chunk = chunk_start + g;
+                let real = if chunk + 1 == layout.chunks {
+                    layout.last_chunk_mel
+                } else {
+                    layout.mel_per_chunk
+                };
+                let chunk_base = g * c.mel_bins * layout.mel_per_chunk;
+                for frequency in 0..c.mel_bins {
+                    let start = frequency * frames + chunk * layout.mel_per_chunk;
+                    let dst_start = chunk_base + frequency * layout.mel_per_chunk;
+                    image_a[dst_start..dst_start + real].copy_from_slice(&mel[start..start + real]);
+                    if real < layout.mel_per_chunk {
+                        image_a[dst_start + real..dst_start + layout.mel_per_chunk].fill(0.0);
+                    }
                 }
             }
             let (mut width, mut height, mut channels) = (layout.mel_per_chunk, c.mel_bins, 1);
             for convolution in &self.weights.convolutions {
-                convolve_into_with_threads(
+                convolve_batch_into_with_threads(
                     convolution,
                     &image_a,
+                    g_chunks,
                     width,
                     height,
                     channels,
@@ -501,26 +513,31 @@ impl Encoder {
                 height = height.div_ceil(2);
                 channels = c.channels;
             }
-            let retained = if chunk + 1 == layout.chunks {
-                layout.last_chunk_rows
-            } else {
-                layout.rows_per_chunk
-            };
-            if retained > 0 {
-                let chunk_flat_dim = channels * height;
-                if chunk_flat_dim != flat_dim {
-                    return Err(invalid());
-                }
-                let chunk_flat =
-                    &mut flat_in[row_offset * flat_dim..(row_offset + retained) * flat_dim];
-                for time in 0..retained {
-                    check(cancel)?;
-                    let dst = &mut chunk_flat[time * flat_dim..(time + 1) * flat_dim];
-                    for cf in 0..flat_dim {
-                        dst[cf] = image_a[cf * width + time];
+            let chunk_flat_dim = channels * height;
+            if chunk_flat_dim != flat_dim {
+                return Err(invalid());
+            }
+            for g in 0..g_chunks {
+                let chunk = chunk_start + g;
+                let retained = if chunk + 1 == layout.chunks {
+                    layout.last_chunk_rows
+                } else {
+                    layout.rows_per_chunk
+                };
+                if retained > 0 {
+                    let chunk_flat =
+                        &mut flat_in[row_offset * flat_dim..(row_offset + retained) * flat_dim];
+                    for time in 0..retained {
+                        check(cancel)?;
+                        let dst = &mut chunk_flat[time * flat_dim..(time + 1) * flat_dim];
+                        for (cf, slot) in dst.iter_mut().enumerate() {
+                            let ch = cf / height;
+                            let freq = cf % height;
+                            *slot = image_a[((ch * g_chunks + g) * height + freq) * width + time];
+                        }
                     }
+                    row_offset += retained;
                 }
-                row_offset += retained;
             }
         }
         if layout.audio_rows > 0 {
@@ -747,71 +764,81 @@ fn add_chunk_sinusoids_parallel(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Direct-to-quads Conv2d im2col writes 4-position quads without an intermediate patch buffer."
+    reason = "Direct-to-panels16 Conv2d im2col writes 16-patch panels across chunk groups without an intermediate buffer."
 )]
-fn im2col_quads_slice(
+fn im2col_panels16_slice(
     rounded: &[f32],
+    chunk_count: usize,
     width: usize,
     height: usize,
     channels: usize,
     out_width: usize,
+    patches_per_chunk: usize,
     total_patches: usize,
-    first_quad: usize,
-    dst_quads: &mut [[f32; 4]],
+    first_p16: usize,
+    dst_panels: &mut [[f32; 16]],
 ) {
     let patch_width = 9 * channels;
-    for (local_q, quad_slice) in dst_quads.chunks_exact_mut(patch_width).enumerate() {
-        let q = first_quad + local_q;
-        let base_pos = q * 4;
-        if base_pos + 3 < total_patches {
-            let y0 = base_pos / out_width;
-            let x0 = base_pos % out_width;
-            if x0 + 3 < out_width && x0 > 0 && 2 * (x0 + 3) + 1 < width {
-                let py_opts: [Option<usize>; 3] = std::array::from_fn(|ky| {
-                    (2 * y0 + ky).checked_sub(1).filter(|&py| py < height)
-                });
-                for ch in 0..channels {
-                    let ch_in_base = ch * height;
-                    let ch_p_base = ch * 9;
-                    for (ky, py_opt) in py_opts.iter().enumerate() {
-                        if let Some(py) = *py_opt {
-                            let in_row =
-                                &rounded[(ch_in_base + py) * width..(ch_in_base + py + 1) * width];
-                            for kx in 0..3 {
-                                let bx = 2 * x0 + kx - 1;
-                                quad_slice[ch_p_base + ky * 3 + kx] =
-                                    [in_row[bx], in_row[bx + 2], in_row[bx + 4], in_row[bx + 6]];
+    let hw = height * width;
+    for (local_p, panel_slice) in dst_panels.chunks_exact_mut(patch_width).enumerate() {
+        let p16 = first_p16 + local_p;
+        let base_pos = p16 * 16;
+        if base_pos + 15 < total_patches {
+            let chunk_local = base_pos / patches_per_chunk;
+            let local_pos = base_pos % patches_per_chunk;
+            if local_pos + 15 < patches_per_chunk {
+                let y0 = local_pos / out_width;
+                let x0 = local_pos % out_width;
+                if x0 + 15 < out_width && x0 > 0 && 2 * (x0 + 15) + 1 < width {
+                    let py_opts: [Option<usize>; 3] = std::array::from_fn(|ky| {
+                        (2 * y0 + ky).checked_sub(1).filter(|&py| py < height)
+                    });
+                    for ch in 0..channels {
+                        let ch_in_base = (ch * chunk_count + chunk_local) * hw;
+                        let ch_p_base = ch * 9;
+                        for (ky, py_opt) in py_opts.iter().enumerate() {
+                            if let Some(py) = *py_opt {
+                                let in_row = &rounded
+                                    [ch_in_base + py * width..ch_in_base + (py + 1) * width];
+                                for kx in 0..3 {
+                                    let bx = 2 * x0 + kx - 1;
+                                    panel_slice[ch_p_base + ky * 3 + kx] =
+                                        std::array::from_fn(|lane| in_row[bx + lane * 2]);
+                                }
+                            } else {
+                                panel_slice[ch_p_base + ky * 3..ch_p_base + ky * 3 + 3]
+                                    .fill([0.0; 16]);
                             }
-                        } else {
-                            quad_slice[ch_p_base + ky * 3..ch_p_base + ky * 3 + 3].fill([0.0; 4]);
                         }
                     }
+                    continue;
                 }
-                continue;
             }
         }
-        quad_slice.fill([0.0; 4]);
-        for lane in 0..4 {
+        panel_slice.fill([0.0; 16]);
+        for lane in 0..16 {
             let pos = base_pos + lane;
             if pos >= total_patches {
                 break;
             }
-            let y = pos / out_width;
-            let x = pos % out_width;
+            let chunk_local = pos / patches_per_chunk;
+            let local_pos = pos % patches_per_chunk;
+            let y = local_pos / out_width;
+            let x = local_pos % out_width;
             let py_opts: [Option<usize>; 3] =
                 std::array::from_fn(|ky| (2 * y + ky).checked_sub(1).filter(|&py| py < height));
             let px_opts: [Option<usize>; 3] =
                 std::array::from_fn(|kx| (2 * x + kx).checked_sub(1).filter(|&px| px < width));
             for ch in 0..channels {
-                let ch_in_base = ch * height;
+                let ch_in_base = (ch * chunk_count + chunk_local) * hw;
                 let ch_p_base = ch * 9;
                 for (ky, py_opt) in py_opts.iter().enumerate() {
                     if let Some(py) = *py_opt {
                         let in_row =
-                            &rounded[(ch_in_base + py) * width..(ch_in_base + py + 1) * width];
+                            &rounded[ch_in_base + py * width..ch_in_base + (py + 1) * width];
                         for (kx, px_opt) in px_opts.iter().enumerate() {
                             if let Some(px) = *px_opt {
-                                quad_slice[ch_p_base + ky * 3 + kx][lane] = in_row[px];
+                                panel_slice[ch_p_base + ky * 3 + kx][lane] = in_row[px];
                             }
                         }
                     }
@@ -823,11 +850,12 @@ fn im2col_quads_slice(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Reuses batch im2col, rounded input, and channel-major buffers across chunked encoder stages."
+    reason = "Reuses batch im2col, rounded input, and channel-major buffers across multi-chunk encoder stages."
 )]
-fn convolve_into_with_threads(
+fn convolve_batch_into_with_threads(
     linear: &Linear,
     input: &[f32],
+    chunk_count: usize,
     width: usize,
     height: usize,
     channels: usize,
@@ -840,14 +868,18 @@ fn convolve_into_with_threads(
 ) -> io::Result<()> {
     let (out_width, out_height) = (width.div_ceil(2), height.div_ceil(2));
     let out_channels = linear.bias.len();
-    let total_patches = out_width * out_height;
+    let patches_per_chunk = out_width * out_height;
+    let total_patches = chunk_count
+        .checked_mul(patches_per_chunk)
+        .ok_or_else(invalid)?;
     let patch_width = 9 * channels;
     for _ in 0..total_patches {
         check(cancel)?;
     }
+    let hw = height.checked_mul(width).ok_or_else(invalid)?;
     let input_len = channels
-        .checked_mul(height)
-        .and_then(|v| v.checked_mul(width))
+        .checked_mul(chunk_count)
+        .and_then(|v| v.checked_mul(hw))
         .ok_or_else(invalid)?;
     let input_view = input.get(..input_len).ok_or_else(invalid)?;
     if total_patches > 0 && patch_width > 0 {
@@ -865,15 +897,17 @@ fn convolve_into_with_threads(
     ensure_buffer(output, out_channels * total_patches)?;
     if linear.weights.is_float() {
         let rounded = &rounded_input[..input_len];
-        prepared.prepare_quads_direct(total_patches, patch_width, workers, &|first_quad, dst| {
-            im2col_quads_slice(
+        prepared.prepare_panels16_direct(total_patches, patch_width, workers, &|first_p16, dst| {
+            im2col_panels16_slice(
                 rounded,
+                chunk_count,
                 width,
                 height,
                 channels,
                 out_width,
+                patches_per_chunk,
                 total_patches,
-                first_quad,
+                first_p16,
                 dst,
             );
         });
@@ -889,38 +923,38 @@ fn convolve_into_with_threads(
         ensure_buffer(&mut patches, total_patches * patch_width)?;
         if total_patches > 0 && patch_width > 0 {
             let rounded = &rounded_input[..input_len];
-            let row_stride = out_width * patch_width;
-            row_workers::run_aligned(&mut patches, workers, row_stride, &|elem_off, slice| {
-                let first_y = elem_off / row_stride;
-                for (local_y, y_slice) in slice.chunks_exact_mut(row_stride).enumerate() {
-                    let y = first_y + local_y;
+            row_workers::run_aligned(&mut patches, workers, patch_width, &|elem_off, slice| {
+                let first_pos = elem_off / patch_width;
+                for (local_pos_idx, patch) in slice.chunks_exact_mut(patch_width).enumerate() {
+                    let pos = first_pos + local_pos_idx;
+                    let chunk_local = pos / patches_per_chunk;
+                    let local_pos = pos % patches_per_chunk;
+                    let y = local_pos / out_width;
+                    let x = local_pos % out_width;
+                    let interior_x = x > 0 && 2 * x + 1 < width;
                     let py_opts: [Option<usize>; 3] = std::array::from_fn(|ky| {
                         (2 * y + ky).checked_sub(1).filter(|&py| py < height)
                     });
-                    for (x, patch) in y_slice.chunks_exact_mut(patch_width).enumerate() {
-                        let interior_x = x > 0 && 2 * x + 1 < width;
-                        for channel in 0..channels {
-                            let ch_in_base = channel * height;
-                            let ch_p_base = channel * 9;
-                            for (ky, py_opt) in py_opts.iter().enumerate() {
-                                let row_dst =
-                                    &mut patch[ch_p_base + ky * 3..ch_p_base + (ky + 1) * 3];
-                                if let Some(py) = *py_opt {
-                                    let in_row = &rounded
-                                        [(ch_in_base + py) * width..(ch_in_base + py + 1) * width];
-                                    if interior_x {
-                                        row_dst.copy_from_slice(&in_row[2 * x - 1..2 * x + 2]);
-                                    } else {
-                                        for (kx, dst) in row_dst.iter_mut().enumerate() {
-                                            *dst = (2 * x + kx)
-                                                .checked_sub(1)
-                                                .filter(|&px| px < width)
-                                                .map_or(0.0, |px| in_row[px]);
-                                        }
-                                    }
+                    for channel in 0..channels {
+                        let ch_in_base = (channel * chunk_count + chunk_local) * hw;
+                        let ch_p_base = channel * 9;
+                        for (ky, py_opt) in py_opts.iter().enumerate() {
+                            let row_dst = &mut patch[ch_p_base + ky * 3..ch_p_base + (ky + 1) * 3];
+                            if let Some(py) = *py_opt {
+                                let in_row = &rounded
+                                    [ch_in_base + py * width..ch_in_base + (py + 1) * width];
+                                if interior_x {
+                                    row_dst.copy_from_slice(&in_row[2 * x - 1..2 * x + 2]);
                                 } else {
-                                    row_dst.fill(0.0);
+                                    for (kx, dst) in row_dst.iter_mut().enumerate() {
+                                        *dst = (2 * x + kx)
+                                            .checked_sub(1)
+                                            .filter(|&px| px < width)
+                                            .map_or(0.0, |px| in_row[px]);
+                                    }
                                 }
+                            } else {
+                                row_dst.fill(0.0);
                             }
                         }
                     }
@@ -942,6 +976,40 @@ fn convolve_into_with_threads(
         &linear.bias,
         total_patches,
         workers,
+    )
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Test convenience wrapper for single-chunk convolve."
+)]
+fn convolve_into_with_threads(
+    linear: &Linear,
+    input: &[f32],
+    width: usize,
+    height: usize,
+    channels: usize,
+    workers: usize,
+    prepared: &mut PreparedBatch,
+    rounded_input: &mut Vec<f32>,
+    scratch: &mut Vec<f32>,
+    output: &mut Vec<f32>,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<()> {
+    convolve_batch_into_with_threads(
+        linear,
+        input,
+        1,
+        width,
+        height,
+        channels,
+        workers,
+        prepared,
+        rounded_input,
+        scratch,
+        output,
+        cancel,
     )
 }
 
@@ -1420,6 +1488,82 @@ mod wave5_tests {
         let mut nan_in = vec![0.5_f32; 70 * 64];
         nan_in[0] = f32::NAN;
         assert!(convolve_with_threads(&linear, &nan_in, 70, 64, 1, 3, &mut || false).is_err());
+
+        // Multi-chunk encode_mel bit-exact invariance across workers (exercising multi-chunk Conv1/Conv2 batching).
+        let cfg = Config {
+            mel_bins: 16,
+            channels: 8,
+            hidden: 16,
+            heads: 2,
+            intermediate: 32,
+            output: 8,
+            window: 5,
+            max_positions: 2,
+        };
+        let make_linear = |in_w: usize, out_w: usize, seed: usize| -> io::Result<Linear> {
+            let weights = (0..in_w * out_w)
+                .map(|i| {
+                    (f32::from(u16::try_from((i * 7 + seed) % 37).unwrap_or(0)) - 18.0) * 0.015625
+                })
+                .collect();
+            let bias = (0..out_w)
+                .map(|i| {
+                    (f32::from(u16::try_from((i * 5 + seed) % 19).unwrap_or(0)) - 9.0) * 0.03125
+                })
+                .collect();
+            Ok(Linear {
+                weights: Projection::f32(in_w, out_w, weights)?,
+                bias,
+            })
+        };
+        let make_norm = |w: usize, seed: usize| Norm {
+            weight: (0..w)
+                .map(|i| 0.5 + f32::from(u16::try_from((i + seed) % 7).unwrap_or(0)) * 0.125)
+                .collect(),
+            bias: vec![0.0; w],
+        };
+        let enc_weights = Weights {
+            convolutions: [
+                make_linear(9, 8, 1)?,
+                make_linear(9 * 8, 8, 2)?,
+                make_linear(9 * 8, 8, 3)?,
+            ],
+            convolution_out: Projection::f32(16, 16, vec![0.0625; 256])?,
+            blocks: vec![Block {
+                attention_norm: make_norm(16, 1),
+                ffn_norm: make_norm(16, 2),
+                query: make_linear(16, 16, 4)?,
+                key: make_linear(16, 16, 5)?,
+                value: make_linear(16, 16, 6)?,
+                attention_out: make_linear(16, 16, 7)?,
+                ffn_in: make_linear(16, 32, 8)?,
+                ffn_out: make_linear(32, 16, 9)?,
+            }],
+            output_norm: make_norm(16, 3),
+            output_in: make_linear(16, 16, 10)?,
+            output_out: make_linear(16, 8, 11)?,
+        };
+        let enc_seq = Encoder::new(cfg, enc_weights)?;
+        let frames = 105_usize; // 11 chunks -> 8 + 3 multi-chunk batches with partial tail chunk!
+        let mel: Vec<f32> = (0..cfg.mel_bins * frames)
+            .map(|i| (f32::from(u16::try_from((i * 11) % 59).unwrap_or(0)) - 29.0) * 0.03125)
+            .collect();
+        let out_1 = enc_seq.encode_mel(&mel, frames, &mut || false)?;
+        let out_4 = enc_seq
+            .with_threads(4)?
+            .encode_mel(&mel, frames, &mut || false)?;
+        assert_eq!(
+            out_1
+                .values()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            out_4
+                .values()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 }

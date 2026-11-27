@@ -195,6 +195,13 @@ pub fn axpy_f16_pair_f32(w0: f32, w1: f32, v_f16: &[u16], out0: &mut [f32], out1
     crate::native::quant_q8::axpy_f16_pair_f32(w0, w1, v_f16, out0, out1);
 }
 
+/// Accumulates a 4-row by 16-column strictly non-FMA `f32` GEMM tile
+/// (`acc[r][c] += sum_k rows[r][k] * act_panel[k][c]`) in exact left-to-right `k` order
+/// using ARM64 NEON `vmulq_laneq_f32` + `vaddq_f32` (`0-ULP` vs scalar).
+pub fn gemm_f32_nonfma_4x16(rows: [&[f32]; 4], act_panel: &[[f32; 16]], acc: &mut [[f32; 16]; 4]) {
+    crate::native::quant_q8::gemm_f32_nonfma_4x16(rows, act_panel, acc);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1229,6 +1236,53 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn gemm_f32_nonfma_4x16_matches_scalar_and_fma_sensitive_edges_bit_exact() {
+        for k_len in [0_usize, 1, 3, 4, 5, 9, 17, 256, 259] {
+            let rows_vec: [Vec<f32>; 4] = std::array::from_fn(|r| {
+                (0..k_len)
+                    .map(|k| match (r + k) % 9 {
+                        0 => -0.0_f32,
+                        1 => f32::from_bits(0x3f80_0001),
+                        2 => 16_777_216.0_f32,
+                        3 => -16_777_216.0_f32,
+                        _ => {
+                            (f32::from(u16::try_from((r * 13 + k * 7) % 41).unwrap_or(0)) - 20.0)
+                                * 0.03125
+                        }
+                    })
+                    .collect()
+            });
+            let row_refs: [&[f32]; 4] = std::array::from_fn(|r| rows_vec[r].as_slice());
+            let panel: Vec<[f32; 16]> = (0..k_len)
+                .map(|k| {
+                    std::array::from_fn(|c| match (k + c) % 7 {
+                        0 => -0.0_f32,
+                        1 => 1.0_f32,
+                        2 => f32::from_bits(0x3bff_ffff),
+                        _ => {
+                            (f32::from(u16::try_from((k * 17 + c * 5) % 53).unwrap_or(0)) - 26.0)
+                                * 0.0625
+                        }
+                    })
+                })
+                .collect();
+
+            let mut acc_nat = [[0.0_f32; 16]; 4];
+            let mut acc_prt = [[0.0_f32; 16]; 4];
+            gemm_f32_nonfma_4x16(row_refs, &panel, &mut acc_nat);
+            crate::native::quant_q8::gemm_f32_nonfma_4x16_portable(row_refs, &panel, &mut acc_prt);
+
+            for r in 0..4 {
+                assert_eq!(
+                    acc_nat[r].map(f32::to_bits),
+                    acc_prt[r].map(f32::to_bits),
+                    "k_len={k_len} r={r}"
+                );
             }
         }
     }

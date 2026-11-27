@@ -19,7 +19,7 @@ use core::arch::aarch64::{
     vdupq_n_u8, vdupq_n_u16, vfmaq_f32, vget_high_s8, vget_high_u16, vget_low_f16, vget_low_s8,
     vget_low_s16, vget_low_u16, vld1_u8, vld1_u16, vld1q_f32, vld1q_lane_u16, vld1q_s8, vld1q_s32,
     vld1q_u8, vld1q_u16, vmaxv_u16, vmaxvq_u16, vmlal_high_s16, vmlal_s16, vmlaq_s32, vmovl_u8,
-    vmovl_u16, vmulq_f32, vorrq_u8, vpaddq_f32, vpaddq_s32, vreinterpret_f16_u16,
+    vmovl_u16, vmulq_f32, vmulq_laneq_f32, vorrq_u8, vpaddq_f32, vpaddq_s32, vreinterpret_f16_u16,
     vreinterpretq_f16_u16, vreinterpretq_s8_u8, vreinterpretq_s16_u16, vreinterpretq_s32_u32,
     vshlq_n_u8, vshrq_n_u8, vst1q_f32, vst1q_s8, vst1q_s32, vsubq_s8, vzip1q_f32, vzip2q_f32,
 };
@@ -1809,5 +1809,123 @@ pub(crate) fn axpy_f16_pair_f32(
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     {
         axpy_f16_pair_f32_portable(w0, w1, v_f16, out0, out1);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+fn gemm_f32_nonfma_4x16_neon(rows: [&[f32]; 4], act_panel: &[[f32; 16]], acc: &mut [[f32; 16]; 4]) {
+    let k_len = act_panel.len();
+    let mut a_acc: [[float32x4_t; 4]; 4] = std::array::from_fn(|r| {
+        let quads = acc[r].as_chunks::<4>().0;
+        [
+            load_f32x4(&quads[0]),
+            load_f32x4(&quads[1]),
+            load_f32x4(&quads[2]),
+            load_f32x4(&quads[3]),
+        ]
+    });
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn step_lane<const LANE: i32>(
+        a_acc: &mut [[float32x4_t; 4]; 4],
+        w: [float32x4_t; 4],
+        panel_k: &[f32; 16],
+    ) {
+        let a_quads = panel_k.as_chunks::<4>().0;
+        let a0 = load_f32x4(&a_quads[0]);
+        let a1 = load_f32x4(&a_quads[1]);
+        let a2 = load_f32x4(&a_quads[2]);
+        let a3 = load_f32x4(&a_quads[3]);
+        for (acc_row, &wr) in a_acc.iter_mut().zip(w.iter()) {
+            acc_row[0] = vaddq_f32(acc_row[0], vmulq_laneq_f32::<LANE>(a0, wr));
+            acc_row[1] = vaddq_f32(acc_row[1], vmulq_laneq_f32::<LANE>(a1, wr));
+            acc_row[2] = vaddq_f32(acc_row[2], vmulq_laneq_f32::<LANE>(a2, wr));
+            acc_row[3] = vaddq_f32(acc_row[3], vmulq_laneq_f32::<LANE>(a3, wr));
+        }
+    }
+
+    let (w0_chunks, _) = rows[0].as_chunks::<4>();
+    let (w1_chunks, _) = rows[1].as_chunks::<4>();
+    let (w2_chunks, _) = rows[2].as_chunks::<4>();
+    let (w3_chunks, _) = rows[3].as_chunks::<4>();
+    let chunk_count = w0_chunks.len();
+    for c_idx in 0..chunk_count {
+        let k = c_idx * 4;
+        let w = [
+            load_f32x4(&w0_chunks[c_idx]),
+            load_f32x4(&w1_chunks[c_idx]),
+            load_f32x4(&w2_chunks[c_idx]),
+            load_f32x4(&w3_chunks[c_idx]),
+        ];
+        step_lane::<0>(&mut a_acc, w, &act_panel[k]);
+        step_lane::<1>(&mut a_acc, w, &act_panel[k + 1]);
+        step_lane::<2>(&mut a_acc, w, &act_panel[k + 2]);
+        step_lane::<3>(&mut a_acc, w, &act_panel[k + 3]);
+    }
+    for (k, panel_k) in act_panel.iter().enumerate().skip(chunk_count * 4) {
+        let a_quads = panel_k.as_chunks::<4>().0;
+        let a0 = load_f32x4(&a_quads[0]);
+        let a1 = load_f32x4(&a_quads[1]);
+        let a2 = load_f32x4(&a_quads[2]);
+        let a3 = load_f32x4(&a_quads[3]);
+        for (r, acc_row) in a_acc.iter_mut().enumerate() {
+            let wv = vdupq_n_f32(rows[r][k]);
+            acc_row[0] = vaddq_f32(acc_row[0], vmulq_f32(a0, wv));
+            acc_row[1] = vaddq_f32(acc_row[1], vmulq_f32(a1, wv));
+            acc_row[2] = vaddq_f32(acc_row[2], vmulq_f32(a2, wv));
+            acc_row[3] = vaddq_f32(acc_row[3], vmulq_f32(a3, wv));
+        }
+    }
+    let _ = k_len;
+
+    for (dst_row, src_row) in acc.iter_mut().zip(a_acc.iter()) {
+        for (dst_quad, &src_quad) in dst_row.as_chunks_mut::<4>().0.iter_mut().zip(src_row) {
+            store_f32x4(src_quad, dst_quad);
+        }
+    }
+}
+
+/// Exact portable non-FMA 4x16 `f32` GEMM accumulation matching scalar `acc[r][c] += w * a`.
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "neon"))))]
+pub(crate) fn gemm_f32_nonfma_4x16_portable(
+    rows: [&[f32]; 4],
+    act_panel: &[[f32; 16]],
+    acc: &mut [[f32; 16]; 4],
+) {
+    let k_len = act_panel.len();
+    if rows.iter().any(|r| r.len() != k_len) {
+        return;
+    }
+    for (k, panel_k) in act_panel.iter().enumerate() {
+        for r in 0..4 {
+            let w = rows[r][k];
+            for (dst, &a) in acc[r].iter_mut().zip(panel_k.iter()) {
+                *dst += w * a;
+            }
+        }
+    }
+}
+
+/// Accumulates a 4-row by 16-column strictly non-FMA `f32` GEMM tile
+/// (`acc[r][c] += sum_k rows[r][k] * act_panel[k][c]`) in exact left-to-right `k` order.
+pub(crate) fn gemm_f32_nonfma_4x16(
+    rows: [&[f32]; 4],
+    act_panel: &[[f32; 16]],
+    acc: &mut [[f32; 16]; 4],
+) {
+    let k_len = act_panel.len();
+    if rows.iter().any(|r| r.len() != k_len) {
+        return;
+    }
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        // SAFETY: Baseline NEON is enabled by target configuration and slice lengths match `k_len`.
+        unsafe { gemm_f32_nonfma_4x16_neon(rows, act_panel, acc) };
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
+        gemm_f32_nonfma_4x16_portable(rows, act_panel, acc);
     }
 }
