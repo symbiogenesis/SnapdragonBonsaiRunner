@@ -895,3 +895,52 @@ fn bonsai25_supports_daisyrose_with_exact_cow_bytes() -> Result<(), LaunchError>
     }
     Ok(())
 }
+
+#[test]
+fn validate_section_grants_rejects_mismatches_and_accepts_valid_slots() -> Result<(), LaunchError> {
+    use bonsai_windows_process::InheritedSectionGrant;
+    let digest = [0x42_u8; 32];
+    let valid_grant = InheritedSectionGrant {
+        slot: 0,
+        child_handle: 0x1234,
+        bytes: 4096,
+    };
+    assert!(validate_section_grants(vec![], vec![digest]).is_err());
+    assert!(
+        validate_section_grants(
+            vec![InheritedSectionGrant {
+                slot: 1,
+                ..valid_grant
+            }],
+            vec![digest],
+        )
+        .is_err()
+    );
+    assert!(
+        validate_section_grants(
+            vec![InheritedSectionGrant {
+                child_handle: 0,
+                ..valid_grant
+            }],
+            vec![digest],
+        )
+        .is_err()
+    );
+    assert!(
+        validate_section_grants(
+            vec![InheritedSectionGrant {
+                bytes: 0,
+                ..valid_grant
+            }],
+            vec![digest],
+        )
+        .is_err()
+    );
+    let attestations = validate_section_grants(vec![valid_grant], vec![digest])?;
+    assert_eq!(attestations.len(), 1);
+    assert_eq!(attestations[0].slot, 0);
+    assert_eq!(attestations[0].child_handle, 0x1234);
+    assert_eq!(attestations[0].bytes, 4096);
+    assert_eq!(attestations[0].sha256, digest);
+    Ok(())
+}

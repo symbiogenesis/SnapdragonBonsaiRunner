@@ -1266,10 +1266,19 @@ impl LaunchConfig {
         plan: &LaunchPlan,
     ) -> Result<VerifiedLaunchGuards, LaunchError> {
         fn join_opt<T>(
-            handle: Option<std::thread::ScopedJoinHandle<'_, Result<Option<T>, LaunchError>>>,
+            handle: Option<
+                Result<
+                    std::thread::ScopedJoinHandle<'_, Result<Option<T>, LaunchError>>,
+                    LaunchError,
+                >,
+            >,
             panic_error: LaunchError,
         ) -> Result<Option<T>, LaunchError> {
-            handle.map_or(Ok(None), |h| h.join().map_err(|_| panic_error)?)
+            match handle {
+                None => Ok(None),
+                Some(Err(err)) => Err(err),
+                Some(Ok(h)) => h.join().map_err(|_| panic_error)?,
+            }
         }
 
         let verify_vision = self.runtime_supports_vision()?;
@@ -1287,23 +1296,31 @@ impl LaunchConfig {
         };
         let model_workers = remaining.saturating_sub(mmproj_workers).max(1);
         std::thread::scope(|scope| {
-            let native_handle = self
-                .native_engine
-                .then(|| scope.spawn(|| self.native_executable_guard()));
-            let daisyrose_handle = daisyrose_selection
-                .as_ref()
-                .map(|selection| scope.spawn(|| Self::verify_daisyrose_selection(selection)));
-            let mmproj_handle =
-                verify_vision.then(|| scope.spawn(|| self.mmproj_guard(mmproj_workers)));
+            let native_handle = self.native_engine.then(|| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, || self.native_executable_guard())
+                    .map_err(|_| LaunchError::NativeRuntime)
+            });
+            let daisyrose_handle = daisyrose_selection.as_ref().map(|selection| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, || Self::verify_daisyrose_selection(selection))
+                    .map_err(|_| LaunchError::Adapter)
+            });
+            let mmproj_handle = verify_vision.then(|| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, || self.mmproj_guard(mmproj_workers))
+                    .map_err(|_| LaunchError::Artifacts)
+            });
 
             let artifacts_result = self.verify_artifacts(plan, model_workers);
-            let native_executable = join_opt(native_handle, LaunchError::NativeRuntime)?;
-            let artifacts = artifacts_result?;
+            let native_executable = join_opt(native_handle, LaunchError::NativeRuntime);
+            let daisyrose = join_opt(daisyrose_handle, LaunchError::Adapter);
+            let mmproj = join_opt(mmproj_handle, LaunchError::Artifacts);
             Ok(VerifiedLaunchGuards {
-                native_executable,
-                artifacts,
-                daisyrose: join_opt(daisyrose_handle, LaunchError::Adapter)?,
-                mmproj: join_opt(mmproj_handle, LaunchError::Artifacts)?,
+                native_executable: native_executable?,
+                artifacts: artifacts_result?,
+                daisyrose: daisyrose?,
+                mmproj: mmproj?,
             })
         })
     }
@@ -1599,22 +1616,10 @@ impl LaunchConfig {
                     &section_files,
                 )
                 .map_err(|error| map_sandbox_error(&error))?;
-            if grants.len() != section_digests.len() {
+            let Ok(attestations) = validate_section_grants(grants, section_digests) else {
+                process.stop(STOP_TIMEOUT).map_err(|_| LaunchError::Stop)?;
                 return Err(LaunchError::Process);
-            }
-            let mut attestations = Vec::with_capacity(grants.len());
-            for (index, (grant, sha256)) in grants.into_iter().zip(section_digests).enumerate() {
-                let expected_slot = u32::try_from(index).map_err(|_| LaunchError::Process)?;
-                if grant.slot != expected_slot || grant.child_handle == 0 || grant.bytes == 0 {
-                    return Err(LaunchError::Process);
-                }
-                attestations.push(crate::pipe_transport::VerifiedSectionAttestation {
-                    slot: grant.slot,
-                    child_handle: grant.child_handle,
-                    bytes: grant.bytes,
-                    sha256,
-                });
-            }
+            };
             Ok((process, Some((child_in, child_out, attestations))))
         } else {
             OwnedProcess::start_sandboxed(specification, &policy)
@@ -2552,6 +2557,29 @@ const fn containment(
 
 fn number(value: Option<OsString>) -> Result<u16, LaunchError> {
     crate::configuration::decimal_u16(value).ok_or(LaunchError::Arguments)
+}
+
+fn validate_section_grants(
+    grants: Vec<bonsai_windows_process::InheritedSectionGrant>,
+    section_digests: Vec<[u8; 32]>,
+) -> Result<Vec<crate::pipe_transport::VerifiedSectionAttestation>, LaunchError> {
+    if grants.len() != section_digests.len() {
+        return Err(LaunchError::Process);
+    }
+    let mut attestations = Vec::with_capacity(grants.len());
+    for (index, (grant, sha256)) in grants.into_iter().zip(section_digests).enumerate() {
+        let expected_slot = u32::try_from(index).map_err(|_| LaunchError::Process)?;
+        if grant.slot != expected_slot || grant.child_handle == 0 || grant.bytes == 0 {
+            return Err(LaunchError::Process);
+        }
+        attestations.push(crate::pipe_transport::VerifiedSectionAttestation {
+            slot: grant.slot,
+            child_handle: grant.child_handle,
+            bytes: grant.bytes,
+            sha256,
+        });
+    }
+    Ok(attestations)
 }
 
 fn decode_sha256_hex(hex: &str) -> Result<[u8; 32], LaunchError> {

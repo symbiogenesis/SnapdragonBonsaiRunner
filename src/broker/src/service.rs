@@ -411,27 +411,62 @@ impl LocalChatService {
     /// avoid a busy retry loop. Dropping this future releases its reservation.
     ///
     /// # Errors
-    /// Returns [`ServiceError`] for capacity, shutdown or socket failure.
+    /// Returns [`ServiceError`] for capacity, shutdown or fatal socket failure.
     pub async fn accept(&self) -> Result<AcceptedChat<'_>, ServiceError> {
         let reservation = self.gate.reserve().map_err(ServiceError::Gate)?;
-        let (stream, peer) = race_gate_close(
-            &self.gate,
-            async { self.listener.accept().await.map_err(|_| ServiceError::Io) },
-            || ServiceError::Gate(GateError::Closed),
-        )
-        .await?;
-        if !peer.ip().is_loopback() || !peer.is_ipv4() {
-            return Err(ServiceError::Configuration);
+        loop {
+            let accept_result = race_gate_close(
+                &self.gate,
+                async {
+                    match self.listener.accept().await {
+                        Ok(pair) => Ok(Ok(pair)),
+                        Err(err) if is_transient_accept_error(&err) => Ok(Err(err)),
+                        Err(_) => Err(ServiceError::Io),
+                    }
+                },
+                || ServiceError::Gate(GateError::Closed),
+            )
+            .await?;
+            let (stream, peer) = match accept_result {
+                Ok(pair) => pair,
+                Err(err) => {
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) {
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
+                }
+            };
+            if !peer.ip().is_loopback() || !peer.is_ipv4() {
+                drop(stream);
+                continue;
+            }
+            if stream.set_nodelay(true).is_err() {
+                drop(stream);
+                continue;
+            }
+            let accepted = Instant::now();
+            return Ok(AcceptedChat {
+                stream,
+                reservation,
+                service: self,
+                accepted,
+            });
         }
-        stream.set_nodelay(true).map_err(|_| ServiceError::Io)?;
-        let accepted = Instant::now();
-        Ok(AcceptedChat {
-            stream,
-            reservation,
-            service: self,
-            accepted,
-        })
     }
+}
+
+fn is_transient_accept_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+    )
 }
 
 /// One reserved, owned socket. Drop closes it and releases capacity.
@@ -879,5 +914,28 @@ mod tests {
             assert_eq!(service.policy.validated_image_cache_len(), 1);
             Ok(())
         })
+    }
+
+    #[test]
+    fn transient_accept_errors_are_classified_without_killing_service() {
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert!(is_transient_accept_error(&io::Error::new(
+                kind,
+                "transient"
+            )));
+        }
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::AddrInUse,
+        ] {
+            assert!(!is_transient_accept_error(&io::Error::new(kind, "fatal")));
+        }
     }
 }
