@@ -62,11 +62,9 @@ struct Observation {
 pub(super) struct Viewport {
     observation: Option<Observation>,
     budget: Budget,
-}
-
-pub(super) struct Rows {
-    pub(super) messages: Vec<Row>,
-    pub(super) correction: f32,
+    pub(super) rows: Vec<Row>,
+    priorities: Vec<(usize, bool)>,
+    queued: Vec<bool>,
 }
 
 pub(super) struct Row {
@@ -100,24 +98,23 @@ impl Transcript {
         width: f32,
         viewport: egui::Rect,
         controls: Option<&MessageControls<'_>>,
-    ) -> Rows {
+        rows: &mut Vec<Row>,
+    ) -> f32 {
         let body_width = 2.0_f32.mul_add(-MESSAGE_INSET.x, width);
-        let mut rows = self.layout_rows(controls);
+        self.layout_rows(controls, rows);
         if rows.is_empty() {
             self.viewport.observation = None;
-            return Rows {
-                messages: rows,
-                correction: 0.0,
-            };
+            return 0.0;
         }
+        let style = super::LayoutStyleKey::from_ui(ui, body_width);
         self.viewport.budget.begin(ui.ctx().cumulative_frame_nr());
         let gap = MESSAGE_GAP.max(ui.spacing().item_spacing.y);
         // ScrollArea rounds the painted content origin to physical pixels.
         // Its supplied viewport retains the exact logical scroll offset.
         let offset = viewport.top().max(0.0);
         let viewport_height = (viewport.bottom() - offset).max(0.0);
-        let old_total = position(&rows, rows.len(), gap);
-        let anchor = self.layout_anchor(&rows, offset, viewport_height, gap);
+        let old_total = position(rows, rows.len(), gap);
+        let anchor = self.layout_anchor(rows, offset, viewport_height, gap);
         let follow_bottom = offset > 0.0
             && self
                 .viewport
@@ -128,10 +125,23 @@ impl Transcript {
                     previous.bottom
                 });
         let navigating = self.search.target.is_some() || self.search.latest;
-        let priorities = self.layout_priorities(&rows, offset, viewport_height, gap, anchor.0);
-        self.measure_rows(ui, body_width, &mut rows, priorities);
-        let total = position(&rows, rows.len(), gap);
-        let anchor_position = position(&rows, anchor.0, gap)
+        let mut priorities = std::mem::take(&mut self.viewport.priorities);
+        let mut queued = std::mem::take(&mut self.viewport.queued);
+        self.layout_priorities(
+            rows,
+            offset,
+            viewport_height,
+            gap,
+            anchor.0,
+            &mut priorities,
+            &mut queued,
+        );
+        self.measure_rows(ui, style, rows, &priorities);
+        priorities.clear();
+        self.viewport.priorities = priorities;
+        self.viewport.queued = queued;
+        let total = position(rows, rows.len(), gap);
+        let anchor_position = position(rows, anchor.0, gap)
             + self
                 .find_anchor_offset(anchor.0, anchor.1.matched.as_ref())
                 .unwrap_or(0.0);
@@ -155,7 +165,7 @@ impl Transcript {
         // Earlier measurements can shrink and expose rows that were offscreen
         // when priorities were chosen. Refine those estimates on the next frame
         // even when none of the old visible rows exhausted the job budget.
-        if visible_pending(&rows, corrected_offset, viewport_height, gap) {
+        if visible_pending(rows, corrected_offset, viewport_height, gap) {
             ui.ctx().request_repaint();
         }
         self.viewport.observation = (!navigating).then_some(Observation {
@@ -168,10 +178,7 @@ impl Transcript {
             },
             bottom: total - corrected_offset <= viewport_height + 2.0,
         });
-        Rows {
-            messages: rows,
-            correction,
-        }
+        correction
     }
 
     fn layout_anchor(
@@ -228,16 +235,15 @@ impl Transcript {
     fn measure_rows(
         &mut self,
         ui: &egui::Ui,
-        body_width: f32,
+        style: super::LayoutStyleKey,
         rows: &mut [Row],
-        priorities: Vec<(usize, bool)>,
+        priorities: &[(usize, bool)],
     ) {
         let mut pending = false;
-        for (index, required) in priorities {
+        for &(index, required) in priorities {
             let message = &mut self.messages[index];
             let row = &mut rows[index];
-            row.ready =
-                message.layout_current(ui, body_width, row.highlights, row.selected.as_ref());
+            row.ready = message.layout_current(style, row.highlights, row.selected.as_ref());
             if row.ready {
                 continue;
             }
@@ -253,9 +259,9 @@ impl Transcript {
                 pending |= required;
                 continue;
             }
-            message.layout(
+            message.layout_with_style(
                 ui,
-                body_width,
+                style,
                 &self.search.matches[row.matches.clone()],
                 row.highlights,
                 row.selected.as_ref(),
@@ -285,48 +291,51 @@ impl Transcript {
         )
     }
 
-    fn layout_rows(&self, controls: Option<&MessageControls<'_>>) -> Vec<Row> {
+    fn layout_rows(&self, controls: Option<&MessageControls<'_>>, rows: &mut Vec<Row>) {
+        rows.clear();
+        rows.reserve(self.messages.len());
         let mut consumed = 0;
-        self.messages
-            .iter()
-            .map(|message| {
-                let count = self.search.matches[consumed..]
-                    .partition_point(|found| found.message == message.id);
-                let matches = consumed..consumed + count;
-                consumed += count;
-                let selected = self
-                    .search
-                    .matches
-                    .get(self.search.active)
-                    .filter(|found| found.message == message.id)
-                    .map(|found| found.range.clone());
-                let extra_height = if controls.is_some_and(|controls| {
-                    message.retry_prefix(controls.history).is_some()
-                        || message.can_continue(controls.history)
-                }) {
-                    MESSAGE_CONTENT_GAP + MESSAGE_ACTION_SIZE
-                } else {
-                    0.0
-                };
-                Row {
-                    matches,
-                    highlights: HighlightKey {
-                        query_revision: if count == 0 {
-                            0
-                        } else {
-                            self.search.query_revision
-                        },
-                        count,
+        for message in &self.messages {
+            let count = self.search.matches[consumed..]
+                .partition_point(|found| found.message == message.id);
+            let matches = consumed..consumed + count;
+            consumed += count;
+            let selected = self
+                .search
+                .matches
+                .get(self.search.active)
+                .filter(|found| found.message == message.id)
+                .map(|found| found.range.clone());
+            let extra_height = if controls.is_some_and(|controls| {
+                message.retry_prefix(controls.history).is_some()
+                    || message.can_continue(controls.history)
+            }) {
+                MESSAGE_CONTENT_GAP + MESSAGE_ACTION_SIZE
+            } else {
+                0.0
+            };
+            rows.push(Row {
+                matches,
+                highlights: HighlightKey {
+                    query_revision: if count == 0 {
+                        0
+                    } else {
+                        self.search.query_revision
                     },
-                    selected,
-                    extra_height,
-                    height: message.height() + extra_height,
-                    ready: false,
-                }
-            })
-            .collect()
+                    count,
+                },
+                selected,
+                extra_height,
+                height: message.height() + extra_height,
+                ready: false,
+            });
+        }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Priority builder reuses Viewport scratch vectors across frames."
+    )]
     fn layout_priorities(
         &self,
         rows: &[Row],
@@ -334,9 +343,13 @@ impl Transcript {
         viewport_height: f32,
         gap: f32,
         anchor: usize,
-    ) -> Vec<(usize, bool)> {
-        let mut priorities = Vec::with_capacity(rows.len());
-        let mut queued = vec![false; rows.len()];
+        priorities: &mut Vec<(usize, bool)>,
+        queued: &mut Vec<bool>,
+    ) {
+        priorities.clear();
+        priorities.reserve(rows.len());
+        queued.clear();
+        queued.resize(rows.len(), false);
         let mut push = |index: usize, required| {
             if !queued[index] {
                 queued[index] = true;
@@ -369,7 +382,6 @@ impl Transcript {
         for index in 0..rows.len() {
             push(index, false);
         }
-        priorities
     }
 }
 

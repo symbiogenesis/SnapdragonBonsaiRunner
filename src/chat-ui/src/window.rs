@@ -43,6 +43,7 @@ mod history_search;
 #[cfg(test)]
 mod history_search_tests;
 mod image_cache;
+pub(crate) use image_cache::fnv1a64;
 #[cfg(test)]
 mod image_ui_tests;
 #[cfg(test)]

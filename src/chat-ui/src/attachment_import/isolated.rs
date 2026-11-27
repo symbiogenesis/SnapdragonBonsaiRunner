@@ -18,7 +18,7 @@ use crate::isolated_worker::{
 use super::{
     Attachment, MAX_IMAGE_EDGE, MAX_MODEL_PNG_BYTES, MAX_SOURCE_MEDIA_BYTES, MAX_THUMBNAIL_EDGE,
     MAX_THUMBNAIL_PNG_BYTES, MAX_TOTAL_VIDEO_PNG_BYTES, MAX_VIDEO_FRAME_EDGE, MAX_VIDEO_KEYFRAMES,
-    MediaKind, POLL, Shared, VideoFrame, display_name, image,
+    MediaKind, POLL, PrehashedPng, Shared, VideoFrame, display_name, image,
 };
 
 pub(super) const MAGIC: &[u8; 8] = b"BSATT001";
@@ -208,7 +208,7 @@ pub(super) fn read_packet(
                 width,
                 height,
                 data_url: Arc::from(data_url),
-                thumbnail_png: Arc::from(thumbnail_png),
+                thumbnail_png: PrehashedPng::from(thumbnail_png),
             })
         }
         MediaKind::Video => {
@@ -238,7 +238,7 @@ pub(super) fn read_packet(
                 height,
                 duration_ms: duration_or_code,
                 frames: Arc::from(frames),
-                thumbnail_png: Arc::from(thumbnail_png),
+                thumbnail_png: PrehashedPng::from(thumbnail_png),
             })
         }
     }

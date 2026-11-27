@@ -1,5 +1,6 @@
 //! Native reading typography, independent of the offline parser's style hints.
 use super::egui;
+use std::sync::Arc;
 
 pub(super) const CODE_BLOCK: &str = "Bonsai Code Block";
 
@@ -101,14 +102,14 @@ pub(super) fn append(
 
 /// Cache full-width code surfaces with the galley. Walk rendered UTF-8 once;
 /// reflow and Find rebuild these bounds with their owning text layout.
-pub(super) fn code_panels(galley: &egui::Galley) -> Vec<egui::Rect> {
+pub(super) fn code_panels(galley: &egui::Galley) -> Arc<[egui::Rect]> {
     if !galley
         .job
         .sections
         .iter()
         .any(|section| block_code(&section.format))
     {
-        return Vec::new();
+        return Arc::default();
     }
     let mut panels: Vec<egui::Rect> = Vec::new();
     let mut byte = 0;
@@ -148,5 +149,5 @@ pub(super) fn code_panels(galley: &egui::Galley) -> Vec<egui::Rect> {
         previous_code = code;
         byte = end;
     }
-    panels
+    Arc::from(panels)
 }

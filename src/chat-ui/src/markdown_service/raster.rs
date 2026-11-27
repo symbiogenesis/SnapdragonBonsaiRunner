@@ -68,8 +68,18 @@ pub(crate) fn decode_raster(bytes: &[u8]) -> Result<Option<DecodedRaster<'_>>, I
             if !remainder.is_empty() {
                 return Err(InvalidRasterWire);
             }
-            for &[r, g, b, alpha] in pixels {
-                if r > alpha || g > alpha || b > alpha {
+            let (chunks, tail) = pixels.as_chunks::<64>();
+            for chunk in chunks {
+                let mut invalid = false;
+                for &[r, g, b, alpha] in chunk {
+                    invalid |= (r > alpha) | (g > alpha) | (b > alpha);
+                }
+                if invalid {
+                    return Err(InvalidRasterWire);
+                }
+            }
+            for &[r, g, b, alpha] in tail {
+                if (r > alpha) | (g > alpha) | (b > alpha) {
                     return Err(InvalidRasterWire);
                 }
             }

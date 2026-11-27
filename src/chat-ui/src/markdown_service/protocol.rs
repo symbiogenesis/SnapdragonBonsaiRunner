@@ -9,6 +9,7 @@ const MARKDOWN_REQUEST_MAGIC: &[u8; 8] = b"BSMD0001";
 const RASTER_REQUEST_MAGIC: &[u8; 8] = b"BSMG0001";
 const RESPONSE_MAGIC: &[u8; 8] = b"BSMR0001";
 const HEADER_BYTES: usize = 20;
+const SCRATCH_LIMIT_BYTES: usize = 64 * 1024;
 
 pub(super) enum Event {
     Ready,
@@ -23,6 +24,18 @@ fn write_frame(
     scratch: &mut Vec<u8>,
 ) -> io::Result<()> {
     let length = u32::try_from(bytes.len()).map_err(io::Error::other)?;
+    if bytes.len() > SCRATCH_LIMIT_BYTES {
+        if scratch.capacity() > HEADER_BYTES + SCRATCH_LIMIT_BYTES {
+            scratch.shrink_to(HEADER_BYTES + SCRATCH_LIMIT_BYTES);
+        }
+        let mut header = [0_u8; HEADER_BYTES];
+        header[..8].copy_from_slice(magic);
+        header[8..16].copy_from_slice(&ticket.0.to_le_bytes());
+        header[16..20].copy_from_slice(&length.to_le_bytes());
+        output.write_all(&header)?;
+        output.write_all(bytes)?;
+        return output.flush();
+    }
     scratch.clear();
     scratch.reserve(HEADER_BYTES + bytes.len());
     scratch.extend_from_slice(magic);
@@ -46,6 +59,20 @@ fn write_raster_frame(
         .checked_add(8)
         .ok_or_else(|| io::Error::other("Oversized SVG raster frame"))?;
     let length = u32::try_from(payload_len).map_err(io::Error::other)?;
+    if payload_len > SCRATCH_LIMIT_BYTES {
+        if scratch.capacity() > HEADER_BYTES + SCRATCH_LIMIT_BYTES {
+            scratch.shrink_to(HEADER_BYTES + SCRATCH_LIMIT_BYTES);
+        }
+        let mut header = [0_u8; HEADER_BYTES + 8];
+        header[..8].copy_from_slice(RASTER_REQUEST_MAGIC);
+        header[8..16].copy_from_slice(&ticket.0.to_le_bytes());
+        header[16..20].copy_from_slice(&length.to_le_bytes());
+        header[20..24].copy_from_slice(&max_width.to_le_bytes());
+        header[24..28].copy_from_slice(&max_height.to_le_bytes());
+        output.write_all(&header)?;
+        output.write_all(svg)?;
+        return output.flush();
+    }
     scratch.clear();
     scratch.reserve(HEADER_BYTES + payload_len);
     scratch.extend_from_slice(RASTER_REQUEST_MAGIC);

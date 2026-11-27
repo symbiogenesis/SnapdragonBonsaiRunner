@@ -1283,7 +1283,7 @@ mod tests {
 
     #[test]
     fn multimodal_attachments_and_legacy_v1_workspaces_roundtrip_cleanly() -> io::Result<()> {
-        use crate::attachment_import::{Attachment, VideoFrame, format_user_turn};
+        use crate::attachment_import::{Attachment, PrehashedPng, VideoFrame, format_user_turn};
         use std::sync::Arc;
 
         let mut original = state();
@@ -1296,7 +1296,7 @@ mod tests {
             width: 64,
             height: 64,
             data_url: Arc::from("data:image/png;base64,AAAA"),
-            thumbnail_png: Arc::from([1_u8, 2, 3]),
+            thumbnail_png: PrehashedPng::from([1_u8, 2, 3]),
         };
         let committed_video = Attachment::Video {
             name: "clip.mp4".to_owned(),
@@ -1307,7 +1307,7 @@ mod tests {
                 timestamp_ms: 500,
                 data_url: Arc::from("data:image/png;base64,BBBB"),
             }]),
-            thumbnail_png: Arc::from([4_u8, 5]),
+            thumbnail_png: PrehashedPng::from([4_u8, 5]),
         };
         let attachments = vec![committed_image.clone(), committed_video.clone()];
         let (wire_text, wire_images) = format_user_turn("Analyze these", &attachments);

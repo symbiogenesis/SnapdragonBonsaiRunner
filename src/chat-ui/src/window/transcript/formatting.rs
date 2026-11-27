@@ -305,14 +305,23 @@ fn plain_chunked(
     let normal = presentation::body_format(text_size, visuals);
     let ranges = top_level_block_ranges(body);
     let mut out = Vec::with_capacity(ranges.len());
+    let mut match_cursor = 0_usize;
     for (start, end) in ranges {
         let abs_start = base_offset + start;
         let abs_end = base_offset + end;
-        let seg_matches: Vec<_> = matches
-            .iter()
-            .filter(|found| found.range.start < abs_end && found.range.end > abs_start)
-            .cloned()
-            .collect();
+        while matches
+            .get(match_cursor)
+            .is_some_and(|found| found.range.end <= abs_start)
+        {
+            match_cursor += 1;
+        }
+        let mut slice_end = match_cursor;
+        while matches
+            .get(slice_end)
+            .is_some_and(|found| found.range.start < abs_end)
+        {
+            slice_end += 1;
+        }
         let layout = plain_slice(
             body,
             base_offset,
@@ -321,9 +330,15 @@ fn plain_chunked(
             width,
             normal.clone(),
             visuals,
-            &seg_matches,
+            &matches[match_cursor..slice_end],
             use_presentation,
         );
+        while matches
+            .get(match_cursor)
+            .is_some_and(|found| found.range.end <= abs_end)
+        {
+            match_cursor += 1;
+        }
         out.push(BodySegment::Text(layout));
     }
     out
@@ -370,12 +385,19 @@ fn append_tail_slice(
     job: &mut egui::text::LayoutJob,
 ) {
     let mut cursor = 0;
-    for found in matches
-        .iter()
-        .filter(|found| found.range.start >= base_offset)
-    {
-        let start = (found.range.start - base_offset).min(tail.len());
-        let end = (found.range.end - base_offset).min(tail.len());
+    let abs_end = base_offset + tail.len();
+    for found in matches {
+        if found.range.end <= base_offset {
+            continue;
+        }
+        if found.range.start >= abs_end {
+            break;
+        }
+        let start = found.range.start.saturating_sub(base_offset).min(tail.len());
+        let end = found.range.end.saturating_sub(base_offset).min(tail.len());
+        if end <= start {
+            continue;
+        }
         if cursor < start {
             presentation::append(job, &tail[cursor..start], normal.clone(), text_size);
         }
@@ -583,32 +605,77 @@ fn parsed_ends_in_code_block(parsed: &wire::TextSegment) -> bool {
     parsed.spans.last().is_some_and(|span| span.is_code_block())
 }
 
+pub(super) struct PrefixAnchor {
+    pub(super) doc: Arc<wire::Document>,
+    pub(super) prefix_segments: usize,
+    pub(super) prefix_images: usize,
+    last_block_display_start: usize,
+    last_block_span_cursor: usize,
+    last_block_mapping_cursor: usize,
+    tail_start: usize,
+}
+
+fn advance_parsed_cursors(
+    parsed: &wire::TextSegment,
+    display_start: usize,
+    span_cursor: &mut usize,
+    mapping_cursor: &mut usize,
+) {
+    while parsed
+        .spans
+        .get(*span_cursor)
+        .is_some_and(|span| span.end <= display_start)
+    {
+        *span_cursor += 1;
+    }
+    while parsed
+        .source_map
+        .entries
+        .get(*mapping_cursor)
+        .is_some_and(|entry| entry.display.end <= display_start)
+    {
+        *mapping_cursor += 1;
+    }
+}
+
 fn build_parsed_chunk_source_map(
     entries: &[Mapping],
+    mapping_cursor: &mut usize,
     display_start: usize,
     display_end: usize,
     tail: Option<(Range<usize>, Range<usize>)>,
     total_display_bytes: usize,
 ) -> Arc<SourceMap> {
     let mut out = Vec::new();
-    for entry in entries {
-        if entry.display.end <= display_start || entry.display.start >= display_end {
-            continue;
+    if display_start < display_end {
+        while let Some(entry) = entries.get(*mapping_cursor) {
+            if entry.display.end <= display_start {
+                *mapping_cursor += 1;
+                continue;
+            }
+            if entry.display.start >= display_end {
+                break;
+            }
+            let d_start = entry.display.start.max(display_start);
+            let d_end = entry.display.end.min(display_end);
+            let source = if entry.verbatim {
+                let s_start = entry.source.start + (d_start - entry.display.start);
+                let s_end = entry.source.start + (d_end - entry.display.start);
+                s_start..s_end
+            } else {
+                entry.source.clone()
+            };
+            out.push(Mapping {
+                source,
+                display: (d_start - display_start)..(d_end - display_start),
+                verbatim: entry.verbatim,
+            });
+            if entry.display.end <= display_end {
+                *mapping_cursor += 1;
+            } else {
+                break;
+            }
         }
-        let d_start = entry.display.start.max(display_start);
-        let d_end = entry.display.end.min(display_end);
-        let source = if entry.verbatim {
-            let s_start = entry.source.start + (d_start - entry.display.start);
-            let s_end = entry.source.start + (d_end - entry.display.start);
-            s_start..s_end
-        } else {
-            entry.source.clone()
-        };
-        out.push(Mapping {
-            source,
-            display: (d_start - display_start)..(d_end - display_start),
-            verbatim: entry.verbatim,
-        });
     }
     if let Some((source, display)) = tail {
         out.push(Mapping {
@@ -623,17 +690,26 @@ fn build_parsed_chunk_source_map(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Monotonic display-range builder updates span and highlight cursors across chunks."
+)]
 fn append_parsed_display_range(
     parsed: &wire::TextSegment,
     range: Range<usize>,
     text_size: f32,
     visuals: &egui::Visuals,
     highlights: &[Range<usize>],
+    span_cursor: &mut usize,
+    match_cursor: &mut usize,
     job: &mut egui::text::LayoutJob,
 ) {
-    let mut next_match = 0;
-    for &span in &parsed.spans {
+    if range.start >= range.end {
+        return;
+    }
+    while let Some(&span) = parsed.spans.get(*span_cursor) {
         if span.end <= range.start {
+            *span_cursor += 1;
             continue;
         }
         if span.start >= range.end {
@@ -644,12 +720,14 @@ fn append_parsed_display_range(
         let end = span.end.min(range.end);
         while cursor < end {
             while highlights
-                .get(next_match)
+                .get(*match_cursor)
                 .is_some_and(|found| found.end <= cursor)
             {
-                next_match += 1;
+                *match_cursor += 1;
             }
-            let found = highlights.get(next_match).filter(|found| found.start < end);
+            let found = highlights
+                .get(*match_cursor)
+                .filter(|found| found.start < end);
             let (until, highlighted) = match found {
                 Some(found) if found.start <= cursor => (found.end.min(end), true),
                 Some(found) => (found.start.min(end), false),
@@ -663,6 +741,159 @@ fn append_parsed_display_range(
             presentation::append(job, &parsed.text[cursor..until], effective, text_size);
             cursor = until;
         }
+        if span.end <= range.end {
+            *span_cursor += 1;
+        } else {
+            break;
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared block renderer aligns one parsed block with an optional source tail."
+)]
+fn render_parsed_block(
+    body_prefix: &str,
+    width: f32,
+    text_size: f32,
+    normal: &egui::TextFormat,
+    visuals: &egui::Visuals,
+    parsed: &wire::TextSegment,
+    chunk_start: usize,
+    chunk_end: usize,
+    is_last_parsed: bool,
+    tail_start: usize,
+    has_tail: bool,
+    tail_breaks_before: bool,
+    first_tail: Option<(usize, usize)>,
+    highlights: &[Range<usize>],
+    matches: &[search::Match],
+    span_cursor: &mut usize,
+    match_cursor: &mut usize,
+    mapping_cursor: &mut usize,
+) -> Layout {
+    let mut effective_end = chunk_end;
+    let mut combined_tail: Option<(usize, usize)> = None;
+    if is_last_parsed && has_tail {
+        if tail_breaks_before {
+            let trimmed = parsed.text[chunk_start..effective_end].trim_end_matches('\n');
+            if !trimmed.is_empty() {
+                effective_end = chunk_start + trimmed.len();
+            }
+        } else if let Some(first) = first_tail {
+            combined_tail = Some(first);
+        }
+    }
+    let tail_len = combined_tail.map_or(0, |(s, e)| e - s);
+    let mut job = egui::text::LayoutJob {
+        text: String::with_capacity((effective_end - chunk_start) + tail_len),
+        ..Default::default()
+    };
+    job.wrap.max_width = width;
+    append_parsed_display_range(
+        parsed,
+        chunk_start..effective_end,
+        text_size,
+        visuals,
+        highlights,
+        span_cursor,
+        match_cursor,
+        &mut job,
+    );
+    let tail_mapping = if let Some((t_start, t_end)) = combined_tail {
+        let tail_display_start = job.text.len();
+        let abs_start = tail_start + t_start;
+        let abs_end = tail_start + t_end;
+        let tail_idx = matches.partition_point(|found| found.range.end <= abs_start);
+        let tail_end_idx =
+            tail_idx + matches[tail_idx..].partition_point(|found| found.range.start < abs_end);
+        append_tail_slice(
+            &body_prefix[abs_start..abs_end],
+            abs_start,
+            normal.clone(),
+            text_size,
+            visuals,
+            &matches[tail_idx..tail_end_idx],
+            &mut job,
+        );
+        Some((abs_start..abs_end, tail_display_start..job.text.len()))
+    } else {
+        None
+    };
+    let source_map = build_parsed_chunk_source_map(
+        &parsed.source_map.entries,
+        mapping_cursor,
+        chunk_start,
+        effective_end,
+        tail_mapping,
+        job.text.len(),
+    );
+    Layout { job, source_map }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tail-block helper advances one monotonic match cursor across unparsed tail paragraphs."
+)]
+fn append_tail_ranges(
+    body_prefix: &str,
+    width: f32,
+    text_size: f32,
+    normal: &egui::TextFormat,
+    visuals: &egui::Visuals,
+    tail_start: usize,
+    tail_ranges: &[(usize, usize)],
+    tail_skip: usize,
+    matches: &[search::Match],
+    layouts: &mut Vec<Layout>,
+) {
+    let mut tail_match_cursor = matches.partition_point(|found| found.range.end <= tail_start);
+    for &(t_start, t_end) in tail_ranges.iter().skip(tail_skip) {
+        let abs_start = tail_start + t_start;
+        let abs_end = tail_start + t_end;
+        while matches
+            .get(tail_match_cursor)
+            .is_some_and(|found| found.range.end <= abs_start)
+        {
+            tail_match_cursor += 1;
+        }
+        let mut slice_end = tail_match_cursor;
+        while matches
+            .get(slice_end)
+            .is_some_and(|found| found.range.start < abs_end)
+        {
+            slice_end += 1;
+        }
+        let mut job = egui::text::LayoutJob {
+            text: String::with_capacity(t_end - t_start),
+            ..Default::default()
+        };
+        job.wrap.max_width = width;
+        append_tail_slice(
+            &body_prefix[abs_start..abs_end],
+            abs_start,
+            normal.clone(),
+            text_size,
+            visuals,
+            &matches[tail_match_cursor..slice_end],
+            &mut job,
+        );
+        while matches
+            .get(tail_match_cursor)
+            .is_some_and(|found| found.range.end <= abs_end)
+        {
+            tail_match_cursor += 1;
+        }
+        let source_map = Arc::new(SourceMap {
+            entries: vec![Mapping {
+                source: abs_start..abs_end,
+                display: 0..job.text.len(),
+                verbatim: true,
+            }],
+            display_bytes: job.text.len(),
+        });
+        layouts.push(Layout { job, source_map });
     }
 }
 
@@ -679,7 +910,7 @@ fn render_parsed_text_segment_chunked(
     parsed: &wire::TextSegment,
     tail_start: usize,
     append_tail: bool,
-) -> Vec<Layout> {
+) -> (Vec<Layout>, usize, usize, usize) {
     let normal = presentation::body_format(text_size, visuals);
     let highlights: Vec<_> = matches
         .iter()
@@ -698,96 +929,194 @@ fn render_parsed_text_segment_chunked(
         && (parsed.text.ends_with("\n\n") || body_prefix[..tail_start].ends_with("\n\n"));
 
     let mut layouts = Vec::with_capacity(blocks.len() + tail_ranges.len());
+    let mut span_cursor = 0_usize;
+    let mut match_cursor = 0_usize;
+    let mut mapping_cursor = 0_usize;
+    let mut last_block_display_start = 0_usize;
+    let mut last_block_span_cursor = 0_usize;
+    let mut last_block_mapping_cursor = 0_usize;
+
     for (idx, &(chunk_start, chunk_end)) in blocks.iter().enumerate() {
         let is_last_parsed = idx + 1 == blocks.len();
-        let mut effective_end = chunk_end;
-        let mut combined_tail: Option<(usize, usize)> = None;
-        if is_last_parsed && has_tail {
-            if tail_breaks_before {
-                let trimmed = parsed.text[chunk_start..effective_end].trim_end_matches('\n');
-                if !trimmed.is_empty() {
-                    effective_end = chunk_start + trimmed.len();
-                }
-            } else if let Some(&(t_start, t_end)) = tail_ranges.first() {
-                combined_tail = Some((t_start, t_end));
-            }
-        }
-        let tail_len = combined_tail.map_or(0, |(s, e)| e - s);
-        let mut job = egui::text::LayoutJob {
-            text: String::with_capacity((effective_end - chunk_start) + tail_len),
-            ..Default::default()
-        };
-        job.wrap.max_width = width;
-        append_parsed_display_range(
-            parsed,
-            chunk_start..effective_end,
-            text_size,
-            visuals,
-            &highlights,
-            &mut job,
-        );
-        let tail_mapping = if let Some((t_start, t_end)) = combined_tail {
-            let tail_display_start = job.text.len();
-            let abs_start = tail_start + t_start;
-            let abs_end = tail_start + t_end;
-            append_tail_slice(
-                &body_prefix[abs_start..abs_end],
-                abs_start,
-                normal.clone(),
-                text_size,
-                visuals,
-                matches,
-                &mut job,
+        if is_last_parsed {
+            advance_parsed_cursors(
+                parsed,
+                chunk_start,
+                &mut span_cursor,
+                &mut mapping_cursor,
             );
-            Some((abs_start..abs_end, tail_display_start..job.text.len()))
-        } else {
-            None
-        };
-        let source_map = build_parsed_chunk_source_map(
-            &parsed.source_map.entries,
+            last_block_display_start = chunk_start;
+            last_block_span_cursor = span_cursor;
+            last_block_mapping_cursor = mapping_cursor;
+        }
+        let layout = render_parsed_block(
+            body_prefix,
+            width,
+            text_size,
+            &normal,
+            visuals,
+            parsed,
             chunk_start,
-            effective_end,
-            tail_mapping,
-            job.text.len(),
+            chunk_end,
+            is_last_parsed,
+            tail_start,
+            has_tail,
+            tail_breaks_before,
+            tail_ranges.first().copied(),
+            &highlights,
+            matches,
+            &mut span_cursor,
+            &mut match_cursor,
+            &mut mapping_cursor,
         );
-        layouts.push(Layout { job, source_map });
+        layouts.push(layout);
     }
     let tail_skip = usize::from(has_tail && !tail_breaks_before);
-    for &(t_start, t_end) in tail_ranges.iter().skip(tail_skip) {
-        let abs_start = tail_start + t_start;
-        let abs_end = tail_start + t_end;
-        let seg_matches: Vec<_> = matches
-            .iter()
-            .filter(|found| found.range.start < abs_end && found.range.end > abs_start)
-            .cloned()
-            .collect();
-        let mut job = egui::text::LayoutJob {
-            text: String::with_capacity(t_end - t_start),
-            ..Default::default()
-        };
-        job.wrap.max_width = width;
-        append_tail_slice(
-            &body_prefix[abs_start..abs_end],
-            abs_start,
-            normal.clone(),
-            text_size,
-            visuals,
-            &seg_matches,
-            &mut job,
-        );
-        let source_map = Arc::new(SourceMap {
-            entries: vec![Mapping {
-                source: abs_start..abs_end,
-                display: 0..job.text.len(),
-                verbatim: true,
-            }],
-            display_bytes: job.text.len(),
-        });
-        layouts.push(Layout { job, source_map });
-    }
-    layouts
+    append_tail_ranges(
+        body_prefix,
+        width,
+        text_size,
+        &normal,
+        visuals,
+        tail_start,
+        &tail_ranges,
+        tail_skip,
+        matches,
+        &mut layouts,
+    );
+    (
+        layouts,
+        last_block_display_start,
+        last_block_span_cursor,
+        last_block_mapping_cursor,
+    )
 }
 
+pub(super) fn layout_document_tail(
+    body: &str,
+    width: f32,
+    text_size: f32,
+    visuals: &egui::Visuals,
+    matches: &[search::Match],
+    anchor: &PrefixAnchor,
+    streaming_visible_prefix: Option<usize>,
+) -> Option<(Vec<BodySegment>, bool)> {
+    if let Some(prefix_end) = streaming_visible_prefix
+        && matches.last().is_some_and(|found| found.range.end > prefix_end)
+    {
+        return None;
+    }
+    let effective_end = streaming_visible_prefix.unwrap_or(body.len());
+    let generating = streaming_visible_prefix.is_some();
+    let effective_body = &body[..effective_end];
+    let tail_start = anchor.tail_start;
+    if tail_start > effective_body.len() || !effective_body.is_char_boundary(tail_start) {
+        return None;
+    }
+    let tail_match_idx = matches.partition_point(|found| found.range.end <= tail_start);
+    if matches[tail_match_idx..]
+        .iter()
+        .any(|found| found.range.start < tail_start)
+    {
+        return None;
+    }
+    let has_images = anchor
+        .doc
+        .segments
+        .iter()
+        .any(|segment| matches!(segment, wire::Segment::Image(_)));
+    match anchor.doc.segments.last()? {
+        wire::Segment::Text(last_text) => {
+            let normal = presentation::body_format(text_size, visuals);
+            let min_source = last_text
+                .source_map
+                .entries
+                .get(anchor.last_block_mapping_cursor)
+                .map_or(tail_start, |entry| entry.source.start);
+            let prefix_match_start =
+                matches[..tail_match_idx].partition_point(|found| found.range.end <= min_source);
+            let highlights: Vec<_> = matches[prefix_match_start..tail_match_idx]
+                .iter()
+                .map(|found| last_text.source_map.range(found.range.clone()))
+                .collect();
+            let has_tail = tail_start < effective_body.len();
+            let tail_ranges = if has_tail {
+                top_level_block_ranges(&effective_body[tail_start..])
+            } else {
+                Vec::new()
+            };
+            let tail_breaks_before = has_tail
+                && !parsed_ends_in_code_block(last_text)
+                && (last_text.text.ends_with("\n\n")
+                    || effective_body[..tail_start].ends_with("\n\n"));
+            let mut span_cursor = anchor.last_block_span_cursor;
+            let mut match_cursor = 0_usize;
+            let mut mapping_cursor = anchor.last_block_mapping_cursor;
+            let mut layouts = Vec::with_capacity(1 + tail_ranges.len());
+            layouts.push(render_parsed_block(
+                effective_body,
+                width,
+                text_size,
+                &normal,
+                visuals,
+                last_text,
+                anchor.last_block_display_start,
+                last_text.text.len(),
+                true,
+                tail_start,
+                has_tail,
+                tail_breaks_before,
+                tail_ranges.first().copied(),
+                &highlights,
+                &matches[tail_match_idx..],
+                &mut span_cursor,
+                &mut match_cursor,
+                &mut mapping_cursor,
+            ));
+            let tail_skip = usize::from(has_tail && !tail_breaks_before);
+            append_tail_ranges(
+                effective_body,
+                width,
+                text_size,
+                &normal,
+                visuals,
+                tail_start,
+                &tail_ranges,
+                tail_skip,
+                &matches[tail_match_idx..],
+                &mut layouts,
+            );
+            let mut rendered = Vec::with_capacity(layouts.len());
+            for out in layouts {
+                if !out.job.text.is_empty() || (!has_images && !generating) {
+                    rendered.push(BodySegment::Text(out));
+                }
+            }
+            Some((rendered, generating))
+        }
+        wire::Segment::Image(_) => {
+            let rendered = if tail_start < effective_body.len() {
+                plain_chunked(
+                    &effective_body[tail_start..],
+                    tail_start,
+                    width,
+                    text_size,
+                    visuals,
+                    &matches[tail_match_idx..],
+                    true,
+                )
+            } else {
+                Vec::new()
+            };
+            Some((rendered, generating))
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Document layout tracks parsed prefix chunks, streaming SVG tails and Find matches."
+)]
 pub(super) fn layout_document(
     body: &str,
     structured: bool,
@@ -795,15 +1124,16 @@ pub(super) fn layout_document(
     text_size: f32,
     visuals: &egui::Visuals,
     matches: &[search::Match],
-    parsed: Option<(&wire::Document, usize)>,
+    parsed: Option<(&Arc<wire::Document>, usize)>,
     streaming_visible_prefix: Option<usize>,
     streaming_chunks: bool,
-) -> (Vec<BodySegment>, bool) {
+) -> (Vec<BodySegment>, bool, Option<PrefixAnchor>) {
     let plain_doc = |text: &str, generating: bool| {
         if streaming_chunks {
             (
                 plain_chunked(text, 0, width, text_size, visuals, matches, false),
                 generating,
+                None,
             )
         } else {
             let normal = presentation::body_format(text_size, visuals);
@@ -812,6 +1142,7 @@ pub(super) fn layout_document(
                     text, width, normal, visuals, matches,
                 ))],
                 generating,
+                None,
             )
         }
     };
@@ -830,7 +1161,7 @@ pub(super) fn layout_document(
 
     let Some((doc, prefix_len)) = parsed else {
         if effective_body.is_empty() && generating {
-            return (Vec::new(), true);
+            return (Vec::new(), true, None);
         }
         return plain_doc(effective_body, generating);
     };
@@ -861,30 +1192,65 @@ pub(super) fn layout_document(
         .any(|segment| matches!(segment, wire::Segment::Image(_)));
     let ends_with_text = matches!(doc.segments.last(), Some(wire::Segment::Text(_)));
     let mut rendered = Vec::with_capacity(doc.segments.len() + 1);
+    let mut prefix_segments = 0_usize;
+    let mut prefix_images = 0_usize;
+    let mut last_block_display_start = 0_usize;
+    let mut last_block_span_cursor = 0_usize;
+    let mut last_block_mapping_cursor = 0_usize;
+    let mut match_cursor = 0_usize;
+
     for (index, segment) in doc.segments.iter().enumerate() {
         match segment {
             wire::Segment::Text(layout) => {
                 let is_last = index + 1 == doc.segments.len();
-                let seg_matches: Vec<_> = matches
-                    .iter()
-                    .filter(|found| {
-                        (found.range.end <= tail_start
-                            && layout.source_map.covers_exact(&found.range))
-                            || (is_last && found.range.start >= tail_start)
+                while matches
+                    .get(match_cursor)
+                    .is_some_and(|found| found.range.end <= tail_start)
+                    && !layout
+                        .source_map
+                        .covers_exact(&matches[match_cursor].range)
+                    && layout.source_map.entries.last().is_some_and(|entry| {
+                        matches[match_cursor].range.end <= entry.source.start
                     })
-                    .cloned()
-                    .collect();
+                {
+                    match_cursor += 1;
+                }
+                let mut slice_end = match_cursor;
+                while let Some(found) = matches.get(slice_end) {
+                    if found.range.end <= tail_start {
+                        if layout.source_map.covers_exact(&found.range) {
+                            slice_end += 1;
+                        } else {
+                            break;
+                        }
+                    } else if is_last && found.range.start >= tail_start {
+                        slice_end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let seg_matches = &matches[match_cursor..slice_end];
                 if streaming_chunks {
-                    let chunks = render_parsed_text_segment_chunked(
+                    let (chunks, blk_disp, blk_span, blk_map) = render_parsed_text_segment_chunked(
                         effective_body,
                         width,
                         text_size,
                         visuals,
-                        &seg_matches,
+                        seg_matches,
                         layout,
                         tail_start,
                         is_last && ends_with_text,
                     );
+                    if is_last && ends_with_text {
+                        let non_empty_chunks = chunks
+                            .iter()
+                            .filter(|out| !out.job.text.is_empty() || (!has_images && !generating))
+                            .count();
+                        prefix_segments = rendered.len() + non_empty_chunks.saturating_sub(1);
+                        last_block_display_start = blk_disp;
+                        last_block_span_cursor = blk_span;
+                        last_block_mapping_cursor = blk_map;
+                    }
                     for out in chunks {
                         if !out.job.text.is_empty() || (!has_images && !generating) {
                             rendered.push(BodySegment::Text(out));
@@ -896,7 +1262,7 @@ pub(super) fn layout_document(
                         width,
                         text_size,
                         visuals,
-                        &seg_matches,
+                        seg_matches,
                         layout,
                         tail_start,
                         is_last && ends_with_text,
@@ -905,27 +1271,46 @@ pub(super) fn layout_document(
                         rendered.push(BodySegment::Text(out));
                     }
                 }
+                match_cursor = slice_end;
             }
             wire::Segment::Image(image) => {
                 rendered.push(BodySegment::Image {
                     svg: image.svg.clone(),
                     intrinsic_size: egui::vec2(image.intrinsic_width, image.intrinsic_height),
                 });
+                prefix_images += 1;
             }
         }
     }
+    if !ends_with_text {
+        prefix_segments = rendered.len();
+    }
     if !ends_with_text && tail_start < effective_body.len() {
         let tail_text = &effective_body[tail_start..];
+        let tail_match_start = matches.partition_point(|found| found.range.end <= tail_start);
+        let tail_matches = &matches[tail_match_start..];
         if streaming_chunks {
             rendered.extend(plain_chunked(
-                tail_text, tail_start, width, text_size, visuals, matches, true,
+                tail_text,
+                tail_start,
+                width,
+                text_size,
+                visuals,
+                tail_matches,
+                true,
             ));
         } else {
             let mut job = egui::text::LayoutJob::default();
             job.wrap.max_width = width;
             let normal = presentation::body_format(text_size, visuals);
             append_tail_slice(
-                tail_text, tail_start, normal, text_size, visuals, matches, &mut job,
+                tail_text,
+                tail_start,
+                normal,
+                text_size,
+                visuals,
+                tail_matches,
+                &mut job,
             );
             let source_map = Arc::new(SourceMap {
                 entries: vec![Mapping {
@@ -938,9 +1323,18 @@ pub(super) fn layout_document(
             rendered.push(BodySegment::Text(Layout { job, source_map }));
         }
     }
-    (rendered, generating)
+    let anchor = streaming_chunks.then(|| PrefixAnchor {
+        doc: Arc::clone(doc),
+        prefix_segments,
+        prefix_images,
+        last_block_display_start,
+        last_block_span_cursor,
+        last_block_mapping_cursor,
+        tail_start,
+    });
+    (rendered, generating, anchor)
 }
 
-pub(super) fn code_panels(galley: &egui::Galley) -> Vec<egui::Rect> {
+pub(super) fn code_panels(galley: &egui::Galley) -> Arc<[egui::Rect]> {
     presentation::code_panels(galley)
 }

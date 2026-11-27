@@ -1967,7 +1967,7 @@ fn test_image_attachment(
         width: 2,
         height: 2,
         data_url,
-        thumbnail_png,
+        thumbnail_png: crate::attachment_import::PrehashedPng::from(thumbnail_png),
     })
 }
 
@@ -2150,7 +2150,7 @@ fn media_attachments_require_vision_capability_to_send_and_open_lightbox() -> io
                 data_url: frame_two,
             },
         ]),
-        thumbnail_png: thumb_video,
+        thumbnail_png: crate::attachment_import::PrehashedPng::from(thumb_video),
     };
 
     assert_eq!(

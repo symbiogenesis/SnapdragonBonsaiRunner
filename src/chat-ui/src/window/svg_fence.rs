@@ -286,20 +286,73 @@ pub(super) fn strip_svg_fences(text: &str) -> String {
     out
 }
 
+/// Returns whether `text` contains any non-whitespace spoken prose outside
+/// top-level ```` ```svg ```` / ```` ~~~svg ```` fenced code blocks without allocating.
+pub(super) fn has_spoken_text(text: &str) -> bool {
+    if memchr::memchr2(b'`', b'~', text.as_bytes()).is_none() {
+        return !text.trim().is_empty();
+    }
+    let mut state = FenceState::Outside;
+    for line in text.split_inclusive('\n') {
+        match state {
+            FenceState::Outside => match parse_opening_fence(line) {
+                Some((open, FenceKind::Svg)) => {
+                    state = FenceState::InSvg { open, start: 0 };
+                }
+                Some((_, FenceKind::Other)) => {
+                    // Any non-SVG fence line itself emits non-whitespace text.
+                    return true;
+                }
+                None => {
+                    if !line.trim().is_empty() {
+                        return true;
+                    }
+                }
+            },
+            FenceState::InSvg { open, .. } => {
+                if is_closing_fence(line, open) {
+                    state = FenceState::Outside;
+                }
+            }
+            FenceState::InOther(_) => {
+                // Returned true when opening the non-SVG fence above.
+            }
+        }
+    }
+    false
+}
+
 /// If `text` currently ends inside an unclosed top-level ```` ```svg ```` / ```` ~~~svg ````
 /// block, returns `(visible_prefix, true)` where `visible_prefix` is the slice of `text`
 /// preceding the unclosed SVG fence line. Otherwise returns `(text, false)`.
 pub(super) fn split_streaming_svg(text: &str) -> (&str, bool) {
+    let bytes = text.as_bytes();
+    if memchr::memchr2(b'`', b'~', bytes).is_none() {
+        return (text, false);
+    }
     let mut state = FenceState::Outside;
     let mut offset = 0usize;
 
-    for line in text.split_inclusive('\n') {
+    while offset < bytes.len() {
+        let candidate = match state {
+            FenceState::Outside => memchr::memchr2(b'`', b'~', &bytes[offset..]),
+            FenceState::InSvg { open, .. } | FenceState::InOther(open) => {
+                memchr::memchr(open.ch, &bytes[offset..])
+            }
+        };
+        let Some(rel) = candidate else {
+            break;
+        };
+        let hit = offset + rel;
+        let line_start = memchr::memrchr(b'\n', &bytes[offset..hit]).map_or(offset, |nl| offset + nl + 1);
+        let line_end = memchr::memchr(b'\n', &bytes[hit..]).map_or(bytes.len(), |nl| hit + nl + 1);
+        let line = &text[line_start..line_end];
         match state {
             FenceState::Outside => match parse_opening_fence(line) {
                 Some((open, FenceKind::Svg)) => {
                     state = FenceState::InSvg {
                         open,
-                        start: offset,
+                        start: line_start,
                     };
                 }
                 Some((open, FenceKind::Other)) => {
@@ -318,7 +371,7 @@ pub(super) fn split_streaming_svg(text: &str) -> (&str, bool) {
                 }
             }
         }
-        offset += line.len();
+        offset = line_end;
     }
 
     match state {
@@ -473,7 +526,29 @@ fn line_might_be_closer(prefix: &str, open: Fence) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilteredDelta, StreamingSvgFilter, split_streaming_svg, strip_svg_fences};
+    use super::{
+        FilteredDelta, StreamingSvgFilter, has_spoken_text, split_streaming_svg, strip_svg_fences,
+    };
+
+    #[test]
+    fn has_spoken_text_matches_stripped_non_whitespace_without_allocating() {
+        for sample in [
+            "",
+            "   \n\t  ",
+            "Hello world",
+            "```svg\n<svg/>\n```",
+            "  ~~~svg\n<svg/>\n~~~\n  ",
+            "Intro\n\n```svg\n<svg/>\n```",
+            "```rust\nfn main() {}\n```",
+            "```rust\n```\n",
+        ] {
+            assert_eq!(
+                has_spoken_text(sample),
+                !strip_svg_fences(sample).trim().is_empty(),
+                "sample: {sample:?}"
+            );
+        }
+    }
 
     #[test]
     fn strip_svg_fences_removes_closed_and_unclosed_top_level_blocks() {

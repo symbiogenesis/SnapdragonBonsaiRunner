@@ -5,6 +5,7 @@ const MARKDOWN_MAGIC: &[u8; 8] = b"BSMD0001";
 const RASTER_MAGIC: &[u8; 8] = b"BSMG0001";
 const RESPONSE_MAGIC: &[u8; 8] = b"BSMR0001";
 const HEADER_BYTES: usize = 20;
+const SCRATCH_LIMIT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RASTER_REQUEST_BYTES: usize = 8 + super::svg::MAX_SVG_BYTES;
 // Four bytes per pixel (premultiplied RGBA8) plus the 13-byte BMG1 header.
@@ -27,6 +28,18 @@ fn write_frame(
     scratch: &mut Vec<u8>,
 ) -> io::Result<()> {
     let length = u32::try_from(bytes.len()).map_err(io::Error::other)?;
+    if bytes.len() > SCRATCH_LIMIT_BYTES {
+        if scratch.capacity() > HEADER_BYTES + SCRATCH_LIMIT_BYTES {
+            scratch.shrink_to(HEADER_BYTES + SCRATCH_LIMIT_BYTES);
+        }
+        let mut header = [0_u8; HEADER_BYTES];
+        header[..8].copy_from_slice(RESPONSE_MAGIC);
+        header[8..16].copy_from_slice(&ticket.to_le_bytes());
+        header[16..20].copy_from_slice(&length.to_le_bytes());
+        output.write_all(&header)?;
+        output.write_all(bytes)?;
+        return output.flush();
+    }
     scratch.clear();
     scratch.reserve(HEADER_BYTES + bytes.len());
     scratch.extend_from_slice(RESPONSE_MAGIC);

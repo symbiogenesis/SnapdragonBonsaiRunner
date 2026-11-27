@@ -63,7 +63,7 @@ pub(super) enum Role {
 
 pub(super) struct TextSegmentCache {
     pub(super) body: Arc<egui::Galley>,
-    pub(super) code_panels: Vec<egui::Rect>,
+    pub(super) code_panels: Arc<[egui::Rect]>,
     pub(in crate::window::transcript) source_map: Arc<formatting::SourceMap>,
     pub(super) underline: Vec<[egui::Pos2; 2]>,
 }
@@ -91,6 +91,36 @@ impl CachedSegment {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct LayoutStyleKey {
+    pub(super) width: f32,
+    pub(super) pixels_per_point: f32,
+    pub(super) text_size: f32,
+    pub(super) color: Color32,
+    pub(super) code_background: Color32,
+    pub(super) strong_color: Color32,
+    pub(super) reasoning_color: Color32,
+    pub(super) highlight_fill: Color32,
+    pub(super) highlight_color: Color32,
+}
+
+impl LayoutStyleKey {
+    pub(super) fn from_ui(ui: &egui::Ui, width: f32) -> Self {
+        let visuals = ui.visuals();
+        Self {
+            width,
+            pixels_per_point: ui.ctx().pixels_per_point(),
+            text_size: super::appearance::text_size(ui.ctx()),
+            color: visuals.text_color(),
+            code_background: visuals.code_bg_color,
+            strong_color: visuals.strong_text_color(),
+            reasoning_color: visuals.weak_text_color(),
+            highlight_fill: visuals.selection.bg_fill,
+            highlight_color: visuals.selection.stroke.color,
+        }
+    }
+}
+
 struct LayoutCache {
     width: f32,
     pixels_per_point: f32,
@@ -101,6 +131,7 @@ struct LayoutCache {
     reasoning_color: Color32,
     body_revision: u64,
     pending: bool,
+    streaming_chunks: bool,
     // Search owns the ranges. For an unchanged body and effective query, the
     // visible ranges are always the same prefix; eviction may change its count.
     highlights: HighlightKey,
@@ -111,6 +142,7 @@ struct LayoutCache {
     highlight_color: Color32,
     reasoning_bytes: usize,
     segments: Vec<CachedSegment>,
+    prefix_anchor: Option<formatting::PrefixAnchor>,
     reasoning: Option<Arc<egui::Galley>>,
 }
 
@@ -217,6 +249,8 @@ pub(super) struct Message {
     markdown: formatting::Pending,
     #[serde(skip)]
     measured_height: Option<f32>,
+    #[serde(skip)]
+    can_speak_cache: std::cell::Cell<Option<(u64, bool)>>,
     #[cfg(test)]
     #[serde(skip)]
     body_layouts: usize,
@@ -383,6 +417,7 @@ impl Transcript {
             cache: None,
             markdown: formatting::Pending::default(),
             measured_height: None,
+            can_speak_cache: std::cell::Cell::new(None),
             #[cfg(test)]
             body_layouts: 0,
             #[cfg(test)]
@@ -641,14 +676,15 @@ impl Transcript {
         let mut action = None;
         self.search.refresh(&self.messages);
         let width = width.max(120.0);
-        let rows = self.prepare_layout(ui, width, viewport, controls.as_ref());
+        let mut rows = std::mem::take(&mut self.viewport.rows);
+        let correction = self.prepare_layout(ui, width, viewport, controls.as_ref(), &mut rows);
         let mut presentation_pending = false;
-        for (message, row) in self.messages.iter_mut().zip(rows.messages) {
+        for (message, row) in self.messages.iter_mut().zip(rows.iter()) {
             let (rect, _) =
                 ui.allocate_exact_size(Vec2::new(width, row.height), egui::Sense::hover());
             // Compensate painting and hit testing in this pass too; the scroll
             // adjustment below makes the same correction persistent next frame.
-            let rect = rect.translate(egui::vec2(0.0, -rows.correction));
+            let rect = rect.translate(egui::vec2(0.0, -correction));
             let target = self
                 .search
                 .target
@@ -686,10 +722,12 @@ impl Transcript {
             }
             ui.add_space((MESSAGE_GAP - ui.spacing().item_spacing.y).max(0.0));
         }
+        rows.clear();
+        self.viewport.rows = rows;
         self.presentation = Some((ui.ctx().cumulative_frame_nr(), presentation_pending));
-        if rows.correction != 0.0 {
+        if correction != 0.0 {
             ui.scroll_with_delta_animation(
-                egui::vec2(0.0, -rows.correction),
+                egui::vec2(0.0, -correction),
                 egui::style::ScrollAnimation::none(),
             );
         }
@@ -742,12 +780,14 @@ impl Message {
         if self.role != Role::Assistant || self.pending {
             return false;
         }
-        if !self.body.contains("```") && !self.body.contains("~~~") {
-            return !self.body.trim().is_empty();
+        if let Some((revision, cached)) = self.can_speak_cache.get()
+            && revision == self.body_revision
+        {
+            return cached;
         }
-        !super::svg_fence::strip_svg_fences(&self.body)
-            .trim()
-            .is_empty()
+        let result = super::svg_fence::has_spoken_text(&self.body);
+        self.can_speak_cache.set(Some((self.body_revision, result)));
+        result
     }
 
     fn speaker(
@@ -823,10 +863,34 @@ impl Message {
         response.clicked()
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "Convenience layout entry point is exercised by unit tests."
+        )
+    )]
     fn layout(
         &mut self,
         ui: &egui::Ui,
         width: f32,
+        matches: &[search::Match],
+        highlights: HighlightKey,
+        selected: Option<&Range<usize>>,
+    ) -> &LayoutCache {
+        self.layout_with_style(
+            ui,
+            LayoutStyleKey::from_ui(ui, width),
+            matches,
+            highlights,
+            selected,
+        )
+    }
+
+    fn layout_with_style(
+        &mut self,
+        ui: &egui::Ui,
+        style: LayoutStyleKey,
         matches: &[search::Match],
         highlights: HighlightKey,
         selected: Option<&Range<usize>>,
@@ -838,17 +902,19 @@ impl Message {
             streaming_visible_prefix.map_or(self.body.as_str(), |end| &self.body[..end]);
         let parse_revision =
             (self.body_revision << 1) | u64::from(streaming_visible_prefix.is_some());
-        let markdown_changed =
-            self.role == Role::Assistant && self.markdown.refresh(ui, parse_revision, parse_source);
-        let color = ui.visuals().text_color();
-        let code_background = (self.role == Role::Assistant).then_some(ui.visuals().code_bg_color);
-        let strong_color =
-            (self.role == Role::Assistant).then_some(ui.visuals().strong_text_color());
-        let reasoning_color = ui.visuals().weak_text_color();
-        let pixels_per_point = ui.ctx().pixels_per_point();
-        let text_size = super::appearance::text_size(ui.ctx());
-        let highlight_fill = ui.visuals().selection.bg_fill;
-        let highlight_color = ui.visuals().selection.stroke.color;
+        let markdown_changed = self.role == Role::Assistant
+            && self
+                .markdown
+                .refresh(ui, parse_revision, parse_source, self.pending);
+        let width = style.width;
+        let color = style.color;
+        let code_background = (self.role == Role::Assistant).then_some(style.code_background);
+        let strong_color = (self.role == Role::Assistant).then_some(style.strong_color);
+        let reasoning_color = style.reasoning_color;
+        let pixels_per_point = style.pixels_per_point;
+        let text_size = style.text_size;
+        let highlight_fill = style.highlight_fill;
+        let highlight_color = style.highlight_color;
         let reasoning_visible = self.show_reasoning && !self.reasoning.is_empty();
         // Polonius lets a complete cache hit lend self.cache directly while a
         // partial miss ends the borrow and reclaims reusable galley owners below.
@@ -899,26 +965,37 @@ impl Message {
         }
         // Move reusable owners on a partial update. A complete cache hit above
         // does not reconstruct the cache or adjust any galley's Arc count.
-        let (previous_segments, previous_reasoning) =
-            self.cache.take().map_or((None, None), |cache| {
-                (Some(cache.segments), cache.reasoning)
+        let (previous_segments, previous_reasoning, previous_anchor, prev_streaming_chunks) =
+            self.cache.take().map_or((None, None, None, false), |cache| {
+                (
+                    Some(cache.segments),
+                    cache.reasoning,
+                    cache.prefix_anchor,
+                    cache.streaming_chunks,
+                )
             });
-        let mut segments = if body_unchanged && let Some(segments) = previous_segments {
-            segments
-        } else {
-            #[cfg(test)]
-            {
-                self.body_layouts += 1;
-            }
-            self.layout_body(
-                ui,
-                width,
-                text_size,
-                matches,
-                streaming_visible_prefix,
-                previous_segments.as_deref().filter(|_| can_reuse_galleys),
-            )
-        };
+        let streaming_chunks = self.pending && self.body_revision > 0;
+        let underline_was_same = previous_anchor.is_some() && underline_unchanged;
+        let (mut segments, prefix_anchor, prefix_reused) =
+            if body_unchanged && let Some(segments) = previous_segments {
+                (segments, previous_anchor, 0_usize)
+            } else {
+                #[cfg(test)]
+                {
+                    self.body_layouts += 1;
+                }
+                self.layout_body(
+                    ui,
+                    width,
+                    text_size,
+                    matches,
+                    streaming_visible_prefix,
+                    streaming_chunks,
+                    can_reuse_galleys,
+                    previous_segments,
+                    previous_anchor.filter(|_| can_reuse_galleys && prev_streaming_chunks),
+                )
+            };
         if !underline_unchanged || !body_unchanged {
             if let Some(selected) = selected {
                 #[cfg(test)]
@@ -926,7 +1003,12 @@ impl Message {
                     self.underline_layouts += 1;
                 }
                 let segment_count = segments.len();
-                for index in 0..segment_count {
+                let start_index = if underline_was_same {
+                    prefix_reused
+                } else {
+                    0
+                };
+                for index in start_index..segment_count {
                     let active_here = handles_source_offset(&segments, index, selected.start);
                     if let CachedSegment::Text(text) = &mut segments[index] {
                         let mapped = text.source_map.range(selected.clone());
@@ -974,48 +1056,53 @@ impl Message {
             reasoning_color,
             body_revision: self.body_revision,
             pending: self.pending,
+            streaming_chunks,
             highlights,
             selected: selected.cloned(),
             highlight_fill,
             highlight_color,
             reasoning_bytes: self.reasoning.len(),
             segments,
+            prefix_anchor,
             reasoning,
         })
     }
 
     fn layout_current(
         &self,
-        ui: &egui::Ui,
-        width: f32,
+        style: LayoutStyleKey,
         highlights: HighlightKey,
         selected: Option<&Range<usize>>,
     ) -> bool {
         let visible_reasoning = self.show_reasoning && !self.reasoning.is_empty();
         self.cache.as_ref().is_some_and(|cache| {
-            cache.width.to_bits() == width.to_bits()
-                && cache.pixels_per_point.to_bits() == ui.ctx().pixels_per_point().to_bits()
-                && cache.text_size.to_bits() == super::appearance::text_size(ui.ctx()).to_bits()
+            cache.width.to_bits() == style.width.to_bits()
+                && cache.pixels_per_point.to_bits() == style.pixels_per_point.to_bits()
+                && cache.text_size.to_bits() == style.text_size.to_bits()
                 && cache.body_revision == self.body_revision
                 && cache.pending == self.pending
                 && (self.role != Role::Assistant || !self.markdown.changed())
-                && cache.color == ui.visuals().text_color()
+                && cache.color == style.color
                 && cache.code_background
-                    == (self.role == Role::Assistant).then_some(ui.visuals().code_bg_color)
+                    == (self.role == Role::Assistant).then_some(style.code_background)
                 && cache.strong_color
-                    == (self.role == Role::Assistant).then_some(ui.visuals().strong_text_color())
+                    == (self.role == Role::Assistant).then_some(style.strong_color)
                 && cache.highlights == highlights
                 && (highlights.count == 0
-                    || (cache.highlight_fill == ui.visuals().selection.bg_fill
-                        && cache.highlight_color == ui.visuals().selection.stroke.color))
+                    || (cache.highlight_fill == style.highlight_fill
+                        && cache.highlight_color == style.highlight_color))
                 && cache.selected.as_ref() == selected
                 && cache.reasoning.is_some() == visible_reasoning
                 && (!visible_reasoning
                     || (cache.reasoning_bytes == self.reasoning.len()
-                        && cache.reasoning_color == ui.visuals().weak_text_color()))
+                        && cache.reasoning_color == style.reasoning_color))
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Body layout threads streaming prefix anchor, reusable segments and Find matches."
+    )]
     fn layout_body(
         &mut self,
         ui: &egui::Ui,
@@ -1023,28 +1110,97 @@ impl Message {
         text_size: f32,
         matches: &[search::Match],
         streaming_visible_prefix: Option<usize>,
-        previous_segments: Option<&[CachedSegment]>,
-    ) -> Vec<CachedSegment> {
+        streaming_chunks: bool,
+        can_reuse_galleys: bool,
+        mut previous_segments: Option<Vec<CachedSegment>>,
+        previous_anchor: Option<formatting::PrefixAnchor>,
+    ) -> (
+        Vec<CachedSegment>,
+        Option<formatting::PrefixAnchor>,
+        usize,
+    ) {
         #[cfg(test)]
         self.highlight_range_visits
             .set(self.highlight_range_visits.get() + matches.len());
         let parse_slice =
             streaming_visible_prefix.map_or(self.body.as_str(), |end| &self.body[..end]);
-        let streaming_chunks = self.pending && self.body_revision > 0;
-        let (body_segments, show_generating) = formatting::layout_document(
+        let parsed = self.markdown.parsed_for(parse_slice);
+
+        if streaming_chunks
+            && can_reuse_galleys
+            && let Some(anchor) = previous_anchor
+            && let Some((doc, _)) = parsed
+            && Arc::ptr_eq(&anchor.doc, doc)
+            && previous_segments
+                .as_ref()
+                .is_some_and(|prevs| prevs.len() >= anchor.prefix_segments)
+            && let Some((tail_segments, show_generating)) = formatting::layout_document_tail(
+                &self.body,
+                width,
+                text_size,
+                ui.visuals(),
+                matches,
+                &anchor,
+                streaming_visible_prefix,
+            )
+            && let Some(mut cached) = previous_segments.take()
+        {
+            let old_tail = cached.split_off(anchor.prefix_segments);
+            let prefix_reused = cached.len();
+            self.append_cached_segments(
+                ui,
+                width,
+                tail_segments,
+                show_generating,
+                anchor.prefix_images,
+                Some(&old_tail),
+                &mut cached,
+            );
+            return (cached, Some(anchor), prefix_reused);
+        }
+
+        let (body_segments, show_generating, anchor) = formatting::layout_document(
             &self.body,
             self.role == Role::Assistant,
             width,
             text_size,
             ui.visuals(),
             matches,
-            self.markdown.parsed_for(parse_slice),
+            parsed,
             streaming_visible_prefix,
             streaming_chunks,
         );
-        let mut image_index = 0_usize;
-        let mut prev_cursor = 0_usize;
+        let prevs = previous_segments
+            .as_deref()
+            .filter(|_| can_reuse_galleys);
         let mut cached = Vec::with_capacity(body_segments.len() + usize::from(show_generating));
+        self.append_cached_segments(
+            ui,
+            width,
+            body_segments,
+            show_generating,
+            0,
+            prevs,
+            &mut cached,
+        );
+        (cached, anchor, 0)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Appending laid-out segments matches reusable tail galleys and image cards."
+    )]
+    fn append_cached_segments(
+        &mut self,
+        ui: &egui::Ui,
+        width: f32,
+        body_segments: Vec<formatting::BodySegment>,
+        show_generating: bool,
+        mut image_index: usize,
+        previous_segments: Option<&[CachedSegment]>,
+        cached: &mut Vec<CachedSegment>,
+    ) {
+        let mut prev_cursor = 0_usize;
         for segment in body_segments {
             match segment {
                 formatting::BodySegment::Text(layout) => {
@@ -1066,7 +1222,7 @@ impl Message {
                     });
                     let (body, code_panels) = if let Some((next_cursor, prev)) = reused {
                         prev_cursor = next_cursor;
-                        (Arc::clone(&prev.body), prev.code_panels.clone())
+                        (Arc::clone(&prev.body), Arc::clone(&prev.code_panels))
                     } else {
                         #[cfg(test)]
                         {
@@ -1104,7 +1260,6 @@ impl Message {
                 card_size: generating_card_size(width),
             });
         }
-        cached
     }
 
     pub(super) fn height(&self) -> f32 {
@@ -1354,7 +1509,7 @@ fn render_attachments_grid(
             .rect_filled(thumb_rect, 6.0, visuals.faint_bg_color);
         if let Some(png) = attachment.thumbnail_png()
             && let Some(cache) = image_cache.as_deref_mut()
-            && let Some(tex) = cache.png_bytes_texture(ui.ctx(), png)
+            && let Some(tex) = cache.png_texture(ui.ctx(), png)
         {
             paint_fitted_texture(ui, thumb_rect, &tex);
         } else {
@@ -1420,27 +1575,32 @@ fn render_text_segment(
     highlight_color: Color32,
     target: Option<usize>,
 ) -> Option<egui::Rect> {
-    // Reserve the paint slot before selectable text, so code surfaces
-    // remain behind glyphs, selection and Find highlights.
-    let code_surface = ui.painter().add(egui::Shape::Noop);
-    let response = ui.add(egui::Label::new(Arc::clone(&text.body)).selectable(true));
-    ui.painter().set(
-        code_surface,
-        egui::Shape::Vec(
-            text.code_panels
-                .iter()
-                .map(|panel| {
-                    egui::Shape::rect_filled(
-                        panel
-                            .translate(response.rect.min.to_vec2())
-                            .expand2(egui::vec2(6.0, 3.0)),
-                        6.0,
-                        ui.visuals().code_bg_color,
-                    )
-                })
-                .collect(),
-        ),
-    );
+    let response = if text.code_panels.is_empty() {
+        ui.add(egui::Label::new(Arc::clone(&text.body)).selectable(true))
+    } else {
+        // Reserve the paint slot before selectable text, so code surfaces
+        // remain behind glyphs, selection and Find highlights.
+        let code_surface = ui.painter().add(egui::Shape::Noop);
+        let response = ui.add(egui::Label::new(Arc::clone(&text.body)).selectable(true));
+        ui.painter().set(
+            code_surface,
+            egui::Shape::Vec(
+                text.code_panels
+                    .iter()
+                    .map(|panel| {
+                        egui::Shape::rect_filled(
+                            panel
+                                .translate(response.rect.min.to_vec2())
+                                .expand2(egui::vec2(6.0, 3.0)),
+                            6.0,
+                            ui.visuals().code_bg_color,
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+        response
+    };
     for line in &text.underline {
         ui.painter().line_segment(
             line.map(|point| point + response.rect.min.to_vec2()),

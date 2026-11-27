@@ -285,6 +285,12 @@ impl Builder<'_> {
     fn value(&mut self, value: &str, span: Option<markdown_syntax::Span>, style: Style) {
         let range = span.and_then(|span| {
             let source = self.source.get(span.start..span.end)?;
+            if source.len() == value.len() && source == value {
+                return Some(span.start..span.end);
+            }
+            if source.len() < value.len() {
+                return Some(span.start..span.end);
+            }
             Some(source.find(value).map_or(span.start..span.end, |offset| {
                 span.start + offset..span.start + offset + value.len()
             }))
@@ -325,13 +331,18 @@ fn parse_layout(body: &str) -> Layout {
 }
 
 fn parse_document(body: &str) -> DocumentLayout {
+    let estimated_spans = if body.is_empty() {
+        0
+    } else {
+        (body.len() / 16).clamp(4, MAX_STYLE_SPANS)
+    };
     let mut builder = Builder {
         source: body,
         scratch: String::new(),
         out: BuilderOut {
             text: String::with_capacity(body.len()),
-            sections: Vec::new(),
-            mappings: Vec::new(),
+            sections: Vec::with_capacity(estimated_spans),
+            mappings: Vec::with_capacity(estimated_spans),
             segments: Vec::new(),
             quote_depth: 0,
             spans: 0,

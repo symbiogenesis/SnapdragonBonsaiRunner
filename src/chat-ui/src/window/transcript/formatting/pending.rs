@@ -1,6 +1,11 @@
 //! Per-message asynchronous parser state. Production never parses in the UI.
 use super::{MAX_MARKDOWN_BYTES, egui, wire};
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+const STREAM_COALESCE_WINDOW: Duration = Duration::from_millis(80);
 
 #[derive(Default)]
 pub(in crate::window::transcript) struct Pending {
@@ -12,7 +17,9 @@ pub(in crate::window::transcript) struct Pending {
     service: Option<Arc<crate::markdown_service::Service>>,
     ticket: Option<crate::markdown_service::Ticket>,
     ticket_source: Option<Arc<str>>,
-    request_source: Option<Arc<str>>,
+    request_dirty: bool,
+    last_dispatch: Option<Instant>,
+    dispatched_len: usize,
     #[cfg(test)]
     asynchronous_fixture: bool,
 }
@@ -21,8 +28,8 @@ impl Pending {
     pub(in crate::window::transcript) fn parsed_for(
         &self,
         source: &str,
-    ) -> Option<(&wire::Document, usize)> {
-        let parsed = self.parsed.as_deref()?;
+    ) -> Option<(&Arc<wire::Document>, usize)> {
+        let parsed = self.parsed.as_ref()?;
         let prefix = self.parsed_source.as_deref()?;
         source.starts_with(prefix).then_some((parsed, prefix.len()))
     }
@@ -42,16 +49,18 @@ impl Pending {
             self.parsed_source = None;
             self.failed = false;
             self.ticket_source = None;
-            self.request_source = None;
+            self.request_dirty = false;
+            self.last_dispatch = None;
+            self.dispatched_len = 0;
             return true;
         }
         if self.parsed_source.as_deref() == Some(source) {
-            self.request_source = None;
+            self.request_dirty = false;
             self.failed = false;
             return false;
         }
         if self.ticket_source.as_deref() == Some(source) {
-            self.request_source = None;
+            self.request_dirty = false;
             self.failed = false;
             return false;
         }
@@ -70,8 +79,12 @@ impl Pending {
         if !preserves_ticket {
             self.ticket_source = None;
         }
+        if !preserves_parsed && !preserves_ticket {
+            self.last_dispatch = None;
+            self.dispatched_len = 0;
+        }
         self.failed = false;
-        self.request_source = Some(Arc::from(source));
+        self.request_dirty = true;
         !preserves_ticket
     }
 
@@ -80,7 +93,7 @@ impl Pending {
         if !self.asynchronous_fixture {
             return self.revision.is_none();
         }
-        self.request_source.is_some()
+        self.request_dirty
             || self.ticket.is_some()
             || self
                 .service
@@ -116,6 +129,7 @@ impl Pending {
         ui: &egui::Ui,
         revision: u64,
         source: &str,
+        streaming: bool,
     ) -> bool {
         #[cfg(test)]
         if !self.asynchronous_fixture {
@@ -159,7 +173,7 @@ impl Pending {
                         self.parsed = None;
                         self.parsed_source = None;
                         self.failed = true;
-                        self.request_source = None;
+                        self.request_dirty = false;
                         service.reject();
                     }
                     service.release(ticket);
@@ -170,38 +184,49 @@ impl Pending {
                     self.parsed = None;
                     self.parsed_source = None;
                     self.failed = true;
-                    self.request_source = None;
+                    self.request_dirty = false;
                     service.release(ticket);
                     self.ticket = None;
                     self.ticket_source = None;
                     changed = true;
-                    ui.ctx()
-                        .request_repaint_after(std::time::Duration::from_secs(5));
+                    ui.ctx().request_repaint_after(Duration::from_secs(5));
                 }
             }
         }
-        if self.ticket.is_none()
-            && !self.failed
-            && let Some(request_source) = &self.request_source
-        {
+        if self.ticket.is_none() && !self.failed && self.request_dirty {
             let Some(service) = Service::get_or_init(&mut self.service, ui.ctx()) else {
                 // Recovered messages can precede the asynchronously prepared
                 // broker image. Startup will repaint when it becomes available.
                 return changed;
             };
-            let ticket = service.request(Arc::clone(request_source));
+            let now = Instant::now();
+            if streaming && let Some(last) = self.last_dispatch {
+                let elapsed = now.saturating_duration_since(last);
+                if elapsed < STREAM_COALESCE_WINDOW {
+                    let tail_start = self.dispatched_len.saturating_sub(1).min(source.len());
+                    if !source[tail_start..].contains("\n\n") {
+                        ui.ctx()
+                            .request_repaint_after(STREAM_COALESCE_WINDOW - elapsed);
+                        return changed;
+                    }
+                }
+            }
+            let request_source: Arc<str> = Arc::from(source);
+            let ticket = service.request(Arc::clone(&request_source));
             if ticket.admitted() {
                 self.ticket = Some(ticket);
-                self.ticket_source = self.request_source.take();
+                self.ticket_source = Some(request_source);
+                self.request_dirty = false;
+                self.last_dispatch = Some(now);
+                self.dispatched_len = source.len();
             } else if service.unavailable() {
                 self.failed = true;
-                self.request_source = None;
+                self.request_dirty = false;
                 changed = true;
             } else {
-                // Backpressure is temporary. Retain one immutable source owner
-                // and retry admission, without restarting a failed worker.
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(25));
+                // Backpressure is temporary. Retry admission on an upcoming frame
+                // without retaining an extra source clone or restarting a failed worker.
+                ui.ctx().request_repaint_after(Duration::from_millis(25));
             }
         }
         changed
@@ -232,10 +257,11 @@ mod tests {
         let mut pending = Pending::default();
         let first = "# Title\n";
         assert!(pending.begin_revision(1, first));
-        assert_eq!(pending.request_source.as_deref(), Some(first));
+        assert!(pending.request_dirty);
 
         // Simulate dispatch of the first ticket and completion of parsed prefix.
-        pending.ticket_source = pending.request_source.take();
+        pending.ticket_source = Some(Arc::from(first));
+        pending.request_dirty = false;
         let wire_bytes = super::super::parse_wire(first);
         pending.parsed = wire::decode(first, &wire_bytes).map(Arc::new);
         pending.parsed_source = pending.ticket_source.take();
@@ -243,12 +269,13 @@ mod tests {
         // Dispatch a second ticket, then extend the stream again while in flight.
         let second = "# Title\n**bold**";
         assert!(pending.begin_revision(2, second));
-        pending.ticket_source = pending.request_source.take();
+        pending.ticket_source = Some(Arc::from(second));
+        pending.request_dirty = false;
 
         let third = "# Title\n**bold** tail";
         assert!(!pending.begin_revision(3, third));
         assert_eq!(pending.ticket_source.as_deref(), Some(second));
-        assert_eq!(pending.request_source.as_deref(), Some(third));
+        assert!(pending.request_dirty);
         assert_eq!(
             pending.parsed_for(third).map(|(_, len)| len),
             Some(first.len())
@@ -260,7 +287,7 @@ mod tests {
         assert!(pending.ticket_source.is_none());
         assert!(pending.parsed.is_none());
         assert!(pending.parsed_source.is_none());
-        assert_eq!(pending.request_source.as_deref(), Some(replaced));
+        assert!(pending.request_dirty);
     }
 
     #[test]
@@ -305,7 +332,7 @@ mod tests {
             );
             assert!(
                 chat.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay
-                    > std::time::Duration::from_millis(16)
+                    > Duration::from_millis(16)
             );
             let respond = Service::fixture(&chat.ctx);
             chat.step();
@@ -319,7 +346,7 @@ mod tests {
             assert!(chat.state().markdown_preparing(&context));
             assert!(
                 chat.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay
-                    > std::time::Duration::from_millis(16)
+                    > Duration::from_millis(16)
             );
             if failed {
                 Service::get(&context)

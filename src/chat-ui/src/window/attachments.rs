@@ -330,7 +330,7 @@ impl State {
                     ui.set_max_width(220.0);
                     ui.horizontal(|ui| {
                         if let Some(png) = attachment.thumbnail_png()
-                            && let Some(tex) = self.image_cache.png_bytes_texture(ui.ctx(), png)
+                            && let Some(tex) = self.image_cache.png_texture(ui.ctx(), png)
                         {
                             let (_, thumb_rect) = ui.allocate_space(egui::vec2(28.0, 28.0));
                             paint_fitted_texture(ui, thumb_rect, &tex);

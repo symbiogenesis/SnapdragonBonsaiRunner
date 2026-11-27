@@ -305,15 +305,34 @@ impl ImageCache {
         }
     }
 
+    /// Returns a GPU texture decoded from pre-hashed bounded PNG bytes (caching decode failures cleanly).
+    pub(super) fn png_texture(
+        &mut self,
+        ctx: &egui::Context,
+        png: &crate::attachment_import::PrehashedPng,
+    ) -> Option<egui::TextureHandle> {
+        self.png_bytes_texture_with_hash(ctx, png.hash(), png)
+    }
+
     /// Returns a GPU texture decoded from bounded PNG bytes (caching decode failures cleanly).
+    #[cfg(test)]
     pub(super) fn png_bytes_texture(
         &mut self,
         ctx: &egui::Context,
         bytes: &[u8],
     ) -> Option<egui::TextureHandle> {
+        self.png_bytes_texture_with_hash(ctx, fnv1a64(bytes), bytes)
+    }
+
+    fn png_bytes_texture_with_hash(
+        &mut self,
+        ctx: &egui::Context,
+        hash: u64,
+        bytes: &[u8],
+    ) -> Option<egui::TextureHandle> {
         let key = PngKey {
             domain: PngDomain::RawBytes,
-            hash: fnv1a64(bytes),
+            hash,
             len: bytes.len(),
         };
         self.cached_png(key, || decode_png_texture(ctx, bytes))
@@ -584,10 +603,10 @@ fn decode_png_texture(ctx: &egui::Context, bytes: &[u8]) -> Option<egui::Texture
     Some(ctx.load_texture("bonsai-attachment-png", image, egui::TextureOptions::LINEAR))
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
+    for &byte in bytes {
+        hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3_u64);
     }
     hash

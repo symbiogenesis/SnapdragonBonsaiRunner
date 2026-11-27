@@ -112,6 +112,66 @@ pub(crate) struct VideoFrame {
     pub(crate) data_url: Arc<str>,
 }
 
+/// Immutable PNG thumbnail bytes paired with a once-computed FNV-1a content hash.
+#[derive(Clone, Debug, Eq)]
+pub(crate) struct PrehashedPng {
+    bytes: Arc<[u8]>,
+    hash: u64,
+}
+
+impl PrehashedPng {
+    /// Wraps `bytes` alongside its precomputed FNV-1a content hash.
+    pub(crate) fn new(bytes: Arc<[u8]>) -> Self {
+        let hash = crate::window::fnv1a64(&bytes);
+        Self { bytes, hash }
+    }
+
+    /// Returns the precomputed FNV-1a content hash of the PNG payload.
+    pub(crate) const fn hash(&self) -> u64 {
+        self.hash
+    }
+}
+
+impl PartialEq for PrehashedPng {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+            && self.bytes.len() == other.bytes.len()
+            && (Arc::ptr_eq(&self.bytes, &other.bytes) || self.bytes.as_ref() == other.bytes.as_ref())
+    }
+}
+
+impl std::ops::Deref for PrehashedPng {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+impl AsRef<[u8]> for PrehashedPng {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl From<Arc<[u8]>> for PrehashedPng {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        Self::new(bytes)
+    }
+}
+
+impl From<Vec<u8>> for PrehashedPng {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::new(Arc::from(bytes))
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for PrehashedPng {
+    fn from(bytes: [u8; N]) -> Self {
+        Self::new(Arc::from(bytes))
+    }
+}
+
 /// Context attachment attached to a draft or persisted prompt message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -126,7 +186,7 @@ pub(crate) enum Attachment {
         height: u32,
         data_url: Arc<str>,
         #[serde(with = "base64_bytes")]
-        thumbnail_png: Arc<[u8]>,
+        thumbnail_png: PrehashedPng,
     },
     Video {
         name: String,
@@ -135,7 +195,7 @@ pub(crate) enum Attachment {
         duration_ms: u64,
         frames: Arc<[VideoFrame]>,
         #[serde(with = "base64_bytes")]
-        thumbnail_png: Arc<[u8]>,
+        thumbnail_png: PrehashedPng,
     },
 }
 
@@ -158,11 +218,11 @@ impl Attachment {
         }
     }
 
-    pub(crate) fn thumbnail_png(&self) -> Option<&[u8]> {
+    pub(crate) fn thumbnail_png(&self) -> Option<&PrehashedPng> {
         match self {
             Self::Text { .. } => None,
             Self::Image { thumbnail_png, .. } | Self::Video { thumbnail_png, .. } => {
-                Some(thumbnail_png.as_ref())
+                Some(thumbnail_png)
             }
         }
     }
@@ -539,7 +599,7 @@ mod base64_bytes {
     use super::*;
 
     pub(super) fn serialize<S: Serializer>(
-        bytes: &Arc<[u8]>,
+        bytes: &PrehashedPng,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&Base64::encode_string(bytes.as_ref()))
@@ -547,10 +607,10 @@ mod base64_bytes {
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Arc<[u8]>, D::Error> {
+    ) -> Result<PrehashedPng, D::Error> {
         let encoded = String::deserialize(deserializer)?;
         let decoded = Base64::decode_vec(&encoded).map_err(D::Error::custom)?;
-        Ok(Arc::from(decoded))
+        Ok(PrehashedPng::from(decoded))
     }
 }
 
@@ -558,7 +618,7 @@ mod base64_bytes {
 mod tests {
     use super::{
         Attachment, FileCategory, MAX_TOTAL_TEXT_ATTACHMENT_BYTES, MediaKind, Outcome, PickerKind,
-        Shared, VideoFrame, classify_path, format_user_turn, import_selected_paths,
+        PrehashedPng, Shared, VideoFrame, classify_path, format_user_turn, import_selected_paths,
     };
     use std::{fs, io, path::Path, sync::Arc};
 
@@ -592,7 +652,7 @@ mod tests {
                 width: 640,
                 height: 480,
                 data_url: Arc::from("data:image/png;base64,iVBORw0KGgo="),
-                thumbnail_png: Arc::from([0x89_u8, b'P', b'N', b'G']),
+                thumbnail_png: PrehashedPng::from([0x89_u8, b'P', b'N', b'G']),
             },
             Attachment::Video {
                 name: "clip.mp4".to_owned(),
@@ -603,7 +663,7 @@ mod tests {
                     timestamp_ms: 500,
                     data_url: Arc::from("data:image/png;base64,iVBORw0KGgo="),
                 }]),
-                thumbnail_png: Arc::from([0x89_u8, b'P', b'N', b'G']),
+                thumbnail_png: PrehashedPng::from([0x89_u8, b'P', b'N', b'G']),
             },
         ];
         let json = serde_json::to_string(&sample).map_err(io::Error::other)?;
@@ -677,7 +737,7 @@ mod tests {
             width: 32,
             height: 32,
             data_url: Arc::from("data:image/png;base64,AAAA"),
-            thumbnail_png: Arc::from([1_u8, 2]),
+            thumbnail_png: PrehashedPng::from([1_u8, 2]),
         };
         let (text, images) = format_user_turn("", std::slice::from_ref(&image_only));
         assert_eq!(text, "");
@@ -702,7 +762,7 @@ mod tests {
                     data_url: Arc::from("data:image/png;base64,CCCC"),
                 },
             ]),
-            thumbnail_png: Arc::from([3_u8]),
+            thumbnail_png: PrehashedPng::from([3_u8]),
         };
         let (text, images) = format_user_turn("Inspect these", &[fenced_text, image_only, video]);
         assert_eq!(
