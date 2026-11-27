@@ -223,8 +223,8 @@ allocation while preserving borrowing and validation.
 
 Explicit adapter scales and SIMD parse failures fall back to production parsing:
 correctly rounded SIMD conversion can differ from serde_json's default without
-either being wrong. Supplemental scale cases include fallback cost. Main-only
-`json-candidate.yml` runs correctness before the original six-case and supplemental
+either being wrong. Supplemental scale cases include fallback cost. The retired main-only
+`json-candidate.yml` workflow ran correctness before the original six-case and supplemental
 5%/5% gates; any case over 5% slower rejects qualification.
 **Both cold/reused screens must pass; qualification remains pending.**
 

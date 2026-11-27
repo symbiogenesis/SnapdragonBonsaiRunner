@@ -47,8 +47,8 @@ Schema-2 packets bind this exact arithmetic identity.
    all numeric comparisons and retain disagreements; never search variants or
    enlarge a tolerance after observing results.
 
-The [hosted workflow](../.github/workflows/ptq1-public-authoring-reference.yml)
-runs only on GitHub-hosted `windows-11-arm`, main, with no owner runner label.
+The retired `ptq1-public-authoring-reference.yml` hosted workflow
+ran only on GitHub-hosted `windows-11-arm`, main, with no owner runner label.
 Relevant source pushes and default `run_reconstruction: false` dispatches build
 the Rust helper and check small independent math/parser/admission
 fixtures, retaining a separate preparation receipt. Set the dispatch boolean true
@@ -132,9 +132,5 @@ loaded-zero/nonzero logits/state, human quality, performance and promotion gates
 pending. The report keeps those qualification/default flags false even on a
 numeric match. Owner-device execution is outside this hosted reconstruction lane.
 
-Reproduce only through GitHub-hosted CI:
-
-```text
-gh workflow run ptq1-public-authoring-reference.yml --ref main -f run_reconstruction=false
-gh workflow run ptq1-public-authoring-reference.yml --ref main -f run_reconstruction=true
-```
+This workflow (`ptq1-public-authoring-reference.yml`) has been retired
+following the move to Ternary Bonsai 2.5.

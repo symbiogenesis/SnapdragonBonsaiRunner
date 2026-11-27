@@ -1,7 +1,7 @@
 # Native CPU bundle comparison
 
-The owner-operated [workflow](../../.github/workflows/cpu-bundle-comparison.yml)
-builds one collector against fixed Prism **0.1.23** and registry **0.1.25** on
+The retired `cpu-bundle-comparison.yml` owner-operated workflow built
+one collector against fixed Prism **0.1.23** and registry **0.1.25** on
 hosted Windows ARM64. The exact published Prism tooling revision supplies the
 collector; the registry runtime has its own authenticated identity.
 

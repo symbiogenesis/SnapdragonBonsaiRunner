@@ -501,19 +501,19 @@ The retained workflows own current checks or open gates in [PLAN.md](../../PLAN.
 | --- | --- |
 | Routine source checks | `foundation`, `source-checks` |
 | Windows ARM64 packaging and publication | `release` |
-| Runtime application and numerical acceptance | `native-runtime-acceptance`, `native-ptq1-numerics` |
-| Independent packing and pending public-pack reconstruction | `ptq1-packing-qualification`, `ptq1-public-authoring-reference` |
 | Native accelerator and containment controls | `hexagon-qualification`, `sandbox-qualification` |
-| Pending paired performance and dependency gates | `cpu-bundle-comparison`, `tts-evaluation`, `x2-cpu-evaluation`, `json-candidate` |
+| Hosted speech evaluation | `tts-evaluation` |
+
+Legacy Swift Bonsai 2, PTQ1, Orca, Prism `0.1.23`–`0.1.25` (`cpu-bundle-comparison`,
+`x2-cpu-evaluation`, `native-ptq1-numerics`, `native-runtime-acceptance`,
+`ptq1-packing-qualification`, `ptq1-public-authoring-reference`), and `json-candidate`
+workflows were retired after upgrading to Ternary Bonsai 2.5.
 
 Source checks select portable, Markdown and dependency jobs by changed paths.
 Hexagon qualification owns the independent hosted Windows ABI control.
 
-The [native CPU bundle comparison](../cpu-bundle/README.md) prepares
-the fixed 0.1.23 control and registry 0.1.25 candidate on hosted ARM64. Its default
-is preparation only; explicit device selection requires the owner's predeclared
-ten-minute aggregate workload. The X2 thread screen compares publisher thread
-counts and cannot substitute for that runtime-bundle comparison.
+The [native CPU bundle evaluator](../cpu-bundle/README.md) documents the
+retired `0.1.23`/`0.1.25` comparison and current-source offline admission.
 
 Native `plan`/`screen-plan` commands inspect LoRA/PTQ1 policy without capture.
 Outstanding model/device/provenance/performance/human gates live in [PLAN.md](../../PLAN.md).

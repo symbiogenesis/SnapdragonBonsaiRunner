@@ -83,7 +83,7 @@ no compiler runs inside a device trial. The workflow forwards to the native
 `acceptance-driver` command, which preserves the original whole-job and inherited
 owner clocks and strips credentials only from its contained child environment.
 
-Actual execution belongs only to the main-only manual `native-ptq1-numerics.yml` workflow on a
+Actual execution belonged only to the retired main-only manual `native-ptq1-numerics.yml` workflow on a
 native ARM64 Snapdragon ephemeral runner with only the `ptq1-numerics-<run_id>` label,
 `run_device: true`, its physical-runner concurrency group and credential-clean child. The default
 `run_device: false` prepares and tests the source-bound bundle on hosted CI only. It retains bounded

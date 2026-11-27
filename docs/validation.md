@@ -35,7 +35,7 @@ without proving the machine otherwise idle. [PLAN.md](../PLAN.md) owns pending a
 
 ### Actual-model application acceptance
 
-The main-only [native-runtime acceptance workflow](../.github/workflows/native-runtime-acceptance.yml)
+The retired main-only `native-runtime-acceptance.yml` workflow (legacy Swift Bonsai 2)
 defaults to `run_device: false`, preparing an exact-source package on hosted ARM64.
 The owner must review that package and predeclare one feasible workload before
 selecting `run_device: true`. Device dispatch builds its own same-run package;
@@ -230,7 +230,7 @@ no actual-model verdict.
 
 ### Bounded source request attribution
 
-The [PTQ1 capture workflow](../.github/workflows/native-ptq1-numerics.yml) defaults
+The retired legacy `native-ptq1-numerics.yml` PTQ1 capture workflow defaulted
 to `capture_mode: numerical`. Explicit `request-timing` selects one production
 SwiftSession request through the same source-bound hosted checker package and
 native Rust owner; it does not execute the native reference model or ABI probes.

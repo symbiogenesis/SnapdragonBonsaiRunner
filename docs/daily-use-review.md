@@ -21,22 +21,18 @@ reviewed Runner checkout after publication:
 ```powershell
 gh workflow run source-checks.yml --ref main
 gh workflow run foundation.yml --ref main
-gh workflow run native-runtime-acceptance.yml --ref main -f run_device=false -f profile=pq2-adapter-row4
 ```
+
+*(The legacy Swift Bonsai 2 `native-runtime-acceptance.yml` workflow has been retired.)*
 
 Inspect the preparation run's successful strict Release analyzer, production-link,
 workflow-contract and exact-inventory receipts before device work. A bundle-only
 Prism run does not qualify Foundation or supply Runner's acceptance package.
 
 Select one feasible application workload before dispatch. The minimal production
-adapter profile below requests exactly one four-token stream with original PQ2,
-adapter 1.3 and four workers, readiness and cleanup. It does not exercise full
-Stop/Retry, long histories, complete-answer quality or performance. Its dispatch
-prepares its own same-run package rather than consuming the preceding run.
-
-```powershell
-gh workflow run native-runtime-acceptance.yml --ref main -f run_device=true -f profile=pq2-adapter-row4 -f owner_budget_minutes=5
-```
+adapter profile expected one four-token stream with original PQ2,
+adapter 1.3 and four workers, readiness and cleanup. It did not exercise full
+Stop/Retry, long histories, complete-answer quality or performance.
 
 Do not use that command until a conservative whole-job estimate covers setup,
 intake, hashes, model loading, output, power observations, teardown and retention

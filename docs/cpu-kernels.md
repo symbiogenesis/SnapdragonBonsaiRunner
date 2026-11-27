@@ -856,7 +856,7 @@ CPU/kernel/features, topology, driver and power identities for each workload;
 stored inventory snapshots do not establish current conditions or kernel eligibility.
 Native ISA semantics live in [capability contracts](hardware-capabilities.md).
 
-The manual [X2 CPU workflow](../.github/workflows/x2-cpu-evaluation.yml) prepares exact maintenance
+The retired manual `x2-cpu-evaluation.yml` workflow prepared exact maintenance
 tools on hosted ARM64 CI. Its default `run_device: false` performs no owner-device execution.
 The optional device job requires settled `main`, a native ARM64 owner runner with the single-run
 label `x2-cpu-<run_id>` and the shared model-capture concurrency group. Register that runner as
