@@ -135,8 +135,8 @@
     },
     {
       "path": "src/speech-asr/Cargo.toml",
-      "bytes": 1948,
-      "sha256": "42acf542fa3047dc41279813690cd48a16d894090bb0a665fcfe6cac00e9c8eb",
+      "bytes": 2002,
+      "sha256": "a5cb842a726bb3310c853f52e067d3cd590c169f610ff2af04e4bc0c8f6e2c7e",
       "family": "native-asr"
     },
     {
