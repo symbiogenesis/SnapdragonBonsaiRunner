@@ -557,6 +557,39 @@ fn scan_mapped_spans_finite(bytes: &[u8], spans: &[TensorSpan]) -> Result<(), Ar
     Ok(())
 }
 
+fn verify_locked_file_stream(
+    file: &mut File,
+    file_len: u64,
+    max_rank_limit: u16,
+    envelope: MultiRankEnvelope,
+) -> Result<(String, ValidatedAdapterPlan), ArtifactError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| ArtifactError::Identity)?;
+    let parsed = parse_gguf_header(BufReader::new(&mut *file), file_len)?;
+    let plan = validate_header_and_pairs(&parsed, file_len, max_rank_limit, envelope)?;
+    let max_span = plan
+        .spans
+        .iter()
+        .map(|span| span.byte_len)
+        .max()
+        .unwrap_or(0);
+    let buf_len = FINITE_SCAN_CHUNK_BYTES
+        .min(usize::try_from(max_span).unwrap_or(FINITE_SCAN_CHUNK_BYTES))
+        .max(4);
+    let mut scan_buf = vec![0_u8; buf_len];
+    for span in &plan.spans {
+        scan_tensor_finite(
+            file,
+            span.abs_start,
+            span.byte_len,
+            span.dtype,
+            &mut scan_buf,
+        )?;
+    }
+    let sha256 = hash_locked_file(file, file_len)?;
+    Ok((sha256, plan))
+}
+
 /// Offline verify a stackable multi-rank `LoRA` GGUF adapter while retaining Windows
 /// ancestor and leaf file locks until the returned guard is dropped.
 ///
@@ -617,38 +650,11 @@ pub fn verify_multi_rank_lora_gguf(
         let sha256 = crate::digest_hex(sha_result?);
         (sha256, plan)
     } else {
-        file.seek(SeekFrom::Start(0))
-            .map_err(|_| ArtifactError::Identity)?;
-        let parsed = parse_gguf_header(BufReader::new(&mut file), file_len)?;
-        let plan = validate_header_and_pairs(&parsed, file_len, max_rank_limit, envelope)?;
-        let max_span = plan
-            .spans
-            .iter()
-            .map(|span| span.byte_len)
-            .max()
-            .unwrap_or(0);
-        let buf_len = FINITE_SCAN_CHUNK_BYTES
-            .min(usize::try_from(max_span).unwrap_or(FINITE_SCAN_CHUNK_BYTES))
-            .max(4);
-        let mut scan_buf = vec![0_u8; buf_len];
-        for span in &plan.spans {
-            scan_tensor_finite(
-                &mut file,
-                span.abs_start,
-                span.byte_len,
-                span.dtype,
-                &mut scan_buf,
-            )?;
-        }
-        let sha256 = hash_locked_file(&mut file, file_len)?;
-        (sha256, plan)
+        verify_locked_file_stream(&mut file, file_len, max_rank_limit, envelope)?
     };
 
     #[cfg(not(windows))]
-    let (sha256, plan) = {
-        let _ = file;
-        return Err(ArtifactError::Configuration);
-    };
+    let (sha256, plan) = verify_locked_file_stream(&mut file, file_len, max_rank_limit, envelope)?;
 
     file.seek(SeekFrom::Start(0))
         .map_err(|_| ArtifactError::Identity)?;
