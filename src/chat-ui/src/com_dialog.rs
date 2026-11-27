@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use windows::{
     Win32::{
@@ -41,6 +41,21 @@ pub(crate) const MAX_PICKED_FILES: usize = 8;
 
 const PICKER_CANCELLED: HRESULT = HRESULT::from_win32(ERROR_CANCELLED.0);
 const POLL: Duration = Duration::from_millis(10);
+/// Bounded grace period for UI-thread `Drop` cleanup of STA picker/closer threads.
+pub(crate) const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Waits up to `timeout` for `handle` to finish and joins it without blocking indefinitely.
+pub(crate) fn join_thread_bounded(handle: JoinHandle<()>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(POLL);
+    }
+    let _joined = handle.join();
+    true
+}
 
 enum Uninit {
     WinRt,
@@ -214,6 +229,11 @@ impl Cancel {
     pub(crate) fn cancel(&self, cancelled: &AtomicBool) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         cancelled.store(true, Ordering::Release);
+        if state.closer.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(closer) = state.closer.take()
+        {
+            let _joined = closer.join();
+        }
         let Some((dialog, showing)) = state.active.take() else {
             return;
         };
@@ -235,17 +255,24 @@ impl Cancel {
         }
     }
 
-    /// Waits for any spawned closer thread to exit.
-    pub(crate) fn join(&self) {
+    /// Waits up to `timeout` for any spawned closer thread to exit.
+    pub(crate) fn join_bounded(&self, timeout: Duration) -> bool {
         let closer = self
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .closer
             .take();
-        if let Some(closer) = closer {
-            let _joined = closer.join();
-        }
+        let Some(closer) = closer else {
+            return true;
+        };
+        join_thread_bounded(closer, timeout)
+    }
+
+    /// Waits up to `DROP_JOIN_TIMEOUT` for any spawned closer thread to exit.
+    #[cfg(test)]
+    pub(crate) fn join(&self) {
+        let _joined = self.join_bounded(DROP_JOIN_TIMEOUT);
     }
 }
 
@@ -618,5 +645,24 @@ mod tests {
                 max: MAX_PICKED_FILES,
             })
         );
+    }
+
+    #[test]
+    fn join_thread_bounded_returns_false_on_timeout_and_true_once_finished() -> std::io::Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let handle = thread::Builder::new()
+            .name("bonsai-bounded-join-test".to_owned())
+            .spawn(move || {
+                let _ = rx.recv();
+            })?;
+        assert!(!join_thread_bounded(handle, Duration::from_millis(20)));
+        let _sent = tx.send(());
+
+        let finished = thread::Builder::new()
+            .name("bonsai-bounded-join-fast".to_owned())
+            .spawn(|| {})?;
+        assert!(join_thread_bounded(finished, Duration::from_secs(1)));
+        assert!(Cancel::default().join_bounded(Duration::from_millis(10)));
+        Ok(())
     }
 }

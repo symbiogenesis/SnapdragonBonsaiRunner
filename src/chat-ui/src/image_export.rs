@@ -119,6 +119,12 @@ impl Export {
         })
     }
 
+    /// Requests non-blocking cancellation of an active Save dialog or pending raster export.
+    pub(crate) fn cancel(&self) {
+        self.shared.cancelled.store(true, Ordering::Release);
+        self.shared.picker.cancel(&self.shared.cancelled);
+    }
+
     /// Drives pending rasterization and returns the latest export status without blocking.
     pub(crate) fn poll(&mut self) -> Outcome {
         if self.finished {
@@ -190,16 +196,19 @@ impl Export {
             service.release(ticket);
         }
         if let Some(worker) = self.worker.take() {
-            let _joined = worker.join();
+            let _joined =
+                crate::com_dialog::join_thread_bounded(worker, crate::com_dialog::DROP_JOIN_TIMEOUT);
         }
-        self.shared.picker.join();
+        let _joined = self
+            .shared
+            .picker
+            .join_bounded(crate::com_dialog::DROP_JOIN_TIMEOUT);
     }
 }
 
 impl Drop for Export {
     fn drop(&mut self) {
-        self.shared.cancelled.store(true, Ordering::Release);
-        self.shared.picker.cancel(&self.shared.cancelled);
+        self.cancel();
         self.finish_resources();
     }
 }
@@ -568,5 +577,23 @@ mod tests {
         assert_eq!(fs::read_to_string(&target)?, &*svg);
         assert_eq!(fs::read_dir(&git_dir)?.count(), 1);
         fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn cancel_request_is_non_blocking_and_poll_reaps_cancelled_worker() -> io::Result<()> {
+        let ctx = egui::Context::default();
+        let svg: Arc<str> = Arc::from(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32"/></svg>"#,
+        );
+        let mut export = Export::start_with(&ctx, svg, "bonsai-image-cancel-test", |shared| {
+            while !shared.cancelled.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(picker::CANCELLED)
+        })?;
+        assert!(matches!(export.poll(), Outcome::Pending));
+        export.cancel();
+        assert!(matches!(wait_outcome(&mut export), Outcome::Cancelled));
+        Ok(())
     }
 }

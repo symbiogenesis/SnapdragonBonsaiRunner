@@ -96,6 +96,14 @@ const VOICE_LIMIT: usize = 1_024;
 const MAX_DIAGNOSTICS: usize = 128;
 const MAX_DIAGNOSTIC_CHARS: usize = 4_096;
 pub(super) const CONVERSATION_DELETED_NOTICE_DURATION: Duration = Duration::from_secs(4);
+const DIALOG_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialogCloseState {
+    Idle,
+    Waiting { deadline: Instant },
+    TimedOut,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ConversationNotice {
@@ -265,6 +273,7 @@ struct State {
     image_cache: image_cache::ImageCache,
     lightbox: Option<lightbox::Lightbox>,
     image_export: Option<crate::image_export::Export>,
+    dialog_close: DialogCloseState,
     speech_output: bool,
     canary_configured: bool,
     tts_configured: bool,
@@ -446,6 +455,7 @@ impl State {
             image_cache: image_cache::ImageCache::default(),
             lightbox: None,
             image_export: None,
+            dialog_close: DialogCloseState::Idle,
             speech_output: false,
             canary_configured: false,
             tts_configured: false,
@@ -1010,6 +1020,10 @@ impl State {
         if self.show_audio_transcript || self.alerts.details.is_some() {
             return;
         }
+        if self.image_export.is_some() && plain_key_pressed(ctx, egui::Key::Escape) {
+            self.cancel_image_export();
+            return;
+        }
         if self.lightbox.is_some() {
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                 self.lightbox = None;
@@ -1076,14 +1090,6 @@ impl State {
     }
 
     fn handle_input_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.input(|input| input.viewport().close_requested()) {
-            if self.dictation_requested {
-                self.cancel_microphone();
-            }
-            self.cancel_attachment_import();
-            self.cancel_branch_comparison();
-            self.image_export = None;
-        }
         ctx.input(|input| {
             for event in &input.events {
                 match event {
@@ -2136,7 +2142,7 @@ impl Drop for State {
         }
         self.appearance_store.take();
         self.audio_paste.take();
-        self.cancel_attachment_import();
+        self.cancel_active_dialogs_for_close();
         self.branch_comparison.take();
         self.updates.take();
         self.pending_config.take();
@@ -2490,12 +2496,13 @@ impl State {
             updates.finish_stop(false);
         }
         let diagnostic = updates.poll();
-        if updates.should_close() {
+        let allow_close = !matches!(self.dialog_close, DialogCloseState::Waiting { .. });
+        if allow_close && updates.should_close() {
             if let Some(approved) = &self.update_exit {
                 approved.store(true, std::sync::atomic::Ordering::Release);
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if updates.closing() && !updates.installing() {
+        } else if allow_close && updates.closing() && !updates.installing() {
             // A publication/teardown failure must neither replace bytes nor
             // trap a user who asked to exit. No approved update exit is set.
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2606,6 +2613,64 @@ impl State {
             Err(_) => {
                 self.set_status("Could not open the image save dialog.", true);
             }
+        }
+    }
+
+    fn cancel_image_export(&mut self) {
+        if let Some(export) = &self.image_export {
+            export.cancel();
+        }
+    }
+
+    const fn has_active_dialog_session(&self) -> bool {
+        self.attachment_import.is_some()
+            || self.audio_import.is_some()
+            || self.image_export.is_some()
+    }
+
+    fn cancel_active_dialogs_for_close(&mut self) {
+        if self.dictation_requested {
+            self.cancel_microphone();
+        } else if let Some(import) = &self.audio_import {
+            import.cancel();
+        }
+        self.cancel_attachment_import();
+        self.cancel_image_export();
+        self.cancel_branch_comparison();
+    }
+
+    fn defer_close_for_dialogs(&mut self, ctx: &egui::Context, close_requested: bool) -> bool {
+        match self.dialog_close {
+            DialogCloseState::Idle => {
+                if close_requested && self.has_active_dialog_session() {
+                    self.dialog_close = DialogCloseState::Waiting {
+                        deadline: Instant::now() + DIALOG_CLOSE_TIMEOUT,
+                    };
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    ctx.request_repaint_after(Duration::from_millis(10));
+                    true
+                } else {
+                    false
+                }
+            }
+            DialogCloseState::Waiting { deadline } => {
+                if !self.has_active_dialog_session() {
+                    self.dialog_close = DialogCloseState::Idle;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    ctx.request_repaint();
+                } else if Instant::now() >= deadline {
+                    self.dialog_close = DialogCloseState::TimedOut;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    ctx.request_repaint();
+                } else {
+                    if close_requested {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    }
+                    ctx.request_repaint_after(Duration::from_millis(10));
+                }
+                true
+            }
+            DialogCloseState::TimedOut => false,
         }
     }
 
@@ -2936,12 +3001,22 @@ impl eframe::App for State {
         if self.repaint_ctx.is_none() {
             self.repaint_ctx = Some(ctx.clone());
         }
-        self.poll_placement(frame, ctx.input(|input| input.viewport().close_requested()));
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        self.poll_placement(frame, close_requested);
         let was_ready = self.model.ready();
         let was_busy = self.model.busy();
         self.poll_startup(ctx);
         self.drain_events();
-        self.close_with_pending_update(ctx);
+        if close_requested {
+            self.cancel_active_dialogs_for_close();
+        }
+        self.poll_audio_import();
+        self.poll_attachment_import(ctx);
+        self.poll_image_export(ctx);
+        let defer_close = self.defer_close_for_dialogs(ctx, close_requested);
+        if !defer_close {
+            self.close_with_pending_update(ctx);
+        }
         self.poll_updates(ctx);
         if ((!was_ready && self.model.ready())
             || (was_busy && !self.model.busy() && self.model.ready()))
@@ -2962,8 +3037,6 @@ impl eframe::App for State {
         self.prepare_audio_paste(frame);
         self.handle_input_shortcuts(ctx);
         self.handle_audio_paste(ctx);
-        self.poll_audio_import();
-        self.poll_attachment_import(ctx);
         self.poll_branch_comparison(ctx);
         self.poll_microphone();
         self.drain_speech_events();
@@ -2971,7 +3044,6 @@ impl eframe::App for State {
         self.poll_appearance(ctx);
         self.poll_profile();
         self.image_cache.poll(ctx);
-        self.poll_image_export(ctx);
         if self.last_theme_check.elapsed() >= Duration::from_secs(1) {
             self.appearance.apply(ctx);
             self.last_theme_check = Instant::now();
@@ -3004,7 +3076,9 @@ impl State {
                     || self.dictation_requested
                     || self.audio_import.is_some()
                     || !self.speech_checked));
-        if active_generation && !self.awaiting_first_token {
+        if matches!(self.dialog_close, DialogCloseState::Waiting { .. }) {
+            Duration::from_millis(10)
+        } else if active_generation && !self.awaiting_first_token {
             Duration::from_millis(150)
         } else if waiting {
             Duration::from_millis(50)

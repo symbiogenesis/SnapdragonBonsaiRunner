@@ -1759,3 +1759,37 @@ fn prefill_repaint_cadence_throttles_until_first_token_arrives() {
     state.model_event(Event::Complete(Completion::Finished));
     assert_eq!(state.next_repaint_delay(), Duration::from_secs(1));
 }
+
+#[test]
+fn close_requested_with_active_dialog_defers_close_until_worker_finishes_or_times_out()
+-> io::Result<()> {
+    let (mut state, _commands, _events) = state();
+    let ctx = egui::Context::default();
+    let session = crate::audio_import::Session::fixture(vec![Ok(None)])?;
+    state.audio_import = Some(session);
+
+    assert!(state.defer_close_for_dialogs(&ctx, true));
+    assert!(matches!(
+        state.dialog_close,
+        DialogCloseState::Waiting { .. }
+    ));
+
+    state.cancel_active_dialogs_for_close();
+    state.audio_import = None;
+    assert!(state.defer_close_for_dialogs(&ctx, false));
+    assert_eq!(state.dialog_close, DialogCloseState::Idle);
+    assert!(!state.defer_close_for_dialogs(&ctx, true));
+
+    // Bounded safety timeout stops deferring once expired.
+    let session = crate::audio_import::Session::fixture(vec![Ok(None)])?;
+    state.audio_import = Some(session);
+    state.dialog_close = DialogCloseState::Waiting {
+        deadline: Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now),
+    };
+    assert!(state.defer_close_for_dialogs(&ctx, false));
+    assert_eq!(state.dialog_close, DialogCloseState::TimedOut);
+    assert!(!state.defer_close_for_dialogs(&ctx, true));
+    Ok(())
+}

@@ -282,9 +282,13 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.cancel();
         if let Some(worker) = self.worker.take() {
-            let _joined = worker.join();
+            let _joined =
+                crate::com_dialog::join_thread_bounded(worker, crate::com_dialog::DROP_JOIN_TIMEOUT);
         }
-        self.shared.picker.join();
+        let _joined = self
+            .shared
+            .picker
+            .join_bounded(crate::com_dialog::DROP_JOIN_TIMEOUT);
     }
 }
 fn import(

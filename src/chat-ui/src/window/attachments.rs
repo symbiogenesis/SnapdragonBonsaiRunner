@@ -72,7 +72,7 @@ impl State {
     }
 
     pub(super) fn cancel_attachment_import(&mut self) {
-        if let Some(mut session) = self.attachment_import.take() {
+        if let Some(session) = &self.attachment_import {
             session.cancel();
         }
     }

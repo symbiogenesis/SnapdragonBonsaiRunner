@@ -372,7 +372,7 @@ impl Session {
         })
     }
 
-    pub(crate) fn cancel(&mut self) {
+    pub(crate) fn cancel(&self) {
         self.shared.picker.cancel(&self.shared.cancelled);
     }
 
@@ -401,10 +401,14 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.shared.picker.cancel(&self.shared.cancelled);
-        self.shared.picker.join();
         if let Some(worker) = self.worker.take() {
-            let _joined = worker.join();
+            let _joined =
+                crate::com_dialog::join_thread_bounded(worker, crate::com_dialog::DROP_JOIN_TIMEOUT);
         }
+        let _joined = self
+            .shared
+            .picker
+            .join_bounded(crate::com_dialog::DROP_JOIN_TIMEOUT);
     }
 }
 
