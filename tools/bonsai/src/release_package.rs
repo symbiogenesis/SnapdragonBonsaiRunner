@@ -153,6 +153,7 @@ fn smoke(executable: &Path, manifest: &str, evidence: &Path) -> Result<Value> {
     )?)?;
     new_directory(evidence)?;
     let installation = evidence.join("extracted");
+    let mut installation_guard = crate::fs_guard::TempDirGuard::new(installation.clone());
     let result = (|| {
         let extraction = json!({"operation":"extract","executablePath":executable,"installationDirectory":installation});
         let bundle = command(
@@ -201,6 +202,7 @@ fn smoke(executable: &Path, manifest: &str, evidence: &Path) -> Result<Value> {
         )?;
         Ok(bundle)
     })();
+    installation_guard.disarm();
     let bundle = completed(result, cleanup(&installation))?;
     let receipt = json!({"schemaVersion":1,"version":bundle["Manifest"]["version"],"sourceRevision":bundle["Manifest"]["sourceRevision"],"manifestSha256":manifest,"executableSha256":crate::startup_cache::digest_file(&executable)?,"guiSubsystemVerified":true,"inventoryVerified":true,"extractionVerified":true,"maintenanceExecutableStarted":true,"extractedFilesRemoved":true,"modelStarted":false,"softwareInstalled":false,"actualModelAcceptance":"pending","cleanMachineAcceptance":"pending"});
     save(&evidence.join("smoke-receipt.json"), &receipt)?;
@@ -243,6 +245,7 @@ fn package(
         crate::startup_process::unique()
     ));
     new_directory(&stage)?;
+    let mut stage_guard = crate::fs_guard::TempDirGuard::new(stage.clone());
     let result = (|| {
         let package = stage.join("package");
         let creation = crate::chat_package::run(
@@ -277,11 +280,13 @@ fn package(
             )
             .map_err(|error| error.to_string())?;
         }
-        fs::write(output.join("SHA256SUMS.txt"), checksums).map_err(|error| error.to_string())?;
+        crate::fs_guard::write_atomic_bytes(&output.join("SHA256SUMS.txt"), checksums.as_bytes())
+            .map_err(|error| error.to_string())?;
         crate::release_tool::run(
             &json!({"operation":"assets","assetDirectory":output,"tag":tag,"sourceRevision":revision}),
         )
     })();
+    stage_guard.disarm();
     completed(result, cleanup(&stage))
 }
 

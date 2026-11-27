@@ -50,17 +50,9 @@ fn github_env(name: &str, value: &str) -> crate::Result<()> {
 
 fn write_json(path: &Path, value: &Value) -> crate::Result<()> {
     external(path)?;
-    let temporary = path.with_extension(format!("{}.partial", crate::startup_process::unique()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| error.to_string())?;
-    serde_json::to_writer_pretty(&mut file, value).map_err(|error| error.to_string())?;
-    file.write_all(b"\n")
-        .and_then(|()| file.sync_all())
-        .map_err(|error| error.to_string())?;
-    fs::rename(temporary, path).map_err(|error| error.to_string())
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    crate::fs_guard::write_atomic_bytes(path, &bytes).map_err(|error| error.to_string())
 }
 
 fn ci_guard() -> crate::Result<()> {
@@ -141,6 +133,7 @@ fn supervise(
         crate::startup_process::unique()
     ));
     fs::create_dir(&capture).map_err(|error| error.to_string())?;
+    let mut capture_guard = crate::fs_guard::TempDirGuard::new(capture.clone());
     let stdout = capture.join("stdout.txt");
     let stderr = capture.join("stderr.txt");
     let process = OwnedProcess::start_tool_with_removed(
@@ -208,33 +201,48 @@ fn supervise(
             capture: capture.clone(),
         };
         if code == 0 {
-            fs::remove_file(&stdout)
-                .and_then(|()| fs::remove_file(&stderr))
+            crate::fs_guard::remove_file_with_retry(&stdout)
+                .and_then(|()| crate::fs_guard::remove_file_with_retry(&stderr))
+                .and_then(|()| crate::fs_guard::remove_dir_all_with_retry(&capture))
                 .map_err(|error| error.to_string())?;
-            fs::remove_dir(&capture).map_err(|error| error.to_string())?;
         } else {
             for path in [&stdout, &stderr] {
                 if fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0) {
-                    fs::remove_file(path).map_err(|error| error.to_string())?;
+                    crate::fs_guard::remove_file_with_retry(path)
+                        .map_err(|error| error.to_string())?;
                 }
             }
         }
         Ok(output)
     })();
+    let mut cleanup_error: Option<String> = None;
     if result.is_err() || !process.active_processes().is_ok_and(|count| count == 0) {
-        process
-            .stop(Duration::from_secs(10))
-            .map_err(|error| format!("Native owner process-tree cleanup failed: {error}"))?;
+        if let Err(error) = process.stop(Duration::from_secs(10)) {
+            cleanup_error = Some(format!("Native owner process-tree cleanup failed: {error}"));
+        }
+        drop(process);
         for path in [&stdout, &stderr] {
-            if fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0) {
-                fs::remove_file(path).map_err(|error| error.to_string())?;
+            if fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0)
+                && let Err(error) = crate::fs_guard::remove_file_with_retry(path)
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(error.to_string());
             }
         }
-        if fs::read_dir(&capture).is_ok_and(|mut entries| entries.next().is_none()) {
-            fs::remove_dir(&capture).map_err(|error| error.to_string())?;
+        if fs::read_dir(&capture).is_ok_and(|mut entries| entries.next().is_none())
+            && let Err(error) = crate::fs_guard::remove_dir_all_with_retry(&capture)
+            && cleanup_error.is_none()
+        {
+            cleanup_error = Some(error.to_string());
         }
     }
-    result
+    // Preserve non-empty stderr/stdout capture directories for caller diagnostics.
+    capture_guard.disarm();
+    let output = result?;
+    if let Some(error) = cleanup_error {
+        return Err(error);
+    }
+    Ok(output)
 }
 
 pub(super) fn supervised_tool(

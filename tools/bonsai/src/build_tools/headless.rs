@@ -583,7 +583,7 @@ pub(super) fn build(repository: &Path, output: &Path) -> crate::Result<Value> {
             fs::create_dir_all(&evidence).map_err(|error| error.to_string())?;
             let probe = crate::completion::run(
                 json!({"schemaVersion":1,"executable":bundle.join(executable),"arguments":arguments,
-                "workingDirectory":working,"evidenceDirectory":evidence,"artifacts":artifacts,"memoryLimitBytes":536_870_912,
+                "workingDirectory":working.path(),"evidenceDirectory":evidence,"artifacts":artifacts,"memoryLimitBytes":536_870_912,
                 "requiredAvailableBytes":536_870_912,"physicalReserveBytes":0,"timeoutSeconds":10,
                 "stdoutLimitBytes":65_536,"stderrLimitBytes":65_536,"requireNonemptyStdout":false,"ciOnly":false}),
             )?;

@@ -38,19 +38,13 @@ fn external(path: &Path) -> Result<()> {
 }
 fn save(path: &Path, value: &Value, new: bool) -> Result<()> {
     external(path)?;
-    let mut options = fs::OpenOptions::new();
-    options.write(true);
-    if new {
-        options.create_new(true);
-    } else {
-        options.create(true).truncate(true);
-    }
-    let mut file = options.open(path).map_err(|e| e.to_string())?;
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| e.to_string())
+    if new {
+        crate::fs_guard::write_new_atomic_bytes(path, &bytes).map_err(|e| e.to_string())
+    } else {
+        crate::fs_guard::write_atomic_bytes(path, &bytes).map_err(|e| e.to_string())
+    }
 }
 fn append_env(name: &str, line: &str) -> Result<()> {
     if let Some(path) = std::env::var_os(name) {
@@ -182,6 +176,8 @@ impl Context {
         let serial = crate::startup_process::unique();
         let stdout = self.working.join(format!("helper-{serial}.stdout"));
         let stderr = self.working.join(format!("helper-{serial}.stderr"));
+        let mut stdout_guard = crate::fs_guard::TempFileGuard::new(stdout.clone());
+        let mut stderr_guard = crate::fs_guard::TempFileGuard::new(stderr.clone());
         let removed = std::env::vars_os()
             .filter_map(|(name, _)| {
                 let name = name.to_string_lossy().into_owned();
@@ -247,16 +243,24 @@ impl Context {
         let cleanup = process
             .stop(Duration::from_secs(10))
             .map_err(|e| e.to_string());
+        drop(process);
+        let mut retain_error = None;
         if result.is_err() || cleanup.is_err() {
             for (source, label) in [(&stdout, "stdout"), (&stderr, "stderr")] {
-                let raw = bytes(source, 4_194_304)?;
-                if raw.iter().any(|b| !b.is_ascii_whitespace()) {
-                    fs::write(
-                        self.retained
-                            .join(format!("failed-helper-{serial}.{label}")),
-                        raw,
-                    )
-                    .map_err(|e| e.to_string())?;
+                match bytes(source, 4_194_304) {
+                    Ok(raw) if raw.iter().any(|b| !b.is_ascii_whitespace()) => {
+                        if let Err(error) = fs::write(
+                            self.retained
+                                .join(format!("failed-helper-{serial}.{label}")),
+                            raw,
+                        ) && retain_error.is_none()
+                        {
+                            retain_error = Some(error.to_string());
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) if retain_error.is_none() => retain_error = Some(error),
+                    Err(_) => {}
                 }
             }
         }
@@ -265,10 +269,21 @@ impl Context {
         } else {
             Err("Native helper failed or cleanup could not be confirmed.".into())
         };
-        fs::remove_file(stdout).map_err(|e| e.to_string())?;
-        fs::remove_file(stderr).map_err(|e| e.to_string())?;
-        cleanup?;
+        let remove_stdout = crate::fs_guard::remove_file_with_retry(&stdout);
+        if remove_stdout.is_ok() {
+            stdout_guard.disarm();
+        }
+        let remove_stderr = crate::fs_guard::remove_file_with_retry(&stderr);
+        if remove_stderr.is_ok() {
+            stderr_guard.disarm();
+        }
         result?;
+        cleanup?;
+        if let Some(error) = retain_error {
+            return Err(error);
+        }
+        remove_stdout.map_err(|e| e.to_string())?;
+        remove_stderr.map_err(|e| e.to_string())?;
         response
     }
 }

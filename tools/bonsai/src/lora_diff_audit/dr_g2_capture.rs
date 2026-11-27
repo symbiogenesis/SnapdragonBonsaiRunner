@@ -2460,7 +2460,7 @@ impl Drop for CaptureScratchRoot {
             && target.parent() == Some(parent.as_path())
             && fs::symlink_metadata(&self.0).is_ok_and(|meta| !bonsai_artifacts::is_redirect(&meta))
         {
-            let _ = fs::remove_dir_all(&self.0);
+            let _ = crate::fs_guard::remove_dir_all_with_retry(&self.0);
         }
     }
 }
@@ -2641,6 +2641,7 @@ fn run_windows_capture(request: &Request) -> crate::Result<Value> {
     let scratch_path = scratch.path().to_path_buf();
     drop(scratch);
 
+    let mut receipt = capture_result?;
     stop_a.map_err(|e| format!("Failed stopping Server A Job: {e}"))?;
     stop_b.map_err(|e| format!("Failed stopping Server B Job: {e}"))?;
     if lingering_count != 0 {
@@ -2650,7 +2651,6 @@ fn run_windows_capture(request: &Request) -> crate::Result<Value> {
     }
 
     let cred_dir_exists_after = cred_dir_a.exists() || cred_dir_b.exists() || scratch_path.exists();
-    let mut receipt = capture_result?;
     receipt["lingeringServerCount"] = json!(lingering_count);
     receipt["credDirExistsAfter"] = json!(cred_dir_exists_after);
     Ok(receipt)

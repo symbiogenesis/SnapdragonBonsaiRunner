@@ -148,6 +148,7 @@ fn build_with(plan: &Plan, mut execute: impl FnMut(&str, Value) -> Result<Value>
         crate::startup_process::unique()
     ));
     fs::create_dir(&stage).map_err(|error| error.to_string())?;
+    let mut stage_guard = crate::fs_guard::TempDirGuard::new(stage.clone());
     let result = (|| {
         fs::create_dir_all(
             plan.output
@@ -205,6 +206,7 @@ fn build_with(plan: &Plan, mut execute: impl FnMut(&str, Value) -> Result<Value>
             json!({"operation":"create","packageDirectory":package,"manifestSha256":receipt["ManifestSha256"],"outputPath":plan.output}),
         )
     })();
+    stage_guard.disarm();
     completed(result, cleanup(&stage))
 }
 

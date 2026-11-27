@@ -114,7 +114,7 @@ pub(super) fn build(repository: &Path, output: &Path, ptq1: bool) -> crate::Resu
     let pins = crate::native_qualification::run(json!({"operation":"source-pins",
         "kind":if ptq1 { "ptq1" } else { "rows" }, "repositoryDirectory":repository}))?;
     stage_output(output, true)?;
-    let working = scratch(if ptq1 {
+    let mut working = scratch(if ptq1 {
         "HostedPtq1Build"
     } else {
         "HostedRowBuild"
@@ -140,6 +140,8 @@ pub(super) fn build(repository: &Path, output: &Path, ptq1: bool) -> crate::Resu
             evidence.display()
         )
         .map_err(|error| error.to_string())?;
+        // Evidence was explicitly exported for downstream workflow retention.
+        working.disarm();
     }
     let source = &pins["rustSource"];
     let mut receipt = json!({"SchemaVersion":1, "Scope":if ptq1 {"hosted-ptq1-capture-build-only"} else {"hosted-row-checker-build-only"},

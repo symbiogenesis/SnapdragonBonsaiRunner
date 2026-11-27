@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read as _, Write as _},
+    io::Read as _,
     path::Path,
     time::Duration,
 };
@@ -19,6 +19,7 @@ fn snapshot(target: &Path, tool: &Path, digest: &str) -> crate::Result<std::path
     let destination = directory.join(format!("{digest}.exe"));
     if !destination.exists() {
         let temporary = directory.join(format!("{}.partial", startup_process::unique()));
+        let mut temp_guard = crate::fs_guard::TempFileGuard::new(temporary.clone());
         let mut output = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -36,7 +37,8 @@ fn snapshot(target: &Path, tool: &Path, digest: &str) -> crate::Result<std::path
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.to_string()),
         }
-        fs::remove_file(temporary).map_err(|error| error.to_string())?;
+        crate::fs_guard::remove_file_with_retry(&temporary).map_err(|error| error.to_string())?;
+        temp_guard.disarm();
     }
     if cache::digest_file(&destination)? != digest {
         return Err("The maintenance bootstrap snapshot changed.".into());
@@ -97,16 +99,7 @@ pub(super) fn publish(target: &Path, working: &Path, tool: &Path) -> crate::Resu
             json!({"ToolPath": tool, "BootstrapPath": bootstrap, "ToolSha256": digest, "Version": version}),
         );
     }
-    let temporary = target.join(format!("bootstrap-{}.partial", startup_process::unique()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| error.to_string())?;
-    file.write_all(&bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
-    drop(file);
-    fs::rename(&temporary, receipt_path).map_err(|error| error.to_string())?;
+    crate::fs_guard::write_atomic_bytes(&receipt_path, &bytes).map_err(|error| error.to_string())?;
     Ok(
         json!({"ToolPath": tool, "BootstrapPath": bootstrap, "ToolSha256": digest, "Version": version}),
     )
@@ -121,6 +114,7 @@ mod tests {
         let target =
             std::env::temp_dir().join(format!("Bonsai-Bootstrap-{}", startup_process::unique()));
         fs::create_dir(&target).map_err(|error| error.to_string())?;
+        let mut target_guard = crate::fs_guard::TempDirGuard::new(target.clone());
         let tool = target.join("tool.exe");
         let mut bytes = vec![0; 512];
         bytes[..2].copy_from_slice(b"MZ");
@@ -132,7 +126,7 @@ mod tests {
         assert_eq!(first, snapshot(&target, &tool, &digest)?);
         fs::write(&first, "tampered").map_err(|error| error.to_string())?;
         assert!(snapshot(&target, &tool, &digest).is_err());
-        fs::remove_dir_all(target).map_err(|error| error.to_string())?;
+        target_guard.cleanup().map_err(|error| error.to_string())?;
         Ok(())
     }
 }

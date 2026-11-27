@@ -159,35 +159,110 @@ impl Drop for TempFileGuard {
 }
 
 /// Removes a temporary or staging directory on drop unless explicitly disarmed.
-pub(crate) struct TempDirGuard(Option<PathBuf>);
+pub(crate) struct TempDirGuard {
+    path: PathBuf,
+    armed: bool,
+}
 
 impl TempDirGuard {
     /// Arms a guard that removes `path` when dropped unless disarmed.
     pub(crate) fn new(path: PathBuf) -> Self {
-        Self(Some(path))
+        Self { path, armed: true }
+    }
+
+    /// Returns the guarded directory path.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Disarms the guard after the directory has been published or intentionally exported.
     pub(crate) fn disarm(&mut self) {
-        self.0 = None;
+        self.armed = false;
     }
 
     /// Explicitly removes the directory with retry and disarms the guard.
     #[cfg(test)]
     pub(crate) fn cleanup(&mut self) -> io::Result<()> {
-        if let Some(path) = self.0.take() {
-            remove_dir_all_with_retry(&path)?;
-        }
-        Ok(())
+        self.armed = false;
+        remove_dir_all_with_retry(&self.path)
+    }
+}
+
+impl std::ops::Deref for TempDirGuard {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempDirGuard {
+    fn as_ref(&self) -> &Path {
+        &self.path
     }
 }
 
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = remove_dir_all_with_retry(&path);
+        if self.armed {
+            let _ = remove_dir_all_with_retry(&self.path);
         }
     }
+}
+
+/// Atomically writes `bytes` to `path` via a guarded `.partial` sibling and Windows rename retry.
+pub(crate) fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Output path requires a file name.",
+        )
+    })?;
+    let temporary = path.with_file_name(format!(
+        "{}.{}.partial",
+        name.to_string_lossy(),
+        crate::startup_process::unique()
+    ));
+    let mut guard = TempFileGuard::new(temporary.clone());
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    use io::Write as _;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    rename_with_retry(&temporary, path)?;
+    guard.disarm();
+    Ok(())
+}
+
+/// Atomically creates a new file at `path` via a guarded `.partial` sibling and hard-link publication.
+pub(crate) fn write_new_atomic_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Output path requires a file name.",
+        )
+    })?;
+    let temporary = path.with_file_name(format!(
+        "{}.{}.partial",
+        name.to_string_lossy(),
+        crate::startup_process::unique()
+    ));
+    let mut guard = TempFileGuard::new(temporary.clone());
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    use io::Write as _;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::hard_link(&temporary, path)?;
+    remove_file_with_retry(&temporary)?;
+    guard.disarm();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -254,6 +329,41 @@ mod tests {
 
         _root_guard.cleanup().map_err(|error| error.to_string())?;
         assert!(!root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_writes_publish_cleanly_without_partial_leaks() -> crate::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "Bonsai-AtomicWrite-{}",
+            crate::startup_process::unique()
+        ));
+        fs::create_dir(&root).map_err(|error| error.to_string())?;
+        let mut root_guard = TempDirGuard::new(root.clone());
+
+        let exclusive = root.join("exclusive.json");
+        write_new_atomic_bytes(&exclusive, b"{\"v\":1}\n").map_err(|error| error.to_string())?;
+        assert_eq!(
+            fs::read(&exclusive).map_err(|error| error.to_string())?,
+            b"{\"v\":1}\n"
+        );
+        assert!(write_new_atomic_bytes(&exclusive, b"{\"v\":2}\n").is_err());
+
+        let manifest = root.join("SHA256SUMS.txt");
+        write_atomic_bytes(&manifest, b"first\n").map_err(|error| error.to_string())?;
+        write_atomic_bytes(&manifest, b"second\n").map_err(|error| error.to_string())?;
+        assert_eq!(
+            fs::read(&manifest).map_err(|error| error.to_string())?,
+            b"second\n"
+        );
+        let partial_count = fs::read_dir(&root)
+            .map_err(|error| error.to_string())?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "partial"))
+            .count();
+        assert_eq!(partial_count, 0);
+
+        root_guard.cleanup().map_err(|error| error.to_string())?;
         Ok(())
     }
 

@@ -398,7 +398,7 @@ pub(super) fn build(
         "scheduling":{"requestedParallel":parallel, "parallelJobs":jobs, "availableMemoryBytes":memory},
         "git":{"path":git, "version":git_version}, "cmake":{"path":cmake, "version":cmake_version}, "compiler":compiler,
         "engine":{"path":engine, "sha256":crate::startup_cache::digest_file(&engine)?, "version":version},
-        "cacheSha256":crate::startup_cache::digest_file(&build.join("CMakeCache.txt"))?, "logs":working,
+        "cacheSha256":crate::startup_cache::digest_file(&build.join("CMakeCache.txt"))?, "logs":working.path(),
         "qualification":"build-and-version-only; inference, UI and performance unqualified"});
     let receipt_path = build.join(format!("receipt-{}.json", crate::startup_process::unique()));
     save(&receipt_path, &receipt, true)?;

@@ -293,6 +293,7 @@ fn execute(
     ));
     external(&work)?;
     fs::create_dir(&work).map_err(|error| error.to_string())?;
+    let _work_guard = crate::fs_guard::TempDirGuard::new(work.clone());
     decode(&invoke(&tool.path, arguments, &work, seconds)?)
 }
 

@@ -143,17 +143,11 @@ fn save(path: &Path, receipt: &Value, exclusive: bool) -> crate::Result<()> {
     if bytes.len() > RECEIPT_LIMIT {
         return Err("Build receipt exceeds its fixed byte bound.".into());
     }
-    let mut options = OpenOptions::new();
-    options.write(true);
     if exclusive {
-        options.create_new(true);
+        crate::fs_guard::write_new_atomic_bytes(path, &bytes).map_err(|error| error.to_string())
     } else {
-        options.create(true).truncate(true);
+        crate::fs_guard::write_atomic_bytes(path, &bytes).map_err(|error| error.to_string())
     }
-    let mut file = options.open(path).map_err(|error| error.to_string())?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| error.to_string())
 }
 
 fn image(path: &Path) -> crate::Result<Value> {
@@ -216,14 +210,14 @@ fn stage_output(path: &Path, empty_allowed: bool) -> crate::Result<()> {
     Ok(())
 }
 
-fn scratch(label: &str) -> crate::Result<PathBuf> {
+fn scratch(label: &str) -> crate::Result<crate::fs_guard::TempDirGuard> {
     let path = std::env::temp_dir().join(format!(
         "Bonsai-{label}-{}",
         crate::startup_process::unique()
     ));
     external(&path)?;
     fs::create_dir(&path).map_err(|error| error.to_string())?;
-    Ok(path)
+    Ok(crate::fs_guard::TempDirGuard::new(path))
 }
 
 fn execute(
@@ -488,20 +482,20 @@ mod tests {
     #[test]
     fn repository_json_inputs_keep_source_access_separate_from_external_artifacts()
     -> crate::Result<()> {
-        let working = scratch("BuildSourceInputTest")?;
+        let mut working = scratch("BuildSourceInputTest")?;
         fs::create_dir(working.join(".git")).map_err(|error| error.to_string())?;
         let path = working.join("pin.json");
         fs::write(&path, b"{\"pin\":1}").map_err(|error| error.to_string())?;
         assert!(validate_external_path(&path).is_err());
         assert_eq!(read_json(&path)?, json!({"pin":1}));
         assert!(input_file(Path::new("relative.json")).is_err());
-        fs::remove_dir_all(working).map_err(|error| error.to_string())
+        working.cleanup().map_err(|error| error.to_string())
     }
 
     #[test]
     fn compiler_evidence_retains_only_bounded_selected_tails_and_failure_scope() -> crate::Result<()>
     {
-        let working = scratch("BuildEvidenceTest")?;
+        let mut working = scratch("BuildEvidenceTest")?;
         let evidence = working.join("evidence");
         fs::create_dir(&evidence).map_err(|error| error.to_string())?;
         let mut bytes = vec![b'x'; 70_000];
@@ -523,6 +517,16 @@ mod tests {
             )
             .is_err()
         );
-        fs::remove_dir_all(working).map_err(|error| error.to_string())
+        // Updating an existing receipt atomically leaves no leftover .partial files.
+        let updated = json!({"Status":"completed", "Phase":"completed", "ModelProcessStarted":false});
+        save(&evidence.join("build-receipt.json"), &updated, false)?;
+        assert_eq!(read_json(&evidence.join("build-receipt.json"))?, updated);
+        let partial_count = fs::read_dir(&evidence)
+            .map_err(|error| error.to_string())?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "partial"))
+            .count();
+        assert_eq!(partial_count, 0);
+        working.cleanup().map_err(|error| error.to_string())
     }
 }
