@@ -540,7 +540,12 @@ mod tests {
             }
         }
         // Let workers park, then wake only a subset.
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        let park_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while pool.shared.parked_count.0.load(Ordering::Acquire) < 7
+            && std::time::Instant::now() < park_deadline
+        {
+            std::thread::yield_now();
+        }
         out.fill(0.0);
         pool.run_aligned(&mut out, 2, 8, &|offset, slice| {
             for (i, slot) in slice.iter_mut().enumerate() {
@@ -563,9 +568,16 @@ mod tests {
         pool.run_aligned(&mut out, 4, 8, &|_, _| {});
         // Worker-only panic: coordinator returns normally into ScopeGuard::drop and resumes the worker panic.
         let worker_res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let shared_panic = &pool.shared.has_panic;
             pool.run_aligned(&mut out, 4, 8, &|offset, _slice| {
                 if std::thread::current().id() == coordinator_id {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(200);
+                    while !shared_panic.load(Ordering::Acquire)
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
                 } else {
                     assert!(
                         std::thread::current().id() == coordinator_id,

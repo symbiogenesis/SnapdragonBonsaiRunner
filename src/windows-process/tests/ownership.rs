@@ -644,117 +644,151 @@ fn argv_environment_and_native_cwd() -> io::Result<()> {
 fn background_tool_job_lowers_root_and_nested_descendant_priority() -> io::Result<()> {
     use windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS;
 
-    let control = Lane::new("priority-control")?;
-    let status = Command::new(probe_executable())
-        .arg("priority-report")
-        .current_dir(&control.path)
-        .creation_flags(0x0800_0000)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    assert!(status.success());
-    let inherited = fs::read_to_string(control.path.join("priority.txt"))?;
-
-    for background in [false, true] {
-        let lane = Lane::new("priority-tree")?;
-        let spec = lane.spec(vec![OsString::from("priority-tree")]);
-        let tool = ToolProcessSpec {
-            executable: spec.executable,
-            arguments: spec.arguments,
-            working_directory: spec.working_directory,
-            stdout: spec.stdout,
-            stderr: spec.stderr,
-            environment: std::collections::BTreeMap::new(),
-        };
-        let process = if background {
-            OwnedProcess::start_background_tool(&tool)?
-        } else {
-            OwnedProcess::start_tool(&tool)?
-        };
-        until(|| {
-            if process.try_wait()?.is_some() {
-                return Err(io::Error::other("priority probe exited before reporting"));
-            }
-            Ok(lane.path.join("child-priority.txt").is_file())
-        })?;
+    let (inherited, results) = std::thread::scope(|scope| -> io::Result<_> {
+        let ctrl_h = scope.spawn(|| -> io::Result<String> {
+            let control = Lane::new("priority-control")?;
+            let status = Command::new(probe_executable())
+                .arg("priority-report")
+                .current_dir(&control.path)
+                .creation_flags(0x0800_0000)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?;
+            assert!(status.success());
+            fs::read_to_string(control.path.join("priority.txt"))
+        });
+        let arm_handles: Vec<_> = [false, true]
+            .into_iter()
+            .map(|background| {
+                scope.spawn(move || -> io::Result<(bool, String, String)> {
+                    let lane = Lane::new("priority-tree")?;
+                    let spec = lane.spec(vec![OsString::from("priority-tree")]);
+                    let tool = ToolProcessSpec {
+                        executable: spec.executable,
+                        arguments: spec.arguments,
+                        working_directory: spec.working_directory,
+                        stdout: spec.stdout,
+                        stderr: spec.stderr,
+                        environment: std::collections::BTreeMap::new(),
+                    };
+                    let process = if background {
+                        OwnedProcess::start_background_tool(&tool)?
+                    } else {
+                        OwnedProcess::start_tool(&tool)?
+                    };
+                    until(|| {
+                        if process.try_wait()?.is_some() {
+                            return Err(io::Error::other("priority probe exited before reporting"));
+                        }
+                        Ok(lane.path.join("child-priority.txt").is_file())
+                    })?;
+                    let root_p = fs::read_to_string(lane.path.join("root-priority.txt"))?;
+                    let child_p = fs::read_to_string(lane.path.join("child-priority.txt"))?;
+                    assert_eq!(process.active_processes()?, 2);
+                    process.stop(TIMEOUT)?;
+                    assert!(process.try_wait()?.is_some());
+                    assert_eq!(process.active_processes()?, 0);
+                    Ok((background, root_p, child_p))
+                })
+            })
+            .collect();
+        let inherited = ctrl_h
+            .join()
+            .map_err(|_| io::Error::other("priority control panicked"))??;
+        let mut results = Vec::with_capacity(2);
+        for handle in arm_handles {
+            results.push(
+                handle
+                    .join()
+                    .map_err(|_| io::Error::other("priority arm panicked"))??,
+            );
+        }
+        Ok((inherited, results))
+    })?;
+    for (background, root_p, child_p) in results {
         let expected = if background {
             BELOW_NORMAL_PRIORITY_CLASS.to_string()
         } else {
             inherited.clone()
         };
-        assert_eq!(
-            fs::read_to_string(lane.path.join("root-priority.txt"))?,
-            expected
-        );
-        assert_eq!(
-            fs::read_to_string(lane.path.join("child-priority.txt"))?,
-            expected
-        );
-        assert_eq!(process.active_processes()?, 2);
-        process.stop(TIMEOUT)?;
-        assert!(process.try_wait()?.is_some());
-        assert_eq!(process.active_processes()?, 0);
+        assert_eq!(root_p, expected);
+        assert_eq!(child_p, expected);
     }
     Ok(())
 }
 
 #[test]
 fn stop_and_drop_kill_descendants_and_observe_memory() -> io::Result<()> {
-    for explicitly_stop in [true, false] {
-        let lane = Lane::new("tree")?;
-        let port = unused_port()?;
-        let process = OwnedProcess::start(&lane.spec(vec![
-            OsString::from("tree"),
-            OsString::from(port.to_string()),
-        ]))?;
-        until(|| listener_process_id(port).map(|owner| owner.is_some()))?;
-        let descendant =
-            listener_process_id(port)?.ok_or_else(|| io::Error::other("listener disappeared"))?;
-        assert_ne!(descendant, process.id());
-        // Hosted run 41333126433 identified two extra conhost.exe children, one
-        // per console-subsystem probe. The fixture now links without a console.
-        // Require exactly the two intended nodes within the existing bound;
-        // the root and same listening descendant must stay live throughout.
-        // Extra processes still fail and remain in bounded failure diagnostics.
-        let mut observed = 0;
-        until(|| {
-            if process.try_wait()?.is_some() || listener_process_id(port)? != Some(descendant) {
-                return Err(io::Error::other(
-                    "owned root or descendant exited before tree accounting settled",
-                ));
-            }
-            observed = process.active_processes()?;
-            Ok(observed == 2)
-        })
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "two-process tree accounting did not settle (root={}, descendant={descendant}, last={observed}): {error}; diagnostic={:?}",
-                    process.id(), process.test_job_accounting()
-                ),
-            )
-        })?;
-        assert_eq!(
-            process.active_processes()?,
-            2,
-            "{:?}",
-            process.test_job_accounting()
-        );
-        assert!(process.memory_usage()?.private_bytes > 0);
-        assert!(process.memory_usage()?.working_set_bytes > 0);
-        assert!(process.peak_job_memory_bytes()? > 0);
-        if explicitly_stop {
-            assert!(process.stop(Duration::ZERO).is_err());
-            process.stop(TIMEOUT)?;
-            assert!(process.try_wait()?.is_some());
-            assert_eq!(process.active_processes()?, 0);
+    let arms = [(true, unused_port()?), (false, unused_port()?)];
+    std::thread::scope(|scope| -> io::Result<()> {
+        let handles: Vec<_> = arms
+            .into_iter()
+            .map(|(explicitly_stop, port)| {
+                scope.spawn(move || -> io::Result<()> {
+                    let lane = Lane::new("tree")?;
+                    let process = OwnedProcess::start(&lane.spec(vec![
+                        OsString::from("tree"),
+                        OsString::from(port.to_string()),
+                    ]))?;
+                    until(|| listener_process_id(port).map(|owner| owner.is_some()))?;
+                    let descendant = listener_process_id(port)?
+                        .ok_or_else(|| io::Error::other("listener disappeared"))?;
+                    assert_ne!(descendant, process.id());
+                    // Hosted run 41333126433 identified two extra conhost.exe children, one
+                    // per console-subsystem probe. The fixture now links without a console.
+                    // Require exactly the two intended nodes within the existing bound;
+                    // the root and same listening descendant must stay live throughout.
+                    // Extra processes still fail and remain in bounded failure diagnostics.
+                    let mut observed = 0;
+                    until(|| {
+                        if process.try_wait()?.is_some()
+                            || listener_process_id(port)? != Some(descendant)
+                        {
+                            return Err(io::Error::other(
+                                "owned root or descendant exited before tree accounting settled",
+                            ));
+                        }
+                        observed = process.active_processes()?;
+                        Ok(observed == 2)
+                    })
+                    .map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!(
+                                "two-process tree accounting did not settle (root={}, descendant={descendant}, last={observed}): {error}; diagnostic={:?}",
+                                process.id(), process.test_job_accounting()
+                            ),
+                        )
+                    })?;
+                    assert_eq!(
+                        process.active_processes()?,
+                        2,
+                        "{:?}",
+                        process.test_job_accounting()
+                    );
+                    assert!(process.memory_usage()?.private_bytes > 0);
+                    assert!(process.memory_usage()?.working_set_bytes > 0);
+                    assert!(process.peak_job_memory_bytes()? > 0);
+                    if explicitly_stop {
+                        assert!(process.stop(Duration::ZERO).is_err());
+                        process.stop(TIMEOUT)?;
+                        assert!(process.try_wait()?.is_some());
+                        assert_eq!(process.active_processes()?, 0);
+                    }
+                    drop(process);
+                    until(|| listener_process_id(port).map(|owner| owner.is_none()))?;
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("tree arm panicked"))??;
         }
-        drop(process);
-        until(|| listener_process_id(port).map(|owner| owner.is_none()))?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[test]
@@ -770,22 +804,66 @@ fn active_process_limit_blocks_descendants() -> io::Result<()> {
 
 #[test]
 fn headless_mitigations_apply_at_creation_without_changing_tool_policy() -> io::Result<()> {
-    let control = Lane::new("mitigation-control")?;
-    let status = Command::new(probe_executable())
-        .arg("mitigations")
-        .current_dir(&control.path)
-        .creation_flags(0x0800_0000)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    assert!(status.success());
-    let baseline = fs::read_to_string(control.path.join("mitigations.txt"))?;
-
-    let worker = Lane::new("mitigation-worker")?;
-    let process = OwnedProcess::start(&worker.spec(vec![OsString::from("mitigations")]))?;
-    assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
-    let observed = fs::read_to_string(worker.path.join("mitigations.txt"))?;
+    let (baseline, observed, tool_observed, nested_observed) =
+        std::thread::scope(|scope| -> io::Result<_> {
+            let ctrl_h = scope.spawn(|| -> io::Result<String> {
+                let control = Lane::new("mitigation-control")?;
+                let status = Command::new(probe_executable())
+                    .arg("mitigations")
+                    .current_dir(&control.path)
+                    .creation_flags(0x0800_0000)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()?;
+                assert!(status.success());
+                fs::read_to_string(control.path.join("mitigations.txt"))
+            });
+            let worker_h = scope.spawn(|| -> io::Result<String> {
+                let worker = Lane::new("mitigation-worker")?;
+                let process =
+                    OwnedProcess::start(&worker.spec(vec![OsString::from("mitigations")]))?;
+                assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
+                fs::read_to_string(worker.path.join("mitigations.txt"))
+            });
+            let tool_h = scope.spawn(|| -> io::Result<String> {
+                let tool = Lane::new("mitigation-tool")?;
+                let spec = tool.spec(vec![OsString::from("mitigations")]);
+                let process = OwnedProcess::start_tool(&ToolProcessSpec {
+                    executable: spec.executable,
+                    arguments: spec.arguments,
+                    working_directory: spec.working_directory,
+                    stdout: spec.stdout,
+                    stderr: spec.stderr,
+                    environment: std::collections::BTreeMap::new(),
+                })?;
+                assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
+                fs::read_to_string(tool.path.join("mitigations.txt"))
+            });
+            let nested_h = scope.spawn(|| -> io::Result<String> {
+                // A second owner inside the restricted worker must retain Job nesting.
+                // JobObjectBasicUIRestrictions would prevent this valid hierarchy.
+                let nested = Lane::new("mitigation-nested")?;
+                let process =
+                    OwnedProcess::start(&nested.spec(vec![OsString::from("nested-mitigations")]))?;
+                assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
+                fs::read_to_string(nested.path.join("mitigations.txt"))
+            });
+            Ok((
+                ctrl_h
+                    .join()
+                    .map_err(|_| io::Error::other("mitigation control panicked"))??,
+                worker_h
+                    .join()
+                    .map_err(|_| io::Error::other("mitigation worker panicked"))??,
+                tool_h
+                    .join()
+                    .map_err(|_| io::Error::other("mitigation tool panicked"))??,
+                nested_h
+                    .join()
+                    .map_err(|_| io::Error::other("mitigation nested panicked"))??,
+            ))
+        })?;
     for (name, required) in [("win32k", 1), ("extensions", 1), ("images", 3)] {
         let flags = observed
             .lines()
@@ -795,51 +873,13 @@ fn headless_mitigations_apply_at_creation_without_changing_tool_policy() -> io::
             .map_err(io::Error::other)?;
         assert_eq!(flags & required, required, "{name}: {observed}");
     }
-
-    let tool = Lane::new("mitigation-tool")?;
-    let spec = tool.spec(vec![OsString::from("mitigations")]);
-    let process = OwnedProcess::start_tool(&ToolProcessSpec {
-        executable: spec.executable,
-        arguments: spec.arguments,
-        working_directory: spec.working_directory,
-        stdout: spec.stdout,
-        stderr: spec.stderr,
-        environment: std::collections::BTreeMap::new(),
-    })?;
-    assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
-    assert_eq!(
-        fs::read_to_string(tool.path.join("mitigations.txt"))?,
-        baseline
-    );
-
-    // A second owner inside the restricted worker must retain Job nesting.
-    // JobObjectBasicUIRestrictions would prevent this valid hierarchy.
-    let nested = Lane::new("mitigation-nested")?;
-    let process = OwnedProcess::start(&nested.spec(vec![OsString::from("nested-mitigations")]))?;
-    assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
-    assert_eq!(
-        fs::read_to_string(nested.path.join("mitigations.txt"))?,
-        observed
-    );
+    assert_eq!(tool_observed, baseline);
+    assert_eq!(nested_observed, observed);
     Ok(())
 }
 
 #[test]
 fn inspection_keeps_non_win32k_mitigations_and_rejects_worker_arguments() -> io::Result<()> {
-    let control = Lane::new("inspection-control")?;
-    let status = Command::new(probe_executable())
-        .arg("--version")
-        .current_dir(&control.path)
-        .creation_flags(0x0800_0000)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    assert!(status.success());
-    assert_eq!(
-        fs::read_to_string(control.path.join("inspection.txt"))?,
-        "spawn=allowed\n"
-    );
     let invalid = Lane::new("inspection-invalid")?;
     for arguments in [
         Vec::new(),
@@ -860,27 +900,60 @@ fn inspection_keeps_non_win32k_mitigations_and_rejects_worker_arguments() -> io:
     assert!(!invalid_count.stdout.exists());
     assert!(!invalid_count.stderr.exists());
 
-    for argument in ["--version", "--help"] {
-        let lane = Lane::new("inspection-mitigations")?;
-        let mut spec = lane.spec(vec![OsString::from(argument)]);
-        spec.active_process_limit = 1;
-        let process = OwnedProcess::start_inspection(&spec)?;
-        assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
-        let observed = fs::read_to_string(lane.path.join("mitigations.txt"))?;
-        for (name, expected) in [("win32k", 0), ("extensions", 1), ("images", 3)] {
-            assert!(
-                observed
-                    .lines()
-                    .any(|line| line == format!("{name}={expected}")),
-                "{observed}"
+    std::thread::scope(|scope| -> io::Result<()> {
+        let ctrl_h = scope.spawn(|| -> io::Result<()> {
+            let control = Lane::new("inspection-control")?;
+            let status = Command::new(probe_executable())
+                .arg("--version")
+                .current_dir(&control.path)
+                .creation_flags(0x0800_0000)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?;
+            assert!(status.success());
+            assert_eq!(
+                fs::read_to_string(control.path.join("inspection.txt"))?,
+                "spawn=allowed\n"
             );
+            Ok(())
+        });
+        let probe_handles: Vec<_> = ["--version", "--help"]
+            .into_iter()
+            .map(|argument| {
+                scope.spawn(move || -> io::Result<()> {
+                    let lane = Lane::new("inspection-mitigations")?;
+                    let mut spec = lane.spec(vec![OsString::from(argument)]);
+                    spec.active_process_limit = 1;
+                    let process = OwnedProcess::start_inspection(&spec)?;
+                    assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
+                    let observed = fs::read_to_string(lane.path.join("mitigations.txt"))?;
+                    for (name, expected) in [("win32k", 0), ("extensions", 1), ("images", 3)] {
+                        assert!(
+                            observed
+                                .lines()
+                                .any(|line| line == format!("{name}={expected}")),
+                            "{observed}"
+                        );
+                    }
+                    assert_eq!(
+                        fs::read_to_string(lane.path.join("inspection.txt"))?,
+                        "spawn=denied\n"
+                    );
+                    Ok(())
+                })
+            })
+            .collect();
+        ctrl_h
+            .join()
+            .map_err(|_| io::Error::other("inspection control panicked"))??;
+        for handle in probe_handles {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("inspection probe panicked"))??;
         }
-        assert_eq!(
-            fs::read_to_string(lane.path.join("inspection.txt"))?,
-            "spawn=denied\n"
-        );
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[test]
@@ -924,37 +997,50 @@ fn graphics_probe_keeps_non_win32k_mitigations_and_rejects_worker_arguments() ->
     assert!(!invalid_count.stdout.exists());
     assert!(!invalid_count.stderr.exists());
 
-    for subcommand in [
-        "host-gpu-query",
-        "host-opencl-query",
-        "opencl-projection-worker",
-    ] {
-        let lane = Lane::new("graphics-probe-mitigations")?;
-        let request = lane.path.join("request.json");
-        fs::write(&request, b"{}")?;
-        let mut spec = lane.spec(vec![
-            OsString::from(subcommand),
-            OsString::from("--request"),
-            request.into_os_string(),
-        ]);
-        spec.active_process_limit = 1;
-        let process = OwnedProcess::start_graphics_probe(&spec)?;
-        assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
-        let observed = fs::read_to_string(lane.path.join("mitigations.txt"))?;
-        for (name, expected) in [("win32k", 0), ("extensions", 1), ("images", 3)] {
-            assert!(
-                observed
-                    .lines()
-                    .any(|line| line == format!("{name}={expected}")),
-                "{observed}"
-            );
+    std::thread::scope(|scope| -> io::Result<()> {
+        let handles: Vec<_> = [
+            "host-gpu-query",
+            "host-opencl-query",
+            "opencl-projection-worker",
+        ]
+        .into_iter()
+        .map(|subcommand| {
+            scope.spawn(move || -> io::Result<()> {
+                let lane = Lane::new("graphics-probe-mitigations")?;
+                let request = lane.path.join("request.json");
+                fs::write(&request, b"{}")?;
+                let mut spec = lane.spec(vec![
+                    OsString::from(subcommand),
+                    OsString::from("--request"),
+                    request.into_os_string(),
+                ]);
+                spec.active_process_limit = 1;
+                let process = OwnedProcess::start_graphics_probe(&spec)?;
+                assert_eq!(process.wait_for_exit(TIMEOUT)?, Some(0));
+                let observed = fs::read_to_string(lane.path.join("mitigations.txt"))?;
+                for (name, expected) in [("win32k", 0), ("extensions", 1), ("images", 3)] {
+                    assert!(
+                        observed
+                            .lines()
+                            .any(|line| line == format!("{name}={expected}")),
+                        "{observed}"
+                    );
+                }
+                assert_eq!(
+                    fs::read_to_string(lane.path.join("inspection.txt"))?,
+                    "spawn=denied\n"
+                );
+                Ok(())
+            })
+        })
+        .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("graphics probe panicked"))??;
         }
-        assert_eq!(
-            fs::read_to_string(lane.path.join("inspection.txt"))?,
-            "spawn=denied\n"
-        );
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[test]

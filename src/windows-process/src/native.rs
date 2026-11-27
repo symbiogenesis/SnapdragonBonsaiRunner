@@ -922,14 +922,14 @@ impl NativeProcess {
     }
 
     #[cfg(feature = "containment")]
-    fn captures_finished(&self) -> io::Result<bool> {
+    fn wait_captures_until(&self, deadline: Instant) -> io::Result<bool> {
         self.captures
             .as_ref()
-            .map_or(Ok(true), output::Captures::finished)
+            .map_or(Ok(true), |captures| captures.wait_until(deadline))
     }
 
     #[cfg(not(feature = "containment"))]
-    const fn captures_finished(&self) -> io::Result<bool> {
+    const fn wait_captures_until(&self, _deadline: Instant) -> io::Result<bool> {
         Ok(true)
     }
 
@@ -1000,6 +1000,7 @@ impl NativeProcess {
 
     fn stop_within(&self, timeout: Duration) -> io::Result<()> {
         let start = Instant::now();
+        let deadline = start + timeout;
         // Retain synchronization handles before termination: Windows removes a
         // member from Job accounting shortly before signaling its process handle.
         let members = self.members();
@@ -1007,24 +1008,31 @@ impl NativeProcess {
         // processes atomically assigned by this owner and their descendants.
         check(unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) })?;
         let members = members?;
+        let timed_out = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "owned job did not become empty after cancellation",
+            )
+        };
+        // Job accounting can reach zero just before the root handle becomes
+        // signaled. Wait directly on root, member handles, and capture threads
+        // before confirming Job accounting reached zero.
+        if self
+            .root_wait_for_exit(deadline.saturating_duration_since(Instant::now()))?
+            .is_none()
+            || !wait_members_exited(&members, deadline)?
+            || !self.wait_captures_until(deadline)?
+        {
+            return Err(timed_out());
+        }
         loop {
-            // Job accounting can reach zero just before the root handle becomes
-            // signaled. Cleanup confirms raw root exit independently of an
-            // operation's retained log-capture failure.
-            if self.active_processes()? == 0
-                && self.root_wait_for_exit(Duration::ZERO)?.is_some()
-                && members_exited(&members)?
-                && self.captures_finished()?
-            {
+            if self.active_processes()? == 0 {
                 return Ok(());
             }
             let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "owned job did not become empty after cancellation",
-                ));
+                return Err(timed_out());
             };
-            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
         }
     }
 
@@ -1481,11 +1489,16 @@ impl Drop for NativeProcess {
     }
 }
 
-fn members_exited(members: &[OwnedHandle]) -> io::Result<bool> {
+fn wait_members_exited(members: &[OwnedHandle], deadline: Instant) -> io::Result<bool> {
     for member in members {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let milliseconds = u32::try_from(remaining.as_millis())
+            .ok()
+            .filter(|value| *value < u32::MAX)
+            .ok_or_else(|| invalid("process wait interval exceeds the bounded native limit"))?;
         // SAFETY: Each noninheritable synchronization handle remains owned for
-        // this zero-timeout wait. No raw ownership is transferred.
-        match unsafe { WaitForSingleObject(member.as_raw_handle(), 0) } {
+        // this bounded wait. No raw ownership is transferred.
+        match unsafe { WaitForSingleObject(member.as_raw_handle(), milliseconds) } {
             WAIT_OBJECT_0 => (),
             WAIT_TIMEOUT => return Ok(false),
             _ => return Err(io::Error::last_os_error()),

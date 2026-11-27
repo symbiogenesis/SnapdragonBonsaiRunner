@@ -699,31 +699,44 @@ fn error_policy(mode: &str) -> io::Result<()> {
     reset_error_mode();
     fs::write("owner-error-mode-before.txt", error_mode().to_string())?;
     let directory = std::env::current_dir()?;
-    for mode in ["crash", "error-policy"] {
-        let process = OwnedProcess::start(&ProcessSpec {
-            executable: std::env::current_exe()?,
-            arguments: vec![OsString::from(mode)],
-            working_directory: directory.clone(),
-            stdout: directory.join(format!("{mode}.stdout")),
-            stderr: directory.join(format!("{mode}.stderr")),
-            memory_limit_bytes: 256 * 1024 * 1024,
-            active_process_limit: 2,
-        })?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(code) = process.try_wait()? {
-                fs::write(format!("{mode}-exit.txt"), code.to_string())?;
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "crash fixture hung",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
+    let exe = std::env::current_exe()?;
+    std::thread::scope(|scope| -> io::Result<()> {
+        let handles: Vec<_> = ["crash", "error-policy"]
+            .into_iter()
+            .map(|submode| {
+                let exe_ref = &exe;
+                let dir_ref = &directory;
+                scope.spawn(move || -> io::Result<()> {
+                    let process = OwnedProcess::start(&ProcessSpec {
+                        executable: exe_ref.clone(),
+                        arguments: vec![OsString::from(submode)],
+                        working_directory: dir_ref.clone(),
+                        stdout: dir_ref.join(format!("{submode}.stdout")),
+                        stderr: dir_ref.join(format!("{submode}.stderr")),
+                        memory_limit_bytes: 256 * 1024 * 1024,
+                        active_process_limit: 2,
+                    })?;
+                    let code =
+                        process
+                            .wait_for_exit(Duration::from_secs(10))?
+                            .ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::TimedOut, "crash fixture hung")
+                            })?;
+                    fs::write(
+                        dir_ref.join(format!("{submode}-exit.txt")),
+                        code.to_string(),
+                    )?;
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("error_policy worker panicked"))??;
         }
-    }
+        Ok(())
+    })?;
     fs::write("owner-error-mode-after.txt", error_mode().to_string())?;
     Ok(())
 }
