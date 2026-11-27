@@ -1277,14 +1277,16 @@ fn serve_broker(
                                 &options,
                                 commands,
                                 events,
+                                Some(broker),
                             )
                         } else {
-                            generate(
+                            generate_with_broker(
                                 config.frontend_port,
                                 key.as_hex(),
                                 request,
                                 commands,
                                 events,
+                                Some(broker),
                             )
                         }
                     });
@@ -2057,20 +2059,47 @@ const fn map_transport(error: crate::http::TransportError) -> Failure {
     })
 }
 
-fn connect_interruptible(
+fn check_broker_and_commands(
+    commands: &Receiver<Command>,
+    broker: Option<&OwnedProcess>,
+) -> Result<()> {
+    check_commands(commands)?;
+    if let Some(broker) = broker
+        && broker
+            .try_wait()
+            .map_err(|_| Failure::Message("Could not inspect the owned broker."))?
+            .is_some()
+    {
+        return Err(Failure::Message("The local model stopped unexpectedly."));
+    }
+    Ok(())
+}
+
+fn connect_interruptible_with_broker(
     address: SocketAddr,
     connect_timeout: Duration,
     commands: &Receiver<Command>,
+    broker: Option<&OwnedProcess>,
 ) -> Result<TcpStream> {
     crate::http::connect_socket(
         address,
         connect_timeout,
         || IO_POLL,
-        || check_commands(commands),
+        || check_broker_and_commands(commands, broker),
     )
     .map_err(map_http_error)
 }
 
+#[cfg(test)]
+fn connect_interruptible(
+    address: SocketAddr,
+    connect_timeout: Duration,
+    commands: &Receiver<Command>,
+) -> Result<TcpStream> {
+    connect_interruptible_with_broker(address, connect_timeout, commands, None)
+}
+
+#[cfg(test)]
 fn generate(
     port: u16,
     key: &str,
@@ -2078,8 +2107,19 @@ fn generate(
     commands: &Receiver<Command>,
     events: &EventSender,
 ) -> Result<(Message, Completion)> {
+    generate_with_broker(port, key, request, commands, events, None)
+}
+
+fn generate_with_broker(
+    port: u16,
+    key: &str,
+    request: Vec<u8>,
+    commands: &Receiver<Command>,
+    events: &EventSender,
+    broker: Option<&OwnedProcess>,
+) -> Result<(Message, Completion)> {
     let (message, completion, _) =
-        generate_with_options(port, key, request, false, commands, events)?;
+        generate_with_options(port, key, request, false, commands, events, broker)?;
     Ok((message, completion))
 }
 
@@ -2090,12 +2130,13 @@ fn generate_with_options(
     stop_on_collapse: bool,
     commands: &Receiver<Command>,
     events: &EventSender,
+    broker: Option<&OwnedProcess>,
 ) -> Result<(Message, Completion, Option<sse::ConfidenceSummary>)> {
-    check_commands(commands)?;
+    check_broker_and_commands(commands, broker)?;
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     let connect_timeout = Duration::from_secs(1);
-    let stream = connect_interruptible(address, connect_timeout, commands)?;
-    check_commands(commands)?;
+    let stream = connect_interruptible_with_broker(address, connect_timeout, commands, broker)?;
+    check_broker_and_commands(commands, broker)?;
     let _nodelay = stream.set_nodelay(true);
     stream
         .set_nonblocking(false)

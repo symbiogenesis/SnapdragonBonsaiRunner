@@ -1,15 +1,21 @@
 //! Publish complete settings or export bytes through a synced, create-new sibling file.
 
 use std::{
-    fs::{self, Metadata, OpenOptions},
+    fs::{self, File, Metadata, OpenOptions},
     io::{self, Write as _},
     os::windows::fs::{MetadataExt as _, OpenOptionsExt as _},
     path::{Component, Path, PathBuf, Prefix},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const MAX_CREATE_ATTEMPTS: usize = 4;
+const TRANSIENT_BACKOFF_MS: [u64; 3] = [10, 25, 50];
+
+static PENDING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Ordered phases reported when callers surface stage-specific persistence failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,8 +47,68 @@ fn pending_path(path: &Path) -> io::Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_nanos();
+    let sequence = PENDING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     // Append the unique suffix rather than replacing multi-dot target extensions.
-    Ok(path.with_added_extension(format!("{}.{stamp}.pending", std::process::id())))
+    Ok(path.with_added_extension(format!(
+        "{}.{stamp}.{sequence}.pending",
+        std::process::id()
+    )))
+}
+
+fn is_transient_windows_file_error(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
+fn retry_transient_io(mut op: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    for delay_ms in TRANSIENT_BACKOFF_MS {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(error) if is_transient_windows_file_error(&error) => {
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    op()
+}
+
+fn open_exclusive_temp(
+    path: &Path,
+    validate_temp: fn(&Path) -> io::Result<()>,
+    mut make_path: impl FnMut(&Path) -> io::Result<PathBuf>,
+) -> Result<(PathBuf, File), StagedError> {
+    for attempt in 0..MAX_CREATE_ATTEMPTS {
+        let temporary = make_path(path).map_err(|error| StagedError {
+            stage: Stage::ValidateTemporary,
+            error,
+        })?;
+        validate_stage(Stage::ValidateTemporary, validate_temp, &temporary)?;
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    && attempt + 1 < MAX_CREATE_ATTEMPTS => {}
+            Err(error) => {
+                return Err(StagedError {
+                    stage: Stage::CreateTemporary,
+                    error,
+                });
+            }
+        }
+    }
+    Err(StagedError {
+        stage: Stage::CreateTemporary,
+        error: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Temporary staging path remained occupied.",
+        ),
+    })
 }
 
 const fn is_allowed_leaf_attributes(is_file: bool, attributes: u32) -> bool {
@@ -175,24 +241,8 @@ fn replace_with(
     revalidate_target: fn(&Path) -> io::Result<()>,
 ) -> Result<(), StagedError> {
     validate_stage(Stage::ValidatePath, validate_target, path)?;
-    let temporary = pending_path(path).map_err(|error| StagedError {
-        stage: Stage::ValidateTemporary,
-        error,
-    })?;
-    validate_stage(Stage::ValidateTemporary, validate_temp, &temporary)?;
-    let mut created = false;
+    let (temporary, mut file) = open_exclusive_temp(path, validate_temp, pending_path)?;
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .share_mode(0)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&temporary)
-            .map_err(|error| StagedError {
-                stage: Stage::CreateTemporary,
-                error,
-            })?;
-        created = true;
         file.metadata()
             .and_then(|meta| ensure_regular_non_reparse(&meta))
             .map_err(|error| StagedError {
@@ -207,14 +257,13 @@ fn replace_with(
             })?;
         drop(file);
         validate_stage(Stage::RevalidatePath, revalidate_target, path)?;
-        fs::rename(&temporary, path).map_err(|error| StagedError {
+        retry_transient_io(|| fs::rename(&temporary, path)).map_err(|error| StagedError {
             stage: Stage::Replace,
             error,
         })
     })();
-    // A create-new collision belongs to somebody else and must survive cleanup.
-    if result.is_err() && created {
-        let _removed = fs::remove_file(temporary);
+    if result.is_err() {
+        let _removed = retry_transient_io(|| fs::remove_file(&temporary));
     }
     result
 }
@@ -339,5 +388,63 @@ mod tests {
         drop(retained);
         fs::remove_file(path)?;
         fs::remove_dir(directory)
+    }
+
+    #[test]
+    fn pending_path_sequence_and_transient_retry_recover_collisions_and_os_locks() -> io::Result<()>
+    {
+        let target = Path::new(r"C:\exports\config.json");
+        assert_ne!(pending_path(target)?, pending_path(target)?);
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "BonsaiAtomicRetry-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir)?;
+        let existing = dir.join("collision.pending");
+        fs::write(&existing, b"occupied")?;
+        let next = dir.join("fresh.pending");
+        let mut calls = 0_usize;
+        let (created_path, file) =
+            open_exclusive_temp(&dir.join("target.json"), |_| Ok(()), |_| {
+                calls += 1;
+                Ok(if calls == 1 {
+                    existing.clone()
+                } else {
+                    next.clone()
+                })
+            })
+            .map_err(|err| err.error)?;
+        drop(file);
+        assert_eq!(calls, 2);
+        assert_eq!(created_path, next);
+        assert_eq!(fs::read(&existing)?, b"occupied");
+
+        let mut os_attempts = 0_usize;
+        retry_transient_io(|| {
+            os_attempts += 1;
+            if os_attempts < 3 {
+                Err(io::Error::from_raw_os_error(32))
+            } else {
+                Ok(())
+            }
+        })?;
+        assert_eq!(os_attempts, 3);
+
+        let mut fatal_attempts = 0_usize;
+        assert!(
+            retry_transient_io(|| {
+                fatal_attempts += 1;
+                Err(io::Error::new(io::ErrorKind::NotFound, "missing"))
+            })
+            .is_err()
+        );
+        assert_eq!(fatal_attempts, 1);
+
+        fs::remove_dir_all(dir)
     }
 }

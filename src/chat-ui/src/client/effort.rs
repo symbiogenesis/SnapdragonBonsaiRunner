@@ -5,6 +5,7 @@ use super::{
     ResponseOptions, Result, check_commands, generate_with_options, notify, request_byte_limit,
     serialize_request_with_options, sse::ConfidenceSummary,
 };
+use bonsai_windows_process::OwnedProcess;
 use serde::Serialize;
 use std::sync::mpsc::Receiver;
 
@@ -23,6 +24,7 @@ pub(super) fn run(
     options: &ResponseOptions,
     commands: &Receiver<Command>,
     events: &EventSender,
+    broker: Option<&OwnedProcess>,
 ) -> Result<(Message, Completion)> {
     run_with_detailed(
         pending,
@@ -30,7 +32,15 @@ pub(super) fn run(
         commands,
         events,
         |request, stop_on_collapse| {
-            generate_with_options(port, key, request, stop_on_collapse, commands, events)
+            generate_with_options(
+                port,
+                key,
+                request,
+                stop_on_collapse,
+                commands,
+                events,
+                broker,
+            )
         },
     )
 }

@@ -16,6 +16,7 @@ use std::{
 /// Maximum HTTP/1.1 response header block admitted from a loopback peer.
 pub(crate) const MAX_HEAD: usize = 16 * 1024;
 const MAX_CHUNK_LINE: usize = 32;
+const CONNECT_TRANSIENT_BACKOFF_MS: [u64; 2] = [50, 150];
 
 /// Shared bounded HTTP/1.1 transport and framing failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +96,39 @@ pub(crate) fn retry_poll(error: &io::Error) -> bool {
     )
 }
 
+fn retry_transient_connect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::AddrNotAvailable
+    )
+}
+
+fn wait_interruptible<E>(
+    delay: Duration,
+    deadline: Instant,
+    poll_step: &mut impl FnMut() -> Duration,
+    check: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, Error<E>> {
+    let wait_until = (Instant::now() + delay).min(deadline);
+    loop {
+        check().map_err(Error::Interrupted)?;
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        if now >= wait_until {
+            return Ok(true);
+        }
+        let step = poll_step().min(wait_until.saturating_duration_since(now));
+        if step.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(step);
+    }
+}
+
 /// Connects only to `127.0.0.1:port` while polling caller cancellation checks.
 pub(crate) fn connect_loopback<E>(
     port: u16,
@@ -116,6 +150,7 @@ pub(crate) fn connect_socket<E>(
 ) -> Result<TcpStream, Error<E>> {
     check().map_err(Error::Interrupted)?;
     let deadline = Instant::now() + connect_timeout;
+    let mut transient_retry = 0_usize;
     loop {
         check().map_err(Error::Interrupted)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -134,6 +169,16 @@ pub(crate) fn connect_socket<E>(
             Err(error) if retry_poll(&error) => {
                 check().map_err(Error::Interrupted)?;
                 if Instant::now() >= deadline {
+                    return Err(Error::Transport(TransportError::Connect));
+                }
+            }
+            Err(error)
+                if retry_transient_connect(&error)
+                    && transient_retry < CONNECT_TRANSIENT_BACKOFF_MS.len() =>
+            {
+                let delay = Duration::from_millis(CONNECT_TRANSIENT_BACKOFF_MS[transient_retry]);
+                transient_retry += 1;
+                if !wait_interruptible(delay, deadline, &mut poll_step, &mut check)? {
                     return Err(Error::Transport(TransportError::Connect));
                 }
             }
@@ -933,6 +978,34 @@ mod tests {
             },
         );
         assert_eq!(cancelled.err(), Some(super::Error::Interrupted("stopped")));
+
+        // Transient ConnectionRefused retries within connect_timeout until peer binds.
+        let probe = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let retry_port = probe.local_addr()?.port();
+        drop(probe);
+        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready_flag = std::sync::Arc::clone(&ready);
+        let delayed_server = std::thread::spawn(move || -> std::io::Result<()> {
+            std::thread::sleep(std::time::Duration::from_millis(35));
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, retry_port))?;
+            ready_flag.store(true, std::sync::atomic::Ordering::Release);
+            let _accepted = listener.accept()?;
+            Ok(())
+        });
+        let retried = super::connect_loopback(
+            retry_port,
+            std::time::Duration::from_millis(400),
+            || std::time::Duration::from_millis(20),
+            || Ok::<(), &'static str>(()),
+        );
+        if delayed_server
+            .join()
+            .map_err(|_| std::io::Error::other("delayed server panicked"))?
+            .is_ok()
+            && ready.load(std::sync::atomic::Ordering::Acquire)
+        {
+            assert!(retried.is_ok());
+        }
         Ok(())
     }
 }
