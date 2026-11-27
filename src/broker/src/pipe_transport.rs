@@ -18,9 +18,10 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
     },
     task::{Context, Poll, Waker},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -305,19 +306,139 @@ impl TxShared {
     }
 }
 
-struct TxCloser(Arc<TxShared>);
+struct ThreadCompletion {
+    exited: Mutex<bool>,
+    condvar: Condvar,
+}
 
-impl Drop for TxCloser {
-    fn drop(&mut self) {
-        let mut state = lock_unpoisoned(&self.0.state);
-        state.closed = true;
-        state.wake_io();
-        drop(state);
-        self.0.writer_ready.notify_one();
+impl ThreadCompletion {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            exited: Mutex::new(false),
+            condvar: Condvar::new(),
+        })
+    }
+
+    fn mark_exited(&self) {
+        let mut exited = lock_unpoisoned(&self.exited);
+        *exited = true;
+        drop(exited);
+        self.condvar.notify_all();
+    }
+
+    fn wait_exited(&self, timeout: Duration) -> bool {
+        let mut guard = lock_unpoisoned(&self.exited);
+        let deadline = std::time::Instant::now() + timeout;
+        while !*guard {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+            let (next_guard, wait_res) = match self.condvar.wait_timeout(guard, remaining) {
+                Ok(pair) => pair,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard = next_guard;
+            if wait_res.timed_out() {
+                break;
+            }
+        }
+        *guard
     }
 }
 
-type ActiveRx = (u32, mpsc::Sender<io::Result<Vec<u8>>>, Arc<AtomicBool>);
+struct ExitGuard(Arc<ThreadCompletion>);
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        self.0.mark_exited();
+    }
+}
+
+struct PipeThreads {
+    tx_handle: Option<std::thread::JoinHandle<()>>,
+    tx_done: Arc<ThreadCompletion>,
+    rx_handle: Option<std::thread::JoinHandle<()>>,
+    rx_done: Arc<ThreadCompletion>,
+}
+
+struct TxCloser {
+    tx: Arc<TxShared>,
+    rx_state: Arc<Mutex<RxState>>,
+    threads: Mutex<PipeThreads>,
+}
+
+impl Drop for TxCloser {
+    fn drop(&mut self) {
+        {
+            let mut state = lock_unpoisoned(&self.tx.state);
+            state.closed = true;
+            state.wake_io();
+        }
+        self.tx.writer_ready.notify_one();
+
+        let (tx_handle, tx_done, rx_handle, rx_done) = {
+            let mut threads = lock_unpoisoned(&self.threads);
+            (
+                threads.tx_handle.take(),
+                Arc::clone(&threads.tx_done),
+                threads.rx_handle.take(),
+                Arc::clone(&threads.rx_done),
+            )
+        };
+        const TEARDOWN_JOIN_WAIT: Duration = Duration::from_millis(50);
+        if let Some(handle) = tx_handle
+            && (handle.is_finished() || tx_done.wait_exited(TEARDOWN_JOIN_WAIT))
+        {
+            let _ = handle.join();
+        }
+        let rx_stopping = {
+            let rx = lock_unpoisoned(&self.rx_state);
+            rx.closed || rx.failed
+        };
+        if let Some(handle) = rx_handle
+            && (handle.is_finished() || (rx_stopping && rx_done.wait_exited(TEARDOWN_JOIN_WAIT)))
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+const RX_ERR_NONE: u8 = 0;
+const RX_ERR_RESET: u8 = 1;
+const RX_ERR_FAILED: u8 = 2;
+
+struct StreamRxStatus {
+    eof_received: AtomicBool,
+    terminal_error: AtomicU8,
+}
+
+impl StreamRxStatus {
+    const fn new() -> Self {
+        Self {
+            eof_received: AtomicBool::new(false),
+            terminal_error: AtomicU8::new(RX_ERR_NONE),
+        }
+    }
+
+    fn terminal_io_error(&self) -> Option<io::Error> {
+        match self.terminal_error.load(Ordering::Acquire) {
+            RX_ERR_RESET => Some(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "backend reset broker-pipe stream",
+            )),
+            RX_ERR_FAILED => Some(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "broker-pipe failed",
+            )),
+            _ => None,
+        }
+    }
+}
+
+type ActiveRx = (u32, mpsc::Sender<io::Result<Vec<u8>>>, Arc<StreamRxStatus>);
 
 struct RxState {
     active: Option<ActiveRx>,
@@ -435,8 +556,19 @@ impl PipeBackend {
         let handshake_key = ScrubHandshake(boxed_key);
 
         let tx = TxShared::new();
-        let closer = Arc::new(TxCloser(Arc::clone(&tx)));
         let rx_state = Arc::new(Mutex::new(RxState::new()));
+        let tx_done = ThreadCompletion::new();
+        let rx_done = ThreadCompletion::new();
+        let closer = Arc::new(TxCloser {
+            tx: Arc::clone(&tx),
+            rx_state: Arc::clone(&rx_state),
+            threads: Mutex::new(PipeThreads {
+                tx_handle: None,
+                tx_done: Arc::clone(&tx_done),
+                rx_handle: None,
+                rx_done: Arc::clone(&rx_done),
+            }),
+        });
         let (ready_tx, ready_rx) = watch::channel(ReadyState::Pending);
         let pool = BufferPool::new();
 
@@ -444,9 +576,10 @@ impl PipeBackend {
         let rx_fail = Arc::clone(&rx_state);
         let ready_tx_fail = ready_tx.clone();
         let tx_pool = Arc::clone(&pool);
-        std::thread::Builder::new()
+        let tx_handle = std::thread::Builder::new()
             .name("broker-pipe-client-tx".to_owned())
             .spawn(move || {
+                let _exit_guard = ExitGuard(tx_done);
                 run_writer(
                     writer,
                     handshake_key,
@@ -458,14 +591,19 @@ impl PipeBackend {
                 );
             })
             .map_err(|_| BackendError::Io)?;
+        lock_unpoisoned(&closer.threads).tx_handle = Some(tx_handle);
 
         let rx_tx = Arc::clone(&tx);
         let rx_worker = Arc::clone(&rx_state);
         let rx_pool = Arc::clone(&pool);
-        std::thread::Builder::new()
+        let rx_handle = std::thread::Builder::new()
             .name("broker-pipe-client-rx".to_owned())
-            .spawn(move || run_reader(reader, &rx_tx, &rx_worker, &ready_tx, &rx_pool))
+            .spawn(move || {
+                let _exit_guard = ExitGuard(rx_done);
+                run_reader(reader, &rx_tx, &rx_worker, &ready_tx, &rx_pool);
+            })
             .map_err(|_| BackendError::Io)?;
+        lock_unpoisoned(&closer.threads).rx_handle = Some(rx_handle);
 
         Ok(Self {
             policy,
@@ -510,7 +648,10 @@ impl BackendConnector for PipeBackend {
         &self.policy
     }
 
-    async fn connect(&self, _deadline: Instant) -> Result<Self::Stream, BackendError> {
+    async fn connect(&self, deadline: Instant) -> Result<Self::Stream, BackendError> {
+        if Instant::now() >= deadline {
+            return Err(BackendError::Deadline);
+        }
         if *self.ready_rx.borrow() != ReadyState::Ready {
             return Err(BackendError::Io);
         }
@@ -521,13 +662,13 @@ impl BackendConnector for PipeBackend {
             })
             .map_err(|_| BackendError::Io)?;
         let (chunk_tx, chunk_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let eof_received = Arc::new(AtomicBool::new(false));
+        let rx_status = Arc::new(StreamRxStatus::new());
         {
             let mut rx = lock_unpoisoned(&self.rx_state);
             if rx.closed || rx.failed || rx.active.is_some() {
                 return Err(BackendError::Io);
             }
-            rx.active = Some((stream_id, chunk_tx, Arc::clone(&eof_received)));
+            rx.active = Some((stream_id, chunk_tx, Arc::clone(&rx_status)));
         }
         {
             let mut state = lock_unpoisoned(&self.tx.state);
@@ -545,7 +686,7 @@ impl BackendConnector for PipeBackend {
             rx: chunk_rx,
             buffered: Vec::new(),
             offset: 0,
-            eof_received,
+            rx_status,
             rx_state: Arc::clone(&self.rx_state),
             tx: Arc::clone(&self.tx),
             _closer: Arc::clone(&self.closer),
@@ -563,7 +704,7 @@ pub struct PipeStream {
     rx: mpsc::Receiver<io::Result<Vec<u8>>>,
     buffered: Vec<u8>,
     offset: usize,
-    eof_received: Arc<AtomicBool>,
+    rx_status: Arc<StreamRxStatus>,
     rx_state: Arc<Mutex<RxState>>,
     tx: Arc<TxShared>,
     _closer: Arc<TxCloser>,
@@ -587,7 +728,7 @@ impl Drop for PipeStream {
         if !self.eof_sent {
             let mut state = lock_unpoisoned(&self.tx.state);
             if !state.closed && !state.failed && !state.is_reset(self.stream_id) {
-                let kind = if self.eof_received.load(Ordering::Acquire) {
+                let kind = if self.rx_status.eof_received.load(Ordering::Acquire) {
                     KIND_EOF
                 } else {
                     state.record_reset(self.stream_id, &self.pool);
@@ -620,7 +761,9 @@ impl AsyncRead for PipeStream {
             self.offset = 0;
             match self.rx.poll_recv(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Ready(None) => {
+                    return Poll::Ready(self.rx_status.terminal_io_error().map_or(Ok(()), Err));
+                }
                 Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
                 Poll::Ready(Some(Ok(chunk))) => {
                     if chunk.is_empty() {
@@ -872,7 +1015,10 @@ fn fail_transport(
     {
         let mut rx = lock_unpoisoned(rx_state);
         rx.failed = true;
-        if let Some((_, sender, _)) = rx.active.take() {
+        if let Some((_, sender, status)) = rx.active.take() {
+            status
+                .terminal_error
+                .store(RX_ERR_FAILED, Ordering::Release);
             let _ = sender.try_send(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "broker-pipe failed",
@@ -940,10 +1086,8 @@ fn handle_reader_frame<R: Read>(
                     "invalid eof frame",
                 ));
             }
-            if let Some((_, sender, eof_received)) =
-                lock_unpoisoned(rx_state).take_if_active(stream_id)
-            {
-                eof_received.store(true, Ordering::Release);
+            if let Some((_, sender, status)) = lock_unpoisoned(rx_state).take_if_active(stream_id) {
+                status.eof_received.store(true, Ordering::Release);
                 drop(sender);
             }
         }
@@ -959,7 +1103,8 @@ fn handle_reader_frame<R: Read>(
                 state.record_reset(stream_id, pool);
                 state.wake_io();
             }
-            if let Some((_, sender, _)) = lock_unpoisoned(rx_state).take_if_active(stream_id) {
+            if let Some((_, sender, status)) = lock_unpoisoned(rx_state).take_if_active(stream_id) {
+                status.terminal_error.store(RX_ERR_RESET, Ordering::Release);
                 let _ = sender.try_send(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "backend reset broker-pipe stream",
@@ -1052,12 +1197,21 @@ fn run_reader<R: Read>(
             Ok(HeaderRead::CleanEof) => {
                 let mut rx = lock_unpoisoned(rx_state);
                 rx.closed = true;
-                rx.active = None;
+                if let Some((_, sender, status)) = rx.active.take() {
+                    status
+                        .terminal_error
+                        .store(RX_ERR_FAILED, Ordering::Release);
+                    let _ = sender.try_send(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "broker-pipe failed",
+                    )));
+                }
                 drop(rx);
                 if *ready_tx.borrow() == ReadyState::Pending {
                     let _ = ready_tx.send(ReadyState::Failed);
                 }
                 lock_unpoisoned(&tx.state).fail_and_drain(pool);
+                tx.writer_ready.notify_one();
                 break;
             }
             Ok(HeaderRead::Frame(header)) => header,
@@ -1222,7 +1376,6 @@ fn run_writer<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const VALID_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1891,5 +2044,76 @@ mod tests {
         assert_eq!(reader.inner.read_calls, 1);
         assert_eq!(read_test_frame_opt(&mut reader)?, None);
         Ok(())
+    }
+
+    #[test]
+    fn clean_eof_wakes_writer_and_allows_teardown_join() -> io::Result<()> {
+        run_async(async {
+            let (backend, mut p_to_c_r, c_to_p_w) = ready_memory_backend().await?;
+            drop(c_to_p_w);
+            let mut trailing = Vec::new();
+            p_to_c_r.read_to_end(&mut trailing)?;
+            assert!(trailing.is_empty());
+            drop(backend);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn full_rx_channel_surfaces_broken_pipe_on_reset_and_failure() -> io::Result<()> {
+        run_async(async {
+            // 1. KIND_RESET with full 64-entry RX channel.
+            let (backend, _p_to_c_r, mut c_to_p_w) = ready_memory_backend().await?;
+            let mut stream = backend
+                .connect(Instant::now() + Duration::from_secs(1))
+                .await
+                .map_err(|_| io::Error::other("connect 1 failed"))?;
+            for _ in 0..CHANNEL_CAPACITY {
+                write_frame(&mut c_to_p_w, 1, KIND_DATA, b"x")?;
+            }
+            c_to_p_w.wait_for_reader_idle();
+            write_frame(&mut c_to_p_w, 1, KIND_RESET, &[])?;
+            c_to_p_w.wait_for_reader_idle();
+            let mut out = Vec::new();
+            let err =
+                stream.read_to_end(&mut out).await.err().ok_or_else(|| {
+                    io::Error::other("expected BrokenPipe after full-RX KIND_RESET")
+                })?;
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            drop(stream);
+            drop(backend);
+
+            // 2. fail_transport with full 64-entry RX channel.
+            let (backend, _p_to_c_r, mut c_to_p_w) = ready_memory_backend().await?;
+            let mut stream = backend
+                .connect(Instant::now() + Duration::from_secs(1))
+                .await
+                .map_err(|_| io::Error::other("connect 2 failed"))?;
+            for _ in 0..CHANNEL_CAPACITY {
+                write_frame(&mut c_to_p_w, 1, KIND_DATA, b"y")?;
+            }
+            c_to_p_w.wait_for_reader_idle();
+            // Invalid frame kind triggers fail_transport.
+            write_frame(&mut c_to_p_w, 0, 255, &[])?;
+            let mut out = Vec::new();
+            let err = stream.read_to_end(&mut out).await.err().ok_or_else(|| {
+                io::Error::other("expected BrokenPipe after full-RX fail_transport")
+            })?;
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn connect_rejects_expired_deadline() -> io::Result<()> {
+        run_async(async {
+            let (backend, _p_to_c_r, _c_to_p_w) = ready_memory_backend().await?;
+            let expired = Instant::now() - Duration::from_millis(1);
+            assert!(matches!(
+                backend.connect(expired).await,
+                Err(BackendError::Deadline)
+            ));
+            Ok(())
+        })
     }
 }
