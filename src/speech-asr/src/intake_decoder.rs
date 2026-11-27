@@ -92,37 +92,53 @@ pub(super) fn load_mapped_blocks<T: Send>(
         .clamp(1, crate::threads::MAX_WORKERS)
         .min(count);
     let blocks = if workers <= 1 {
-        (0..count)
-            .map(&load_layer)
-            .collect::<io::Result<Vec<_>>>()?
+        let mut blocks = Vec::with_capacity(count);
+        for layer in 0..count {
+            if cancel() {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            blocks.push(load_layer(layer)?);
+        }
+        blocks
     } else {
         let next = AtomicUsize::new(0);
         let abort = AtomicBool::new(false);
-        let run_worker = || -> io::Result<Vec<(usize, T)>> {
-            let mut items = Vec::new();
-            loop {
-                if abort.load(Ordering::Acquire) {
-                    return Err(invalid());
-                }
-                let layer = next.fetch_add(1, Ordering::Relaxed);
-                if layer >= count {
-                    return Ok(items);
-                }
-                match load_layer(layer) {
-                    Ok(item) => items.push((layer, item)),
-                    Err(error) => {
-                        abort.store(true, Ordering::Release);
-                        return Err(error);
+        let cancelled = AtomicBool::new(false);
+        let run_worker =
+            |mut poll: Option<&mut dyn FnMut() -> bool>| -> io::Result<Vec<(usize, T)>> {
+                let mut items = Vec::new();
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(io::Error::from(io::ErrorKind::Interrupted));
+                    }
+                    if let Some(poll_cancel) = poll.as_deref_mut()
+                        && poll_cancel()
+                    {
+                        cancelled.store(true, Ordering::Release);
+                        return Err(io::Error::from(io::ErrorKind::Interrupted));
+                    }
+                    if abort.load(Ordering::Acquire) {
+                        return Err(invalid());
+                    }
+                    let layer = next.fetch_add(1, Ordering::Relaxed);
+                    if layer >= count {
+                        return Ok(items);
+                    }
+                    match load_layer(layer) {
+                        Ok(item) => items.push((layer, item)),
+                        Err(error) => {
+                            abort.store(true, Ordering::Release);
+                            return Err(error);
+                        }
                     }
                 }
-            }
-        };
+            };
         let mut pairs = std::thread::scope(|scope| -> io::Result<Vec<(usize, T)>> {
             let mut handles = Vec::with_capacity(workers - 1);
             for _ in 1..workers {
-                handles.push(scope.spawn(run_worker));
+                handles.push(scope.spawn(|| run_worker(None)));
             }
-            let mut result = run_worker();
+            let mut result = run_worker(Some(cancel));
             for handle in handles {
                 let worker_items = handle.join().unwrap_or_else(|_| {
                     Err(io::Error::other("ASR decoder block worker panicked."))
@@ -559,7 +575,7 @@ pub(super) fn load_mapped(
     let (embedding_res, output_norm_res, blocks_res) = std::thread::scope(|scope| {
         let embedding_handle = scope.spawn(|| slice_loader.projection("dec.token_embd.weight"));
         let output_norm_handle = scope.spawn(|| slice_loader.vector("dec.output_norm.weight"));
-        let blocks_res = load_mapped_blocks(count, &mut || false, |layer| {
+        let blocks_res = load_mapped_blocks(count, cancel, |layer| {
             let mut s = &slice_loader;
             load_decoder_block(&mut s, layer)
         });
@@ -842,5 +858,21 @@ mod tests {
         assert!(loader.convolution("weight", &mut || false).is_err());
         assert_eq!(source.position(), 0);
         Ok(())
+    }
+
+    #[cfg(all(windows, feature = "rust-qualification"))]
+    #[test]
+    fn load_mapped_blocks_obeys_cooperative_cancellation() {
+        let mut checks = 0_usize;
+        let err = super::load_mapped_blocks(
+            8,
+            &mut || {
+                checks += 1;
+                checks >= 2
+            },
+            |layer| Ok(layer),
+        )
+        .err();
+        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::Interrupted));
     }
 }

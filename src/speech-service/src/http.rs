@@ -322,25 +322,41 @@ fn body_buffer(wire: &mut Vec<u8>, end: usize, length: usize) -> Result<(), Erro
     Ok(())
 }
 
-fn read(peer: &mut TcpStream, buffer: &mut [u8], until: Instant) -> Result<usize, Error> {
-    let remaining = until
-        .checked_duration_since(Instant::now())
-        .ok_or(Error::new(408, "intake_timeout"))?;
-    peer.set_read_timeout(Some(remaining))
-        .map_err(|_| Error::bad("read_failed"))?;
-    match peer.read(buffer) {
-        Ok(0) => Err(Error::bad("incomplete_request")),
-        Ok(count) => Ok(count),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-            ) =>
-        {
-            Err(Error::new(408, "intake_timeout"))
+fn read_with_deadline<R: Read>(
+    reader: &mut R,
+    set_timeout: &mut impl FnMut(&mut R, Duration) -> io::Result<()>,
+    buffer: &mut [u8],
+    until: Instant,
+) -> Result<usize, Error> {
+    loop {
+        let remaining = until
+            .checked_duration_since(Instant::now())
+            .ok_or(Error::new(408, "intake_timeout"))?;
+        set_timeout(reader, remaining).map_err(|_| Error::bad("read_failed"))?;
+        match reader.read(buffer) {
+            Ok(0) => return Err(Error::bad("incomplete_request")),
+            Ok(count) => return Ok(count),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(Error::new(408, "intake_timeout"));
+            }
+            Err(_) => return Err(Error::bad("read_failed")),
         }
-        Err(_) => Err(Error::bad("read_failed")),
     }
+}
+
+fn read(peer: &mut TcpStream, buffer: &mut [u8], until: Instant) -> Result<usize, Error> {
+    read_with_deadline(
+        peer,
+        &mut |stream, timeout| stream.set_read_timeout(Some(timeout)),
+        buffer,
+        until,
+    )
 }
 
 fn parse_head(bytes: &[u8], port: u16, key: &[u8; 64], kind: Kind) -> Result<Head, Error> {
@@ -535,13 +551,22 @@ fn send(peer: &mut TcpStream, status: u16, media: &str, bytes: &[u8]) -> io::Res
     write_before(peer, bytes, until)
 }
 
-fn write_before(peer: &mut TcpStream, mut remaining: &[u8], until: Instant) -> io::Result<()> {
+fn write_before_with_deadline<W: Write>(
+    writer: &mut W,
+    set_timeout: &mut impl FnMut(&mut W, Duration) -> io::Result<()>,
+    mut remaining: &[u8],
+    until: Instant,
+) -> io::Result<()> {
     while !remaining.is_empty() {
         let timeout = until
             .checked_duration_since(Instant::now())
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "Speech response deadline"))?;
-        peer.set_write_timeout(Some(timeout))?;
-        let count = peer.write(remaining)?;
+        set_timeout(writer, timeout)?;
+        let count = match writer.write(remaining) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
         if count == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -551,6 +576,15 @@ fn write_before(peer: &mut TcpStream, mut remaining: &[u8], until: Instant) -> i
         remaining = &remaining[count..];
     }
     Ok(())
+}
+
+fn write_before(peer: &mut TcpStream, remaining: &[u8], until: Instant) -> io::Result<()> {
+    write_before_with_deadline(
+        peer,
+        &mut |stream, timeout| stream.set_write_timeout(Some(timeout)),
+        remaining,
+        until,
+    )
 }
 
 #[cfg(test)]
@@ -857,6 +891,104 @@ mod pcm_tests {
             );
             assert_eq!(frame.bytes.as_ptr(), storage);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn read_and_write_before_retry_interrupted_and_respect_deadline() -> io::Result<()> {
+        use std::{
+            io::{Read, Write},
+            time::{Duration, Instant},
+        };
+
+        struct InterruptedReader {
+            eintr_left: usize,
+            payload: &'static [u8],
+        }
+        impl Read for InterruptedReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.eintr_left > 0 {
+                    self.eintr_left -= 1;
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                let n = buf.len().min(self.payload.len());
+                buf[..n].copy_from_slice(&self.payload[..n]);
+                Ok(n)
+            }
+        }
+
+        struct InterruptedWriter {
+            eintr_left: usize,
+            written: Vec<u8>,
+        }
+        impl Write for InterruptedWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.eintr_left > 0 {
+                    self.eintr_left -= 1;
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                let take = buf.len().min(2);
+                self.written.extend_from_slice(&buf[..take]);
+                Ok(take)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut reader = InterruptedReader {
+            eintr_left: 3,
+            payload: b"hello",
+        };
+        let mut buf = [0_u8; 8];
+        let got = super::read_with_deadline(
+            &mut reader,
+            &mut |_, _| Ok(()),
+            &mut buf,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .map_err(|_| io::Error::other("read_with_deadline failed"))?;
+        assert_eq!(&buf[..got], b"hello");
+
+        let mut writer = InterruptedWriter {
+            eintr_left: 3,
+            written: Vec::new(),
+        };
+        super::write_before_with_deadline(
+            &mut writer,
+            &mut |_, _| Ok(()),
+            b"abcde",
+            Instant::now() + Duration::from_secs(1),
+        )?;
+        assert_eq!(writer.written, b"abcde");
+
+        let mut expired_reader = InterruptedReader {
+            eintr_left: 1,
+            payload: b"x",
+        };
+        let read_err = super::read_with_deadline(
+            &mut expired_reader,
+            &mut |_, _| Ok(()),
+            &mut buf,
+            Instant::now() - Duration::from_millis(1),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("expected timeout error"))?;
+        assert_eq!(read_err.status, 408);
+
+        let mut expired_writer = InterruptedWriter {
+            eintr_left: 1,
+            written: Vec::new(),
+        };
+        let write_err = super::write_before_with_deadline(
+            &mut expired_writer,
+            &mut |_, _| Ok(()),
+            b"x",
+            Instant::now() - Duration::from_millis(1),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("expected timeout error"))?;
+        assert_eq!(write_err.kind(), io::ErrorKind::TimedOut);
         Ok(())
     }
 }

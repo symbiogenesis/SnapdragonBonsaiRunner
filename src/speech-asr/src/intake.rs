@@ -272,11 +272,21 @@ pub(super) fn load_artifacts_mapped(
     check_cancel(cancel)?;
     let (tokens, merges, eos) = take_tokenizer_inputs(&mut index)?;
     check_cancel(cancel)?;
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
     let (tokenizer_res, encoder_res, decoder_res) = std::thread::scope(|scope| {
         let tokenizer_handle =
             scope.spawn(|| crate::tokenizer::Tokenizer::from_tables(tokens, merges, eos));
-        let encoder_handle = scope.spawn(|| encoder::load_mapped(&index, mapping, &mut || false));
-        let decoder_res = decoder::load_mapped(&index, mapping, precision, &mut || false);
+        let encoder_handle = scope.spawn(|| {
+            let mut encoder_cancel = || cancelled.load(std::sync::atomic::Ordering::Acquire);
+            encoder::load_mapped(&index, mapping, &mut encoder_cancel)
+        });
+        let mut decoder_cancel = || {
+            if !cancelled.load(std::sync::atomic::Ordering::Acquire) && cancel() {
+                cancelled.store(true, std::sync::atomic::Ordering::Release);
+            }
+            cancelled.load(std::sync::atomic::Ordering::Acquire)
+        };
+        let decoder_res = decoder::load_mapped(&index, mapping, precision, &mut decoder_cancel);
         let tokenizer_res = tokenizer_handle
             .join()
             .unwrap_or_else(|_| Err(io::Error::other("ASR tokenizer intake thread panicked.")));

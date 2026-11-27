@@ -236,7 +236,7 @@ pub(super) fn load_mapped(
         let frontend_handle = scope.spawn(load_frontend);
         let conv_handle = scope.spawn(load_convolutions);
         let tail_handle = scope.spawn(load_tail);
-        let blocks_res = load_mapped_blocks(layers, &mut || false, |layer| {
+        let blocks_res = load_mapped_blocks(layers, cancel, |layer| {
             let mut s = &slice_loader;
             load_encoder_block(&mut s, layer)
         });
