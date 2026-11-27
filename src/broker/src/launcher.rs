@@ -1196,6 +1196,7 @@ impl LaunchConfig {
 
     fn mmproj_guard(
         &self,
+        workers: usize,
     ) -> Result<
         Option<(
             bonsai_cpu_policy::SwiftMmprojArtifact,
@@ -1223,17 +1224,22 @@ impl LaunchConfig {
             &artifact.sha256,
             artifact.chunk_bytes,
             artifact.chunk_sha256s.as_deref(),
+            workers,
         )
         .map_err(|_| LaunchError::Artifacts)?;
         Ok(Some((artifact, guard)))
     }
 
-    fn verify_artifacts(&self, plan: &LaunchPlan) -> Result<VerifiedArtifacts, LaunchError> {
+    fn verify_artifacts(
+        &self,
+        plan: &LaunchPlan,
+        workers: usize,
+    ) -> Result<VerifiedArtifacts, LaunchError> {
         if self.native_engine {
             let artifacts = if let Some(variant) = self.nariq_variant() {
-                VerifiedArtifacts::verify_nariq_model(&self.data, variant)
+                VerifiedArtifacts::verify_nariq_model(&self.data, variant, workers)
             } else if let Some(variant) = self.bonsai25_variant() {
-                VerifiedArtifacts::verify_bonsai25_model(&self.data, variant)
+                VerifiedArtifacts::verify_bonsai25_model(&self.data, variant, workers)
             } else {
                 Err(crate::artifacts::ArtifactError::Configuration)
             }
@@ -1268,6 +1274,16 @@ impl LaunchConfig {
 
         let verify_vision = self.runtime_supports_vision()?;
         let daisyrose_selection = self.resolve_daisyrose_selection()?;
+        let total_workers = crate::artifacts::default_chunk_workers();
+        let exe_workers = usize::from(self.native_engine);
+        let lora_workers = if daisyrose_selection.is_some() { 2 } else { 0 };
+        let remaining = total_workers.saturating_sub(exe_workers + lora_workers).max(1);
+        let mmproj_workers = if verify_vision {
+            (remaining / 4).max(1)
+        } else {
+            0
+        };
+        let model_workers = remaining.saturating_sub(mmproj_workers).max(1);
         std::thread::scope(|scope| {
             let native_handle = self
                 .native_engine
@@ -1275,9 +1291,10 @@ impl LaunchConfig {
             let daisyrose_handle = daisyrose_selection
                 .as_ref()
                 .map(|selection| scope.spawn(|| Self::verify_daisyrose_selection(selection)));
-            let mmproj_handle = verify_vision.then(|| scope.spawn(|| self.mmproj_guard()));
+            let mmproj_handle =
+                verify_vision.then(|| scope.spawn(|| self.mmproj_guard(mmproj_workers)));
 
-            let artifacts_result = self.verify_artifacts(plan);
+            let artifacts_result = self.verify_artifacts(plan, model_workers);
             let native_executable = join_opt(native_handle, LaunchError::NativeRuntime)?;
             let artifacts = artifacts_result?;
             Ok(VerifiedLaunchGuards {
@@ -1833,7 +1850,6 @@ impl LaunchConfig {
             )?;
             validate_external_path(&specification.executable).map_err(|_| LaunchError::Path)?;
             drop(reservation);
-            let worker_root = specification.working_directory.clone();
             if attempt == 0 {
                 startup_timing.phase(StartupPhase::ProcessCreation);
             }
@@ -1845,19 +1861,19 @@ impl LaunchConfig {
                 &credentials,
                 broker_pipe,
             )?;
+            // Sandboxed `OwnedProcess` instances already include `specification.working_directory`
+            // (`worker_root`) in their private roots, so skip a duplicate walk here.
             let process_guard = ProcessGuard {
                 process: &process,
                 private_limit: specification.memory_limit_bytes,
                 working_set_limit: working_set_limit_bytes,
                 storage_budget,
-                worker_root: Some(worker_root.as_path()),
+                worker_root: None,
             };
             if let Err(guard_error) = process_guard.check() {
                 // Keep sandbox storage rejections distinct if the check tripped right after spawn,
                 // without discarding Memory or Sandbox errors returned by guard itself.
-                let storage_error =
-                    check_storage_budget(&process, storage_budget, Some(worker_root.as_path()))
-                        .err();
+                let storage_error = check_storage_budget(&process, storage_budget, None).err();
                 let err = classify_initial_guard_error(guard_error, storage_error);
                 handle_startup_attempt_error(
                     &process,
@@ -1957,6 +1973,7 @@ impl LaunchConfig {
                 working_set_limit_bytes,
                 backend_port: if broker_pipe { 0 } else { self.backend_port },
                 storage_budget,
+                worker_root_covered_by_process: true,
             });
         }
         Err(LaunchError::Memory)
@@ -2329,6 +2346,7 @@ pub struct LaunchedService {
     working_set_limit_bytes: usize,
     backend_port: u16,
     storage_budget: Option<(u64, usize)>,
+    worker_root_covered_by_process: bool,
 }
 
 impl LaunchedService {
@@ -2409,14 +2427,15 @@ impl LaunchedService {
         let failure = Cell::new(None);
         let resources = Cell::new(BackendResources::default());
         let mut shutdown = pin!(shutdown);
-        let worker_root = self.credentials.directory().join("worker");
+        let worker_root = (!self.worker_root_covered_by_process)
+            .then(|| self.credentials.directory().join("worker"));
         let monitoring = async {
             let process_guard = ProcessGuard {
                 process: &self.process,
                 private_limit: self.memory_limit_bytes,
                 working_set_limit: self.working_set_limit_bytes,
                 storage_budget: self.storage_budget,
-                worker_root: Some(worker_root.as_path()),
+                worker_root: worker_root.as_deref(),
             };
             let mut tick = interval(Duration::from_millis(250));
             loop {
@@ -4526,7 +4545,7 @@ mod tests {
         let parsed_opt_out = LaunchConfig::parse(opt_out.clone())?;
         assert!(parsed_opt_out.no_mmproj);
         assert!(!parsed_opt_out.runtime_supports_vision()?);
-        assert!(parsed_opt_out.mmproj_guard()?.is_none());
+        assert!(parsed_opt_out.mmproj_guard(1)?.is_none());
 
         // Duplicate --no-mmproj and reference-cpu --no-mmproj are rejected.
         let mut dup = opt_out;
@@ -4546,7 +4565,7 @@ mod tests {
         assert!(native.runtime_supports_vision()?);
         let parsed_native_opt_out = LaunchConfig::parse(native_opt_out)?;
         assert!(!parsed_native_opt_out.runtime_supports_vision()?);
-        assert!(parsed_native_opt_out.mmproj_guard()?.is_none());
+        assert!(parsed_native_opt_out.mmproj_guard(1)?.is_none());
 
         // Real temp data directory: missing mmproj falls back cleanly to None;
         // wrong bytes at the locked mmproj path fails closed with Artifacts.
@@ -4570,7 +4589,7 @@ mod tests {
             "--backend-port".into(),
             "8081".into(),
         ])?;
-        assert!(temp_cfg.mmproj_guard()?.is_none());
+        assert!(temp_cfg.mmproj_guard(1)?.is_none());
 
         let artifact =
             bonsai_cpu_policy::swift_mmproj_artifact(temp).map_err(|_| LaunchError::Policy)?;
@@ -4578,9 +4597,9 @@ mod tests {
             std::fs::create_dir_all(parent).map_err(|_| LaunchError::Path)?;
         }
         std::fs::write(&artifact.path, b"not the genuine mmproj").map_err(|_| LaunchError::Path)?;
-        assert_eq!(temp_cfg.mmproj_guard().err(), Some(LaunchError::Artifacts));
+        assert_eq!(temp_cfg.mmproj_guard(1).err(), Some(LaunchError::Artifacts));
         temp_cfg.no_mmproj = true;
-        assert!(temp_cfg.mmproj_guard()?.is_none());
+        assert!(temp_cfg.mmproj_guard(1)?.is_none());
         Ok(())
     }
 

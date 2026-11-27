@@ -9,7 +9,7 @@ use std::{
 
 pub use bonsai_artifacts::ArtifactError;
 
-fn default_chunk_workers() -> usize {
+pub(crate) fn default_chunk_workers() -> usize {
     #[cfg(windows)]
     {
         std::thread::available_parallelism()
@@ -38,6 +38,7 @@ pub(crate) fn verify_file_with_optional_chunks(
     sha256: &str,
     chunk_bytes: Option<usize>,
     chunk_sha256s: Option<&[String]>,
+    workers: usize,
 ) -> Result<VerifiedFile, ArtifactError> {
     match (chunk_bytes, chunk_sha256s) {
         (Some(chunk_bytes), Some(chunk_sha256s)) => {
@@ -48,11 +49,7 @@ pub(crate) fn verify_file_with_optional_chunks(
                 chunk_bytes,
                 chunk_sha256s: chunk_sha256s.to_vec(),
             };
-            VerifiedFile::verify_chunked_with(
-                &spec,
-                default_chunk_workers(),
-                &AtomicBool::new(false),
-            )
+            VerifiedFile::verify_chunked_with(&spec, workers.max(1), &AtomicBool::new(false))
         }
         (None, None) => VerifiedFile::verify(path, bytes, sha256),
         (Some(_), None) | (None, Some(_)) => Err(ArtifactError::Configuration),
@@ -185,6 +182,7 @@ impl VerifiedArtifacts {
     pub(crate) fn verify_nariq_model(
         data: &Path,
         variant: bonsai_cpu_policy::NariqVariant,
+        workers: usize,
     ) -> Result<Self, ArtifactError> {
         use std::io::Write as _;
         let artifact = bonsai_cpu_policy::nariq_model_artifact(data, variant)
@@ -195,6 +193,7 @@ impl VerifiedArtifacts {
             &artifact.sha256,
             artifact.chunk_bytes,
             artifact.chunk_sha256s.as_deref(),
+            workers,
         )
         .inspect_err(|error| {
             let mut err = std::io::stderr().lock();
@@ -219,6 +218,7 @@ impl VerifiedArtifacts {
     pub(crate) fn verify_bonsai25_model(
         data: &Path,
         variant: bonsai_cpu_policy::Bonsai25Variant,
+        workers: usize,
     ) -> Result<Self, ArtifactError> {
         use std::io::Write as _;
         let artifact = bonsai_cpu_policy::bonsai25_model_artifact(data, variant)
@@ -229,6 +229,7 @@ impl VerifiedArtifacts {
             &artifact.sha256,
             artifact.chunk_bytes,
             artifact.chunk_sha256s.as_deref(),
+            workers,
         )
         .inspect_err(|error| {
             let mut err = std::io::stderr().lock();
@@ -265,6 +266,7 @@ impl VerifiedArtifacts {
             &artifact.sha256,
             chunk_bytes,
             chunk_sha256s,
+            default_chunk_workers(),
         )
         .inspect_err(|error| {
             // Only fixed classifications enter stderr; paths, file contents
@@ -579,6 +581,7 @@ mod tests {
                 &whole_sha256,
                 Some(chunk_bytes),
                 None,
+                default_chunk_workers(),
             )
             .err(),
             Some(ArtifactError::Configuration)
@@ -590,6 +593,7 @@ mod tests {
                 &whole_sha256,
                 None,
                 Some(&chunk_sha256s),
+                default_chunk_workers(),
             )
             .err(),
             Some(ArtifactError::Configuration)

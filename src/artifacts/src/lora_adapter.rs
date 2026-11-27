@@ -262,46 +262,81 @@ fn validate_target_name(
     Ok(())
 }
 
+fn check_f32_finite_slice(bytes: &[u8]) -> Result<(), ArtifactError> {
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err(ArtifactError::Identity);
+    }
+    let (blocks, tail) = chunks.as_chunks::<64>();
+    for block in blocks {
+        let mut nonfinite = false;
+        for &raw in block {
+            nonfinite |= (u32::from_le_bytes(raw) & 0x7f80_0000) == 0x7f80_0000;
+        }
+        if nonfinite {
+            return Err(ArtifactError::Identity);
+        }
+    }
+    for &raw in tail {
+        if (u32::from_le_bytes(raw) & 0x7f80_0000) == 0x7f80_0000 {
+            return Err(ArtifactError::Identity);
+        }
+    }
+    Ok(())
+}
+
+fn check_f16_finite_slice(bytes: &[u8]) -> Result<(), ArtifactError> {
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(ArtifactError::Identity);
+    }
+    let (blocks, tail) = chunks.as_chunks::<64>();
+    for block in blocks {
+        let mut nonfinite = false;
+        for &raw in block {
+            nonfinite |= (u16::from_le_bytes(raw) & 0x7c00) == 0x7c00;
+        }
+        if nonfinite {
+            return Err(ArtifactError::Identity);
+        }
+    }
+    for &raw in tail {
+        if (u16::from_le_bytes(raw) & 0x7c00) == 0x7c00 {
+            return Err(ArtifactError::Identity);
+        }
+    }
+    Ok(())
+}
+
+fn check_finite_slice(bytes: &[u8], dtype: FactorDtype) -> Result<(), ArtifactError> {
+    match dtype {
+        FactorDtype::F32 => check_f32_finite_slice(bytes),
+        FactorDtype::F16 => check_f16_finite_slice(bytes),
+    }
+}
+
 fn scan_tensor_finite(
     file: &mut File,
     abs_offset: u64,
     byte_len: u64,
     dtype: FactorDtype,
+    scan_buf: &mut [u8],
 ) -> Result<(), ArtifactError> {
     file.seek(SeekFrom::Start(abs_offset))
         .map_err(|_| ArtifactError::Identity)?;
-    let width = match dtype {
-        FactorDtype::F32 => 4_usize,
-        FactorDtype::F16 => 2_usize,
-    };
-    let cap =
-        FINITE_SCAN_CHUNK_BYTES.min(usize::try_from(byte_len).unwrap_or(FINITE_SCAN_CHUNK_BYTES));
-    let mut buf = vec![0_u8; cap.max(width)];
+    let width = dtype.byte_width();
+    let max_take = u64::try_from(scan_buf.len())
+        .map_err(|_| ArtifactError::Identity)?
+        .checked_div(width)
+        .and_then(|elements| elements.checked_mul(width))
+        .filter(|&bytes| bytes >= width)
+        .ok_or(ArtifactError::Identity)?;
     let mut remaining = byte_len;
     while remaining > 0 {
-        let max_take = u64::try_from(buf.len()).map_err(|_| ArtifactError::Identity)?;
         let take = usize::try_from(remaining.min(max_take)).map_err(|_| ArtifactError::Identity)?;
-        file.read_exact(&mut buf[..take])
+        file.read_exact(&mut scan_buf[..take])
             .map_err(|_| ArtifactError::Identity)?;
-        match dtype {
-            FactorDtype::F32 => {
-                for chunk in buf[..take].chunks_exact(4) {
-                    let array: [u8; 4] = chunk.try_into().map_err(|_| ArtifactError::Identity)?;
-                    if !f32::from_le_bytes(array).is_finite() {
-                        return Err(ArtifactError::Identity);
-                    }
-                }
-            }
-            FactorDtype::F16 => {
-                for chunk in buf[..take].chunks_exact(2) {
-                    let array: [u8; 2] = chunk.try_into().map_err(|_| ArtifactError::Identity)?;
-                    let bits = u16::from_le_bytes(array);
-                    if (bits & 0x7c00) == 0x7c00 {
-                        return Err(ArtifactError::Identity);
-                    }
-                }
-            }
-        }
+        check_finite_slice(&scan_buf[..take], dtype)?;
         remaining -= u64::try_from(take).map_err(|_| ArtifactError::Identity)?;
     }
     Ok(())
@@ -312,10 +347,21 @@ struct ParsedHeader {
     tensors: Vec<TensorDesc>,
 }
 
-fn parse_gguf_header(file: &mut File, file_len: u64) -> Result<ParsedHeader, ArtifactError> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| ArtifactError::Identity)?;
-    let mut reader = BoundedReader::new(BufReader::new(file), file_len);
+struct TensorSpan {
+    abs_start: u64,
+    byte_len: u64,
+    dtype: FactorDtype,
+}
+
+struct ValidatedAdapterPlan {
+    max_rank: u16,
+    target_count: usize,
+    payload_bytes: u64,
+    spans: Vec<TensorSpan>,
+}
+
+fn parse_gguf_header<R: Read>(reader: R, file_len: u64) -> Result<ParsedHeader, ArtifactError> {
+    let mut reader = BoundedReader::new(reader, file_len);
     let magic = reader.read_array::<4>()?;
     if &magic != GGUF_MAGIC {
         return Err(ArtifactError::Identity);
@@ -428,6 +474,89 @@ fn parse_gguf_header(file: &mut File, file_len: u64) -> Result<ParsedHeader, Art
     })
 }
 
+fn validate_header_and_pairs(
+    parsed: &ParsedHeader,
+    file_len: u64,
+    max_rank_limit: u16,
+    envelope: MultiRankEnvelope,
+) -> Result<ValidatedAdapterPlan, ArtifactError> {
+    let mut pairs: BTreeMap<String, PairEntry> = BTreeMap::new();
+    let mut payload_bytes = 0_u64;
+    let mut spans = Vec::with_capacity(parsed.tensors.len());
+
+    for tensor in &parsed.tensors {
+        let abs_start = parsed
+            .data_start
+            .checked_add(tensor.offset)
+            .ok_or(ArtifactError::Identity)?;
+        abs_start
+            .checked_add(tensor.byte_len)
+            .filter(|&end| end <= file_len)
+            .ok_or(ArtifactError::Identity)?;
+        payload_bytes = payload_bytes
+            .checked_add(tensor.byte_len)
+            .ok_or(ArtifactError::Identity)?;
+
+        let (base_name, is_a) = if let Some(name) = tensor.name.strip_suffix(".lora_a") {
+            (name, true)
+        } else if let Some(name) = tensor.name.strip_suffix(".lora_b") {
+            (name, false)
+        } else {
+            return Err(ArtifactError::Identity);
+        };
+        validate_target_name(base_name, envelope)?;
+        let entry = pairs.entry(base_name.to_owned()).or_default();
+        let slot = if is_a { &mut entry.a } else { &mut entry.b };
+        if slot.is_some() {
+            return Err(ArtifactError::Identity);
+        }
+        *slot = Some((tensor.dims[0], tensor.dims[1], tensor.dtype));
+        spans.push(TensorSpan {
+            abs_start,
+            byte_len: tensor.byte_len,
+            dtype: tensor.dtype,
+        });
+    }
+
+    if pairs.is_empty() {
+        return Err(ArtifactError::Identity);
+    }
+
+    let mut max_rank = 0_u16;
+    for entry in pairs.values() {
+        let (Some((_, a_rank, a_dtype)), Some((b_rank, _, b_dtype))) = (entry.a, entry.b) else {
+            return Err(ArtifactError::Identity);
+        };
+        if a_dtype != b_dtype || a_rank != b_rank {
+            return Err(ArtifactError::Identity);
+        }
+        let rank_u16 = u16::try_from(a_rank).map_err(|_| ArtifactError::Identity)?;
+        if rank_u16 == 0 || rank_u16 > max_rank_limit {
+            return Err(ArtifactError::Identity);
+        }
+        max_rank = max_rank.max(rank_u16);
+    }
+
+    Ok(ValidatedAdapterPlan {
+        max_rank,
+        target_count: pairs.len(),
+        payload_bytes,
+        spans,
+    })
+}
+
+#[cfg(windows)]
+fn scan_mapped_spans_finite(bytes: &[u8], spans: &[TensorSpan]) -> Result<(), ArtifactError> {
+    for span in spans {
+        let start = usize::try_from(span.abs_start).map_err(|_| ArtifactError::Identity)?;
+        let len = usize::try_from(span.byte_len).map_err(|_| ArtifactError::Identity)?;
+        let end = start.checked_add(len).ok_or(ArtifactError::Identity)?;
+        let slice = bytes.get(start..end).ok_or(ArtifactError::Identity)?;
+        check_finite_slice(slice, span.dtype)?;
+    }
+    Ok(())
+}
+
 /// Offline verify a stackable multi-rank `LoRA` GGUF adapter while retaining Windows
 /// ancestor and leaf file locks until the returned guard is dropped.
 ///
@@ -457,61 +586,61 @@ pub fn verify_multi_rank_lora_gguf(
         return Err(ArtifactError::Identity);
     }
 
-    let sha256 = hash_locked_file(&mut file, file_len)?;
-    let parsed = parse_gguf_header(&mut file, file_len)?;
-
-    let mut pairs: BTreeMap<String, PairEntry> = BTreeMap::new();
-    let mut payload_bytes = 0_u64;
-
-    for tensor in &parsed.tensors {
-        let abs_start = parsed
-            .data_start
-            .checked_add(tensor.offset)
-            .ok_or(ArtifactError::Identity)?;
-        abs_start
-            .checked_add(tensor.byte_len)
-            .filter(|&end| end <= file_len)
-            .ok_or(ArtifactError::Identity)?;
-        payload_bytes = payload_bytes
-            .checked_add(tensor.byte_len)
-            .ok_or(ArtifactError::Identity)?;
-
-        let (base_name, is_a) = if let Some(name) = tensor.name.strip_suffix(".lora_a") {
-            (name, true)
-        } else if let Some(name) = tensor.name.strip_suffix(".lora_b") {
-            (name, false)
-        } else {
-            return Err(ArtifactError::Identity);
+    #[cfg(windows)]
+    let (sha256, plan) = if let Some(mapped) =
+        bonsai_windows_credentials::MappedLockedFile::try_open(&file, file_len)
+    {
+        let mapped_bytes = mapped.as_bytes();
+        let parsed = parse_gguf_header(mapped_bytes, file_len)?;
+        let plan = validate_header_and_pairs(&parsed, file_len, max_rank_limit, envelope)?;
+        let (sha_result, scan_result) = std::thread::scope(|scope| {
+            let hash_handle = scope.spawn(|| {
+                bonsai_windows_credentials::try_hash_locked_file_mapped(
+                    &file,
+                    file_len,
+                    &mut || Ok(()),
+                    |_| ArtifactError::Identity,
+                )
+            });
+            let scan_result = scan_mapped_spans_finite(mapped_bytes, &plan.spans);
+            let hash_result = hash_handle.join().unwrap_or(Err(ArtifactError::Identity));
+            (hash_result, scan_result)
+        });
+        drop(mapped);
+        scan_result?;
+        let sha256 = match sha_result? {
+            Some(digest) => crate::digest_hex(digest),
+            None => hash_locked_file(&mut file, file_len)?,
         };
-        validate_target_name(base_name, envelope)?;
-        let entry = pairs.entry(base_name.to_owned()).or_default();
-        let slot = if is_a { &mut entry.a } else { &mut entry.b };
-        if slot.is_some() {
-            return Err(ArtifactError::Identity);
+        (sha256, plan)
+    } else {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| ArtifactError::Identity)?;
+        let parsed = parse_gguf_header(BufReader::new(&mut file), file_len)?;
+        let plan = validate_header_and_pairs(&parsed, file_len, max_rank_limit, envelope)?;
+        let max_span = plan.spans.iter().map(|span| span.byte_len).max().unwrap_or(0);
+        let buf_len = FINITE_SCAN_CHUNK_BYTES
+            .min(usize::try_from(max_span).unwrap_or(FINITE_SCAN_CHUNK_BYTES))
+            .max(4);
+        let mut scan_buf = vec![0_u8; buf_len];
+        for span in &plan.spans {
+            scan_tensor_finite(
+                &mut file,
+                span.abs_start,
+                span.byte_len,
+                span.dtype,
+                &mut scan_buf,
+            )?;
         }
-        *slot = Some((tensor.dims[0], tensor.dims[1], tensor.dtype));
+        let sha256 = hash_locked_file(&mut file, file_len)?;
+        (sha256, plan)
+    };
 
-        scan_tensor_finite(&mut file, abs_start, tensor.byte_len, tensor.dtype)?;
-    }
-
-    if pairs.is_empty() {
-        return Err(ArtifactError::Identity);
-    }
-
-    let mut max_rank = 0_u16;
-    for entry in pairs.values() {
-        let (Some((_, a_rank, a_dtype)), Some((b_rank, _, b_dtype))) = (entry.a, entry.b) else {
-            return Err(ArtifactError::Identity);
-        };
-        if a_dtype != b_dtype || a_rank != b_rank {
-            return Err(ArtifactError::Identity);
-        }
-        let rank_u16 = u16::try_from(a_rank).map_err(|_| ArtifactError::Identity)?;
-        if rank_u16 == 0 || rank_u16 > max_rank_limit {
-            return Err(ArtifactError::Identity);
-        }
-        max_rank = max_rank.max(rank_u16);
-    }
+    #[cfg(not(windows))]
+    let (sha256, plan) = {
+        let _ = file;
+        return Err(ArtifactError::Configuration);
+    };
 
     file.seek(SeekFrom::Start(0))
         .map_err(|_| ArtifactError::Identity)?;
@@ -521,9 +650,9 @@ pub fn verify_multi_rank_lora_gguf(
         path: path.to_owned(),
         bytes: file_len,
         sha256,
-        max_rank,
-        target_count: pairs.len(),
-        payload_bytes,
+        max_rank: plan.max_rank,
+        target_count: plan.target_count,
+        payload_bytes: plan.payload_bytes,
         envelope,
         _handles: handles,
     })
@@ -988,6 +1117,114 @@ mod tests {
             Some(ArtifactError::Identity)
         );
 
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mapped_single_pass_verifies_large_f16_and_f32_adapters_and_catches_tail_nan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::create("mapped-lora")?;
+        // >= MIN_MAPPED_HASH_BYTES (4 MiB) exercises the MappedLockedFile single-pass path
+        // plus 64-element block scanning and tail handling.
+        let f16_elems = 1_100_005_usize;
+        let f32_elems = 550_003_usize;
+        let f16_data = f16_bytes(&vec![0x3c00_u16; f16_elems]);
+        let mut f32_data = f32_bytes(&vec![0.5_f32; f32_elems]);
+        let path = dir.0.join("large-valid.gguf");
+        let gguf = build_gguf(
+            16.0,
+            None,
+            32,
+            vec![
+                TensorBuildSpec {
+                    name: "blk.0.ffn_down.weight.lora_a",
+                    dims: [u64::try_from(f16_elems)?, 1],
+                    gguf_type: 1,
+                    data: f16_data.clone(),
+                },
+                TensorBuildSpec {
+                    name: "blk.0.ffn_down.weight.lora_b",
+                    dims: [1, 4],
+                    gguf_type: 1,
+                    data: f16_bytes(&[0x3800; 4]),
+                },
+                TensorBuildSpec {
+                    name: "blk.1.attn_q.weight.lora_a",
+                    dims: [u64::try_from(f32_elems)?, 1],
+                    gguf_type: 0,
+                    data: f32_data.clone(),
+                },
+                TensorBuildSpec {
+                    name: "blk.1.attn_q.weight.lora_b",
+                    dims: [1, 4],
+                    gguf_type: 0,
+                    data: f32_bytes(&[0.25; 4]),
+                },
+            ],
+        );
+        assert!(u64::try_from(gguf.len())? >= bonsai_windows_credentials::MIN_MAPPED_HASH_BYTES);
+        fs::write(&path, &gguf)?;
+        let expected_sha = hex::encode(Sha256::digest(&gguf));
+        let verified = verify_multi_rank_lora_gguf(
+            &path,
+            16,
+            64 * 1024 * 1024,
+            MultiRankEnvelope::NpuFriendly,
+        )?;
+        assert_eq!(verified.sha256(), expected_sha);
+        assert_eq!(verified.max_rank(), 1);
+        assert_eq!(verified.target_count(), 2);
+        drop(verified);
+
+        // Corrupt the final tail element of F32 tensor with NaN.
+        let tail_start = f32_data.len() - 4;
+        f32_data[tail_start..].copy_from_slice(&f32::NAN.to_le_bytes());
+        let nan_path = dir.0.join("large-nan-f32.gguf");
+        fs::write(
+            &nan_path,
+            build_gguf(
+                16.0,
+                None,
+                32,
+                vec![
+                    TensorBuildSpec {
+                        name: "blk.0.ffn_down.weight.lora_a",
+                        dims: [u64::try_from(f16_elems)?, 1],
+                        gguf_type: 1,
+                        data: f16_data,
+                    },
+                    TensorBuildSpec {
+                        name: "blk.0.ffn_down.weight.lora_b",
+                        dims: [1, 4],
+                        gguf_type: 1,
+                        data: f16_bytes(&[0x3800; 4]),
+                    },
+                    TensorBuildSpec {
+                        name: "blk.1.attn_q.weight.lora_a",
+                        dims: [u64::try_from(f32_elems)?, 1],
+                        gguf_type: 0,
+                        data: f32_data,
+                    },
+                    TensorBuildSpec {
+                        name: "blk.1.attn_q.weight.lora_b",
+                        dims: [1, 4],
+                        gguf_type: 0,
+                        data: f32_bytes(&[0.25; 4]),
+                    },
+                ],
+            ),
+        )?;
+        assert_eq!(
+            verify_multi_rank_lora_gguf(
+                &nan_path,
+                16,
+                64 * 1024 * 1024,
+                MultiRankEnvelope::NpuFriendly
+            )
+            .err(),
+            Some(ArtifactError::Identity)
+        );
         Ok(())
     }
 }

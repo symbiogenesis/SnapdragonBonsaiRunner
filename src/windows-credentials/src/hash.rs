@@ -98,6 +98,30 @@ impl ReadOnlyMapping {
     }
 }
 
+/// Safe read-only section mapping over a read-locked regular file.
+///
+/// Owns the Windows kernel section handle and read-only view until `Drop`,
+/// exposing only an immutable byte slice over `0..expected_bytes`.
+pub struct MappedLockedFile(ReadOnlyMapping);
+
+impl MappedLockedFile {
+    /// Attempt to map `file` read-only when it is a regular file of at least
+    /// [`MIN_MAPPED_HASH_BYTES`] matching `expected_bytes`.
+    ///
+    /// Returns `None` when the file is smaller than [`MIN_MAPPED_HASH_BYTES`],
+    /// its length mismatches or overflows `usize`, or section mapping fails.
+    #[must_use]
+    pub fn try_open(file: &File, expected_bytes: u64) -> Option<Self> {
+        ReadOnlyMapping::open(file, expected_bytes).map(Self)
+    }
+
+    /// Immutable view of the mapped file bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
 fn prefetch_window(window: &[u8]) {
     if window.is_empty() {
         return;
@@ -118,9 +142,16 @@ fn hash_mapped_windows<E>(
     mut map_io_error: impl FnMut(io::Error) -> E,
 ) -> Result<[u8; 32], E> {
     let mut hasher = Sha256::new().map_err(&mut map_io_error)?;
-    for window in bytes.chunks(MAPPED_PREFETCH_WINDOW_BYTES) {
+    let mut windows = bytes.chunks(MAPPED_PREFETCH_WINDOW_BYTES).peekable();
+    if let Some(&first) = windows.peek() {
         checkpoint()?;
-        prefetch_window(window);
+        prefetch_window(first);
+    }
+    while let Some(window) = windows.next() {
+        if let Some(&next_window) = windows.peek() {
+            checkpoint()?;
+            prefetch_window(next_window);
+        }
         for chunk in window.chunks(MAPPED_HASH_CHUNK_BYTES) {
             checkpoint()?;
             hasher.update(chunk).map_err(&mut map_io_error)?;
@@ -191,6 +222,7 @@ fn hash_mapped_chunk(
     chunk: &[u8],
     should_cancel: &(impl Fn() -> bool + Sync),
     peer_error: &AtomicBool,
+    already_prefetched: bool,
 ) -> Result<[u8; 32], WorkerError> {
     let mut check_abort = || {
         if should_cancel() {
@@ -203,8 +235,10 @@ fn hash_mapped_chunk(
     };
     if chunk.len() <= MAPPED_PREFETCH_WINDOW_BYTES {
         check_abort()?;
-        prefetch_window(chunk);
-        check_abort()?;
+        if !already_prefetched {
+            prefetch_window(chunk);
+            check_abort()?;
+        }
         return Sha256::digest_bytes(chunk).map_err(WorkerError::Io);
     }
     hash_mapped_windows(chunk, &mut check_abort, WorkerError::Io)
@@ -239,6 +273,21 @@ pub fn compute_mapped_chunk_digests_with(
     let data = mapping.as_bytes();
     let chunk_count = data.len().div_ceil(chunk_bytes);
     let worker_count = workers.clamp(1, MAX_PARALLEL_HASH_WORKERS).min(chunk_count);
+    let lookahead = worker_count;
+    for prefetch_index in 0..lookahead {
+        if should_cancel() {
+            return Err(cancelled_error());
+        }
+        let start = prefetch_index
+            .checked_mul(chunk_bytes)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Chunk offset overflow."))?;
+        let end = start
+            .saturating_add(chunk_bytes.min(MAPPED_PREFETCH_WINDOW_BYTES))
+            .min(data.len());
+        if let Some(window) = data.get(start..end) {
+            prefetch_window(window);
+        }
+    }
     let next_chunk = AtomicUsize::new(0);
     let peer_error = AtomicBool::new(false);
 
@@ -256,6 +305,31 @@ pub fn compute_mapped_chunk_digests_with(
             if chunk_index >= chunk_count {
                 break;
             }
+            if let Some(ahead_index) = chunk_index
+                .checked_add(lookahead)
+                .filter(|&index| index < chunk_count)
+            {
+                if should_cancel() {
+                    peer_error.store(true, Ordering::Release);
+                    return Err(WorkerError::Cancelled);
+                }
+                if peer_error.load(Ordering::Acquire) {
+                    return Err(WorkerError::PeerAborted);
+                }
+                let ahead_start = ahead_index.checked_mul(chunk_bytes).ok_or_else(|| {
+                    peer_error.store(true, Ordering::Release);
+                    WorkerError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Chunk offset overflow.",
+                    ))
+                })?;
+                let ahead_end = ahead_start
+                    .saturating_add(chunk_bytes.min(MAPPED_PREFETCH_WINDOW_BYTES))
+                    .min(data.len());
+                if let Some(window) = data.get(ahead_start..ahead_end) {
+                    prefetch_window(window);
+                }
+            }
             let start = chunk_index.checked_mul(chunk_bytes).ok_or_else(|| {
                 peer_error.store(true, Ordering::Release);
                 WorkerError::Io(io::Error::new(
@@ -271,7 +345,7 @@ pub fn compute_mapped_chunk_digests_with(
                     "Chunk bounds out of range.",
                 ))
             })?;
-            let digest = match hash_mapped_chunk(chunk, should_cancel, &peer_error) {
+            let digest = match hash_mapped_chunk(chunk, should_cancel, &peer_error, true) {
                 Ok(digest) => digest,
                 Err(error) => {
                     peer_error.store(true, Ordering::Release);

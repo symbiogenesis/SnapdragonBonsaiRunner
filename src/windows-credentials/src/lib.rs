@@ -37,8 +37,9 @@ pub use sealed::{
 mod hash;
 
 pub use hash::{
-    MAX_PARALLEL_HASH_WORKERS, MIN_MAPPED_HASH_BYTES, PARALLEL_HASH_DEFAULT_CHUNK_BYTES, Sha256,
-    compute_mapped_chunk_digests, compute_mapped_chunk_digests_with, try_hash_locked_file_mapped,
+    MAX_PARALLEL_HASH_WORKERS, MIN_MAPPED_HASH_BYTES, MappedLockedFile,
+    PARALLEL_HASH_DEFAULT_CHUNK_BYTES, Sha256, compute_mapped_chunk_digests,
+    compute_mapped_chunk_digests_with, try_hash_locked_file_mapped,
     try_verify_locked_file_chunk_digests_mapped, try_verify_locked_file_chunk_digests_mapped_with,
 };
 

@@ -34,6 +34,7 @@ fn synthetic_launched_service(
         working_set_limit_bytes: PROBE_MEMORY,
         backend_port,
         storage_budget,
+        worker_root_covered_by_process: false,
     }
 }
 
@@ -148,7 +149,9 @@ fn missing_native_runtime_is_distinct_from_missing_model_artifacts() -> io::Resu
     )
     .map_err(|_| io::Error::other("Invalid fixture launch policy."))?;
     assert_eq!(
-        config.verify_artifacts(&plan).err(),
+        config
+            .verify_artifacts(&plan, crate::artifacts::default_chunk_workers())
+            .err(),
         Some(LaunchError::Artifacts)
     );
     config.native_engine = false;
