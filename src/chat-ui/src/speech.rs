@@ -22,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod command_queue;
+pub(crate) use command_queue::SendError;
 mod file_input;
 mod input;
 mod pipeline;
@@ -130,7 +131,7 @@ pub(crate) struct Commands {
     current_input: Arc<AtomicU64>,
 }
 impl Commands {
-    pub(crate) fn send(&self, command: Command) -> Result<(), mpsc::SendError<()>> {
+    pub(crate) fn send(&self, command: Command) -> Result<(), SendError> {
         // Preparation never supersedes output. A late capture-start result must
         // not queue work after cancellation or a read-aloud request.
         if let Command::PrepareInput { generation } = &command
@@ -162,18 +163,13 @@ impl Commands {
         } else {
             self.current_output.load(Ordering::Acquire)
         };
-        self.sender
-            .send(
-                Envelope {
-                    command,
-                    output_generation: generation,
-                },
-                &self.current_output,
-            )
-            // File input owns a Send-only receiver. Failure reports channel
-            // closure without embedding that session in a Sync error object.
-            // Dropping a rejected command still cancels and joins its worker.
-            .map_err(|_| mpsc::SendError(()))
+        self.sender.send(
+            Envelope {
+                command,
+                output_generation: generation,
+            },
+            &self.current_output,
+        )
     }
 }
 
@@ -227,6 +223,14 @@ impl Session {
     pub(crate) fn set_input_generation(&self, generation: Option<u64>) {
         self.current_input
             .store(generation.unwrap_or(NO_INPUT), Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&mut self) {
+        let _sent = self.commands.send(Command::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            let _joined = worker.join();
+        }
     }
 }
 impl Drop for Session {

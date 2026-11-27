@@ -96,6 +96,8 @@ pub(super) enum DiffError {
     InputTooLarge,
     /// The Myers edit distance exceeded [`MAX_EDIT_DISTANCE`].
     EditLimitExceeded,
+    /// Background diff worker exited or panicked before sending an outcome.
+    WorkerFailed,
 }
 
 impl fmt::Display for DiffError {
@@ -104,6 +106,7 @@ impl fmt::Display for DiffError {
             Self::Cancelled => "Branch comparison was cancelled.",
             Self::InputTooLarge => "Comparison input exceeds the 4 MiB draft diff limit.",
             Self::EditLimitExceeded => "Texts differ too extensively for inline token comparison.",
+            Self::WorkerFailed => "Branch comparison stopped unexpectedly.",
         })
     }
 }
@@ -262,13 +265,31 @@ impl BranchDiffJob {
         {
             let _joined = handle.join();
         }
-        if let Ok(outcome) = self.receiver.try_recv() {
-            if let Some(handle) = self.worker.take() {
-                let _joined = handle.join();
+        match self.receiver.try_recv() {
+            Ok(outcome) => {
+                if let Some(handle) = self.worker.take() {
+                    let _joined = handle.join();
+                }
+                Some(self.completed.insert(outcome))
             }
-            return Some(self.completed.insert(outcome));
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if let Some(handle) = self.worker.take() {
+                    let _joined = handle.join();
+                }
+                let result = if self.is_cancelled() {
+                    Err(DiffError::Cancelled)
+                } else {
+                    Err(DiffError::WorkerFailed)
+                };
+                Some(self.completed.insert(BranchDiffOutcome {
+                    generation: self.generation,
+                    left_source: self.left_source.clone(),
+                    right_source: self.right_source.clone(),
+                    result,
+                }))
+            }
         }
-        None
     }
 }
 
@@ -934,6 +955,42 @@ mod tests {
                 Err(DiffError::Cancelled | DiffError::EditLimitExceeded)
             ));
         }
+
+        // A disconnected/panicked worker transitions poll() to a terminal error and stops running.
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<super::BranchDiffOutcome>(1);
+        let panicked = std::thread::Builder::new()
+            .name("bonsai-branch-diff-panic-test".to_owned())
+            .spawn(move || {
+                let _hold = sender;
+                std::panic::resume_unwind(Box::new("simulated branch diff panic"));
+            })?;
+        let mut failed_job = BranchDiffJob {
+            generation: 9,
+            left_source: BranchDiffSource {
+                origin: BranchDiffOrigin::Draft { conversation_id: 1 },
+                title: "Left".to_owned(),
+                text: "a".to_owned(),
+            },
+            right_source: BranchDiffSource {
+                origin: BranchDiffOrigin::Draft { conversation_id: 1 },
+                title: "Right".to_owned(),
+                text: "b".to_owned(),
+            },
+            cancel: Arc::new(AtomicBool::new(false)),
+            receiver,
+            worker: Some(panicked),
+            completed: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while failed_job.poll().is_none() {
+            assert!(Instant::now() < deadline, "failed job timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!failed_job.is_running());
+        assert_eq!(
+            failed_job.poll().map(|o| &o.result),
+            Some(&Err(DiffError::WorkerFailed))
+        );
         Ok(())
     }
 }

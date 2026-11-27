@@ -342,33 +342,58 @@ impl State {
         ui.add_space(16.0);
     }
 
+    fn disconnect_recovery(&mut self) {
+        self.recovery = None;
+        self.recovery_dirty = false;
+        self.recovery_erase_pending = false;
+        self.alerts
+            .clear_dismissed(super::error_ui::AlertKind::Recovery);
+        "Could not save conversations: the recovery worker stopped. Unsaved work remains in this window."
+            .clone_into(&mut self.recovery_notice);
+    }
+
     pub(super) fn poll_recovery(&mut self) {
+        let mut disconnected = false;
         if let Some(recovery) = &self.recovery {
-            while let Ok(event) = recovery.events.try_recv() {
-                if !recovery.is_current(&event) {
-                    continue;
-                }
-                match event {
-                    crate::recovery::Event::Saved(_) if self.save_conversations => {
-                        self.alerts
-                            .clear_dismissed(super::error_ui::AlertKind::Recovery);
-                        "Saved on this device with Windows user encryption."
-                            .clone_into(&mut self.recovery_notice);
+            loop {
+                match recovery.events.try_recv() {
+                    Ok(event) => {
+                        if !recovery.is_current(&event) {
+                            continue;
+                        }
+                        match event {
+                            crate::recovery::Event::Saved(_) if self.save_conversations => {
+                                self.alerts
+                                    .clear_dismissed(super::error_ui::AlertKind::Recovery);
+                                "Saved on this device with Windows user encryption."
+                                    .clone_into(&mut self.recovery_notice);
+                            }
+                            crate::recovery::Event::Erased(_) if !self.save_conversations => {
+                                self.alerts
+                                    .clear_dismissed(super::error_ui::AlertKind::Recovery);
+                                self.recovery_erase_pending = false;
+                                "Saving is off. The saved workspace has been removed."
+                                    .clone_into(&mut self.recovery_notice);
+                            }
+                            crate::recovery::Event::Failed(_, error) => {
+                                self.recovery_notice = error.notice();
+                                self.recovery_dirty = self.save_conversations;
+                            }
+                            crate::recovery::Event::Saved(_)
+                            | crate::recovery::Event::Erased(_) => {}
+                        }
                     }
-                    crate::recovery::Event::Erased(_) if !self.save_conversations => {
-                        self.alerts
-                            .clear_dismissed(super::error_ui::AlertKind::Recovery);
-                        self.recovery_erase_pending = false;
-                        "Saving is off. The saved workspace has been removed."
-                            .clone_into(&mut self.recovery_notice);
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
                     }
-                    crate::recovery::Event::Failed(_, error) => {
-                        self.recovery_notice = error.notice();
-                        self.recovery_dirty = self.save_conversations;
-                    }
-                    crate::recovery::Event::Saved(_) | crate::recovery::Event::Erased(_) => {}
                 }
             }
+        }
+        if disconnected {
+            self.disconnect_recovery();
+            return;
         }
         let flush_now = std::mem::take(&mut self.recovery_flush_now);
         let interval = if !self.preview && self.model.busy() {
@@ -381,15 +406,21 @@ impl State {
         }
         self.last_recovery_save = Instant::now();
         if self.recovery_erase_pending {
-            if let Some(recovery) = &self.recovery {
-                let _queued = recovery.erase();
+            if let Some(recovery) = &self.recovery
+                && recovery.erase() == crate::recovery::DispatchStatus::Disconnected
+            {
+                self.disconnect_recovery();
             }
         } else if self.save_conversations
             && self.recovery_dirty
             && let Some(recovery) = &self.recovery
         {
             match recovery.save_with(|| self.workspace_bytes()) {
-                Ok(queued) => self.recovery_dirty = !queued,
+                Ok(crate::recovery::DispatchStatus::Queued) => self.recovery_dirty = false,
+                Ok(crate::recovery::DispatchStatus::Busy) => self.recovery_dirty = true,
+                Ok(crate::recovery::DispatchStatus::Disconnected) => {
+                    self.disconnect_recovery();
+                }
                 Err(error) => {
                     self.recovery_notice = format!("Could not save conversations: {error}");
                 }
@@ -1489,5 +1520,25 @@ mod tests {
         controlled.complete(completed_save)?;
         drop(controlled);
         Ok(())
+    }
+
+    #[test]
+    fn recovery_worker_disconnect_surfaces_alert_and_stops_reserializing() {
+        let mut state = state();
+        let (store, controlled) = crate::recovery::Recovery::controlled();
+        state.recovery = Some(store);
+        state.save_conversations = true;
+        state.recovery_dirty = true;
+        drop(controlled);
+
+        state.poll_recovery();
+        assert!(state.recovery.is_none());
+        assert!(!state.recovery_dirty);
+        assert!(!state.recovery_erase_pending);
+        assert!(state.recovery_notice.starts_with("Could not"));
+        assert_eq!(
+            state.active_alerts(),
+            vec![crate::window::error_ui::AlertKind::Recovery]
+        );
     }
 }

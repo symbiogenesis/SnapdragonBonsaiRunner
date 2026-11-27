@@ -1793,3 +1793,52 @@ fn close_requested_with_active_dialog_defers_close_until_worker_finishes_or_time
     assert!(!state.defer_close_for_dialogs(&ctx, true));
     Ok(())
 }
+
+#[test]
+fn speech_disconnect_stops_per_frame_alerts_and_oversized_read_aloud_preserves_session()
+-> io::Result<()> {
+    let (mut state, _commands, _events) = state();
+    state.speech = Some(speech::start(None, None)?);
+    state.speech_output = true;
+    state.speech_input = true;
+
+    // Oversized message fails pre-check in toggle_read_aloud without disabling speech.
+    state.model = ModelLifecycle::Generating;
+    state
+        .transcript
+        .push(Role::Assistant, "a".repeat(speech::MAX_TEXT + 1));
+    state.model_event(Event::Complete(Completion::Finished));
+    let id = state.transcript.messages[0].id;
+    state.toggle_read_aloud(id);
+    assert!(state.speech.is_some());
+    assert!(state.speech_output);
+    assert!(state.speech_input);
+    assert!(state.speech_notice);
+
+    // PayloadTooLarge from speech_command keeps speech enabled.
+    state.speech_notice = false;
+    assert!(!state.speech_command(speech::Command::Transcribe {
+        generation: 1,
+        wav: vec![0; 2 * 1024 * 1024],
+    }));
+    assert!(state.speech.is_some());
+    assert!(state.speech_output);
+    assert!(state.speech_input);
+    assert!(state.speech_notice);
+
+    // Disconnecting the worker clears self.speech and never re-raises the alert once dismissed.
+    if let Some(session) = &mut state.speech {
+        session.stop_for_test();
+    }
+    state.drain_speech_events();
+    assert!(state.speech.is_none());
+    assert!(!state.speech_output);
+    assert!(!state.speech_input);
+    assert!(state.speech_notice);
+
+    state.dismiss_alert(error_ui::AlertKind::Speech);
+    assert!(!state.speech_notice);
+    state.drain_speech_events();
+    assert!(!state.speech_notice);
+    Ok(())
+}

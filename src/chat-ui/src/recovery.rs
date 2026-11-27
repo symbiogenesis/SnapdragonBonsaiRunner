@@ -52,6 +52,17 @@ pub(crate) enum Event {
     Failed(u64, Failure),
 }
 
+/// Result of attempting a non-blocking recovery command dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DispatchStatus {
+    /// Command was queued on the recovery worker.
+    Queued,
+    /// Worker is busy or payload was empty/oversized; caller may retry later.
+    Busy,
+    /// Recovery worker channel disconnected and cannot accept further commands.
+    Disconnected,
+}
+
 pub(crate) struct Failure {
     stage: &'static str,
     kind: io::ErrorKind,
@@ -196,35 +207,37 @@ impl Recovery {
     pub(crate) fn save_with(
         &self,
         encode: impl FnOnce() -> io::Result<Vec<u8>>,
-    ) -> io::Result<bool> {
+    ) -> io::Result<DispatchStatus> {
         let Some(slot) = SnapshotSlot::reserve(&self.snapshot_occupied) else {
-            return Ok(false);
+            return Ok(DispatchStatus::Busy);
         };
         let bytes = crate::scrub::ScrubbingBytes::new(encode()?);
         if bytes.is_empty() || bytes.len() > MAX_BYTES {
-            return Ok(false);
+            return Ok(DispatchStatus::Busy);
         }
         let operation = self.operation.get().saturating_add(1);
-        if self
+        match self
             .commands
             .try_send(Command::Save(operation, bytes, slot))
-            .is_ok()
         {
-            self.operation.set(operation);
-            Ok(true)
-        } else {
-            Ok(false)
+            Ok(()) => {
+                self.operation.set(operation);
+                Ok(DispatchStatus::Queued)
+            }
+            Err(TrySendError::Full(_)) => Ok(DispatchStatus::Busy),
+            Err(TrySendError::Disconnected(_)) => Ok(DispatchStatus::Disconnected),
         }
     }
 
-    pub(crate) fn erase(&self) -> bool {
+    pub(crate) fn erase(&self) -> DispatchStatus {
         let operation = self.operation.get().saturating_add(1);
         match self.commands.try_send(Command::Erase(operation)) {
             Ok(()) => {
                 self.operation.set(operation);
-                true
+                DispatchStatus::Queued
             }
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+            Err(TrySendError::Full(_)) => DispatchStatus::Busy,
+            Err(TrySendError::Disconnected(_)) => DispatchStatus::Disconnected,
         }
     }
 
@@ -474,8 +487,8 @@ mod tests {
             encoded.set(encoded.get() + 1);
             Ok(b"Latest bounded workspace".to_vec())
         };
-        assert!(store.save_with(encode)?);
-        assert!(!store.save_with(encode)?);
+        assert_eq!(store.save_with(encode)?, DispatchStatus::Queued);
+        assert_eq!(store.save_with(encode)?, DispatchStatus::Busy);
         assert_eq!(encoded.get(), 1);
 
         // Model a worker that took the command but is still encrypting/writing.
@@ -483,11 +496,11 @@ mod tests {
             .incoming
             .recv_timeout(std::time::Duration::from_secs(5))
             .map_err(io::Error::other)?;
-        assert!(!store.save_with(encode)?);
+        assert_eq!(store.save_with(encode)?, DispatchStatus::Busy);
         assert_eq!(encoded.get(), 1);
         drop(active);
 
-        assert!(store.save_with(encode)?);
+        assert_eq!(store.save_with(encode)?, DispatchStatus::Queued);
         assert_eq!(encoded.get(), 2);
         let _saved = controlled.next_completion()?;
         assert!(
@@ -495,18 +508,24 @@ mod tests {
                 .save_with(|| Err(io::Error::other("Synthetic encoding failure.")))
                 .is_err()
         );
-        assert!(!store.save_with(|| Ok(Vec::new()))?);
-        assert!(store.save_with(encode)?);
+        assert_eq!(store.save_with(|| Ok(Vec::new()))?, DispatchStatus::Busy);
+        assert_eq!(store.save_with(encode)?, DispatchStatus::Queued);
         assert_eq!(encoded.get(), 3);
         let _saved = controlled.next_completion()?;
         drop(controlled);
+        assert_eq!(store.save_with(encode)?, DispatchStatus::Disconnected);
+        assert_eq!(store.erase(), DispatchStatus::Disconnected);
+        assert_eq!(encoded.get(), 4);
         Ok(())
     }
 
     #[test]
     fn recovery_final_snapshot_waits_for_prior_plaintext_before_encoding() -> io::Result<()> {
         let (store, controlled) = Recovery::controlled();
-        assert!(store.save_with(|| Ok(b"Prior workspace".to_vec()))?);
+        assert_eq!(
+            store.save_with(|| Ok(b"Prior workspace".to_vec()))?,
+            DispatchStatus::Queued
+        );
         let active = controlled
             .incoming
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -615,7 +634,7 @@ mod tests {
         let store = opened.store;
         assert!(Recovery::open(&directory).is_err());
         let text = "A saved draft 🌱".as_bytes().to_vec();
-        assert!(store.save_with(|| Ok(text.clone()))?);
+        assert_eq!(store.save_with(|| Ok(text.clone()))?, DispatchStatus::Queued);
         assert!(matches!(
             store.events.recv_timeout(std::time::Duration::from_secs(5)),
             Ok(Event::Saved(_))
@@ -628,7 +647,7 @@ mod tests {
             Ok(Event::Saved(_))
         ));
         assert_eq!(read(&path)?.as_deref(), Some(replacement.as_slice()));
-        assert!(store.erase());
+        assert_eq!(store.erase(), DispatchStatus::Queued);
         assert!(matches!(
             store.events.recv_timeout(std::time::Duration::from_secs(5)),
             Ok(Event::Erased(_))

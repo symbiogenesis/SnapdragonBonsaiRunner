@@ -1645,18 +1645,36 @@ impl State {
     }
 
     fn speech_command(&mut self, command: speech::Command) -> bool {
-        if self
-            .speech
-            .as_ref()
-            .is_some_and(|session| session.commands.send(command).is_ok())
-        {
-            return true;
+        let Some(session) = &self.speech else {
+            self.clear_speech_session(
+                "The speech worker stopped. Restart the app and try the recording again.",
+                "Speech worker stopped. Restart the app to retry.",
+            );
+            return false;
+        };
+        match session.commands.send(command) {
+            Ok(()) => true,
+            Err(speech::SendError::Disconnected) => {
+                self.speech = None;
+                self.clear_speech_session(
+                    "The speech worker stopped. Restart the app and try the recording again.",
+                    "Speech worker stopped. Restart the app to retry.",
+                );
+                false
+            }
+            Err(speech::SendError::PayloadTooLarge) => {
+                self.speech_notice = true;
+                "This request exceeds the speech worker's size limit. Text chat remains available."
+                    .clone_into(&mut self.speech_status);
+                false
+            }
+            Err(speech::SendError::QueueFull) => {
+                self.speech_notice = true;
+                "The speech worker is busy. Try again in a moment."
+                    .clone_into(&mut self.speech_status);
+                false
+            }
         }
-        self.clear_speech_session(
-            "The speech worker stopped. Restart the app and try the recording again.",
-            "Speech worker stopped. Restart the app to retry.",
-        );
-        false
     }
 
     fn stop_speech(&mut self) {
@@ -1782,6 +1800,16 @@ impl State {
         };
         self.speech_notice = false;
         if self.speech_output {
+            if text.trim().is_empty()
+                || text.contains('\0')
+                || text.encode_utf16().take(speech::MAX_TEXT + 1).count() > speech::MAX_TEXT
+            {
+                "This response exceeds the 32,768-character read aloud limit."
+                    .clone_into(&mut self.speech_status);
+                self.speech_notice = true;
+                self.record_speech_status();
+                return;
+            }
             let voice_description = self.voice_profile.trim().to_owned();
             if voice_description.is_empty() {
                 "Describe the voice in Settings before reading aloud."
@@ -1838,6 +1866,7 @@ impl State {
                 Ok(event) => self.speech_event(event),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.speech = None;
                     self.speech_checked = true;
                     self.clear_speech_session(
                         "The speech worker disconnected. Restart the app and try the recording again.",

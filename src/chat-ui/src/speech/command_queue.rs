@@ -3,6 +3,8 @@
 use super::{AtomicU64, Command, Envelope, MAX_TEXT, Ordering};
 use std::{
     collections::VecDeque,
+    error::Error,
+    fmt,
     sync::{Arc, Condvar, Mutex, mpsc},
     time::Duration,
 };
@@ -13,6 +15,29 @@ const STREAM_COMMANDS: usize = MAX_COMMANDS - 2;
 const MAX_BYTES: usize = 1024 * 1024;
 const COALESCE_BYTES: usize = 16 * 1024;
 pub(super) const OVERFLOW_MESSAGE: &str = "Read aloud stopped because its queued text or speech input exceeded the local limit. Text chat remains available.";
+
+/// Typed rejection reasons when submitting a command to the speech worker queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SendError {
+    /// The speech worker channel has disconnected or been closed.
+    Disconnected,
+    /// The command payload exceeded the queue's maximum byte limit.
+    PayloadTooLarge,
+    /// The bounded command queue is temporarily full.
+    QueueFull,
+}
+
+impl fmt::Display for SendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Disconnected => "speech command channel disconnected",
+            Self::PayloadTooLarge => "speech command payload exceeded the queue limit",
+            Self::QueueFull => "speech command queue is full",
+        })
+    }
+}
+
+impl Error for SendError {}
 
 #[derive(Default)]
 enum StreamState {
@@ -136,16 +161,16 @@ impl Sender {
         &self,
         envelope: Envelope,
         current: &AtomicU64,
-    ) -> Result<(), Box<mpsc::SendError<Envelope>>> {
+    ) -> Result<(), SendError> {
         #[cfg(test)]
         if let Some(observed) = &self.observed {
-            return observed.send(envelope).map_err(Box::new);
+            return observed.send(envelope).map_err(|_| SendError::Disconnected);
         }
         let Ok(mut queue) = self.shared.0.lock() else {
-            return Err(Box::new(mpsc::SendError(envelope)));
+            return Err(SendError::Disconnected);
         };
         if queue.receiver_closed || queue.sender_closed {
-            return Err(Box::new(mpsc::SendError(envelope)));
+            return Err(SendError::Disconnected);
         }
         match &envelope.command {
             Command::Shutdown => queue.retain(|_| false),
@@ -214,7 +239,7 @@ impl Sender {
         }
         let payload_bytes = bytes(&envelope.command);
         if payload_bytes > MAX_BYTES {
-            return Err(Box::new(mpsc::SendError(envelope)));
+            return Err(SendError::PayloadTooLarge);
         }
         let command_limit = if matches!(envelope.command, Command::AppendStream { .. }) {
             STREAM_COMMANDS
@@ -228,7 +253,7 @@ impl Sender {
             ) {
                 queue.overflow(current);
             } else {
-                return Err(Box::new(mpsc::SendError(envelope)));
+                return Err(SendError::QueueFull);
             }
         } else {
             if matches!(envelope.command, Command::Shutdown) {
@@ -580,18 +605,37 @@ mod tests {
     #[test]
     fn speech_payload_limit_rejects_oversized_audio_before_storage() {
         let (commands, receiver) = fixture();
-        assert!(
-            commands
-                .send(Command::Transcribe {
-                    generation: 7,
-                    wav: vec![0; MAX_BYTES + 1]
-                })
-                .is_err()
+        assert_eq!(
+            commands.send(Command::Transcribe {
+                generation: 7,
+                wav: vec![0; MAX_BYTES + 1]
+            }),
+            Err(SendError::PayloadTooLarge)
         );
         assert!(matches!(
             receiver.recv_timeout(Duration::ZERO),
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
+    }
+
+    #[test]
+    fn speech_command_queue_distinguishes_full_and_disconnected_errors() -> io::Result<()> {
+        let (commands, receiver) = fixture();
+        for _ in 0..MAX_COMMANDS {
+            commands
+                .send(Command::OutputOverflow)
+                .map_err(io::Error::other)?;
+        }
+        assert_eq!(
+            commands.send(Command::OutputOverflow),
+            Err(SendError::QueueFull)
+        );
+        drop(receiver);
+        assert_eq!(
+            commands.send(Command::OutputOverflow),
+            Err(SendError::Disconnected)
+        );
+        Ok(())
     }
 
     #[test]
