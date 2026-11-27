@@ -23,7 +23,7 @@ bonsai-native-hash.workspace = true
 hex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde", "std"] }
+toml.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
