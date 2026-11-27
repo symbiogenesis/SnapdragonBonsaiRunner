@@ -71,7 +71,6 @@
       "tools/qwen-tts/model.lock.json",
       "tools/hexagon/diagnostic.manifest",
       "tools/hexagon/public-qaic-wire.expected.json",
-      ".github/workflows/ptq1-packing-qualification.yml",
       "config/native-speech.lock.json",
       "config/prism-inference.lock.json"
     ]
@@ -180,16 +179,11 @@
         "config/native-speech.lock.json",
         ".github/workflows/tts-evaluation.yml",
         "tools/qwen-tts/model.lock.json",
-        ".github/workflows/ptq1-packing-qualification.yml",
         "tools/native-reference/**",
-        ".github/workflows/native-ptq1-numerics.yml",
-        ".github/workflows/ptq1-public-authoring-reference.yml",
         "docs/runtime-candidates/headless-ucrt-argv.json",
         "tests/fixtures/**",
         "config/prism-inference.lock.json",
-        "config/model.metadata.json",
-        ".github/workflows/x2-cpu-evaluation.yml",
-        ".github/workflows/native-runtime-acceptance.yml"
+        "config/model.metadata.json"
       ]
     }
   },
