@@ -2596,25 +2596,25 @@ fn load_upsample_stage<S: CodecSource + ?Sized>(
 ) -> io::Result<Upsample> {
     let name = format!("tok_dec.upsample.{index}");
     let dw_weight = weights.tensor_f32(&format!("{name}.dwconv.weight"), &[7, 1, latent])?;
-    let dw_weight_kc = Some(ConvNeXtBlock::pack_dw_kc(&dw_weight, latent, 7));
+    let pwconv1_w = weights.tensor_f32(&format!("{name}.pwconv1.weight"), &[latent, latent * 4])?;
+    let pwconv1_b = weights.tensor_f32(&format!("{name}.pwconv1.bias"), &[latent * 4])?;
+    let pwconv2_w = weights.tensor_f32(&format!("{name}.pwconv2.weight"), &[latent * 4, latent])?;
+    let pwconv2_b = weights.tensor_f32(&format!("{name}.pwconv2.bias"), &[latent])?;
     Ok(Upsample {
         conv: trans_conv(weights, &format!("{name}.conv"), latent, latent, 2, 2)?,
-        block: ConvNeXtBlock {
-            channels: latent,
-            kernel: 7,
+        block: ConvNeXtBlock::from_weights_packed_only(
+            latent,
+            7,
             dw_weight,
-            dw_weight_kc,
-            dw_bias: weights.tensor_f32(&format!("{name}.dwconv.bias"), &[latent])?,
-            norm_w: weights.tensor_f32(&format!("{name}.norm.weight"), &[latent])?,
-            norm_b: weights.tensor_f32(&format!("{name}.norm.bias"), &[latent])?,
-            pwconv1_w: weights
-                .tensor_f32(&format!("{name}.pwconv1.weight"), &[latent, latent * 4])?,
-            pwconv1_b: weights.tensor_f32(&format!("{name}.pwconv1.bias"), &[latent * 4])?,
-            pwconv2_w: weights
-                .tensor_f32(&format!("{name}.pwconv2.weight"), &[latent * 4, latent])?,
-            pwconv2_b: weights.tensor_f32(&format!("{name}.pwconv2.bias"), &[latent])?,
-            gamma: weights.tensor_f32(&format!("{name}.gamma"), &[latent])?,
-        },
+            weights.tensor_f32(&format!("{name}.dwconv.bias"), &[latent])?,
+            weights.tensor_f32(&format!("{name}.norm.weight"), &[latent])?,
+            weights.tensor_f32(&format!("{name}.norm.bias"), &[latent])?,
+            pwconv1_w,
+            pwconv1_b,
+            pwconv2_w,
+            pwconv2_b,
+            weights.tensor_f32(&format!("{name}.gamma"), &[latent])?,
+        )?,
     })
 }
 
@@ -3737,8 +3737,10 @@ mod tests {
                             norm_w: vec![1.0; 2],
                             norm_b: vec![0.0; 2],
                             pwconv1_w: vec![0.02; 8 * 2],
+                            pwconv1_w_packed: None,
                             pwconv1_b: vec![0.0; 8],
                             pwconv2_w: vec![0.02; 2 * 8],
+                            pwconv2_w_packed: None,
                             pwconv2_b: vec![0.0; 2],
                             gamma: vec![0.1; 2],
                         },

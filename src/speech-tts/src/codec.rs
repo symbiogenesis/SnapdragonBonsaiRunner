@@ -22,25 +22,10 @@ thread_local! {
     static CHANNEL_TILE_OUT: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static CONVNEXT_SCRATCH: RefCell<(Vec<f32>, Vec<f32>)> =
         const { RefCell::new((Vec::new(), Vec::new())) };
-    static CONVNEXT_PACK_TILE: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 fn with_channel_tile_out<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
     CHANNEL_TILE_OUT.with(|slot| {
-        if let Ok(mut buf) = slot.try_borrow_mut() {
-            if buf.len() < len {
-                buf.resize(len, 0.0_f32);
-            }
-            f(&mut buf[..len])
-        } else {
-            let mut buf = vec![0.0_f32; len];
-            f(&mut buf)
-        }
-    })
-}
-
-fn with_convnext_pack_tile<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
-    CONVNEXT_PACK_TILE.with(|slot| {
         if let Ok(mut buf) = slot.try_borrow_mut() {
             if buf.len() < len {
                 buf.resize(len, 0.0_f32);
@@ -472,28 +457,71 @@ fn scatter_transposed_to_time_first(
     }
 }
 
-#[expect(
-    clippy::inline_always,
-    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
-)]
-#[inline(always)]
-fn conv1d_16oc_frames_acc<const F: usize>(
+const CONV_F_TILE: usize = 32;
+const CONV_IC_TILE: usize = 128;
+
+#[inline]
+fn gemm_16oc_ic_tiled(
+    w_blk: &[f32],
+    input: &[f32],
+    first_row: usize,
+    f_len: usize,
+    in_c: usize,
+    acc_tile: &mut [[f32; 16]],
+) {
+    let mut x_rows: [&[f32]; CONV_F_TILE] = [&[]; CONV_F_TILE];
+    for ic_base in (0..in_c).step_by(CONV_IC_TILE) {
+        let ic_end = (ic_base + CONV_IC_TILE).min(in_c);
+        let ic_len = ic_end - ic_base;
+        let w_tile = &w_blk[ic_base * 16..ic_end * 16];
+        for df in 0..f_len {
+            let off = (first_row + df) * in_c + ic_base;
+            x_rows[df] = &input[off..off + ic_len];
+        }
+        conv_kernels::gemm_f32_fma_16oc_frames(
+            w_tile,
+            &x_rows[..f_len],
+            ic_len,
+            &mut acc_tile[..f_len],
+        );
+    }
+}
+
+#[inline]
+fn conv1d_16oc_tile_acc(
     w_blk: &[f32],
     ext: &[f32],
-    (first_frame, f, stride, in_c, kernel, dilation): (usize, usize, usize, usize, usize, usize),
-) -> [[f32; 16]; F] {
-    let mut acc = [[0.0_f32; 16]; F];
-    let f_offs: [usize; F] = core::array::from_fn(|df| (first_frame + f + df) * stride);
+    (first_frame, f_start, f_len, stride, in_c, kernel, dilation): (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ),
+    acc_tile: &mut [[f32; 16]],
+) {
+    let mut x_rows: [&[f32]; CONV_F_TILE] = [&[]; CONV_F_TILE];
     for k in 0..kernel {
-        let tap_shift = k * dilation;
-        let x_rows: [&[f32]; F] = core::array::from_fn(|df| {
-            let off = (f_offs[df] + tap_shift) * in_c;
-            &ext[off..off + in_c]
-        });
         let w_k = &w_blk[k * in_c * 16..(k + 1) * in_c * 16];
-        conv_kernels::gemm_f32_fma_16oc::<F>(w_k, x_rows, in_c, &mut acc);
+        let tap_shift = k * dilation;
+        for ic_base in (0..in_c).step_by(CONV_IC_TILE) {
+            let ic_end = (ic_base + CONV_IC_TILE).min(in_c);
+            let ic_len = ic_end - ic_base;
+            let w_tile = &w_k[ic_base * 16..ic_end * 16];
+            for df in 0..f_len {
+                let off = ((first_frame + f_start + df) * stride + tap_shift) * in_c + ic_base;
+                x_rows[df] = &ext[off..off + ic_len];
+            }
+            conv_kernels::gemm_f32_fma_16oc_frames(
+                w_tile,
+                &x_rows[..f_len],
+                ic_len,
+                &mut acc_tile[..f_len],
+            );
+        }
     }
-    acc
 }
 
 #[expect(
@@ -501,9 +529,9 @@ fn conv1d_16oc_frames_acc<const F: usize>(
     reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
 )]
 #[inline(always)]
-fn store_16oc_time_first<S: Simd, const F: usize>(
+fn store_16oc_time_first<S: Simd>(
     simd: S,
-    acc: &[[f32; 16]; F],
+    acc: &[[f32; 16]],
     bias_vec: Option<[f32x4<S>; 4]>,
     residual: Option<&[f32]>,
     f: usize,
@@ -708,53 +736,25 @@ fn conv1d_oc_outer_time_first_simd<S: Simd>(
                     f32x4::from_slice(simd, &b[oc_base + 12..oc_base + 16]),
                 ]
             });
-            for f_start in (0..num_frames).step_by(f_tile) {
-                let f_end = (f_start + f_tile).min(num_frames);
-                let mut f = f_start;
-                while f + 4 <= f_end {
-                    let acc = conv1d_16oc_frames_acc::<4>(
-                        w_blk,
-                        ext,
-                        (first_frame, f, stride, in_c, kernel, dilation),
-                    );
-                    store_16oc_time_first(
-                        simd, &acc, bias_vec, residual, f, num_rows, oc_base, out,
-                    );
-                    f += 4;
-                }
-                match f_end - f {
-                    3 => {
-                        let acc = conv1d_16oc_frames_acc::<3>(
-                            w_blk,
-                            ext,
-                            (first_frame, f, stride, in_c, kernel, dilation),
-                        );
-                        store_16oc_time_first(
-                            simd, &acc, bias_vec, residual, f, num_rows, oc_base, out,
-                        );
-                    }
-                    2 => {
-                        let acc = conv1d_16oc_frames_acc::<2>(
-                            w_blk,
-                            ext,
-                            (first_frame, f, stride, in_c, kernel, dilation),
-                        );
-                        store_16oc_time_first(
-                            simd, &acc, bias_vec, residual, f, num_rows, oc_base, out,
-                        );
-                    }
-                    1 => {
-                        let acc = conv1d_16oc_frames_acc::<1>(
-                            w_blk,
-                            ext,
-                            (first_frame, f, stride, in_c, kernel, dilation),
-                        );
-                        store_16oc_time_first(
-                            simd, &acc, bias_vec, residual, f, num_rows, oc_base, out,
-                        );
-                    }
-                    _ => {}
-                }
+            for f_start in (0..num_frames).step_by(CONV_F_TILE) {
+                let f_len = (num_frames - f_start).min(CONV_F_TILE);
+                let mut acc_tile = [[0.0_f32; 16]; CONV_F_TILE];
+                conv1d_16oc_tile_acc(
+                    w_blk,
+                    ext,
+                    (first_frame, f_start, f_len, stride, in_c, kernel, dilation),
+                    &mut acc_tile[..f_len],
+                );
+                store_16oc_time_first(
+                    simd,
+                    &acc_tile[..f_len],
+                    bias_vec,
+                    residual,
+                    f_start,
+                    num_rows,
+                    oc_base,
+                    out,
+                );
             }
         } else {
             for f_start in (0..num_frames).step_by(f_tile) {
@@ -896,29 +896,35 @@ fn conv1d_oc_outer_channel_first_simd<S: Simd>(
                     f32x4::from_slice(simd, &b[oc_base + 12..oc_base + 16]),
                 ]
             });
-            let mut f = 0_usize;
-            while f + 4 <= num_frames {
-                let acc =
-                    conv1d_16oc_frames_acc::<4>(w_blk, ext, (0, f, stride, in_c, kernel, dilation));
-                store_16oc_channel_first_4f(
-                    simd,
-                    &acc,
-                    bias_vec,
-                    num_frames,
-                    f,
-                    oc_base,
-                    transposed_rows,
+            for f_start in (0..num_frames).step_by(CONV_F_TILE) {
+                let f_len = (num_frames - f_start).min(CONV_F_TILE);
+                let mut acc_tile = [[0.0_f32; 16]; CONV_F_TILE];
+                conv1d_16oc_tile_acc(
+                    w_blk,
+                    ext,
+                    (0, f_start, f_len, stride, in_c, kernel, dilation),
+                    &mut acc_tile[..f_len],
                 );
-                f += 4;
-            }
-            while f < num_frames {
-                let [acc_row] =
-                    conv1d_16oc_frames_acc::<1>(w_blk, ext, (0, f, stride, in_c, kernel, dilation));
-                for (lane, &val) in acc_row.iter().enumerate() {
-                    let b = bias_rows.map_or(0.0_f32, |bs| bs[oc_base + lane]);
-                    transposed_rows[(oc_base + lane) * num_frames + f] = val + b;
+                let (acc_quads, acc_tail) = acc_tile[..f_len].as_chunks::<4>();
+                for (q_idx, aq) in acc_quads.iter().enumerate() {
+                    store_16oc_channel_first_4f(
+                        simd,
+                        aq,
+                        bias_vec,
+                        num_frames,
+                        f_start + q_idx * 4,
+                        oc_base,
+                        transposed_rows,
+                    );
                 }
-                f += 1;
+                let f_tail_base = f_start + acc_quads.len() * 4;
+                for (t_idx, acc_row) in acc_tail.iter().enumerate() {
+                    let f = f_tail_base + t_idx;
+                    for (lane, &val) in acc_row.iter().enumerate() {
+                        let b = bias_rows.map_or(0.0_f32, |bs| bs[oc_base + lane]);
+                        transposed_rows[(oc_base + lane) * num_frames + f] = val + b;
+                    }
+                }
             }
         } else {
             let mut f = 0_usize;
@@ -971,24 +977,22 @@ const fn trans_conv_phase_tap_offset(kernel: usize, stride: usize, phase: usize)
     reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
 )]
 #[inline(always)]
-fn trans_conv_frames_16oc_simd<S: Simd, const F: usize>(
+fn trans_conv_tile_16oc_simd<S: Simd>(
     simd: S,
     input: &[f32],
     w_tile: &[f32],
     bias_blk: Option<&[f32]>,
-    (t0_base, n_taps, in_c): (usize, usize, usize),
+    (q_start, q_len, n_taps, in_c): (usize, usize, usize, usize),
     (dst, dst_base, dst_stride): (&mut [f32], usize, usize),
 ) {
-    let mut acc = [[0.0_f32; 16]; F];
+    let mut acc_tile = [[0.0_f32; 16]; CONV_F_TILE];
     let tap_stride = in_c * 16;
 
     for tap_idx in 0..n_taps {
         let m = n_taps - 1 - tap_idx;
-        let t0 = t0_base - m;
-        let x_rows: [&[f32]; F] =
-            core::array::from_fn(|f| &input[(t0 + f) * in_c..(t0 + f + 1) * in_c]);
+        let t0 = q_start - m;
         let w_tap = &w_tile[tap_idx * tap_stride..(tap_idx + 1) * tap_stride];
-        conv_kernels::gemm_f32_fma_16oc::<F>(w_tap, x_rows, in_c, &mut acc);
+        gemm_16oc_ic_tiled(w_tap, input, t0, q_len, in_c, &mut acc_tile[..q_len]);
     }
 
     let bias_vec = bias_blk.map(|b| {
@@ -999,7 +1003,7 @@ fn trans_conv_frames_16oc_simd<S: Simd, const F: usize>(
             f32x4::from_slice(simd, &b[12..16]),
         ]
     });
-    for (f, acc_row) in acc.iter().enumerate() {
+    for (df, acc_row) in acc_tile[..q_len].iter().enumerate() {
         let (aq, _) = acc_row.as_chunks::<4>();
         let mut v0 = f32x4::from_slice(simd, &aq[0]);
         let mut v1 = f32x4::from_slice(simd, &aq[1]);
@@ -1011,7 +1015,7 @@ fn trans_conv_frames_16oc_simd<S: Simd, const F: usize>(
             v2 += bv[2];
             v3 += bv[3];
         }
-        let row = &mut dst[dst_base + f * dst_stride..dst_base + f * dst_stride + 16];
+        let row = &mut dst[dst_base + df * dst_stride..dst_base + df * dst_stride + 16];
         v0.store_slice(&mut row[0..4]);
         v1.store_slice(&mut row[4..8]);
         v2.store_slice(&mut row[8..12]);
@@ -1125,9 +1129,8 @@ fn trans_conv_edge_1frame_16oc_simd<S: Simd>(
     for tap_idx in tap_start..tap_end {
         let m = n_taps - 1 - tap_idx;
         let t = q - m;
-        let x_row = &input[t * in_c..(t + 1) * in_c];
         let w_tap = &w_tile[tap_idx * tap_stride..(tap_idx + 1) * tap_stride];
-        conv_kernels::gemm_f32_fma_16oc_1f(w_tap, [x_row], in_c, &mut acc);
+        gemm_16oc_ic_tiled(w_tap, input, t, 1, in_c, &mut acc);
     }
 
     let (aq, _) = acc[0].as_chunks::<4>();
@@ -1284,23 +1287,31 @@ fn trans_conv_run_q_range_simd<S: Simd>(
         q += 1;
     }
 
-    let mut q_mid = mid_start;
-    while q_mid + 4 <= mid_end {
-        let dst_base = if dst_frame_stride == 1 {
-            (q_mid - dst_origin_frame) * dst_oc_stride + dst_oc_off
-        } else {
-            (q_mid * stride + phase - dst_origin_frame) * dst_oc_stride + dst_oc_off
-        };
-        if lane_w == 16 {
-            trans_conv_frames_16oc_simd::<S, 4>(
+    if lane_w == 16 {
+        for q_start in (mid_start..mid_end).step_by(CONV_F_TILE) {
+            let q_len = (mid_end - q_start).min(CONV_F_TILE);
+            let dst_base = if dst_frame_stride == 1 {
+                (q_start - dst_origin_frame) * dst_oc_stride + dst_oc_off
+            } else {
+                (q_start * stride + phase - dst_origin_frame) * dst_oc_stride + dst_oc_off
+            };
+            trans_conv_tile_16oc_simd(
                 simd,
                 input,
                 w_tile,
                 bias_blk,
-                (q_mid, n_taps, in_c),
+                (q_start, q_len, n_taps, in_c),
                 (dst, dst_base, row_step),
             );
-        } else {
+        }
+    } else {
+        let mut q_mid = mid_start;
+        while q_mid + 4 <= mid_end {
+            let dst_base = if dst_frame_stride == 1 {
+                (q_mid - dst_origin_frame) * dst_oc_stride + dst_oc_off
+            } else {
+                (q_mid * stride + phase - dst_origin_frame) * dst_oc_stride + dst_oc_off
+            };
             trans_conv_frames_tail_oc_simd::<S, 4>(
                 simd,
                 input,
@@ -1309,65 +1320,41 @@ fn trans_conv_run_q_range_simd<S: Simd>(
                 (q_mid, n_taps, in_c, lane_w),
                 (dst, dst_base, row_step),
             );
+            q_mid += 4;
         }
-        q_mid += 4;
-    }
-    let rem = mid_end - q_mid;
-    if rem > 0 {
-        let dst_base = if dst_frame_stride == 1 {
-            (q_mid - dst_origin_frame) * dst_oc_stride + dst_oc_off
-        } else {
-            (q_mid * stride + phase - dst_origin_frame) * dst_oc_stride + dst_oc_off
-        };
-        match (lane_w == 16, rem) {
-            (true, 3) => trans_conv_frames_16oc_simd::<S, 3>(
-                simd,
-                input,
-                w_tile,
-                bias_blk,
-                (q_mid, n_taps, in_c),
-                (dst, dst_base, row_step),
-            ),
-            (true, 2) => trans_conv_frames_16oc_simd::<S, 2>(
-                simd,
-                input,
-                w_tile,
-                bias_blk,
-                (q_mid, n_taps, in_c),
-                (dst, dst_base, row_step),
-            ),
-            (true, _) => trans_conv_frames_16oc_simd::<S, 1>(
-                simd,
-                input,
-                w_tile,
-                bias_blk,
-                (q_mid, n_taps, in_c),
-                (dst, dst_base, row_step),
-            ),
-            (false, 3) => trans_conv_frames_tail_oc_simd::<S, 3>(
-                simd,
-                input,
-                w_tile,
-                bias_blk,
-                (q_mid, n_taps, in_c, lane_w),
-                (dst, dst_base, row_step),
-            ),
-            (false, 2) => trans_conv_frames_tail_oc_simd::<S, 2>(
-                simd,
-                input,
-                w_tile,
-                bias_blk,
-                (q_mid, n_taps, in_c, lane_w),
-                (dst, dst_base, row_step),
-            ),
-            (false, _) => trans_conv_frames_tail_oc_simd::<S, 1>(
-                simd,
-                input,
-                w_tile,
-                bias_blk,
-                (q_mid, n_taps, in_c, lane_w),
-                (dst, dst_base, row_step),
-            ),
+        let rem = mid_end - q_mid;
+        if rem > 0 {
+            let dst_base = if dst_frame_stride == 1 {
+                (q_mid - dst_origin_frame) * dst_oc_stride + dst_oc_off
+            } else {
+                (q_mid * stride + phase - dst_origin_frame) * dst_oc_stride + dst_oc_off
+            };
+            match rem {
+                3 => trans_conv_frames_tail_oc_simd::<S, 3>(
+                    simd,
+                    input,
+                    w_tile,
+                    bias_blk,
+                    (q_mid, n_taps, in_c, lane_w),
+                    (dst, dst_base, row_step),
+                ),
+                2 => trans_conv_frames_tail_oc_simd::<S, 2>(
+                    simd,
+                    input,
+                    w_tile,
+                    bias_blk,
+                    (q_mid, n_taps, in_c, lane_w),
+                    (dst, dst_base, row_step),
+                ),
+                _ => trans_conv_frames_tail_oc_simd::<S, 1>(
+                    simd,
+                    input,
+                    w_tile,
+                    bias_blk,
+                    (q_mid, n_taps, in_c, lane_w),
+                    (dst, dst_base, row_step),
+                ),
+            }
         }
     }
 
@@ -2007,9 +1994,9 @@ fn dot_1row_sequential_ic<const F: usize>(
     reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
 )]
 #[inline(always)]
-fn convnext_pwconv1_store_16oc_tf<S: Simd, const F: usize>(
+fn convnext_pwconv1_store_16oc_tf<S: Simd>(
     simd: S,
-    acc: &[[f32; 16]; F],
+    acc: &[[f32; 16]],
     bias_vec: [f32x4<S>; 4],
     f: usize,
     num_rows: usize,
@@ -2038,85 +2025,48 @@ fn convnext_pwconv1_store_16oc_tf<S: Simd, const F: usize>(
 #[inline(always)]
 fn convnext_pwconv1_gelu_time_first_simd<S: Simd>(
     simd: S,
-    w_rows: &[f32],
+    w_packed: &[f32],
     b_rows: &[f32],
     norm_buf: &[f32],
     (first_frame, num_frames, in_c): (usize, usize, usize),
     mid_out: &mut [f32],
 ) {
     let num_rows = b_rows.len();
-    let oc_blocks16 = if num_frames >= 2 { num_rows / 16 } else { 0 };
+    let oc_blocks16 = num_rows / 16;
 
-    if oc_blocks16 > 0 {
-        with_convnext_pack_tile(16 * in_c, |tile_w| {
-            for oc_blk in 0..oc_blocks16 {
-                let oc_base = oc_blk * 16;
-                pack_16_rows_to_ic_16(
-                    simd,
-                    &w_rows[oc_base * in_c..(oc_base + 16) * in_c],
-                    in_c,
-                    tile_w,
-                );
-                let bias_vec = [
-                    f32x4::from_slice(simd, &b_rows[oc_base..oc_base + 4]),
-                    f32x4::from_slice(simd, &b_rows[oc_base + 4..oc_base + 8]),
-                    f32x4::from_slice(simd, &b_rows[oc_base + 8..oc_base + 12]),
-                    f32x4::from_slice(simd, &b_rows[oc_base + 12..oc_base + 16]),
-                ];
-                let mut f = 0_usize;
-                while f + 4 <= num_frames {
-                    let x_rows: [&[f32]; 4] = core::array::from_fn(|df| {
-                        let off = (first_frame + f + df) * in_c;
-                        &norm_buf[off..off + in_c]
-                    });
-                    let mut acc = [[0.0_f32; 16]; 4];
-                    conv_kernels::gemm_f32_fma_16oc_4f(tile_w, x_rows, in_c, &mut acc);
-                    convnext_pwconv1_store_16oc_tf(
-                        simd, &acc, bias_vec, f, num_rows, oc_base, mid_out,
-                    );
-                    f += 4;
-                }
-                match num_frames - f {
-                    3 => {
-                        let x_rows: [&[f32]; 3] = core::array::from_fn(|df| {
-                            let off = (first_frame + f + df) * in_c;
-                            &norm_buf[off..off + in_c]
-                        });
-                        let mut acc = [[0.0_f32; 16]; 3];
-                        conv_kernels::gemm_f32_fma_16oc_3f(tile_w, x_rows, in_c, &mut acc);
-                        convnext_pwconv1_store_16oc_tf(
-                            simd, &acc, bias_vec, f, num_rows, oc_base, mid_out,
-                        );
-                    }
-                    2 => {
-                        let x_rows: [&[f32]; 2] = core::array::from_fn(|df| {
-                            let off = (first_frame + f + df) * in_c;
-                            &norm_buf[off..off + in_c]
-                        });
-                        let mut acc = [[0.0_f32; 16]; 2];
-                        conv_kernels::gemm_f32_fma_16oc_2f(tile_w, x_rows, in_c, &mut acc);
-                        convnext_pwconv1_store_16oc_tf(
-                            simd, &acc, bias_vec, f, num_rows, oc_base, mid_out,
-                        );
-                    }
-                    1 => {
-                        let off = (first_frame + f) * in_c;
-                        let mut acc = [[0.0_f32; 16]; 1];
-                        conv_kernels::gemm_f32_fma_16oc_1f(
-                            tile_w,
-                            [&norm_buf[off..off + in_c]],
-                            in_c,
-                            &mut acc,
-                        );
-                        convnext_pwconv1_store_16oc_tf(
-                            simd, &acc, bias_vec, f, num_rows, oc_base, mid_out,
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        });
+    for oc_blk in 0..oc_blocks16 {
+        let oc_base = oc_blk * 16;
+        let w_blk = &w_packed[oc_base * in_c..(oc_base + 16) * in_c];
+        let bias_vec = [
+            f32x4::from_slice(simd, &b_rows[oc_base..oc_base + 4]),
+            f32x4::from_slice(simd, &b_rows[oc_base + 4..oc_base + 8]),
+            f32x4::from_slice(simd, &b_rows[oc_base + 8..oc_base + 12]),
+            f32x4::from_slice(simd, &b_rows[oc_base + 12..oc_base + 16]),
+        ];
+        for f_start in (0..num_frames).step_by(CONV_F_TILE) {
+            let f_len = (num_frames - f_start).min(CONV_F_TILE);
+            let mut acc_tile = [[0.0_f32; 16]; CONV_F_TILE];
+            gemm_16oc_ic_tiled(
+                w_blk,
+                norm_buf,
+                first_frame + f_start,
+                f_len,
+                in_c,
+                &mut acc_tile[..f_len],
+            );
+            convnext_pwconv1_store_16oc_tf(
+                simd,
+                &acc_tile[..f_len],
+                bias_vec,
+                f_start,
+                num_rows,
+                oc_base,
+                mid_out,
+            );
+        }
     }
+
+    let w_rows = w_packed;
 
     let tail_oc_start = oc_blocks16 * 16;
     let tail_quads = (num_rows - tail_oc_start) / 4;
@@ -2181,81 +2131,69 @@ fn convnext_pwconv1_gelu_time_first_simd<S: Simd>(
 #[inline(always)]
 fn convnext_pwconv1_gelu_channel_first_simd<S: Simd>(
     simd: S,
-    w_rows: &[f32],
+    w_packed: &[f32],
     b_rows: &[f32],
     norm_buf: &[f32],
     (frames, in_c): (usize, usize),
     transposed_rows: &mut [f32],
 ) {
     let num_rows = b_rows.len();
-    let oc_blocks16 = if frames >= 2 { num_rows / 16 } else { 0 };
+    let oc_blocks16 = num_rows / 16;
 
-    if oc_blocks16 > 0 {
-        with_convnext_pack_tile(16 * in_c, |tile_w| {
-            for oc_blk in 0..oc_blocks16 {
-                let oc_base = oc_blk * 16;
-                pack_16_rows_to_ic_16(
-                    simd,
-                    &w_rows[oc_base * in_c..(oc_base + 16) * in_c],
-                    in_c,
-                    tile_w,
-                );
-                let bias_vec = [
-                    f32x4::from_slice(simd, &b_rows[oc_base..oc_base + 4]),
-                    f32x4::from_slice(simd, &b_rows[oc_base + 4..oc_base + 8]),
-                    f32x4::from_slice(simd, &b_rows[oc_base + 8..oc_base + 12]),
-                    f32x4::from_slice(simd, &b_rows[oc_base + 12..oc_base + 16]),
-                ];
-                let mut f = 0_usize;
-                while f + 4 <= frames {
-                    let x_rows: [&[f32]; 4] =
-                        core::array::from_fn(|df| &norm_buf[(f + df) * in_c..(f + df + 1) * in_c]);
-                    let mut acc = [[0.0_f32; 16]; 4];
-                    conv_kernels::gemm_f32_fma_16oc_4f(tile_w, x_rows, in_c, &mut acc);
-                    for rq in 0..4 {
-                        let r_off = rq * 4;
-                        let bv = bias_vec[rq];
-                        let cols = transpose_4x4(
-                            simd,
-                            [
-                                f32x4::from_slice(simd, &acc[0][r_off..r_off + 4]) + bv,
-                                f32x4::from_slice(simd, &acc[1][r_off..r_off + 4]) + bv,
-                                f32x4::from_slice(simd, &acc[2][r_off..r_off + 4]) + bv,
-                                f32x4::from_slice(simd, &acc[3][r_off..r_off + 4]) + bv,
-                            ],
-                        );
-                        for (lane, col) in cols.into_iter().enumerate() {
-                            let row_off = (oc_base + r_off + lane) * frames + f;
-                            gelu_tanh_f32x4(simd, col)
-                                .store_slice(&mut transposed_rows[row_off..row_off + 4]);
-                        }
-                    }
-                    f += 4;
-                }
-                while f < frames {
-                    let mut acc = [[0.0_f32; 16]; 1];
-                    conv_kernels::gemm_f32_fma_16oc_1f(
-                        tile_w,
-                        [&norm_buf[f * in_c..(f + 1) * in_c]],
-                        in_c,
-                        &mut acc,
+    for oc_blk in 0..oc_blocks16 {
+        let oc_base = oc_blk * 16;
+        let w_blk = &w_packed[oc_base * in_c..(oc_base + 16) * in_c];
+        let bias_vec = [
+            f32x4::from_slice(simd, &b_rows[oc_base..oc_base + 4]),
+            f32x4::from_slice(simd, &b_rows[oc_base + 4..oc_base + 8]),
+            f32x4::from_slice(simd, &b_rows[oc_base + 8..oc_base + 12]),
+            f32x4::from_slice(simd, &b_rows[oc_base + 12..oc_base + 16]),
+        ];
+        for f_start in (0..frames).step_by(CONV_F_TILE) {
+            let f_len = (frames - f_start).min(CONV_F_TILE);
+            let mut acc_tile = [[0.0_f32; 16]; CONV_F_TILE];
+            gemm_16oc_ic_tiled(w_blk, norm_buf, f_start, f_len, in_c, &mut acc_tile[..f_len]);
+            let (acc_quads, acc_tail) = acc_tile[..f_len].as_chunks::<4>();
+            for (q_idx, aq) in acc_quads.iter().enumerate() {
+                let f = f_start + q_idx * 4;
+                for rq in 0..4 {
+                    let r_off = rq * 4;
+                    let bv = bias_vec[rq];
+                    let cols = transpose_4x4(
+                        simd,
+                        [
+                            f32x4::from_slice(simd, &aq[0][r_off..r_off + 4]) + bv,
+                            f32x4::from_slice(simd, &aq[1][r_off..r_off + 4]) + bv,
+                            f32x4::from_slice(simd, &aq[2][r_off..r_off + 4]) + bv,
+                            f32x4::from_slice(simd, &aq[3][r_off..r_off + 4]) + bv,
+                        ],
                     );
-                    for rq in 0..4 {
-                        let r_off = rq * 4;
-                        let g: [f32; 4] = gelu_tanh_f32x4(
-                            simd,
-                            f32x4::from_slice(simd, &acc[0][r_off..r_off + 4]) + bias_vec[rq],
-                        )
-                        .into();
-                        for (lane, &val) in g.iter().enumerate() {
-                            transposed_rows[(oc_base + r_off + lane) * frames + f] = val;
-                        }
+                    for (lane, col) in cols.into_iter().enumerate() {
+                        let row_off = (oc_base + r_off + lane) * frames + f;
+                        gelu_tanh_f32x4(simd, col)
+                            .store_slice(&mut transposed_rows[row_off..row_off + 4]);
                     }
-                    f += 1;
                 }
             }
-        });
+            let f_tail_base = f_start + acc_quads.len() * 4;
+            for (t_idx, acc_row) in acc_tail.iter().enumerate() {
+                let f = f_tail_base + t_idx;
+                for rq in 0..4 {
+                    let r_off = rq * 4;
+                    let g: [f32; 4] = gelu_tanh_f32x4(
+                        simd,
+                        f32x4::from_slice(simd, &acc_row[r_off..r_off + 4]) + bias_vec[rq],
+                    )
+                    .into();
+                    for (lane, &val) in g.iter().enumerate() {
+                        transposed_rows[(oc_base + r_off + lane) * frames + f] = val;
+                    }
+                }
+            }
+        }
     }
+
+    let w_rows = w_packed;
 
     let tail_oc_start = oc_blocks16 * 16;
     let tail_quads = (num_rows - tail_oc_start) / 4;
@@ -2326,9 +2264,9 @@ fn convnext_pwconv1_gelu_channel_first_simd<S: Simd>(
     reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
 )]
 #[inline(always)]
-fn convnext_pwconv2_store_16oc_tf<S: Simd, const F: usize>(
+fn convnext_pwconv2_store_16oc_tf<S: Simd>(
     simd: S,
-    acc: &[[f32; 16]; F],
+    acc: &[[f32; 16]],
     bias_vec: [f32x4<S>; 4],
     gamma_vec: [f32x4<S>; 4],
     residual_in: &[f32],
@@ -2358,114 +2296,53 @@ fn convnext_pwconv2_store_16oc_tf<S: Simd, const F: usize>(
 #[inline(always)]
 fn convnext_pwconv2_res_time_first_simd<S: Simd>(
     simd: S,
-    (w_rows, b_rows, gamma_rows): (&[f32], &[f32], &[f32]),
+    (w_packed, b_rows, gamma_rows): (&[f32], &[f32], &[f32]),
     (mid_buf, residual_in): (&[f32], &[f32]),
     (first_frame, num_frames, mid_c): (usize, usize, usize),
     out: &mut [f32],
 ) {
     let num_rows = b_rows.len();
-    let oc_blocks16 = if num_frames >= 2 { num_rows / 16 } else { 0 };
+    let oc_blocks16 = num_rows / 16;
 
-    if oc_blocks16 > 0 {
-        with_convnext_pack_tile(16 * mid_c, |tile_w| {
-            for oc_blk in 0..oc_blocks16 {
-                let oc_base = oc_blk * 16;
-                pack_16_rows_to_ic_16(
-                    simd,
-                    &w_rows[oc_base * mid_c..(oc_base + 16) * mid_c],
-                    mid_c,
-                    tile_w,
-                );
-                let bias_vec = [
-                    f32x4::from_slice(simd, &b_rows[oc_base..oc_base + 4]),
-                    f32x4::from_slice(simd, &b_rows[oc_base + 4..oc_base + 8]),
-                    f32x4::from_slice(simd, &b_rows[oc_base + 8..oc_base + 12]),
-                    f32x4::from_slice(simd, &b_rows[oc_base + 12..oc_base + 16]),
-                ];
-                let gamma_vec = [
-                    f32x4::from_slice(simd, &gamma_rows[oc_base..oc_base + 4]),
-                    f32x4::from_slice(simd, &gamma_rows[oc_base + 4..oc_base + 8]),
-                    f32x4::from_slice(simd, &gamma_rows[oc_base + 8..oc_base + 12]),
-                    f32x4::from_slice(simd, &gamma_rows[oc_base + 12..oc_base + 16]),
-                ];
-                let mut f = 0_usize;
-                while f + 4 <= num_frames {
-                    let x_rows: [&[f32]; 4] = core::array::from_fn(|df| {
-                        let off = (first_frame + f + df) * mid_c;
-                        &mid_buf[off..off + mid_c]
-                    });
-                    let mut acc = [[0.0_f32; 16]; 4];
-                    conv_kernels::gemm_f32_fma_16oc_4f(tile_w, x_rows, mid_c, &mut acc);
-                    convnext_pwconv2_store_16oc_tf(
-                        simd,
-                        &acc,
-                        bias_vec,
-                        gamma_vec,
-                        residual_in,
-                        (first_frame, f, num_rows, oc_base),
-                        out,
-                    );
-                    f += 4;
-                }
-                match num_frames - f {
-                    3 => {
-                        let x_rows: [&[f32]; 3] = core::array::from_fn(|df| {
-                            let off = (first_frame + f + df) * mid_c;
-                            &mid_buf[off..off + mid_c]
-                        });
-                        let mut acc = [[0.0_f32; 16]; 3];
-                        conv_kernels::gemm_f32_fma_16oc_3f(tile_w, x_rows, mid_c, &mut acc);
-                        convnext_pwconv2_store_16oc_tf(
-                            simd,
-                            &acc,
-                            bias_vec,
-                            gamma_vec,
-                            residual_in,
-                            (first_frame, f, num_rows, oc_base),
-                            out,
-                        );
-                    }
-                    2 => {
-                        let x_rows: [&[f32]; 2] = core::array::from_fn(|df| {
-                            let off = (first_frame + f + df) * mid_c;
-                            &mid_buf[off..off + mid_c]
-                        });
-                        let mut acc = [[0.0_f32; 16]; 2];
-                        conv_kernels::gemm_f32_fma_16oc_2f(tile_w, x_rows, mid_c, &mut acc);
-                        convnext_pwconv2_store_16oc_tf(
-                            simd,
-                            &acc,
-                            bias_vec,
-                            gamma_vec,
-                            residual_in,
-                            (first_frame, f, num_rows, oc_base),
-                            out,
-                        );
-                    }
-                    1 => {
-                        let off = (first_frame + f) * mid_c;
-                        let mut acc = [[0.0_f32; 16]; 1];
-                        conv_kernels::gemm_f32_fma_16oc_1f(
-                            tile_w,
-                            [&mid_buf[off..off + mid_c]],
-                            mid_c,
-                            &mut acc,
-                        );
-                        convnext_pwconv2_store_16oc_tf(
-                            simd,
-                            &acc,
-                            bias_vec,
-                            gamma_vec,
-                            residual_in,
-                            (first_frame, f, num_rows, oc_base),
-                            out,
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        });
+    for oc_blk in 0..oc_blocks16 {
+        let oc_base = oc_blk * 16;
+        let w_blk = &w_packed[oc_base * mid_c..(oc_base + 16) * mid_c];
+        let bias_vec = [
+            f32x4::from_slice(simd, &b_rows[oc_base..oc_base + 4]),
+            f32x4::from_slice(simd, &b_rows[oc_base + 4..oc_base + 8]),
+            f32x4::from_slice(simd, &b_rows[oc_base + 8..oc_base + 12]),
+            f32x4::from_slice(simd, &b_rows[oc_base + 12..oc_base + 16]),
+        ];
+        let gamma_vec = [
+            f32x4::from_slice(simd, &gamma_rows[oc_base..oc_base + 4]),
+            f32x4::from_slice(simd, &gamma_rows[oc_base + 4..oc_base + 8]),
+            f32x4::from_slice(simd, &gamma_rows[oc_base + 8..oc_base + 12]),
+            f32x4::from_slice(simd, &gamma_rows[oc_base + 12..oc_base + 16]),
+        ];
+        for f_start in (0..num_frames).step_by(CONV_F_TILE) {
+            let f_len = (num_frames - f_start).min(CONV_F_TILE);
+            let mut acc_tile = [[0.0_f32; 16]; CONV_F_TILE];
+            gemm_16oc_ic_tiled(
+                w_blk,
+                mid_buf,
+                first_frame + f_start,
+                f_len,
+                mid_c,
+                &mut acc_tile[..f_len],
+            );
+            convnext_pwconv2_store_16oc_tf(
+                simd,
+                &acc_tile[..f_len],
+                bias_vec,
+                gamma_vec,
+                residual_in,
+                (first_frame, f_start, num_rows, oc_base),
+                out,
+            );
+        }
     }
+
+    let w_rows = w_packed;
 
     let tail_oc_start = oc_blocks16 * 16;
     let tail_quads = (num_rows - tail_oc_start) / 4;
@@ -2539,113 +2416,101 @@ fn convnext_pwconv2_res_time_first_simd<S: Simd>(
 #[inline(always)]
 fn convnext_pwconv2_res_channel_first_simd<S: Simd>(
     simd: S,
-    (w_rows, b_rows, gamma_rows): (&[f32], &[f32], &[f32]),
+    (w_packed, b_rows, gamma_rows): (&[f32], &[f32], &[f32]),
     (mid_buf, residual_in): (&[f32], &[f32]),
     (frames, mid_c, total_c, oc_off): (usize, usize, usize, usize),
     transposed_rows: &mut [f32],
 ) {
     let num_rows = b_rows.len();
-    let oc_blocks16 = if frames >= 2 { num_rows / 16 } else { 0 };
+    let oc_blocks16 = num_rows / 16;
 
-    if oc_blocks16 > 0 {
-        with_convnext_pack_tile(16 * mid_c, |tile_w| {
-            for oc_blk in 0..oc_blocks16 {
-                let oc_base = oc_blk * 16;
-                let oc_abs_base = oc_off + oc_base;
-                pack_16_rows_to_ic_16(
-                    simd,
-                    &w_rows[oc_base * mid_c..(oc_base + 16) * mid_c],
-                    mid_c,
-                    tile_w,
-                );
-                let bias_vec = [
-                    f32x4::from_slice(simd, &b_rows[oc_base..oc_base + 4]),
-                    f32x4::from_slice(simd, &b_rows[oc_base + 4..oc_base + 8]),
-                    f32x4::from_slice(simd, &b_rows[oc_base + 8..oc_base + 12]),
-                    f32x4::from_slice(simd, &b_rows[oc_base + 12..oc_base + 16]),
-                ];
-                let gamma_vec = [
-                    f32x4::from_slice(simd, &gamma_rows[oc_base..oc_base + 4]),
-                    f32x4::from_slice(simd, &gamma_rows[oc_base + 4..oc_base + 8]),
-                    f32x4::from_slice(simd, &gamma_rows[oc_base + 8..oc_base + 12]),
-                    f32x4::from_slice(simd, &gamma_rows[oc_base + 12..oc_base + 16]),
-                ];
-                let mut f = 0_usize;
-                while f + 4 <= frames {
-                    let x_rows: [&[f32]; 4] =
-                        core::array::from_fn(|df| &mid_buf[(f + df) * mid_c..(f + df + 1) * mid_c]);
-                    let mut acc = [[0.0_f32; 16]; 4];
-                    conv_kernels::gemm_f32_fma_16oc_4f(tile_w, x_rows, mid_c, &mut acc);
-                    for rq in 0..4 {
-                        let r_off = rq * 4;
-                        let bv = bias_vec[rq];
-                        let gv = gamma_vec[rq];
-                        let res0 = f32x4::from_slice(
-                            simd,
-                            &residual_in[f * total_c + oc_abs_base + r_off
-                                ..f * total_c + oc_abs_base + r_off + 4],
-                        );
-                        let res1 = f32x4::from_slice(
-                            simd,
-                            &residual_in[(f + 1) * total_c + oc_abs_base + r_off
-                                ..(f + 1) * total_c + oc_abs_base + r_off + 4],
-                        );
-                        let res2 = f32x4::from_slice(
-                            simd,
-                            &residual_in[(f + 2) * total_c + oc_abs_base + r_off
-                                ..(f + 2) * total_c + oc_abs_base + r_off + 4],
-                        );
-                        let res3 = f32x4::from_slice(
-                            simd,
-                            &residual_in[(f + 3) * total_c + oc_abs_base + r_off
-                                ..(f + 3) * total_c + oc_abs_base + r_off + 4],
-                        );
-                        let cols = transpose_4x4(
-                            simd,
-                            [
-                                (f32x4::from_slice(simd, &acc[0][r_off..r_off + 4]) + bv)
-                                    .mul_add(gv, res0),
-                                (f32x4::from_slice(simd, &acc[1][r_off..r_off + 4]) + bv)
-                                    .mul_add(gv, res1),
-                                (f32x4::from_slice(simd, &acc[2][r_off..r_off + 4]) + bv)
-                                    .mul_add(gv, res2),
-                                (f32x4::from_slice(simd, &acc[3][r_off..r_off + 4]) + bv)
-                                    .mul_add(gv, res3),
-                            ],
-                        );
-                        for (lane, col) in cols.into_iter().enumerate() {
-                            let row_off = (oc_base + r_off + lane) * frames + f;
-                            col.store_slice(&mut transposed_rows[row_off..row_off + 4]);
-                        }
-                    }
-                    f += 4;
-                }
-                while f < frames {
-                    let mut acc = [[0.0_f32; 16]; 1];
-                    conv_kernels::gemm_f32_fma_16oc_1f(
-                        tile_w,
-                        [&mid_buf[f * mid_c..(f + 1) * mid_c]],
-                        mid_c,
-                        &mut acc,
+    for oc_blk in 0..oc_blocks16 {
+        let oc_base = oc_blk * 16;
+        let oc_abs_base = oc_off + oc_base;
+        let w_blk = &w_packed[oc_base * mid_c..(oc_base + 16) * mid_c];
+        let bias_vec = [
+            f32x4::from_slice(simd, &b_rows[oc_base..oc_base + 4]),
+            f32x4::from_slice(simd, &b_rows[oc_base + 4..oc_base + 8]),
+            f32x4::from_slice(simd, &b_rows[oc_base + 8..oc_base + 12]),
+            f32x4::from_slice(simd, &b_rows[oc_base + 12..oc_base + 16]),
+        ];
+        let gamma_vec = [
+            f32x4::from_slice(simd, &gamma_rows[oc_base..oc_base + 4]),
+            f32x4::from_slice(simd, &gamma_rows[oc_base + 4..oc_base + 8]),
+            f32x4::from_slice(simd, &gamma_rows[oc_base + 8..oc_base + 12]),
+            f32x4::from_slice(simd, &gamma_rows[oc_base + 12..oc_base + 16]),
+        ];
+        for f_start in (0..frames).step_by(CONV_F_TILE) {
+            let f_len = (frames - f_start).min(CONV_F_TILE);
+            let mut acc_tile = [[0.0_f32; 16]; CONV_F_TILE];
+            gemm_16oc_ic_tiled(w_blk, mid_buf, f_start, f_len, mid_c, &mut acc_tile[..f_len]);
+            let (acc_quads, acc_tail) = acc_tile[..f_len].as_chunks::<4>();
+            for (q_idx, aq) in acc_quads.iter().enumerate() {
+                let f = f_start + q_idx * 4;
+                for rq in 0..4 {
+                    let r_off = rq * 4;
+                    let bv = bias_vec[rq];
+                    let gv = gamma_vec[rq];
+                    let res0 = f32x4::from_slice(
+                        simd,
+                        &residual_in[f * total_c + oc_abs_base + r_off
+                            ..f * total_c + oc_abs_base + r_off + 4],
                     );
-                    for rq in 0..4 {
-                        let r_off = rq * 4;
-                        let dv = f32x4::from_slice(simd, &acc[0][r_off..r_off + 4]) + bias_vec[rq];
-                        let rv = f32x4::from_slice(
-                            simd,
-                            &residual_in[f * total_c + oc_abs_base + r_off
-                                ..f * total_c + oc_abs_base + r_off + 4],
-                        );
-                        let out_vals: [f32; 4] = dv.mul_add(gamma_vec[rq], rv).into();
-                        for (lane, &val) in out_vals.iter().enumerate() {
-                            transposed_rows[(oc_base + r_off + lane) * frames + f] = val;
-                        }
+                    let res1 = f32x4::from_slice(
+                        simd,
+                        &residual_in[(f + 1) * total_c + oc_abs_base + r_off
+                            ..(f + 1) * total_c + oc_abs_base + r_off + 4],
+                    );
+                    let res2 = f32x4::from_slice(
+                        simd,
+                        &residual_in[(f + 2) * total_c + oc_abs_base + r_off
+                            ..(f + 2) * total_c + oc_abs_base + r_off + 4],
+                    );
+                    let res3 = f32x4::from_slice(
+                        simd,
+                        &residual_in[(f + 3) * total_c + oc_abs_base + r_off
+                            ..(f + 3) * total_c + oc_abs_base + r_off + 4],
+                    );
+                    let cols = transpose_4x4(
+                        simd,
+                        [
+                            (f32x4::from_slice(simd, &aq[0][r_off..r_off + 4]) + bv)
+                                .mul_add(gv, res0),
+                            (f32x4::from_slice(simd, &aq[1][r_off..r_off + 4]) + bv)
+                                .mul_add(gv, res1),
+                            (f32x4::from_slice(simd, &aq[2][r_off..r_off + 4]) + bv)
+                                .mul_add(gv, res2),
+                            (f32x4::from_slice(simd, &aq[3][r_off..r_off + 4]) + bv)
+                                .mul_add(gv, res3),
+                        ],
+                    );
+                    for (lane, col) in cols.into_iter().enumerate() {
+                        let row_off = (oc_base + r_off + lane) * frames + f;
+                        col.store_slice(&mut transposed_rows[row_off..row_off + 4]);
                     }
-                    f += 1;
                 }
             }
-        });
+            let f_tail_base = f_start + acc_quads.len() * 4;
+            for (t_idx, acc_row) in acc_tail.iter().enumerate() {
+                let f = f_tail_base + t_idx;
+                for rq in 0..4 {
+                    let r_off = rq * 4;
+                    let dv = f32x4::from_slice(simd, &acc_row[r_off..r_off + 4]) + bias_vec[rq];
+                    let rv = f32x4::from_slice(
+                        simd,
+                        &residual_in[f * total_c + oc_abs_base + r_off
+                            ..f * total_c + oc_abs_base + r_off + 4],
+                    );
+                    let out_vals: [f32; 4] = dv.mul_add(gamma_vec[rq], rv).into();
+                    for (lane, &val) in out_vals.iter().enumerate() {
+                        transposed_rows[(oc_base + r_off + lane) * frames + f] = val;
+                    }
+                }
+            }
+        }
     }
+
+    let w_rows = w_packed;
 
     let tail_oc_start = oc_blocks16 * 16;
     let tail_quads = (num_rows - tail_oc_start) / 4;
@@ -3589,7 +3454,7 @@ impl CausalTransConv1d {
         // run `(q_block, phase)` directly into each worker's disjoint raw slice.
         let workers = frame_workers(threads, raw_frames, work);
         row_workers::run_aligned(raw, workers, self.stride * self.out_c, &|offset, output| {
-            const Q_TILE: usize = 64;
+            const Q_TILE: usize = CONV_F_TILE;
             let first_frame = offset / self.out_c;
             let end_frame = first_frame + output.len() / self.out_c;
             let q_start = first_frame / self.stride;
@@ -3943,12 +3808,16 @@ pub struct ConvNeXtBlock {
     pub norm_w: Vec<f32>,
     /// `LayerNorm` bias `[channels]`.
     pub norm_b: Vec<f32>,
-    /// Pointwise expansion `[4 * channels, channels]` (`out_c, in_c`).
+    /// Pointwise expansion `[4 * channels, channels]` (`out_c, in_c`), or empty when `pwconv1_w_packed` is populated.
     pub pwconv1_w: Vec<f32>,
+    /// Optional pre-packed pointwise expansion `[oc_blk(16), channels, 16]` (+ row-major tail) weights.
+    pub pwconv1_w_packed: Option<Vec<f32>>,
     /// Pointwise expansion bias `[4 * channels]`.
     pub pwconv1_b: Vec<f32>,
-    /// Pointwise projection `[channels, 4 * channels]` (`out_c, in_c`).
+    /// Pointwise projection `[channels, 4 * channels]` (`out_c, in_c`), or empty when `pwconv2_w_packed` is populated.
     pub pwconv2_w: Vec<f32>,
+    /// Optional pre-packed pointwise projection `[oc_blk(16), 4 * channels, 16]` (+ row-major tail) weights.
+    pub pwconv2_w_packed: Option<Vec<f32>>,
     /// Pointwise projection bias `[channels]`.
     pub pwconv2_b: Vec<f32>,
     /// `LayerScale` `[channels]`.
@@ -3968,6 +3837,110 @@ impl ConvNeXtBlock {
             }
         }
         kc
+    }
+
+    /// Pre-pack pointwise `[out_c, in_c]` weights into `[oc_blk(16), in_c, 16]` order
+    /// for full 16-channel blocks, retaining any remaining `out_c % 16` rows in row-major order.
+    #[must_use]
+    pub fn pack_pw_weights(w_rows: &[f32], out_c: usize, in_c: usize) -> Vec<f32> {
+        let mut packed = vec![0.0_f32; w_rows.len()];
+        let full_blocks = out_c / 16;
+        if full_blocks > 0 {
+            let level = Level::new();
+            dispatch!(level, simd => {
+                for blk in 0..full_blocks {
+                    let base = blk * 16 * in_c;
+                    pack_16_rows_to_ic_16(
+                        simd,
+                        &w_rows[base..base + 16 * in_c],
+                        in_c,
+                        &mut packed[base..base + 16 * in_c],
+                    );
+                }
+            });
+        }
+        let tail_start = full_blocks * 16 * in_c;
+        if tail_start < w_rows.len() {
+            packed[tail_start..].copy_from_slice(&w_rows[tail_start..]);
+        }
+        packed
+    }
+
+    /// Construct a `ConvNeXtBlock` from raw weights, pre-packing `dw_weight`, `pwconv1_w`,
+    /// and `pwconv2_w` at load time and dropping raw `pwconv1_w`/`pwconv2_w` copies when packed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Explicit ConvNeXt layer parameters and owned weights avoid an extra configuration struct."
+    )]
+    pub fn from_weights_packed_only(
+        channels: usize,
+        kernel: usize,
+        dw_weight: Vec<f32>,
+        dw_bias: Vec<f32>,
+        norm_w: Vec<f32>,
+        norm_b: Vec<f32>,
+        pwconv1_w: Vec<f32>,
+        pwconv1_b: Vec<f32>,
+        pwconv2_w: Vec<f32>,
+        pwconv2_b: Vec<f32>,
+        gamma: Vec<f32>,
+    ) -> io::Result<Self> {
+        let mid_c = pwconv1_b.len();
+        let expected_dw = channels.checked_mul(kernel);
+        let expected_pw = channels.checked_mul(mid_c);
+        if channels == 0
+            || kernel == 0
+            || mid_c == 0
+            || expected_dw != Some(dw_weight.len())
+            || dw_bias.len() != channels
+            || norm_w.len() != channels
+            || norm_b.len() != channels
+            || expected_pw != Some(pwconv1_w.len())
+            || expected_pw != Some(pwconv2_w.len())
+            || pwconv2_b.len() != channels
+            || gamma.len() != channels
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid ConvNeXtBlock dimensions.",
+            ));
+        }
+        let dw_weight_kc = Some(Self::pack_dw_kc(&dw_weight, channels, kernel));
+        let pwconv1_w_packed = (mid_c >= 16).then(|| Self::pack_pw_weights(&pwconv1_w, mid_c, channels));
+        let pwconv2_w_packed = (channels >= 16).then(|| Self::pack_pw_weights(&pwconv2_w, channels, mid_c));
+        let pwconv1_w = if pwconv1_w_packed.is_some() {
+            Vec::new()
+        } else {
+            pwconv1_w
+        };
+        let pwconv2_w = if pwconv2_w_packed.is_some() {
+            Vec::new()
+        } else {
+            pwconv2_w
+        };
+        Ok(Self {
+            channels,
+            kernel,
+            dw_weight,
+            dw_weight_kc,
+            dw_bias,
+            norm_w,
+            norm_b,
+            pwconv1_w,
+            pwconv1_w_packed,
+            pwconv1_b,
+            pwconv2_w,
+            pwconv2_w_packed,
+            pwconv2_b,
+            gamma,
+        })
+    }
+
+    fn pw_weights_valid(raw: &[f32], packed: Option<&[f32]>, expected: Option<usize>) -> bool {
+        match packed {
+            Some(p) => expected == Some(p.len()) && (raw.is_empty() || raw.len() == p.len()),
+            None => expected == Some(raw.len()),
+        }
     }
 
     /// Run the `ConvNeXt` block on `[frames, channels]` time-first input with `dw_state` (`[kernel - 1, channels]`).
@@ -4013,6 +3986,7 @@ impl ConvNeXtBlock {
         let k = self.kernel;
         let ctx_len = k.saturating_sub(1);
         let mid_c = self.pwconv1_b.len();
+        let expected_pw = c.checked_mul(mid_c);
         if frames == 0
             || c == 0
             || k == 0
@@ -4024,8 +3998,8 @@ impl ConvNeXtBlock {
             || self.dw_bias.len() != c
             || self.norm_w.len() != c
             || self.norm_b.len() != c
-            || self.pwconv1_w.len() != mid_c * c
-            || self.pwconv2_w.len() != c * mid_c
+            || !Self::pw_weights_valid(&self.pwconv1_w, self.pwconv1_w_packed.as_deref(), expected_pw)
+            || !Self::pw_weights_valid(&self.pwconv2_w, self.pwconv2_w_packed.as_deref(), expected_pw)
             || self.pwconv2_b.len() != c
             || self.gamma.len() != c
         {
@@ -4047,6 +4021,24 @@ impl ConvNeXtBlock {
         } else {
             packed_dw = Self::pack_dw_kc(&self.dw_weight, c, k);
             &packed_dw
+        };
+        let pw1_packed_fallback;
+        let pw1_w: &[f32] = if let Some(p) = self.pwconv1_w_packed.as_deref() {
+            p
+        } else if mid_c >= 16 {
+            pw1_packed_fallback = Self::pack_pw_weights(&self.pwconv1_w, mid_c, c);
+            &pw1_packed_fallback
+        } else {
+            &self.pwconv1_w
+        };
+        let pw2_packed_fallback;
+        let pw2_w: &[f32] = if let Some(p) = self.pwconv2_w_packed.as_deref() {
+            p
+        } else if c >= 16 {
+            pw2_packed_fallback = Self::pack_pw_weights(&self.pwconv2_w, c, mid_c);
+            &pw2_packed_fallback
+        } else {
+            &self.pwconv2_w
         };
 
         with_convnext_scratch(frames * c, frames * mid_c, |norm_buf, mid_buf| {
@@ -4073,9 +4065,9 @@ impl ConvNeXtBlock {
                 }
             });
 
-            // Stage 2: channel-parallel `oc`-outer x `frame_quad`-inner `pwconv1` + fused SIMD GELU.
-            let pw1_bytes = self.pwconv1_w.len().saturating_mul(size_of::<f32>());
-            let pw1_work = frames.saturating_mul(self.pwconv1_w.len());
+            // Stage 2: channel-parallel `oc`-outer x `frame_tile`-inner `pwconv1` + fused SIMD GELU.
+            let pw1_bytes = pw1_w.len().saturating_mul(size_of::<f32>());
+            let pw1_work = frames.saturating_mul(pw1_w.len());
             let pw1_max_frames = if pw1_bytes >= OC_PARALLEL_LARGE_BYTES {
                 (OC_PARALLEL_SCRATCH_MAX_ELEMS / mid_c.max(1))
                     .clamp(OC_PARALLEL_MAX_FRAMES, OC_PARALLEL_LARGE_MAX_FRAMES)
@@ -4095,7 +4087,7 @@ impl ConvNeXtBlock {
                         pw1_align,
                         &|oc_off, rows| {
                             let count = rows.len();
-                            let w_slice = &self.pwconv1_w[oc_off * c..(oc_off + count) * c];
+                            let w_slice = &pw1_w[oc_off * c..(oc_off + count) * c];
                             let b_slice = &self.pwconv1_b[oc_off..oc_off + count];
                             dispatch!(
                                 level,
@@ -4119,7 +4111,7 @@ impl ConvNeXtBlock {
                             &|elem_off, slice| {
                                 let oc_off = elem_off / frames;
                                 let count = slice.len() / frames;
-                                let w_slice = &self.pwconv1_w[oc_off * c..(oc_off + count) * c];
+                                let w_slice = &pw1_w[oc_off * c..(oc_off + count) * c];
                                 let b_slice = &self.pwconv1_b[oc_off..oc_off + count];
                                 dispatch!(
                                     level,
@@ -4153,7 +4145,7 @@ impl ConvNeXtBlock {
                         level,
                         simd => convnext_pwconv1_gelu_time_first_simd(
                             simd,
-                            &self.pwconv1_w,
+                            pw1_w,
                             &self.pwconv1_b,
                             norm_buf,
                             (first_frame, worker_frames, c),
@@ -4164,8 +4156,8 @@ impl ConvNeXtBlock {
             }
 
             // Stage 3: channel-parallel `pwconv2` + fused `* gamma + residual`.
-            let pw2_bytes = self.pwconv2_w.len().saturating_mul(size_of::<f32>());
-            let pw2_work = frames.saturating_mul(self.pwconv2_w.len());
+            let pw2_bytes = pw2_w.len().saturating_mul(size_of::<f32>());
+            let pw2_work = frames.saturating_mul(pw2_w.len());
             let pw2_max_frames = if pw2_bytes >= OC_PARALLEL_LARGE_BYTES {
                 (OC_PARALLEL_SCRATCH_MAX_ELEMS / c.max(1))
                     .clamp(OC_PARALLEL_MAX_FRAMES, OC_PARALLEL_LARGE_MAX_FRAMES)
@@ -4181,7 +4173,7 @@ impl ConvNeXtBlock {
                 if frames == 1 {
                     row_workers::run_aligned(out, active_threads, pw2_align, &|oc_off, rows| {
                         let count = rows.len();
-                        let w_slice = &self.pwconv2_w[oc_off * mid_c..(oc_off + count) * mid_c];
+                        let w_slice = &pw2_w[oc_off * mid_c..(oc_off + count) * mid_c];
                         let b_slice = &self.pwconv2_b[oc_off..oc_off + count];
                         let g_slice = &self.gamma[oc_off..oc_off + count];
                         let res_slice = &input[oc_off..oc_off + count];
@@ -4206,7 +4198,7 @@ impl ConvNeXtBlock {
                                 let oc_off = elem_off / frames;
                                 let count = slice.len() / frames;
                                 let w_slice =
-                                    &self.pwconv2_w[oc_off * mid_c..(oc_off + count) * mid_c];
+                                    &pw2_w[oc_off * mid_c..(oc_off + count) * mid_c];
                                 let b_slice = &self.pwconv2_b[oc_off..oc_off + count];
                                 let g_slice = &self.gamma[oc_off..oc_off + count];
                                 dispatch!(
@@ -4240,7 +4232,7 @@ impl ConvNeXtBlock {
                         level,
                         simd => convnext_pwconv2_res_time_first_simd(
                             simd,
-                            (&self.pwconv2_w, &self.pwconv2_b, &self.gamma),
+                            (pw2_w, &self.pwconv2_b, &self.gamma),
                             (mid_buf, input),
                             (first_frame, worker_frames, mid_c),
                             slice,
@@ -5035,8 +5027,10 @@ mod tests {
             norm_w: vec![1.0; channels],
             norm_b: values(channels),
             pwconv1_w: values(channels * mid),
+            pwconv1_w_packed: None,
             pwconv1_b: values(mid),
             pwconv2_w: values(channels * mid),
+            pwconv2_w_packed: None,
             pwconv2_b: values(channels),
             gamma: values(channels),
         };
@@ -5330,8 +5324,10 @@ mod tests {
             norm_w: vec![1.0; 2],
             norm_b: vec![0.0; 2],
             pwconv1_w: vec![0.05; 16],
+            pwconv1_w_packed: None,
             pwconv1_b: vec![0.0; 8],
             pwconv2_w: vec![0.05; 16],
+            pwconv2_w_packed: None,
             pwconv2_b: vec![0.0; 2],
             gamma: vec![0.5; 2],
         };
@@ -5414,10 +5410,12 @@ mod tests {
             pwconv1_w: (0..(mid_c * c))
                 .map(|i| f32::from(u16::try_from((i % 17) + 1).unwrap_or(1)) * 0.01)
                 .collect(),
+            pwconv1_w_packed: None,
             pwconv1_b: vec![0.02; mid_c],
             pwconv2_w: (0..(c * mid_c))
                 .map(|i| f32::from(u16::try_from((i % 23) + 1).unwrap_or(1)) * 0.01)
                 .collect(),
+            pwconv2_w_packed: None,
             pwconv2_b: vec![-0.01; c],
             gamma: vec![0.5; c],
         };
@@ -5586,8 +5584,10 @@ mod tests {
             norm_w: vec![1.0; c],
             norm_b: vec![0.0; c],
             pwconv1_w: vec![0.05; 4 * c * c],
+            pwconv1_w_packed: None,
             pwconv1_b: vec![0.01; 4 * c],
             pwconv2_w: vec![-0.02; c * 4 * c],
+            pwconv2_w_packed: None,
             pwconv2_b: vec![0.03; c],
             gamma: vec![0.5; c],
         };
@@ -5758,8 +5758,10 @@ mod tests {
             norm_w: vec![1.0; channels],
             norm_b: values(channels),
             pwconv1_w: values(mid_c * channels),
+            pwconv1_w_packed: None,
             pwconv1_b: values(mid_c),
             pwconv2_w: values(channels * mid_c),
+            pwconv2_w_packed: None,
             pwconv2_b: values(channels),
             gamma: values(channels),
         };
@@ -6256,8 +6258,10 @@ mod tests {
                     norm_w: vec![1.05; channels],
                     norm_b: values(channels),
                     pwconv1_w: values(mid_c * channels),
+                    pwconv1_w_packed: None,
                     pwconv1_b: values(mid_c),
                     pwconv2_w: values(channels * mid_c),
+                    pwconv2_w_packed: None,
                     pwconv2_b: values(channels),
                     gamma: values(channels),
                 };
@@ -6307,6 +6311,66 @@ mod tests {
                 ),
             );
             assert_eq!(state_t16, state_t1);
+        }
+
+        // Verify ConvNeXtBlock::from_weights_packed_only drops raw weights when packed and
+        // matches unpacked bit-for-bit across F_TILE=32 and IC_TILE=128 boundaries.
+        for (channels, mid_c) in [(129_usize, 517_usize), (192, 512)] {
+            let kernel = 7_usize;
+            let dw_weight = values(channels * kernel);
+            let dw_weight_kc = Some(ConvNeXtBlock::pack_dw_kc(&dw_weight, channels, kernel));
+            let dw_bias = values(channels);
+            let norm_w = vec![1.05; channels];
+            let norm_b = values(channels);
+            let pwconv1_w = values(mid_c * channels);
+            let pwconv1_b = values(mid_c);
+            let pwconv2_w = values(channels * mid_c);
+            let pwconv2_b = values(channels);
+            let gamma = values(channels);
+
+            let raw_block = ConvNeXtBlock {
+                channels,
+                kernel,
+                dw_weight: dw_weight.clone(),
+                dw_weight_kc,
+                dw_bias: dw_bias.clone(),
+                norm_w: norm_w.clone(),
+                norm_b: norm_b.clone(),
+                pwconv1_w: pwconv1_w.clone(),
+                pwconv1_w_packed: None,
+                pwconv1_b: pwconv1_b.clone(),
+                pwconv2_w: pwconv2_w.clone(),
+                pwconv2_w_packed: None,
+                pwconv2_b: pwconv2_b.clone(),
+                gamma: gamma.clone(),
+            };
+            let packed_block = ConvNeXtBlock::from_weights_packed_only(
+                channels, kernel, dw_weight, dw_bias, norm_w, norm_b, pwconv1_w, pwconv1_b,
+                pwconv2_w, pwconv2_b, gamma,
+            )?;
+            assert!(packed_block.pwconv1_w.is_empty());
+            assert!(packed_block.pwconv1_w_packed.is_some());
+            assert!(packed_block.pwconv2_w.is_empty());
+            assert!(packed_block.pwconv2_w_packed.is_some());
+
+            for frames in [1_usize, 7, 32, 33] {
+                let input = values(frames * channels);
+                let init_st = values((kernel - 1) * channels);
+                for threads in [1_usize, 8] {
+                    let mut st_raw = init_st.clone();
+                    let mut st_pkg = init_st.clone();
+                    let out_raw =
+                        raw_block.forward_stream_parallel(&input, frames, &mut st_raw, threads)?;
+                    let out_pkg =
+                        packed_block.forward_stream_parallel(&input, frames, &mut st_pkg, threads)?;
+                    assert_f32_bits_eq(
+                        &out_pkg,
+                        &out_raw,
+                        &format!("ConvNeXt packed_only mismatch c={channels} frames={frames} threads={threads}"),
+                    );
+                    assert_eq!(st_pkg, st_raw);
+                }
+            }
         }
         Ok(())
     }
