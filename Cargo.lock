@@ -662,7 +662,6 @@ dependencies = [
  "bonsai-windows-process",
  "fearless_simd 1.2.0",
  "libm",
- "rayon",
  "serde",
  "serde_json",
  "sha2",

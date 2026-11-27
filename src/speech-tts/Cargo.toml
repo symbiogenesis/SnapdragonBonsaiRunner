@@ -48,8 +48,5 @@ sha2.workspace = true
 [target.'cfg(windows)'.dependencies]
 bonsai-windows-process = { workspace = true }
 
-[target.'cfg(not(windows))'.dependencies]
-rayon = "=1.12.0"
-
 [lints]
 workspace = true
