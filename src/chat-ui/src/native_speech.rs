@@ -539,18 +539,34 @@ fn main() -> std::io::Result<()> {
         // initialize under worker Win32k denial. Compile a std-only fixture with
         // the compiler beside the pinned Cargo that built this test instead.
         let compiler = Path::new(env!("CARGO")).with_file_name("rustc.exe");
+        let lld = compiler
+            .parent()
+            .and_then(Path::parent)
+            .map(|sysroot| sysroot.join("lib/rustlib/aarch64-pc-windows-msvc/bin/rust-lld.exe"))
+            .filter(|path| path.is_file());
         let source = template_dir.join("resource_guard.rs");
         let executable = template_dir.join("resource_guard.exe");
         fs::write(&source, RESOURCE_SOURCE)?;
         let built = (|| {
+            let mut arguments = vec![
+                OsString::from("--edition=2024"),
+                OsString::from("-C"),
+                OsString::from("debuginfo=0"),
+            ];
+            if let Some(lld) = &lld {
+                arguments.push(OsString::from("-C"));
+                arguments.push(OsString::from(format!("linker={}", lld.display())));
+                arguments.push(OsString::from("-C"));
+                arguments.push(OsString::from("linker-flavor=lld-link"));
+            }
+            arguments.extend([
+                source.clone().into_os_string(),
+                OsString::from("-o"),
+                executable.clone().into_os_string(),
+            ]);
             let process = OwnedProcess::start_tool(&ToolProcessSpec {
                 executable: compiler,
-                arguments: vec![
-                    OsString::from("--edition=2024"),
-                    source.clone().into_os_string(),
-                    OsString::from("-o"),
-                    executable.clone().into_os_string(),
-                ],
+                arguments,
                 working_directory: template_dir.clone(),
                 stdout: template_dir.join("compiler.stdout"),
                 stderr: template_dir.join("compiler.stderr"),
