@@ -22,9 +22,9 @@ use windows_sys::Win32::Foundation::{
     DuplicateHandle, HANDLE_FLAG_INHERIT, LocalFree, SetHandleInformation,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES,
-    FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
+    ERROR_NO_MORE_FILES, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
@@ -743,15 +743,17 @@ impl NativeProcess {
         let executable = wide(spec.executable.as_os_str());
         let directory = wide(spec.working_directory.as_os_str());
         let job = launch_job(spec)?;
+        let mut created_outputs = cleanup::CreatedOutputs::new();
         #[cfg(feature = "containment")]
         let native_containment = containment.is_some();
         #[cfg(not(feature = "containment"))]
         let native_containment = false;
         #[cfg(feature = "containment")]
         let ([input, output, error_output], pending_captures) =
-            standard_streams(spec, pipes, native_containment)?;
+            standard_streams(spec, pipes, native_containment, &mut created_outputs)?;
         #[cfg(not(feature = "containment"))]
-        let [input, output, error_output] = standard_streams(spec, pipes, native_containment)?;
+        let [input, output, error_output] =
+            standard_streams(spec, pipes, native_containment, &mut created_outputs)?;
         #[cfg(feature = "containment")]
         let extra_handles = sections.len();
         #[cfg(not(feature = "containment"))]
@@ -824,7 +826,8 @@ impl NativeProcess {
             Ok(captures) => captures,
             Err(error) => {
                 drop([input, output, error_output]);
-                terminate_failed_start(&process, None).map_err(crate::unconfirmed_start_cleanup)?;
+                terminate_failed_start(&process, &job, None)
+                    .map_err(crate::unconfirmed_start_cleanup)?;
                 return Err(error);
             }
         };
@@ -847,7 +850,7 @@ impl NativeProcess {
                 // Any failure before confirmed ownership must terminate this exact
                 // retained root, even when closing our Job cannot reach it yet.
                 drop([input, output, error_output]);
-                terminate_failed_start(&process, captures.as_ref())
+                terminate_failed_start(&process, &job, captures.as_ref())
                     .map_err(crate::unconfirmed_start_cleanup)?;
                 return Err(error);
             }
@@ -863,7 +866,8 @@ impl NativeProcess {
             Ok(folder) => folder,
             Err(error) => {
                 drop([input, output, error_output]);
-                terminate_failed_start(&process).map_err(crate::unconfirmed_start_cleanup)?;
+                terminate_failed_start(&process, &job)
+                    .map_err(crate::unconfirmed_start_cleanup)?;
                 return Err(error);
             }
         };
@@ -874,6 +878,7 @@ impl NativeProcess {
         if let Some(folder) = appcontainer_folder {
             private_roots.push(folder);
         }
+        created_outputs.disarm();
         Ok(Self {
             job,
             process,
@@ -1000,14 +1005,15 @@ impl NativeProcess {
 
     fn stop_within(&self, timeout: Duration) -> io::Result<()> {
         let start = Instant::now();
-        let deadline = start + timeout;
+        let deadline = start
+            .checked_add(timeout)
+            .ok_or_else(|| invalid("cleanup timeout overflows instant deadline"))?;
         // Retain synchronization handles before termination: Windows removes a
         // member from Job accounting shortly before signaling its process handle.
         let members = self.members();
         // SAFETY: This owned/live Job has termination rights and contains only
         // processes atomically assigned by this owner and their descendants.
         check(unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) })?;
-        let members = members?;
         let timed_out = || {
             io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1020,14 +1026,16 @@ impl NativeProcess {
         if self
             .root_wait_for_exit(deadline.saturating_duration_since(Instant::now()))?
             .is_none()
-            || !wait_members_exited(&members, deadline)?
+            || !members
+                .as_ref()
+                .map_or(Ok(true), |handles| wait_members_exited(handles, deadline))?
             || !self.wait_captures_until(deadline)?
         {
             return Err(timed_out());
         }
         loop {
             if self.active_processes()? == 0 {
-                return Ok(());
+                return members.map(|_| ());
             }
             let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
                 return Err(timed_out());
@@ -1115,9 +1123,10 @@ impl NativeProcess {
                         }
                     }
                     Err(error)
-                        if error.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() =>
+                        if error.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok()
+                            || error.raw_os_error() == i32::try_from(ERROR_ACCESS_DENIED).ok() =>
                     {
-                        // A member can finish between querying and opening it.
+                        // A member can finish or its PID can be reused between querying and opening it.
                     }
                     Err(error) => return Err(error),
                 }
@@ -1430,10 +1439,16 @@ fn resume_owned(
 
 fn terminate_failed_start(
     process: &OwnedHandle,
+    job: &OwnedHandle,
     #[cfg(feature = "containment")] captures: Option<&output::Captures>,
 ) -> io::Result<()> {
     let started = Instant::now();
+    // SAFETY: `job` is an owned/live Job created for this launch; terminating it
+    // closes any descendants that could still hold capture pipe write ends.
+    let job_error = (unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0)
+        .then(io::Error::last_os_error);
     // SAFETY: This is the exact newly created root, retained against PID reuse.
+    // Terminate it directly as well in case PSEC brokered creation outside JOB_LIST.
     let terminated = unsafe { TerminateProcess(process.as_raw_handle(), 1) };
     let remaining = Duration::from_secs(10).saturating_sub(started.elapsed());
     let milliseconds = u32::try_from(remaining.as_millis())
@@ -1470,6 +1485,9 @@ fn terminate_failed_start(
                 "failed worker capture cleanup timed out",
             ));
         }
+    }
+    if let Some(error) = job_error {
+        return Err(error);
     }
     Ok(())
 }
@@ -1789,10 +1807,11 @@ mod pipe_tests {
 }
 
 #[cfg(feature = "containment")]
-fn standard_streams(
-    spec: &LaunchSpec<'_>,
+fn standard_streams<'a>(
+    spec: &LaunchSpec<'a>,
     pipes: PipeMode,
     bounded_logs: bool,
+    guard: &mut cleanup::CreatedOutputs<'a>,
 ) -> io::Result<([OwnedHandle; 3], Option<output::PendingCaptures>)> {
     match pipes {
         PipeMode::BinaryStdio { input, output } => {
@@ -1807,7 +1826,7 @@ fn standard_streams(
             return Ok(([input, output, error], None));
         }
         PipeMode::BrokerStdio { input, output } => {
-            let (error, captures) = output::prepare_stderr(spec.stdout, spec.stderr)?;
+            let (error, captures) = output::prepare_stderr(spec.stdout, spec.stderr, guard)?;
             return Ok(([input, output, error], Some(captures)));
         }
         PipeMode::None => {}
@@ -1819,34 +1838,32 @@ fn standard_streams(
         OPEN_EXISTING,
     )?;
     if bounded_logs {
-        let ([output, error], captures) = output::prepare(spec.stdout, spec.stderr)?;
+        let ([output, error], captures) = output::prepare(spec.stdout, spec.stderr, guard)?;
         return Ok(([input, output, error], Some(captures)));
     }
-    Ok((
-        [
-            input,
-            standard_file(
-                spec.stdout.as_os_str(),
-                GENERIC_WRITE,
-                FILE_SHARE_READ,
-                CREATE_NEW,
-            )?,
-            standard_file(
-                spec.stderr.as_os_str(),
-                GENERIC_WRITE,
-                FILE_SHARE_READ,
-                CREATE_NEW,
-            )?,
-        ],
-        None,
-    ))
+    let stdout = standard_file(
+        spec.stdout.as_os_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        CREATE_NEW,
+    )?;
+    guard.record(spec.stdout);
+    let stderr = standard_file(
+        spec.stderr.as_os_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        CREATE_NEW,
+    )?;
+    guard.record(spec.stderr);
+    Ok(([input, stdout, stderr], None))
 }
 
 #[cfg(not(feature = "containment"))]
-fn standard_streams(
-    spec: &LaunchSpec<'_>,
+fn standard_streams<'a>(
+    spec: &LaunchSpec<'a>,
     pipes: PipeMode,
     bounded_logs: bool,
+    guard: &mut cleanup::CreatedOutputs<'a>,
 ) -> io::Result<[OwnedHandle; 3]> {
     let _ = bounded_logs;
     match pipes {
@@ -1858,21 +1875,21 @@ fn standard_streams(
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         OPEN_EXISTING,
     )?;
-    Ok([
-        input,
-        standard_file(
-            spec.stdout.as_os_str(),
-            GENERIC_WRITE,
-            FILE_SHARE_READ,
-            CREATE_NEW,
-        )?,
-        standard_file(
-            spec.stderr.as_os_str(),
-            GENERIC_WRITE,
-            FILE_SHARE_READ,
-            CREATE_NEW,
-        )?,
-    ])
+    let stdout = standard_file(
+        spec.stdout.as_os_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        CREATE_NEW,
+    )?;
+    guard.record(spec.stdout);
+    let stderr = standard_file(
+        spec.stderr.as_os_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        CREATE_NEW,
+    )?;
+    guard.record(spec.stderr);
+    Ok([input, stdout, stderr])
 }
 
 fn launch_job(spec: &LaunchSpec<'_>) -> io::Result<OwnedHandle> {
@@ -2150,7 +2167,7 @@ mod section_tests {
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GetHandleInformation};
+    use windows_sys::Win32::Foundation::GetHandleInformation;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
     use windows_sys::Win32::System::Memory::{
         FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,

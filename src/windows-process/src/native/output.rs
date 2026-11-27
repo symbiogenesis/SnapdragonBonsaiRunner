@@ -64,18 +64,20 @@ struct Capture {
 
 pub(super) struct Captures(Vec<Capture>);
 
-pub(super) fn prepare(
-    stdout: &Path,
-    stderr: &Path,
+pub(super) fn prepare<'a>(
+    stdout: &'a Path,
+    stderr: &'a Path,
+    guard: &mut super::cleanup::CreatedOutputs<'a>,
 ) -> io::Result<([OwnedHandle; 2], PendingCaptures)> {
-    let (output, stdout) = pending(stdout, "stdout")?;
-    let (error, stderr) = pending(stderr, "stderr")?;
+    let (output, stdout) = pending(stdout, "stdout", guard)?;
+    let (error, stderr) = pending(stderr, "stderr", guard)?;
     Ok(([output, error], PendingCaptures(vec![stdout, stderr])))
 }
 
-pub(super) fn prepare_stderr(
-    stdout: &Path,
-    stderr: &Path,
+pub(super) fn prepare_stderr<'a>(
+    stdout: &'a Path,
+    stderr: &'a Path,
+    guard: &mut super::cleanup::CreatedOutputs<'a>,
 ) -> io::Result<(OwnedHandle, PendingCaptures)> {
     // Keep a 0-byte stdout sentinel on disk while protocol traffic uses pipes.
     drop(
@@ -86,17 +88,23 @@ pub(super) fn prepare_stderr(
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(stdout)?,
     );
-    let (error, stderr) = pending(stderr, "stderr")?;
+    guard.record(stdout);
+    let (error, stderr) = pending(stderr, "stderr", guard)?;
     Ok((error, PendingCaptures(vec![stderr])))
 }
 
-fn pending(path: &Path, label: &'static str) -> io::Result<(OwnedHandle, PendingCapture)> {
+fn pending<'a>(
+    path: &'a Path,
+    label: &'static str,
+    guard: &mut super::cleanup::CreatedOutputs<'a>,
+) -> io::Result<(OwnedHandle, PendingCapture)> {
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
+    guard.record(path);
     let (reader, writer) = anonymous_pipe(false)?;
     Ok((
         writer,
