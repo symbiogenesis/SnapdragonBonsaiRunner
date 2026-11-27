@@ -83,6 +83,7 @@ impl WeightBytes {
 pub struct Projection {
     input: usize,
     output: usize,
+    f16_rounded: bool,
     data: Storage,
 }
 
@@ -104,9 +105,57 @@ impl Projection {
         let Storage::Float(values) = &mut self.data else {
             return Err(invalid());
         };
-        for value in values {
-            *value = binary16_operand(*value)?;
+        if self.f16_rounded {
+            return Ok(());
         }
+        let round_chunk = |chunk: &mut [f32]| -> io::Result<()> {
+            let mut half = [0_u16; 1024];
+            let half_slice = &mut half[..chunk.len()];
+            if !packed::narrow_f32_to_f16_slice(chunk, half_slice) {
+                return Err(invalid());
+            }
+            packed::widen_f16_slice(half_slice, chunk);
+            Ok(())
+        };
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .clamp(1, threads::MAX_WORKERS);
+        if values.len() < 4096 || workers <= 1 {
+            for chunk in values.chunks_mut(1024) {
+                round_chunk(chunk)?;
+            }
+        } else {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let ok = AtomicBool::new(true);
+            let blocks_per_worker = values.len().div_ceil(1024).div_ceil(workers).max(1);
+            let worker_len = blocks_per_worker * 1024;
+            let round_worker = |sub: &mut [f32]| {
+                for chunk in sub.chunks_mut(1024) {
+                    if !ok.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if round_chunk(chunk).is_err() {
+                        ok.store(false, Ordering::Release);
+                        return;
+                    }
+                }
+            };
+            std::thread::scope(|scope| {
+                let mut chunks = values.chunks_mut(worker_len);
+                let Some(first) = chunks.next() else {
+                    return;
+                };
+                for sub in chunks {
+                    scope.spawn(move || round_worker(sub));
+                }
+                round_worker(first);
+            });
+            if !ok.load(Ordering::Acquire) {
+                return Err(invalid());
+            }
+        }
+        self.f16_rounded = true;
         Ok(())
     }
 
@@ -145,7 +194,9 @@ impl Projection {
         for (value, pair) in values[offset..].iter_mut().zip(tail.as_chunks::<2>().0) {
             *value = half(u16::from_le_bytes(*pair))?;
         }
-        Self::f32(input, output, values)
+        let mut f16_proj = Self::f32(input, output, values)?;
+        f16_proj.f16_rounded = true;
+        Ok(f16_proj)
     }
     /// Admit finite F32 values in `[output, input]` row order.
     ///
@@ -160,8 +211,15 @@ impl Projection {
         Ok(Self {
             input,
             output,
+            f16_rounded: false,
             data: Storage::Float(data),
         })
+    }
+
+    pub(super) fn f16_decoded(input: usize, output: usize, data: Vec<f32>) -> io::Result<Self> {
+        let mut proj = Self::f32(input, output, data)?;
+        proj.f16_rounded = true;
+        Ok(proj)
     }
 
     fn admit_quant<const BLOCK_BYTES: usize>(
@@ -181,6 +239,7 @@ impl Projection {
         Ok(Self {
             input,
             output,
+            f16_rounded: false,
             data: wrap(data),
         })
     }
@@ -702,6 +761,7 @@ fn cache_value(value: f32, precision: CachePrecision) -> io::Result<f32> {
 
 // Shared exact nearest-even conversion for F16 cache and convolution operands.
 // Reject finite values that would narrow to infinity before graph publication.
+#[cfg(test)]
 pub(super) fn binary16_operand(value: f32) -> io::Result<f32> {
     let bits = packed::checked_float_to_half(value).ok_or_else(invalid)?;
     Ok(bonsai_ternary::half_to_float(bits))

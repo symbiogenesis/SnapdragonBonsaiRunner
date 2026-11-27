@@ -121,12 +121,23 @@ pub(super) fn load_mapped(
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<(Encoder, Frontend)> {
     use super::decoder::{MappedSliceLoader, load_mapped_blocks};
+    use crate::decoder::Projection;
 
-    let mut cursor = io::Cursor::new(mapping.as_slice());
-    let mut loader = Loader::new_mapped(index, &mut cursor, mapping);
-    let (c, layers, frontend, convolutions) = load_encoder_prefix(index, &mut loader, cancel)?;
+    if cancel() {
+        return Err(io::Error::from(io::ErrorKind::Interrupted));
+    }
+    let (c, layers) = validate_encoder_geometry(index)?;
     let slice_loader = MappedSliceLoader::new(index, mapping);
-    let mut remaining = loader.remaining;
+    let mut remaining: u64 = 8 * 1024 * 1024 * 1024;
+    for opt in ["frontend.window", "frontend.mel_filterbank"] {
+        if index.tensors.contains_key(opt) {
+            slice_loader.reserve_tensor(&mut remaining, opt)?;
+        }
+    }
+    for conv_idx in 0..3 {
+        slice_loader.reserve_tensor(&mut remaining, &format!("enc.conv.{conv_idx}.weight"))?;
+        slice_loader.reserve_tensor(&mut remaining, &format!("enc.conv.{conv_idx}.bias"))?;
+    }
     for layer in 0..layers {
         let prefix = format!("enc.blocks.{layer}.");
         for suffix in [
@@ -150,28 +161,118 @@ pub(super) fn load_mapped(
             slice_loader.reserve_tensor(&mut remaining, &(prefix.clone() + suffix))?;
         }
     }
-    loader.remaining = remaining;
-    let blocks = load_mapped_blocks(layers, cancel, |layer| {
-        let mut s = &slice_loader;
-        load_encoder_block(&mut s, layer)
-    })?;
-    let mut tail_loader = CancellableLoader::new(&mut loader, cancel);
+    for tail_name in [
+        "enc.conv_out.weight",
+        "enc.ln_post.weight",
+        "enc.ln_post.bias",
+        "enc.proj1.weight",
+        "enc.proj1.bias",
+        "enc.proj2.weight",
+        "enc.proj2.bias",
+    ] {
+        slice_loader.reserve_tensor(&mut remaining, tail_name)?;
+    }
+
+    let load_conv = |conv_idx: usize| -> io::Result<Linear> {
+        Ok(Linear {
+            weights: slice_loader.convolution(&format!("enc.conv.{conv_idx}.weight"))?,
+            bias: slice_loader.vector(&format!("enc.conv.{conv_idx}.bias"))?,
+        })
+    };
+    let load_frontend = || -> io::Result<Frontend> {
+        let window = slice_loader.optional_vector("frontend.window")?;
+        let bank = slice_loader.optional_vector("frontend.mel_filterbank")?;
+        Frontend::from_checkpoint(window.as_deref(), bank.as_deref())
+    };
+    let load_convolutions = || -> io::Result<[Linear; 3]> {
+        let (c0_res, c1_res, c2_res) = std::thread::scope(|scope| {
+            let h1 = scope.spawn(|| load_conv(1));
+            let h2 = scope.spawn(|| load_conv(2));
+            let c0_res = load_conv(0);
+            let c1_res = h1.join().unwrap_or_else(|_| {
+                Err(io::Error::other("ASR encoder conv intake thread panicked."))
+            });
+            let c2_res = h2.join().unwrap_or_else(|_| {
+                Err(io::Error::other("ASR encoder conv intake thread panicked."))
+            });
+            (c0_res, c1_res, c2_res)
+        });
+        Ok([c0_res?, c1_res?, c2_res?])
+    };
+    let load_tail = || -> io::Result<(Projection, Norm, Linear, Linear)> {
+        let (conv_out_res, ln_post_res, proj1_res, proj2_res) = std::thread::scope(|scope| {
+            let conv_handle = scope.spawn(|| slice_loader.projection("enc.conv_out.weight"));
+            let ln_handle = scope.spawn(|| {
+                let mut n_loader = &slice_loader;
+                norm(&mut n_loader, "enc.ln_post")
+            });
+            let p1_handle = scope.spawn(|| {
+                let mut p1_loader = &slice_loader;
+                linear(&mut p1_loader, "enc.proj1")
+            });
+            let mut p2_loader = &slice_loader;
+            let proj2_res = linear(&mut p2_loader, "enc.proj2");
+            let conv_out_res = conv_handle.join().unwrap_or_else(|_| {
+                Err(io::Error::other(
+                    "ASR encoder conv_out intake thread panicked.",
+                ))
+            });
+            let ln_post_res = ln_handle.join().unwrap_or_else(|_| {
+                Err(io::Error::other(
+                    "ASR encoder ln_post intake thread panicked.",
+                ))
+            });
+            let proj1_res = p1_handle.join().unwrap_or_else(|_| {
+                Err(io::Error::other("ASR encoder proj1 intake thread panicked."))
+            });
+            (conv_out_res, ln_post_res, proj1_res, proj2_res)
+        });
+        Ok((conv_out_res?, ln_post_res?, proj1_res?, proj2_res?))
+    };
+
+    let (frontend_res, conv_res, blocks_res, tail_res) = std::thread::scope(|scope| {
+        let frontend_handle = scope.spawn(load_frontend);
+        let conv_handle = scope.spawn(load_convolutions);
+        let tail_handle = scope.spawn(load_tail);
+        let blocks_res = load_mapped_blocks(layers, &mut || false, |layer| {
+            let mut s = &slice_loader;
+            load_encoder_block(&mut s, layer)
+        });
+        let frontend_res = frontend_handle.join().unwrap_or_else(|_| {
+            Err(io::Error::other(
+                "ASR encoder frontend intake thread panicked.",
+            ))
+        });
+        let conv_res = conv_handle.join().unwrap_or_else(|_| {
+            Err(io::Error::other(
+                "ASR encoder convolution intake thread panicked.",
+            ))
+        });
+        let tail_res = tail_handle.join().unwrap_or_else(|_| {
+            Err(io::Error::other("ASR encoder tail intake thread panicked."))
+        });
+        (frontend_res, conv_res, blocks_res, tail_res)
+    });
+
+    if cancel() {
+        return Err(io::Error::from(io::ErrorKind::Interrupted));
+    }
+    let frontend = frontend_res?;
+    let convolutions = conv_res?;
+    let blocks = blocks_res?;
+    let (convolution_out, output_norm, output_in, output_out) = tail_res?;
     let weights = Weights {
         convolutions,
-        convolution_out: tail_loader.projection("enc.conv_out.weight")?,
+        convolution_out,
         blocks,
-        output_norm: norm(&mut tail_loader, "enc.ln_post")?,
-        output_in: linear(&mut tail_loader, "enc.proj1")?,
-        output_out: linear(&mut tail_loader, "enc.proj2")?,
+        output_norm,
+        output_in,
+        output_out,
     };
     Ok((Encoder::new(c, weights)?, frontend))
 }
 
-fn load_encoder_prefix<R: Read + Seek>(
-    index: &Index,
-    loader: &mut Loader<'_, R>,
-    cancel: &mut impl FnMut() -> bool,
-) -> io::Result<(Config, usize, Frontend, [Linear; 3])> {
+fn validate_encoder_geometry(index: &Index) -> io::Result<(Config, usize)> {
     frontend_metadata(index)?;
     let count = |suffix| index.count("stt.qwen3_asr.encoder", suffix);
     let c = Config {
@@ -200,6 +301,15 @@ fn load_encoder_prefix<R: Read + Seek>(
     {
         return Err(invalid());
     }
+    Ok((c, layers))
+}
+
+fn load_encoder_prefix<R: Read + Seek>(
+    index: &Index,
+    loader: &mut Loader<'_, R>,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<(Config, usize, Frontend, [Linear; 3])> {
+    let (c, layers) = validate_encoder_geometry(index)?;
     let window = loader.optional_vector("frontend.window", cancel)?;
     let bank = loader.optional_vector("frontend.mel_filterbank", cancel)?;
     let frontend = Frontend::from_checkpoint(window.as_deref(), bank.as_deref())?;

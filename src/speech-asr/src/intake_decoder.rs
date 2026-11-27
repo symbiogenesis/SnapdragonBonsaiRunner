@@ -324,7 +324,7 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
         let (input, output, kind) = projection_dims(self.index, name)?;
         match kind {
             0 => Projection::f32(input, output, self.vector(name, cancel)?),
-            1 => Projection::f32(input, output, self.f16_vector(name, cancel)?),
+            1 => Projection::f16_decoded(input, output, self.f16_vector(name, cancel)?),
             8 => Projection::q8_bytes(input, output, self.projection_bytes(name, cancel)?.1),
             12 => Projection::q4_k_bytes(input, output, self.projection_bytes(name, cancel)?.1),
             14 => Projection::q6_k_bytes(input, output, self.projection_bytes(name, cancel)?.1),
@@ -337,27 +337,32 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
         name: &str,
         cancel: &mut impl FnMut() -> bool,
     ) -> io::Result<Projection> {
-        let tensor = self.index.tensors.get(name).ok_or_else(invalid)?;
-        if tensor.shape.first() != Some(&3)
-            || tensor.shape.get(1) != Some(&3)
-            || tensor.shape.iter().skip(4).any(|axis| *axis != 1)
-        {
-            return Err(invalid());
-        }
-        let input = usize::try_from(
-            9_u64
-                .checked_mul(tensor.shape.get(2).copied().unwrap_or(1))
-                .ok_or_else(invalid)?,
-        )
-        .map_err(|_| invalid())?;
-        let output =
-            usize::try_from(tensor.shape.get(3).copied().unwrap_or(1)).map_err(|_| invalid())?;
-        match tensor.kind {
+        let (input, output, kind) = convolution_dims(self.index, name)?;
+        match kind {
             0 => Projection::f32(input, output, self.vector(name, cancel)?),
-            1 => Projection::f32(input, output, self.f16_vector(name, cancel)?),
+            1 => Projection::f16_decoded(input, output, self.f16_vector(name, cancel)?),
             _ => Err(invalid()),
         }
     }
+}
+
+fn convolution_dims(index: &Index, name: &str) -> io::Result<(usize, usize, u32)> {
+    let tensor = index.tensors.get(name).ok_or_else(invalid)?;
+    if tensor.shape.first() != Some(&3)
+        || tensor.shape.get(1) != Some(&3)
+        || tensor.shape.iter().skip(4).any(|axis| *axis != 1)
+    {
+        return Err(invalid());
+    }
+    let input = usize::try_from(
+        9_u64
+            .checked_mul(tensor.shape.get(2).copied().unwrap_or(1))
+            .ok_or_else(invalid)?,
+    )
+    .map_err(|_| invalid())?;
+    let output =
+        usize::try_from(tensor.shape.get(3).copied().unwrap_or(1)).map_err(|_| invalid())?;
+    Ok((input, output, tensor.kind))
 }
 
 fn decode_f16(bits: u16) -> io::Result<f32> {
@@ -430,6 +435,23 @@ impl<'a> MappedSliceLoader<'a> {
         Ok(values)
     }
 
+    pub(super) fn optional_vector(&self, name: &str) -> io::Result<Option<Vec<f32>>> {
+        if self.index.tensors.contains_key(name) {
+            self.vector(name).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) fn convolution(&self, name: &str) -> io::Result<Projection> {
+        let (input, output, kind) = convolution_dims(self.index, name)?;
+        match kind {
+            0 => Projection::f32(input, output, self.vector(name)?),
+            1 => Projection::f16_decoded(input, output, self.f16_vector(name)?),
+            _ => Err(invalid()),
+        }
+    }
+
     pub(super) fn projection(&self, name: &str) -> io::Result<Projection> {
         let (input, output, kind) = projection_dims(self.index, name)?;
         let tensor = self.index.tensors.get(name).ok_or_else(invalid)?;
@@ -441,7 +463,7 @@ impl<'a> MappedSliceLoader<'a> {
         };
         match kind {
             0 => Projection::f32(input, output, self.vector(name)?),
-            1 => Projection::f32(input, output, self.f16_vector(name)?),
+            1 => Projection::f16_decoded(input, output, self.f16_vector(name)?),
             8 => Projection::q8_bytes(input, output, mapped_bytes()),
             12 => Projection::q4_k_bytes(input, output, mapped_bytes()),
             14 => Projection::q6_k_bytes(input, output, mapped_bytes()),

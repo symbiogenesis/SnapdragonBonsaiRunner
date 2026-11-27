@@ -270,26 +270,30 @@ pub(super) fn load_artifacts_mapped(
     let mut index = read_index(&mut cursor, length, cancel)?;
     model::validate(&index)?;
     check_cancel(cancel)?;
-    let (tokenizer, prompt_tokens) = load_tokenizer(&mut index, cancel)?;
+    let (tokens, merges, eos) = take_tokenizer_inputs(&mut index)?;
     check_cancel(cancel)?;
-    let (encoder_res, decoder_res) = std::thread::scope(|scope| {
+    let (tokenizer_res, encoder_res, decoder_res) = std::thread::scope(|scope| {
+        let tokenizer_handle =
+            scope.spawn(|| crate::tokenizer::Tokenizer::from_tables(tokens, merges, eos));
         let encoder_handle = scope.spawn(|| encoder::load_mapped(&index, mapping, &mut || false));
         let decoder_res = decoder::load_mapped(&index, mapping, precision, &mut || false);
+        let tokenizer_res = tokenizer_handle
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("ASR tokenizer intake thread panicked.")));
         let encoder_res = encoder_handle
             .join()
             .unwrap_or_else(|_| Err(io::Error::other("ASR encoder intake thread panicked.")));
-        (encoder_res, decoder_res)
+        (tokenizer_res, encoder_res, decoder_res)
     });
     check_cancel(cancel)?;
+    let tokenizer = tokenizer_res?;
     let (encoder, frontend) = encoder_res?;
     let decoder = decoder_res?;
+    let prompt_tokens = model::prompt_tokens(&index, &tokenizer)?;
     Ok((tokenizer, prompt_tokens, encoder, frontend, decoder))
 }
 
-fn load_tokenizer(
-    index: &mut Index,
-    cancel: &mut impl FnMut() -> bool,
-) -> io::Result<(crate::tokenizer::Tokenizer, crate::protocol::PromptTokens)> {
+fn take_tokenizer_inputs(index: &mut Index) -> io::Result<(Vec<String>, Vec<String>, u32)> {
     if let Some(Value::Text(pre)) = index.metadata.get("tokenizer.ggml.pre")
         && !matches!(pre.as_str(), "" | "qwen2")
     {
@@ -306,11 +310,15 @@ fn load_tokenizer(
     else {
         return Err(invalid());
     };
-    let tokenizer = crate::tokenizer::Tokenizer::from_tables(
-        tokens,
-        merges,
-        u32::try_from(eos).map_err(|_| invalid())?,
-    )?;
+    Ok((tokens, merges, u32::try_from(eos).map_err(|_| invalid())?))
+}
+
+fn load_tokenizer(
+    index: &mut Index,
+    cancel: &mut impl FnMut() -> bool,
+) -> io::Result<(crate::tokenizer::Tokenizer, crate::protocol::PromptTokens)> {
+    let (tokens, merges, eos) = take_tokenizer_inputs(index)?;
+    let tokenizer = crate::tokenizer::Tokenizer::from_tables(tokens, merges, eos)?;
     check_cancel(cancel)?;
     let prompt = model::prompt_tokens(index, &tokenizer)?;
     Ok((tokenizer, prompt))

@@ -13,8 +13,11 @@
 )]
 
 use crate::{packed, row_workers, threads};
-use fearless_simd::{dispatch, f32x4, prelude::*};
-use std::io;
+use fearless_simd::{dispatch, f32x4, f64x2, prelude::*};
+use std::{
+    io,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 /// Required mono PCM sample rate.
 pub const SAMPLE_RATE: usize = 16_000;
@@ -271,17 +274,53 @@ impl Frontend {
         ensure_zeroed(&mut scratch.frame_major, frame_elems)?;
         let frame_major = &mut scratch.frame_major[..frame_elems];
         let level = packed::simd_level();
+        let global_max_bits = AtomicU64::new(f64::NEG_INFINITY.to_bits());
+        let has_nonfinite = AtomicBool::new(false);
         row_workers::run_aligned(frame_major, threads, 4 * MEL_BINS, &|elem_off, slice| {
             let start_frame = elem_off / MEL_BINS;
-            dispatch!(
+            let (local_max, slice_nonfinite) = dispatch!(
                 level,
                 simd => compute_frame_slice_simd(simd, self, padded, start_frame, slice)
             );
+            if slice_nonfinite {
+                has_nonfinite.store(true, Ordering::Relaxed);
+            } else {
+                atomic_max_f64(&global_max_bits, local_max);
+            }
         });
+        if has_nonfinite.load(Ordering::Relaxed) {
+            return Err(invalid());
+        }
         let mut values = zeroes(MEL_BINS * frames)?;
         packed::transpose_f32_matrix(frame_major, frames, MEL_BINS, threads, &mut values);
-        normalize(&mut values, &mut is_cancelled)?;
+        let maximum = f64::from_bits(global_max_bits.load(Ordering::Relaxed));
+        let floor = maximum - 8.0;
+        row_workers::run_aligned(&mut values, threads, 4096, &|_elem_off, chunk| {
+            dispatch!(level, simd => normalize_apply_simd(simd, chunk, floor));
+        });
+        cancelled(&mut is_cancelled)?;
         Ok(MelSpectrogram { frames, values })
+    }
+}
+
+fn atomic_max_f64(slot: &AtomicU64, candidate: f64) {
+    let mut current_bits = slot.load(Ordering::Relaxed);
+    loop {
+        let current = f64::from_bits(current_bits);
+        let updated = current.max(candidate);
+        let updated_bits = updated.to_bits();
+        if updated_bits == current_bits {
+            return;
+        }
+        match slot.compare_exchange_weak(
+            current_bits,
+            updated_bits,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current_bits = observed,
+        }
     }
 }
 
@@ -303,7 +342,9 @@ fn compute_frame_slice_simd<S: Simd>(
     padded: &[f32],
     start_frame: usize,
     slice: &mut [f32],
-) {
+) -> (f64, bool) {
+    let mut local_max = f64::NEG_INFINITY;
+    let mut nonfinite = false;
     let quad_stride = 4 * MEL_BINS;
     let quad_count = slice.len() / quad_stride;
     if quad_count > 0 {
@@ -314,7 +355,7 @@ fn compute_frame_slice_simd<S: Simd>(
             .chunks_exact_mut(quad_stride)
             .enumerate()
         {
-            compute_four_frames_simd(
+            let (quad_max, quad_nf) = compute_four_frames_simd(
                 simd,
                 frontend,
                 padded,
@@ -324,6 +365,8 @@ fn compute_frame_slice_simd<S: Simd>(
                 &mut power4,
                 group_out,
             );
+            local_max = local_max.max(quad_max);
+            nonfinite |= quad_nf;
         }
     }
     let tail_slice = &mut slice[quad_count * quad_stride..];
@@ -333,7 +376,7 @@ fn compute_frame_slice_simd<S: Simd>(
         let mut power = [0.0_f32; FREQUENCIES];
         let tail_start_frame = start_frame + quad_count * 4;
         for (tail_idx, frame_out) in tail_slice.chunks_exact_mut(MEL_BINS).enumerate() {
-            compute_single_frame(
+            let (frame_max, frame_nf) = compute_single_frame(
                 frontend,
                 padded,
                 tail_start_frame + tail_idx,
@@ -342,8 +385,11 @@ fn compute_frame_slice_simd<S: Simd>(
                 &mut power,
                 frame_out,
             );
+            local_max = local_max.max(frame_max);
+            nonfinite |= frame_nf;
         }
     }
+    (local_max, nonfinite)
 }
 
 #[expect(
@@ -364,7 +410,7 @@ fn compute_four_frames_simd<S: Simd>(
     output: &mut [f32x4<S>; 8 * FFT_SIZE],
     power4: &mut [[f32; 4]; FREQUENCIES],
     group_out: &mut [f32],
-) {
+) -> (f64, bool) {
     let s0 = base_frame * HOP_LENGTH;
     let s1 = (base_frame + 1) * HOP_LENGTH;
     let s2 = (base_frame + 2) * HOP_LENGTH;
@@ -388,45 +434,63 @@ fn compute_four_frames_simd<S: Simd>(
         &frontend.cos,
         &frontend.sin,
         output,
+        false,
     );
     for (index, slot) in power4.iter_mut().enumerate() {
         let real = output[2 * index];
         let imaginary = output[2 * index + 1];
         *slot = (real * real + imaginary * imaginary).into();
     }
+    let mut local_max = f64::NEG_INFINITY;
+    let mut nonfinite = false;
     for mel in 0..MEL_BINS {
         let bank = &frontend.filterbank[mel * FREQUENCIES..(mel + 1) * FREQUENCIES];
         let (mut bin, end) = frontend.extents[mel];
-        let mut sum = [0.0_f64; 4];
+        let mut sum_lo = f64x2::splat(simd, 0.0);
+        let mut sum_hi = f64x2::splat(simd, 0.0);
         while bin < end && bin < FREQUENCIES - 3 {
-            let b0 = f64::from(bank[bin]);
-            let b1 = f64::from(bank[bin + 1]);
-            let b2 = f64::from(bank[bin + 2]);
-            let b3 = f64::from(bank[bin + 3]);
+            let b0 = f64x2::splat(simd, f64::from(bank[bin]));
+            let b1 = f64x2::splat(simd, f64::from(bank[bin + 1]));
+            let b2 = f64x2::splat(simd, f64::from(bank[bin + 2]));
+            let b3 = f64x2::splat(simd, f64::from(bank[bin + 3]));
             let p0 = power4[bin];
             let p1 = power4[bin + 1];
             let p2 = power4[bin + 2];
             let p3 = power4[bin + 3];
-            for lane in 0..4 {
-                sum[lane] += b0 * f64::from(p0[lane])
-                    + b1 * f64::from(p1[lane])
-                    + b2 * f64::from(p2[lane])
-                    + b3 * f64::from(p3[lane]);
-            }
+            let p0_lo = f64x2::from_slice(simd, &[f64::from(p0[0]), f64::from(p0[1])]);
+            let p0_hi = f64x2::from_slice(simd, &[f64::from(p0[2]), f64::from(p0[3])]);
+            let p1_lo = f64x2::from_slice(simd, &[f64::from(p1[0]), f64::from(p1[1])]);
+            let p1_hi = f64x2::from_slice(simd, &[f64::from(p1[2]), f64::from(p1[3])]);
+            let p2_lo = f64x2::from_slice(simd, &[f64::from(p2[0]), f64::from(p2[1])]);
+            let p2_hi = f64x2::from_slice(simd, &[f64::from(p2[2]), f64::from(p2[3])]);
+            let p3_lo = f64x2::from_slice(simd, &[f64::from(p3[0]), f64::from(p3[1])]);
+            let p3_hi = f64x2::from_slice(simd, &[f64::from(p3[2]), f64::from(p3[3])]);
+            sum_lo = sum_lo + (((b0 * p0_lo + b1 * p1_lo) + b2 * p2_lo) + b3 * p3_lo);
+            sum_hi = sum_hi + (((b0 * p0_hi + b1 * p1_hi) + b2 * p2_hi) + b3 * p3_hi);
             bin += 4;
         }
         while bin < end {
-            let b = f64::from(bank[bin]);
+            let b = f64x2::splat(simd, f64::from(bank[bin]));
             let p = power4[bin];
-            for lane in 0..4 {
-                sum[lane] += b * f64::from(p[lane]);
-            }
+            let p_lo = f64x2::from_slice(simd, &[f64::from(p[0]), f64::from(p[1])]);
+            let p_hi = f64x2::from_slice(simd, &[f64::from(p[2]), f64::from(p[3])]);
+            sum_lo = sum_lo + b * p_lo;
+            sum_hi = sum_hi + b * p_hi;
             bin += 1;
         }
-        for lane in 0..4 {
-            group_out[lane * MEL_BINS + mel] = rounded(sum[lane].max(1.0e-10).log10());
+        let [s0, s1]: [f64; 2] = sum_lo.into();
+        let [s2, s3]: [f64; 2] = sum_hi.into();
+        for (lane, s) in [s0, s1, s2, s3].into_iter().enumerate() {
+            let val = rounded(s.max(1.0e-10).log10());
+            if !val.is_finite() {
+                nonfinite = true;
+            } else {
+                local_max = local_max.max(f64::from(val));
+            }
+            group_out[lane * MEL_BINS + mel] = val;
         }
     }
+    (local_max, nonfinite)
 }
 
 fn compute_single_frame(
@@ -437,17 +501,27 @@ fn compute_single_frame(
     output: &mut [f32; 8 * FFT_SIZE],
     power: &mut [f32; FREQUENCIES],
     frame_out: &mut [f32],
-) {
+) -> (f64, bool) {
     let start = frame * HOP_LENGTH;
     for (index, sample) in input[..FFT_SIZE].iter_mut().enumerate() {
         *sample = padded[start + index] * frontend.window[index];
     }
-    mixed_fft(input, FFT_SIZE, &frontend.cos, &frontend.sin, output);
+    mixed_fft_lane(
+        ScalarLane,
+        input,
+        FFT_SIZE,
+        &frontend.cos,
+        &frontend.sin,
+        output,
+        false,
+    );
     for (index, value) in power.iter_mut().enumerate() {
         let real = output[2 * index];
         let imaginary = output[2 * index + 1];
         *value = real * real + imaginary * imaginary;
     }
+    let mut local_max = f64::NEG_INFINITY;
+    let mut nonfinite = false;
     for mel in 0..MEL_BINS {
         let bank = &frontend.filterbank[mel * FREQUENCIES..(mel + 1) * FREQUENCIES];
         let (mut bin, end) = frontend.extents[mel];
@@ -463,8 +537,15 @@ fn compute_single_frame(
             sum += f64::from(bank[bin]) * f64::from(power[bin]);
             bin += 1;
         }
-        frame_out[mel] = rounded(sum.max(1.0e-10).log10());
+        let val = rounded(sum.max(1.0e-10).log10());
+        if !val.is_finite() {
+            nonfinite = true;
+        } else {
+            local_max = local_max.max(f64::from(val));
+        }
+        frame_out[mel] = val;
     }
+    (local_max, nonfinite)
 }
 
 #[derive(Clone, Copy)]
@@ -545,6 +626,7 @@ fn fft5_real<L: FftLane>(
 
 // Exact mixed-radix split, odd-leaf DFT and butterfly order of the reviewed
 // fp32 frontend. Buffers follow its 2*N input / 8*N output scratch contract.
+#[cfg(test)]
 fn mixed_fft(
     input: &mut [f32],
     size: usize,
@@ -552,7 +634,7 @@ fn mixed_fft(
     sin: &[f32; FFT_SIZE],
     output: &mut [f32],
 ) {
-    mixed_fft_lane(ScalarLane, input, size, cos, sin, output);
+    mixed_fft_lane(ScalarLane, input, size, cos, sin, output, true);
 }
 
 #[expect(
@@ -567,6 +649,7 @@ fn mixed_fft_lane<L: FftLane>(
     cos: &[f32; FFT_SIZE],
     sin: &[f32; FFT_SIZE],
     output: &mut [L::Value],
+    full_spectrum: bool,
 ) {
     if size == 1 {
         output[0] = input[0];
@@ -578,12 +661,12 @@ fn mixed_fft_lane<L: FftLane>(
             input_scratch[index] = original[2 * index];
         }
         let (result, output_scratch) = output.split_at_mut(2 * size);
-        mixed_fft_lane(lane, input_scratch, half, cos, sin, output_scratch);
+        mixed_fft_lane(lane, input_scratch, half, cos, sin, output_scratch, true);
         for index in 0..half {
             input_scratch[index] = original[2 * index + 1];
         }
         let (even, odd_scratch) = output_scratch.split_at_mut(size);
-        mixed_fft_lane(lane, input_scratch, half, cos, sin, odd_scratch);
+        mixed_fft_lane(lane, input_scratch, half, cos, sin, odd_scratch, true);
         let step = FFT_SIZE / size;
         for bin in 0..half {
             let phase = bin * step;
@@ -597,8 +680,10 @@ fn mixed_fft_lane<L: FftLane>(
             let wi_real = wi * real;
             result[2 * bin] = even[2 * bin] + wr_real - wi_imag;
             result[2 * bin + 1] = even[2 * bin + 1] + wr_imag + wi_real;
-            result[2 * (bin + half)] = even[2 * bin] - wr_real + wi_imag;
-            result[2 * (bin + half) + 1] = even[2 * bin + 1] - wr_imag - wi_real;
+            if full_spectrum || bin + half < FREQUENCIES {
+                result[2 * (bin + half)] = even[2 * bin] - wr_real + wi_imag;
+                result[2 * (bin + half) + 1] = even[2 * bin + 1] - wr_imag - wi_real;
+            }
         }
     } else if size == 5 {
         let stride = FFT_SIZE / 5;
@@ -723,6 +808,28 @@ fn reflect_edges(padded: &mut [f32], samples: usize) {
     }
 }
 
+#[expect(
+    clippy::inline_always,
+    reason = "fearless_simd helper called within dispatch! target_feature boundary."
+)]
+#[inline(always)]
+fn normalize_apply_simd<S: Simd>(simd: S, values: &mut [f32], floor: f64) {
+    let floor_v = f64x2::splat(simd, floor);
+    let four_v = f64x2::splat(simd, 4.0);
+    let (chunks, tail) = values.as_chunks_mut::<2>();
+    for pair in chunks {
+        let x = f64x2::from_slice(simd, &[f64::from(pair[0]), f64::from(pair[1])]);
+        let res = (x.max(floor_v) + four_v) / four_v;
+        let [a, b]: [f64; 2] = res.into();
+        pair[0] = rounded(a);
+        pair[1] = rounded(b);
+    }
+    for value in tail {
+        *value = rounded((f64::from(*value).max(floor) + 4.0) / 4.0);
+    }
+}
+
+#[cfg(test)]
 fn normalize(values: &mut [f32], check: &mut impl FnMut() -> bool) -> io::Result<()> {
     let mut maximum = f64::NEG_INFINITY;
     for chunk in values.chunks(4096) {
@@ -735,11 +842,10 @@ fn normalize(values: &mut [f32], check: &mut impl FnMut() -> bool) -> io::Result
         }
     }
     let floor = maximum - 8.0;
+    let level = packed::simd_level();
     for chunk in values.chunks_mut(4096) {
         cancelled(check)?;
-        for value in chunk {
-            *value = rounded((f64::from(*value).max(floor) + 4.0) / 4.0);
-        }
+        dispatch!(level, simd => normalize_apply_simd(simd, chunk, floor));
     }
     cancelled(check)
 }

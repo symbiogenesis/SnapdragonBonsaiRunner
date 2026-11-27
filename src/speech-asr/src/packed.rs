@@ -3914,6 +3914,7 @@ pub(super) fn attend_head(
 
 /// Narrows finite `f32` to IEEE binary16 bits using round-ties-to-even, returning `None`
 /// when `value` is nonfinite or rounds to infinity (`|value| >= 65520`).
+#[cfg(test)]
 #[inline]
 pub(super) fn checked_float_to_half(value: f32) -> Option<u16> {
     bonsai_ternary::checked_float_to_half(value)
