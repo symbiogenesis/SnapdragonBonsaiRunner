@@ -1,12 +1,6 @@
 //! Immutable, digest-bound maintenance bootstrap publication.
 
-use std::{
-    collections::BTreeMap,
-    fs,
-    io::Read as _,
-    path::Path,
-    time::Duration,
-};
+use std::{collections::BTreeMap, fs, io::Read as _, path::Path, time::Duration};
 
 use serde_json::{Value, json};
 
@@ -99,7 +93,8 @@ pub(super) fn publish(target: &Path, working: &Path, tool: &Path) -> crate::Resu
             json!({"ToolPath": tool, "BootstrapPath": bootstrap, "ToolSha256": digest, "Version": version}),
         );
     }
-    crate::fs_guard::write_atomic_bytes(&receipt_path, &bytes).map_err(|error| error.to_string())?;
+    crate::fs_guard::write_atomic_bytes(&receipt_path, &bytes)
+        .map_err(|error| error.to_string())?;
     Ok(
         json!({"ToolPath": tool, "BootstrapPath": bootstrap, "ToolSha256": digest, "Version": version}),
     )

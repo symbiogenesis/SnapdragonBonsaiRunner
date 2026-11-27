@@ -379,9 +379,7 @@ fn execute(
         {
             return Err(io::Error::other("Update tool output exceeded its limit."));
         }
-        if let Some(code) = child
-            .wait_for_exit(remaining.min(Duration::from_millis(250)))?
-        {
+        if let Some(code) = child.wait_for_exit(remaining.min(Duration::from_millis(250)))? {
             break Ok(code);
         }
     })();

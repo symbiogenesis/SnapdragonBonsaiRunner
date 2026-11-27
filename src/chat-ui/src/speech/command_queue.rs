@@ -157,11 +157,7 @@ impl Queue {
 }
 
 impl Sender {
-    pub(super) fn send(
-        &self,
-        envelope: Envelope,
-        current: &AtomicU64,
-    ) -> Result<(), SendError> {
+    pub(super) fn send(&self, envelope: Envelope, current: &AtomicU64) -> Result<(), SendError> {
         #[cfg(test)]
         if let Some(observed) = &self.observed {
             return observed.send(envelope).map_err(|_| SendError::Disconnected);

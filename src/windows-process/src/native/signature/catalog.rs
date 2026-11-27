@@ -103,8 +103,9 @@ pub(super) fn verify(file: &File, filename: &[u16]) -> io::Result<crate::Authent
             Err(error) => last_error = Some(error),
         }
     }
-    Err(last_error
-        .unwrap_or_else(|| super::super::invalid("No installed catalog binds the retained file hash.")))
+    Err(last_error.unwrap_or_else(|| {
+        super::super::invalid("No installed catalog binds the retained file hash.")
+    }))
 }
 
 fn verify_catalog_member(

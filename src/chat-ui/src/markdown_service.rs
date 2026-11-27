@@ -357,7 +357,12 @@ impl Service {
     }
 
     /// Admits a bounded offline SVG rasterization request without blocking the event loop.
-    pub(crate) fn request_raster(&self, svg: Arc<str>, max_width: u32, max_height: u32) -> Admission {
+    pub(crate) fn request_raster(
+        &self,
+        svg: Arc<str>,
+        max_width: u32,
+        max_height: u32,
+    ) -> Admission {
         if svg.is_empty()
             || svg.len() > MAX_SVG_BYTES
             || !(1..=MAX_RASTER_DIMENSION).contains(&max_width)
@@ -487,11 +492,7 @@ const fn can_restart_worker(
     slot_closed: bool,
     restarts: usize,
 ) -> bool {
-    !protocol_error
-        && cleanup_ok
-        && !cancelled
-        && !slot_closed
-        && restarts < MAX_WORKER_RESTARTS
+    !protocol_error && cleanup_ok && !cancelled && !slot_closed && restarts < MAX_WORKER_RESTARTS
 }
 
 fn next_request(
@@ -564,7 +565,12 @@ fn supervise(shared: &Shared, requests: &Receiver<Request>, image: &Path) {
             .name("bonsai-markdown-pipe".to_owned())
             .spawn(move || protocol::exchange(input, output, &commands_rx, &events_tx));
         let Ok(reader) = reader else {
-            let _ = finish_prepared_cleanup(prepared, None, process.stop(CLEANUP_LIMIT).is_err(), shared);
+            let _ = finish_prepared_cleanup(
+                prepared,
+                None,
+                process.stop(CLEANUP_LIMIT).is_err(),
+                shared,
+            );
             break;
         };
         let startup_event = await_event(shared, &process, &events, startup);
@@ -817,7 +823,8 @@ mod tests {
     }
 
     #[test]
-    fn single_ticket_failure_and_bounded_restart_policy_keep_healthy_session_alive() -> io::Result<()> {
+    fn single_ticket_failure_and_bounded_restart_policy_keep_healthy_session_alive()
+    -> io::Result<()> {
         let context = egui::Context::default();
         let (service, _pending) = Service::inert(&context);
         let Admission::Admitted(first) = service.request(Arc::from("bad")) else {

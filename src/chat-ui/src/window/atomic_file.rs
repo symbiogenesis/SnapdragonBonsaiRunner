@@ -49,10 +49,7 @@ fn pending_path(path: &Path) -> io::Result<PathBuf> {
         .as_nanos();
     let sequence = PENDING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     // Append the unique suffix rather than replacing multi-dot target extensions.
-    Ok(path.with_added_extension(format!(
-        "{}.{stamp}.{sequence}.pending",
-        std::process::id()
-    )))
+    Ok(path.with_added_extension(format!("{}.{stamp}.{sequence}.pending", std::process::id())))
 }
 
 fn is_transient_windows_file_error(error: &io::Error) -> bool {
@@ -400,25 +397,26 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_err(io::Error::other)?
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "BonsaiAtomicRetry-{}-{stamp}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("BonsaiAtomicRetry-{}-{stamp}", std::process::id()));
         fs::create_dir(&dir)?;
         let existing = dir.join("collision.pending");
         fs::write(&existing, b"occupied")?;
         let next = dir.join("fresh.pending");
         let mut calls = 0_usize;
-        let (created_path, file) =
-            open_exclusive_temp(&dir.join("target.json"), |_| Ok(()), |_| {
+        let (created_path, file) = open_exclusive_temp(
+            &dir.join("target.json"),
+            |_| Ok(()),
+            |_| {
                 calls += 1;
                 Ok(if calls == 1 {
                     existing.clone()
                 } else {
                     next.clone()
                 })
-            })
-            .map_err(|err| err.error)?;
+            },
+        )
+        .map_err(|err| err.error)?;
         drop(file);
         assert_eq!(calls, 2);
         assert_eq!(created_path, next);

@@ -595,11 +595,9 @@ pub fn verify_multi_rank_lora_gguf(
         let plan = validate_header_and_pairs(&parsed, file_len, max_rank_limit, envelope)?;
         let (sha_result, scan_result) = std::thread::scope(|scope| {
             let hash_task = || {
-                bonsai_windows_credentials::hash_mapped_bytes(
-                    mapped_bytes,
-                    &mut || Ok(()),
-                    |_| ArtifactError::Identity,
-                )
+                bonsai_windows_credentials::hash_mapped_bytes(mapped_bytes, &mut || Ok(()), |_| {
+                    ArtifactError::Identity
+                })
             };
             if let Ok(hash_handle) = std::thread::Builder::new()
                 .name("lora-sha256".into())

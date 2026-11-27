@@ -987,7 +987,8 @@ mod tests {
         let ready_flag = std::sync::Arc::clone(&ready);
         let delayed_server = std::thread::spawn(move || -> std::io::Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(35));
-            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, retry_port))?;
+            let listener =
+                std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, retry_port))?;
             ready_flag.store(true, std::sync::atomic::Ordering::Release);
             let _accepted = listener.accept()?;
             Ok(())

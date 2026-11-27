@@ -136,10 +136,8 @@ mod tests {
 
     #[test]
     fn created_outputs_removes_recorded_files_unless_disarmed() -> io::Result<()> {
-        let dir = std::env::temp_dir().join(format!(
-            "bonsai-created-outputs-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("bonsai-created-outputs-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
         let orphan = dir.join("orphan.log");
         let kept = dir.join("kept.log");

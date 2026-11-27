@@ -746,11 +746,9 @@ mod tests {
         );
         assert!(cancelled.is_err());
 
-        let mapped = MappedLockedFile::try_open(
-            &file,
-            u64::try_from(len).map_err(io::Error::other)?,
-        )
-        .ok_or_else(|| io::Error::other("expected mapped locked file"))?;
+        let mapped =
+            MappedLockedFile::try_open(&file, u64::try_from(len).map_err(io::Error::other)?)
+                .ok_or_else(|| io::Error::other("expected mapped locked file"))?;
         let mut slice_checks = 0_usize;
         let slice_digest = hash_mapped_bytes(
             mapped.as_bytes(),

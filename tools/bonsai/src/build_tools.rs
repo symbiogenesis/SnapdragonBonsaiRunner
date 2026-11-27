@@ -518,7 +518,8 @@ mod tests {
             .is_err()
         );
         // Updating an existing receipt atomically leaves no leftover .partial files.
-        let updated = json!({"Status":"completed", "Phase":"completed", "ModelProcessStarted":false});
+        let updated =
+            json!({"Status":"completed", "Phase":"completed", "ModelProcessStarted":false});
         save(&evidence.join("build-receipt.json"), &updated, false)?;
         assert_eq!(read_json(&evidence.join("build-receipt.json"))?, updated);
         let partial_count = fs::read_dir(&evidence)

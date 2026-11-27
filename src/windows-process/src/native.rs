@@ -866,8 +866,7 @@ impl NativeProcess {
             Ok(folder) => folder,
             Err(error) => {
                 drop([input, output, error_output]);
-                terminate_failed_start(&process, &job)
-                    .map_err(crate::unconfirmed_start_cleanup)?;
+                terminate_failed_start(&process, &job).map_err(crate::unconfirmed_start_cleanup)?;
                 return Err(error);
             }
         };
@@ -1445,8 +1444,8 @@ fn terminate_failed_start(
     let started = Instant::now();
     // SAFETY: `job` is an owned/live Job created for this launch; terminating it
     // closes any descendants that could still hold capture pipe write ends.
-    let job_error = (unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0)
-        .then(io::Error::last_os_error);
+    let job_error =
+        (unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0).then(io::Error::last_os_error);
     // SAFETY: This is the exact newly created root, retained against PID reuse.
     // Terminate it directly as well in case PSEC brokered creation outside JOB_LIST.
     let terminated = unsafe { TerminateProcess(process.as_raw_handle(), 1) };

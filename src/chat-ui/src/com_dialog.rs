@@ -648,7 +648,8 @@ mod tests {
     }
 
     #[test]
-    fn join_thread_bounded_returns_false_on_timeout_and_true_once_finished() -> std::io::Result<()> {
+    fn join_thread_bounded_returns_false_on_timeout_and_true_once_finished() -> std::io::Result<()>
+    {
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         let handle = thread::Builder::new()
             .name("bonsai-bounded-join-test".to_owned())

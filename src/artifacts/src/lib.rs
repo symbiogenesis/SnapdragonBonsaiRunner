@@ -1350,10 +1350,7 @@ pub fn validate_external_path(path: &Path) -> Result<(), ArtifactError> {
     #[cfg(not(windows))]
     {
         let spelling = path.to_str().ok_or(ArtifactError::Path)?;
-        if !path.is_absolute()
-            || path.parent().is_none()
-            || spelling.contains(['%', '\0', '\\'])
-        {
+        if !path.is_absolute() || path.parent().is_none() || spelling.contains(['%', '\0', '\\']) {
             return Err(ArtifactError::Path);
         }
         let trimmed = spelling.trim_end_matches('/');

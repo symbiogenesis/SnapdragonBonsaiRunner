@@ -634,7 +634,10 @@ mod tests {
         let store = opened.store;
         assert!(Recovery::open(&directory).is_err());
         let text = "A saved draft 🌱".as_bytes().to_vec();
-        assert_eq!(store.save_with(|| Ok(text.clone()))?, DispatchStatus::Queued);
+        assert_eq!(
+            store.save_with(|| Ok(text.clone()))?,
+            DispatchStatus::Queued
+        );
         assert!(matches!(
             store.events.recv_timeout(std::time::Duration::from_secs(5)),
             Ok(Event::Saved(_))
