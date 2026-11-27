@@ -134,6 +134,145 @@ fn plan(request: &Request) -> Result<Vec<Control>> {
 }
 
 #[cfg(any(windows, test))]
+fn extract_test_executable(
+    stdout: &str,
+    package: &str,
+    target_kind: &str,
+    target_name: &str,
+) -> Result<PathBuf> {
+    let expected_name = if target_kind == "lib" {
+        package.replace('-', "_")
+    } else {
+        target_name.to_owned()
+    };
+    let pkg_hash = format!("#{package}@");
+    let pkg_hash_suffix = format!("#{package}");
+    let pkg_prefix = format!("{package} ");
+    let mut executables = BTreeSet::new();
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value["reason"].as_str() != Some("compiler-artifact")
+            || value["profile"]["test"].as_bool() != Some(true)
+        {
+            continue;
+        }
+        let pkg_id = value["package_id"].as_str().unwrap_or_default();
+        let pkg_matches = pkg_id.contains(&pkg_hash)
+            || pkg_id.ends_with(&pkg_hash_suffix)
+            || pkg_id.starts_with(&pkg_prefix);
+        if !pkg_matches || value["target"]["name"].as_str() != Some(expected_name.as_str()) {
+            continue;
+        }
+        let kind_matches = value["target"]["kind"].as_array().is_some_and(|kinds| {
+            kinds.iter().any(|kind| match kind.as_str() {
+                Some(kind) if target_kind == "lib" => {
+                    matches!(kind, "lib" | "rlib" | "cdylib" | "staticlib" | "proc-macro")
+                }
+                Some(kind) => kind == target_kind,
+                None => false,
+            })
+        });
+        if !kind_matches {
+            continue;
+        }
+        if let Some(executable) = value["executable"].as_str().filter(|path| !path.is_empty()) {
+            executables.insert(PathBuf::from(executable));
+        }
+    }
+    if executables.len() != 1 {
+        return Err(format!(
+            "Expected one compiled test executable for {package} ({target_kind} {expected_name}), found {}.",
+            executables.len()
+        ));
+    }
+    executables
+        .into_iter()
+        .next()
+        .ok_or_else(|| String::from("Missing compiled test executable."))
+}
+
+#[cfg(windows)]
+fn compile_test_binary(
+    cargo: &std::path::Path,
+    request: &Request,
+    scratch: &std::path::Path,
+    environment: &std::collections::BTreeMap<String, String>,
+    allowance: Option<std::time::Duration>,
+) -> Result<PathBuf> {
+    use bonsai_windows_process::ToolProcessSpec;
+    use std::fs;
+
+    let mut arguments = vec![
+        format!("+{}", request.toolchain),
+        "test".into(),
+        "--locked".into(),
+        "--release".into(),
+        "--manifest-path".into(),
+        request
+            .root
+            .join("Cargo.toml")
+            .to_str()
+            .ok_or("Regression source paths must be Unicode.")?
+            .into(),
+        "--package".into(),
+        request.package.clone(),
+        format!("--{}", request.target_kind),
+    ];
+    if request.target_kind != "lib" {
+        arguments.push(request.target_name.clone());
+    }
+    arguments.extend([
+        "--no-run".into(),
+        "--message-format=json-render-diagnostics".into(),
+    ]);
+
+    let stdout = scratch.join("compile.stdout");
+    let stderr = scratch.join("compile.stderr");
+    let log = scratch.join("compile.log");
+    let spec = ToolProcessSpec {
+        executable: cargo.to_path_buf(),
+        arguments: arguments.iter().map(OsString::from).collect(),
+        working_directory: scratch.to_path_buf(),
+        stdout: stdout.clone(),
+        stderr: stderr.clone(),
+        environment: environment.clone(),
+    };
+    let (code, _) = super::execute::command(&spec, allowance, &log)?;
+    if code != 0 {
+        super::execute::write_failure_logs(&mut std::io::stderr().lock(), &spec);
+        for path in [&stdout, &stderr] {
+            fs::remove_file(path).map_err(|e| e.to_string())?;
+        }
+        if fs::metadata(&log).map_err(|e| e.to_string())?.len() == 0 {
+            fs::write(
+                &log,
+                "Regression compilation failed with empty output log.\n",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        return Err(format!(
+            "Regression compilation failed with exit status {code}. Evidence: {}",
+            log.display()
+        ));
+    }
+    let output = raw_stdout(&stdout)?;
+    for path in [&stdout, &stderr, &log] {
+        fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    extract_test_executable(
+        &output,
+        &request.package,
+        &request.target_kind,
+        &request.target_name,
+    )
+}
+
+#[cfg(any(windows, test))]
 fn selected(
     controls: &[Control],
     mut execute: impl FnMut(&Control) -> Result<(u32, String)>,
@@ -191,58 +330,66 @@ fn execute(request: &Request, controls: &[Control]) -> Result<String> {
     } else {
         Some(Duration::from_mins(15))
     };
-    let result = selected(controls, |control| {
-        index += 1;
-        let stdout = scratch.join(format!("{index}.stdout"));
-        let stderr = scratch.join(format!("{index}.stderr"));
-        let log = scratch.join(format!("{index}.log"));
-        let spec = ToolProcessSpec {
-            executable: cargo.clone(),
-            arguments: control.arguments.iter().map(OsString::from).collect(),
-            working_directory: scratch.clone(),
-            stdout: stdout.clone(),
-            stderr: stderr.clone(),
-            environment: BTreeMap::from([
-                (
-                    "CARGO_TARGET_DIR".into(),
-                    request
-                        .target_directory
-                        .to_str()
-                        .ok_or("Regression target must be Unicode.")?
-                        .into(),
-                ),
-                ("CARGO_UNSTABLE_CHECKSUM_FRESHNESS".into(), "true".into()),
-                ("CARGO_BUILD_FINGERPRINT".into(), "content".into()),
-            ]),
-        };
-        let result = super::execute::command(&spec, allowance, &log)?;
-        let result = (result.0, raw_stdout(&stdout)?);
-        let lines = result.1.lines().map(str::to_owned).collect::<Vec<_>>();
-        let disposition = super::super::native_acceptance_guard::test_output(
-            &lines,
-            i32::try_from(result.0).map_err(|_| "Invalid regression exit code.")?,
-            control.expected_passed,
-        );
-        if disposition.is_err() && result.0 == 0 {
-            super::execute::write_failure_logs(&mut std::io::stderr().lock(), &spec);
-        }
-        // One combined diagnostic is sufficient after a completed failure;
-        // passing controls retain no successful build chatter or empty captures.
-        for path in [&stdout, &stderr] {
-            fs::remove_file(path).map_err(|e| e.to_string())?;
-        }
-        if disposition.is_ok() {
-            fs::remove_file(&log).map_err(|e| e.to_string())?;
-        } else if fs::metadata(&log).map_err(|e| e.to_string())?.len() == 0 {
-            fs::write(
-                &log,
-                "Regression produced no typed test result; empty output is not success.\n",
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        disposition.map_err(|error| format!("{error} Evidence: {}", log.display()))?;
-        Ok(result)
-    });
+    let environment = BTreeMap::from([
+        (
+            "CARGO_TARGET_DIR".into(),
+            request
+                .target_directory
+                .to_str()
+                .ok_or("Regression target must be Unicode.")?
+                .into(),
+        ),
+        ("CARGO_UNSTABLE_CHECKSUM_FRESHNESS".into(), "true".into()),
+        ("CARGO_BUILD_FINGERPRINT".into(), "content".into()),
+    ]);
+    let result = (|| -> Result<String> {
+        let test_binary = compile_test_binary(&cargo, request, &scratch, &environment, allowance)?;
+        selected(controls, |control| {
+            index += 1;
+            let stdout = scratch.join(format!("{index}.stdout"));
+            let stderr = scratch.join(format!("{index}.stderr"));
+            let log = scratch.join(format!("{index}.log"));
+            let mut arguments = vec![OsString::from(&control.name)];
+            if control.arguments.last().is_some_and(|arg| arg == "--exact") {
+                arguments.push(OsString::from("--exact"));
+            }
+            let spec = ToolProcessSpec {
+                executable: test_binary.clone(),
+                arguments,
+                working_directory: scratch.clone(),
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                environment: environment.clone(),
+            };
+            let result = super::execute::command(&spec, allowance, &log)?;
+            let result = (result.0, raw_stdout(&stdout)?);
+            let lines = result.1.lines().map(str::to_owned).collect::<Vec<_>>();
+            let disposition = super::super::native_acceptance_guard::test_output(
+                &lines,
+                i32::try_from(result.0).map_err(|_| "Invalid regression exit code.")?,
+                control.expected_passed,
+            );
+            if disposition.is_err() && result.0 == 0 {
+                super::execute::write_failure_logs(&mut std::io::stderr().lock(), &spec);
+            }
+            // One combined diagnostic is sufficient after a completed failure;
+            // passing controls retain no successful build chatter or empty captures.
+            for path in [&stdout, &stderr] {
+                fs::remove_file(path).map_err(|e| e.to_string())?;
+            }
+            if disposition.is_ok() {
+                fs::remove_file(&log).map_err(|e| e.to_string())?;
+            } else if fs::metadata(&log).map_err(|e| e.to_string())?.len() == 0 {
+                fs::write(
+                    &log,
+                    "Regression produced no typed test result; empty output is not success.\n",
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            disposition.map_err(|error| format!("{error} Evidence: {}", log.display()))?;
+            Ok(result)
+        })
+    })();
     if fs::read_dir(&scratch)
         .map_err(|e| e.to_string())?
         .next()
@@ -406,6 +553,71 @@ mod tests {
         let mut calls = 0;
         assert!(selected(&controls,|_| {calls+=1;Ok((0,"test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s".into()))}).is_err());
         assert_eq!(calls, 1);
+        Ok(())
+    }
+    #[test]
+    fn extract_test_executable_selects_matching_target_and_rejects_missing_or_ambiguous()
+    -> Result<()> {
+        let artifacts = [
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "path+file:///repo/tools/bonsai#bonsai-tools@0.3.7",
+                "target": { "kind": ["lib"], "name": "bonsai_tools" },
+                "profile": { "test": true },
+                "executable": "C:/target/release/deps/bonsai_tools-lib.exe"
+            }),
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "path+file:///repo/tools/bonsai#bonsai-tools@0.3.7",
+                "target": { "kind": ["lib"], "name": "bonsai_tools" },
+                "profile": { "test": false },
+                "executable": "C:/target/release/deps/ignored-nontest.exe"
+            }),
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "path+file:///repo/src/chat-ui#bonsai-chat@0.3.7",
+                "target": { "kind": ["bin"], "name": "bonsai-chat" },
+                "profile": { "test": true },
+                "executable": "C:/target/release/deps/bonsai_chat-bin.exe"
+            }),
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "path+file:///repo/tools/ci#bonsai-ci@0.3.7",
+                "target": { "kind": ["test"], "name": "routing" },
+                "profile": { "test": true },
+                "executable": "C:/target/release/deps/routing-test.exe"
+            }),
+        ]
+        .into_iter()
+        .map(|entry| entry.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert_eq!(
+            extract_test_executable(&artifacts, "bonsai-tools", "lib", "")?,
+            PathBuf::from("C:/target/release/deps/bonsai_tools-lib.exe")
+        );
+        assert_eq!(
+            extract_test_executable(&artifacts, "bonsai-chat", "bin", "bonsai-chat")?,
+            PathBuf::from("C:/target/release/deps/bonsai_chat-bin.exe")
+        );
+        assert_eq!(
+            extract_test_executable(&artifacts, "bonsai-ci", "test", "routing")?,
+            PathBuf::from("C:/target/release/deps/routing-test.exe")
+        );
+        assert!(extract_test_executable(&artifacts, "bonsai-ci", "lib", "").is_err());
+
+        let ambiguous = format!(
+            "{artifacts}\n{}",
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "path+file:///repo/tools/bonsai#bonsai-tools@0.3.7",
+                "target": { "kind": ["lib"], "name": "bonsai_tools" },
+                "profile": { "test": true },
+                "executable": "C:/target/release/deps/bonsai_tools-other.exe"
+            })
+        );
+        assert!(extract_test_executable(&ambiguous, "bonsai-tools", "lib", "").is_err());
         Ok(())
     }
 }
