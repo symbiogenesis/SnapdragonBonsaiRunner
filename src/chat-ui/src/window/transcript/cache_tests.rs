@@ -996,7 +996,9 @@ fn incremental_streaming_layout_reuses_completed_chunks_and_preserves_find_offse
         return Err("Expected closed fence segment");
     };
     let first_galley = Arc::clone(&first.body);
+    let first_source_map = Arc::clone(&first.source_map);
     let fence_galley = Arc::clone(&fence.body);
+    let fence_source_map = Arc::clone(&fence.source_map);
     let shaped_before = message.shaped_galleys;
     assert_eq!(shaped_before, 3);
 
@@ -1015,7 +1017,9 @@ fn incremental_streaming_layout_reuses_completed_chunks_and_preserves_find_offse
         return Err("Expected closed fence segment");
     };
     assert!(Arc::ptr_eq(&first_galley, &first_after.body));
+    assert!(Arc::ptr_eq(&first_source_map, &first_after.source_map));
     assert!(Arc::ptr_eq(&fence_galley, &fence_after.body));
+    assert!(Arc::ptr_eq(&fence_source_map, &fence_after.source_map));
     assert_eq!(message.shaped_galleys, shaped_before + 3);
 
     // Find maps into the active tail chunk cleanly.

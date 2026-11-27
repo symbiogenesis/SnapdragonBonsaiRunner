@@ -5,7 +5,47 @@ use std::{
     time::{Duration, Instant},
 };
 
-const STREAM_COALESCE_WINDOW: Duration = Duration::from_millis(80);
+const STREAM_COALESCE_MIN_WINDOW: Duration = Duration::from_millis(80);
+const STREAM_COALESCE_MEDIUM_WINDOW: Duration = Duration::from_millis(160);
+const STREAM_COALESCE_LARGE_WINDOW: Duration = Duration::from_millis(280);
+const STREAM_COALESCE_MEDIUM_BYTES: usize = 8 * 1024;
+const STREAM_COALESCE_LARGE_BYTES: usize = 32 * 1024;
+
+const fn stream_coalesce_window(source_len: usize) -> Duration {
+    if source_len < STREAM_COALESCE_MEDIUM_BYTES {
+        STREAM_COALESCE_MIN_WINDOW
+    } else if source_len < STREAM_COALESCE_LARGE_BYTES {
+        STREAM_COALESCE_MEDIUM_WINDOW
+    } else {
+        STREAM_COALESCE_LARGE_WINDOW
+    }
+}
+
+fn coalesce_delay(
+    streaming: bool,
+    last_dispatch: Option<Instant>,
+    now: Instant,
+    dispatched_len: usize,
+    source: &str,
+) -> Option<Duration> {
+    if !streaming {
+        return None;
+    }
+    let last = last_dispatch?;
+    let elapsed = now.saturating_duration_since(last);
+    let window = stream_coalesce_window(source.len());
+    if elapsed >= window {
+        return None;
+    }
+    let mut tail_start = dispatched_len.saturating_sub(1).min(source.len());
+    while tail_start > 0 && !source.is_char_boundary(tail_start) {
+        tail_start -= 1;
+    }
+    if !source[tail_start..].contains("\n\n") {
+        return Some(window - elapsed);
+    }
+    (elapsed < STREAM_COALESCE_MIN_WINDOW).then_some(STREAM_COALESCE_MIN_WINDOW - elapsed)
+}
 
 #[derive(Default)]
 pub(in crate::window::transcript) struct Pending {
@@ -200,16 +240,15 @@ impl Pending {
                 return changed;
             };
             let now = Instant::now();
-            if streaming && let Some(last) = self.last_dispatch {
-                let elapsed = now.saturating_duration_since(last);
-                if elapsed < STREAM_COALESCE_WINDOW {
-                    let tail_start = self.dispatched_len.saturating_sub(1).min(source.len());
-                    if !source[tail_start..].contains("\n\n") {
-                        ui.ctx()
-                            .request_repaint_after(STREAM_COALESCE_WINDOW - elapsed);
-                        return changed;
-                    }
-                }
+            if let Some(delay) = coalesce_delay(
+                streaming,
+                self.last_dispatch,
+                now,
+                self.dispatched_len,
+                source,
+            ) {
+                ui.ctx().request_repaint_after(delay);
+                return changed;
             }
             let request_source: Arc<str> = Arc::from(source);
             let ticket = service.request(Arc::clone(&request_source));
@@ -288,6 +327,113 @@ mod tests {
         assert!(pending.parsed.is_none());
         assert!(pending.parsed_source.is_none());
         assert!(pending.request_dirty);
+    }
+
+    #[test]
+    fn adaptive_stream_coalesce_window_scales_with_length_and_enforces_paragraph_floor() {
+        assert_eq!(stream_coalesce_window(0), Duration::from_millis(80));
+        assert_eq!(
+            stream_coalesce_window(STREAM_COALESCE_MEDIUM_BYTES - 1),
+            Duration::from_millis(80)
+        );
+        assert_eq!(
+            stream_coalesce_window(STREAM_COALESCE_MEDIUM_BYTES),
+            Duration::from_millis(160)
+        );
+        assert_eq!(
+            stream_coalesce_window(STREAM_COALESCE_LARGE_BYTES - 1),
+            Duration::from_millis(160)
+        );
+        assert_eq!(
+            stream_coalesce_window(STREAM_COALESCE_LARGE_BYTES),
+            Duration::from_millis(280)
+        );
+
+        let start = Instant::now();
+        let small = "abc";
+        assert_eq!(
+            coalesce_delay(false, Some(start), start, 0, small),
+            None,
+            "non-streaming must dispatch immediately"
+        );
+        assert_eq!(
+            coalesce_delay(
+                true,
+                Some(start),
+                start + Duration::from_millis(30),
+                0,
+                small
+            ),
+            Some(Duration::from_millis(50))
+        );
+
+        let medium_plain = "x".repeat(STREAM_COALESCE_MEDIUM_BYTES);
+        assert_eq!(
+            coalesce_delay(
+                true,
+                Some(start),
+                start + Duration::from_millis(100),
+                0,
+                &medium_plain,
+            ),
+            Some(Duration::from_millis(60))
+        );
+        assert_eq!(
+            coalesce_delay(
+                true,
+                Some(start),
+                start + Duration::from_millis(160),
+                0,
+                &medium_plain,
+            ),
+            None
+        );
+
+        // Paragraph break fast-dispatch still honors the 80 ms floor.
+        let mut medium_break = "x".repeat(STREAM_COALESCE_MEDIUM_BYTES);
+        medium_break.push_str("\n\nnext");
+        assert_eq!(
+            coalesce_delay(
+                true,
+                Some(start),
+                start + Duration::from_millis(50),
+                STREAM_COALESCE_MEDIUM_BYTES,
+                &medium_break,
+            ),
+            Some(Duration::from_millis(30))
+        );
+        assert_eq!(
+            coalesce_delay(
+                true,
+                Some(start),
+                start + Duration::from_millis(80),
+                STREAM_COALESCE_MEDIUM_BYTES,
+                &medium_break,
+            ),
+            None
+        );
+
+        let large_plain = "界".repeat(STREAM_COALESCE_LARGE_BYTES / 3 + 1);
+        assert_eq!(
+            coalesce_delay(
+                true,
+                Some(start),
+                start + Duration::from_millis(200),
+                3,
+                &large_plain,
+            ),
+            Some(Duration::from_millis(80))
+        );
+        assert_eq!(
+            coalesce_delay(
+                true,
+                Some(start),
+                start + Duration::from_millis(280),
+                3,
+                &large_plain,
+            ),
+            None
+        );
     }
 
     #[test]

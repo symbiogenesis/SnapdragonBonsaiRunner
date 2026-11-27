@@ -94,6 +94,56 @@ impl SourceMap {
     pub(super) fn first_source_start(&self) -> Option<usize> {
         self.entries.first().map(|entry| entry.source.start)
     }
+
+    fn matches_chunk(
+        &self,
+        entries: &[Mapping],
+        mut mapping_cursor: usize,
+        display_start: usize,
+        display_end: usize,
+    ) -> bool {
+        if self.display_bytes != display_end - display_start {
+            return false;
+        }
+        let mut out_idx = 0_usize;
+        if display_start < display_end {
+            while let Some(entry) = entries.get(mapping_cursor) {
+                if entry.display.end <= display_start {
+                    mapping_cursor += 1;
+                    continue;
+                }
+                if entry.display.start >= display_end {
+                    break;
+                }
+                let Some(prev) = self.entries.get(out_idx) else {
+                    return false;
+                };
+                let d_start = entry.display.start.max(display_start);
+                let d_end = entry.display.end.min(display_end);
+                let expected_display = (d_start - display_start)..(d_end - display_start);
+                let expected_source = if entry.verbatim {
+                    let s_start = entry.source.start + (d_start - entry.display.start);
+                    let s_end = entry.source.start + (d_end - entry.display.start);
+                    s_start..s_end
+                } else {
+                    entry.source.clone()
+                };
+                if prev.source != expected_source
+                    || prev.display != expected_display
+                    || prev.verbatim != entry.verbatim
+                {
+                    return false;
+                }
+                out_idx += 1;
+                if entry.display.end <= display_end {
+                    mapping_cursor += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        out_idx == self.entries.len()
+    }
 }
 
 pub(super) struct Layout {
@@ -103,6 +153,7 @@ pub(super) struct Layout {
 
 pub(super) enum BodySegment {
     Text(Layout),
+    ReusedText(super::TextSegmentCache),
     Image {
         svg: PrehashedSvg,
         intrinsic_size: egui::Vec2,
@@ -901,6 +952,192 @@ fn append_tail_ranges(
     }
 }
 
+fn section_matches_expected(
+    sections: &[egui::text::LayoutSection],
+    sec_idx: &mut usize,
+    start: usize,
+    end: usize,
+    format: &egui::TextFormat,
+) -> bool {
+    let Some(sec) = sections.get(*sec_idx) else {
+        return false;
+    };
+    if sec.byte_range.start.0 != start
+        || sec.byte_range.end.0 != end
+        || sec.leading_space.to_bits() != 0.0_f32.to_bits()
+        || sec.format != *format
+    {
+        return false;
+    }
+    *sec_idx += 1;
+    true
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Section verification mirrors presentation::append without allocating LayoutJob."
+)]
+fn check_presentation_sections(
+    parsed_text: &str,
+    chunk_start: usize,
+    cursor: usize,
+    until: usize,
+    format: &egui::TextFormat,
+    size: f32,
+    sections: &[egui::text::LayoutSection],
+    sec_idx: &mut usize,
+) -> bool {
+    let text = &parsed_text[cursor..until];
+    if text.is_empty() {
+        return true;
+    }
+    let is_code_block = matches!(
+        &format.font_id.family,
+        egui::FontFamily::Name(name) if name.as_ref() == presentation::CODE_BLOCK
+    );
+    if is_code_block || !text.contains('\n') {
+        return section_matches_expected(
+            sections,
+            sec_idx,
+            cursor - chunk_start,
+            until - chunk_start,
+            format,
+        );
+    }
+    let bytes = text.as_bytes();
+    let mut sub_cursor = 0_usize;
+    for pos in memchr::memchr_iter(b'\n', bytes) {
+        let prev_is_newline = if pos > sub_cursor {
+            bytes[pos - 1] == b'\n'
+        } else {
+            cursor > chunk_start && parsed_text.as_bytes()[cursor - 1] == b'\n'
+        };
+        if prev_is_newline {
+            if sub_cursor < pos
+                && !section_matches_expected(
+                    sections,
+                    sec_idx,
+                    cursor + sub_cursor - chunk_start,
+                    cursor + pos - chunk_start,
+                    format,
+                )
+            {
+                return false;
+            }
+            let gap = egui::TextFormat {
+                font_id: egui::FontId::proportional(1.0),
+                line_height: Some(size * 0.65),
+                ..format.clone()
+            };
+            if !section_matches_expected(
+                sections,
+                sec_idx,
+                cursor + pos - chunk_start,
+                cursor + pos + 1 - chunk_start,
+                &gap,
+            ) {
+                return false;
+            }
+            sub_cursor = pos + 1;
+        }
+    }
+    if sub_cursor < text.len() {
+        return section_matches_expected(
+            sections,
+            sec_idx,
+            cursor + sub_cursor - chunk_start,
+            until - chunk_start,
+            format,
+        );
+    }
+    true
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Zero-allocation cache probe verifies text, sections, highlights and source map."
+)]
+fn chunk_matches_cached(
+    prev: &super::TextSegmentCache,
+    parsed: &wire::TextSegment,
+    chunk_start: usize,
+    effective_end: usize,
+    text_size: f32,
+    visuals: &egui::Visuals,
+    highlights: &[Range<usize>],
+    mut span_cursor: usize,
+    mut match_cursor: usize,
+    mapping_cursor: usize,
+) -> bool {
+    if prev.body.job.text != parsed.text[chunk_start..effective_end] {
+        return false;
+    }
+    if !prev.source_map.matches_chunk(
+        &parsed.source_map.entries,
+        mapping_cursor,
+        chunk_start,
+        effective_end,
+    ) {
+        return false;
+    }
+    let prev_sections = &prev.body.job.sections;
+    let mut sec_idx = 0_usize;
+    if chunk_start < effective_end {
+        while let Some(&span) = parsed.spans.get(span_cursor) {
+            if span.end <= chunk_start {
+                span_cursor += 1;
+                continue;
+            }
+            if span.start >= effective_end {
+                break;
+            }
+            let format = presentation::text_format(span, text_size, visuals);
+            let mut cursor = span.start.max(chunk_start);
+            let end = span.end.min(effective_end);
+            while cursor < end {
+                while highlights
+                    .get(match_cursor)
+                    .is_some_and(|found| found.end <= cursor)
+                {
+                    match_cursor += 1;
+                }
+                let found = highlights
+                    .get(match_cursor)
+                    .filter(|found| found.start < end);
+                let (until, highlighted) = match found {
+                    Some(found) if found.start <= cursor => (found.end.min(end), true),
+                    Some(found) => (found.start.min(end), false),
+                    None => (end, false),
+                };
+                let mut effective = format.clone();
+                if highlighted {
+                    effective.background = visuals.selection.bg_fill;
+                    effective.color = visuals.selection.stroke.color;
+                }
+                if !check_presentation_sections(
+                    &parsed.text,
+                    chunk_start,
+                    cursor,
+                    until,
+                    &effective,
+                    text_size,
+                    prev_sections,
+                    &mut sec_idx,
+                ) {
+                    return false;
+                }
+                cursor = until;
+            }
+            if span.end <= effective_end {
+                span_cursor += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    sec_idx == prev_sections.len()
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Chunked streaming layout aligns parsed display ranges with source tail blocks."
@@ -914,7 +1151,9 @@ fn render_parsed_text_segment_chunked(
     parsed: &wire::TextSegment,
     tail_start: usize,
     append_tail: bool,
-) -> (Vec<Layout>, usize, usize, usize) {
+    previous_segments: Option<&[super::CachedSegment]>,
+    prev_cursor: &mut usize,
+) -> (Vec<BodySegment>, usize, usize, usize) {
     let normal = presentation::body_format(text_size, visuals);
     let highlights: Vec<_> = matches
         .iter()
@@ -932,7 +1171,7 @@ fn render_parsed_text_segment_chunked(
         && !parsed_ends_in_code_block(parsed)
         && (parsed.text.ends_with("\n\n") || body_prefix[..tail_start].ends_with("\n\n"));
 
-    let mut layouts = Vec::with_capacity(blocks.len() + tail_ranges.len());
+    let mut segments = Vec::with_capacity(blocks.len() + tail_ranges.len());
     let mut span_cursor = 0_usize;
     let mut match_cursor = 0_usize;
     let mut mapping_cursor = 0_usize;
@@ -947,6 +1186,47 @@ fn render_parsed_text_segment_chunked(
             last_block_display_start = chunk_start;
             last_block_span_cursor = span_cursor;
             last_block_mapping_cursor = mapping_cursor;
+        }
+        if (!is_last_parsed || !has_tail)
+            && let Some(super::CachedSegment::Text(prev)) =
+                previous_segments.and_then(|prevs| prevs.get(*prev_cursor))
+            && chunk_matches_cached(
+                prev,
+                parsed,
+                chunk_start,
+                chunk_end,
+                text_size,
+                visuals,
+                &highlights,
+                span_cursor,
+                match_cursor,
+                mapping_cursor,
+            )
+        {
+            while parsed
+                .spans
+                .get(span_cursor)
+                .is_some_and(|span| span.end <= chunk_end)
+            {
+                span_cursor += 1;
+            }
+            while highlights
+                .get(match_cursor)
+                .is_some_and(|found| found.end <= chunk_end)
+            {
+                match_cursor += 1;
+            }
+            while parsed
+                .source_map
+                .entries
+                .get(mapping_cursor)
+                .is_some_and(|entry| entry.display.end <= chunk_end)
+            {
+                mapping_cursor += 1;
+            }
+            *prev_cursor += 1;
+            segments.push(BodySegment::ReusedText(prev.clone_settled()));
+            continue;
         }
         let layout = render_parsed_block(
             body_prefix,
@@ -968,9 +1248,10 @@ fn render_parsed_text_segment_chunked(
             &mut match_cursor,
             &mut mapping_cursor,
         );
-        layouts.push(layout);
+        segments.push(BodySegment::Text(layout));
     }
     let tail_skip = usize::from(has_tail && !tail_breaks_before);
+    let mut tail_layouts = Vec::with_capacity(tail_ranges.len().saturating_sub(tail_skip));
     append_tail_ranges(
         body_prefix,
         width,
@@ -981,10 +1262,11 @@ fn render_parsed_text_segment_chunked(
         &tail_ranges,
         tail_skip,
         matches,
-        &mut layouts,
+        &mut tail_layouts,
     );
+    segments.extend(tail_layouts.into_iter().map(BodySegment::Text));
     (
-        layouts,
+        segments,
         last_block_display_start,
         last_block_span_cursor,
         last_block_mapping_cursor,
@@ -1116,7 +1398,7 @@ pub(super) fn layout_document_tail(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Document layout tracks parsed prefix chunks, streaming SVG tails and Find matches."
+    reason = "Document layout tracks parsed prefix chunks, streaming SVG tails, Find matches and reusable segments."
 )]
 pub(super) fn layout_document(
     body: &str,
@@ -1128,6 +1410,7 @@ pub(super) fn layout_document(
     parsed: Option<(&Arc<wire::Document>, usize)>,
     streaming_visible_prefix: Option<usize>,
     streaming_chunks: bool,
+    previous_segments: Option<&[super::CachedSegment]>,
 ) -> (Vec<BodySegment>, bool, Option<PrefixAnchor>) {
     let plain_doc = |text: &str, generating: bool| {
         if streaming_chunks {
@@ -1199,6 +1482,7 @@ pub(super) fn layout_document(
     let mut last_block_span_cursor = 0_usize;
     let mut last_block_mapping_cursor = 0_usize;
     let mut match_cursor = 0_usize;
+    let mut prev_cursor = 0_usize;
 
     for (index, segment) in doc.segments.iter().enumerate() {
         match segment {
@@ -1241,20 +1525,29 @@ pub(super) fn layout_document(
                         layout,
                         tail_start,
                         is_last && ends_with_text,
+                        previous_segments,
+                        &mut prev_cursor,
                     );
+                    let chunk_non_empty = |out: &BodySegment| match out {
+                        BodySegment::Text(layout) => {
+                            !layout.job.text.is_empty() || (!has_images && !generating)
+                        }
+                        BodySegment::ReusedText(reused) => {
+                            !reused.body.job.text.is_empty() || (!has_images && !generating)
+                        }
+                        BodySegment::Image { .. } => true,
+                    };
                     if is_last && ends_with_text {
-                        let non_empty_chunks = chunks
-                            .iter()
-                            .filter(|out| !out.job.text.is_empty() || (!has_images && !generating))
-                            .count();
+                        let non_empty_chunks =
+                            chunks.iter().filter(|out| chunk_non_empty(out)).count();
                         prefix_segments = rendered.len() + non_empty_chunks.saturating_sub(1);
                         last_block_display_start = blk_disp;
                         last_block_span_cursor = blk_span;
                         last_block_mapping_cursor = blk_map;
                     }
                     for out in chunks {
-                        if !out.job.text.is_empty() || (!has_images && !generating) {
-                            rendered.push(BodySegment::Text(out));
+                        if chunk_non_empty(&out) {
+                            rendered.push(out);
                         }
                     }
                 } else {
@@ -1275,6 +1568,12 @@ pub(super) fn layout_document(
                 match_cursor = slice_end;
             }
             wire::Segment::Image(image) => {
+                if matches!(
+                    previous_segments.and_then(|prevs| prevs.get(prev_cursor)),
+                    Some(super::CachedSegment::Image { .. })
+                ) {
+                    prev_cursor += 1;
+                }
                 rendered.push(BodySegment::Image {
                     svg: image.svg.clone(),
                     intrinsic_size: egui::vec2(image.intrinsic_width, image.intrinsic_height),

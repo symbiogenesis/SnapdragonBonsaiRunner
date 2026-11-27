@@ -68,6 +68,17 @@ pub(super) struct TextSegmentCache {
     pub(super) underline: Vec<[egui::Pos2; 2]>,
 }
 
+impl TextSegmentCache {
+    pub(in crate::window::transcript) fn clone_settled(&self) -> Self {
+        Self {
+            body: Arc::clone(&self.body),
+            code_panels: Arc::clone(&self.code_panels),
+            source_map: Arc::clone(&self.source_map),
+            underline: Vec::new(),
+        }
+    }
+}
+
 pub(super) enum CachedSegment {
     Text(TextSegmentCache),
     Image {
@@ -1254,6 +1265,7 @@ impl Message {
             return (cached, Some(anchor), prefix_reused);
         }
 
+        let prevs = previous_segments.as_deref().filter(|_| can_reuse_galleys);
         let (body_segments, show_generating, anchor) = formatting::layout_document(
             &self.body,
             self.role == Role::Assistant,
@@ -1264,8 +1276,8 @@ impl Message {
             parsed,
             streaming_visible_prefix,
             streaming_chunks,
+            prevs,
         );
-        let prevs = previous_segments.as_deref().filter(|_| can_reuse_galleys);
         let mut cached = Vec::with_capacity(body_segments.len() + usize::from(show_generating));
         self.append_cached_segments(
             ui,
@@ -1296,6 +1308,19 @@ impl Message {
         let mut prev_cursor = 0_usize;
         for segment in body_segments {
             match segment {
+                formatting::BodySegment::ReusedText(reused) => {
+                    if let Some(prevs) = previous_segments {
+                        while let Some(prev) = prevs.get(prev_cursor) {
+                            prev_cursor += 1;
+                            if let CachedSegment::Text(candidate) = prev
+                                && Arc::ptr_eq(&candidate.body, &reused.body)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    cached.push(CachedSegment::Text(reused));
+                }
                 formatting::BodySegment::Text(layout) => {
                     let reused = previous_segments.and_then(|prevs| {
                         prevs[prev_cursor..]
@@ -1336,6 +1361,11 @@ impl Message {
                     svg,
                     intrinsic_size,
                 } => {
+                    if let Some(prevs) = previous_segments
+                        && matches!(prevs.get(prev_cursor), Some(CachedSegment::Image { .. }))
+                    {
+                        prev_cursor += 1;
+                    }
                     let (preview_size, card_size) = image_card_layout(width, intrinsic_size);
                     cached.push(CachedSegment::Image {
                         svg,
