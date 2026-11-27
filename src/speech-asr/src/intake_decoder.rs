@@ -79,26 +79,66 @@ pub(super) fn load_mapped_blocks<T: Send>(
     cancel: &mut impl FnMut() -> bool,
     load_layer: impl Fn(usize) -> io::Result<T> + Sync,
 ) -> io::Result<Vec<T>> {
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     if cancel() {
         return Err(io::Error::from(io::ErrorKind::Interrupted));
     }
-    let abort = AtomicBool::new(false);
-    let blocks = (0..count)
-        .into_par_iter()
-        .map(|layer| {
-            if abort.load(Ordering::Acquire) {
-                return Err(invalid());
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .clamp(1, crate::threads::MAX_WORKERS)
+        .min(count);
+    let blocks = if workers <= 1 {
+        (0..count)
+            .map(&load_layer)
+            .collect::<io::Result<Vec<_>>>()?
+    } else {
+        let next = AtomicUsize::new(0);
+        let abort = AtomicBool::new(false);
+        let run_worker = || -> io::Result<Vec<(usize, T)>> {
+            let mut items = Vec::new();
+            loop {
+                if abort.load(Ordering::Acquire) {
+                    return Err(invalid());
+                }
+                let layer = next.fetch_add(1, Ordering::Relaxed);
+                if layer >= count {
+                    return Ok(items);
+                }
+                match load_layer(layer) {
+                    Ok(item) => items.push((layer, item)),
+                    Err(error) => {
+                        abort.store(true, Ordering::Release);
+                        return Err(error);
+                    }
+                }
             }
-            let res = load_layer(layer);
-            if res.is_err() {
-                abort.store(true, Ordering::Release);
+        };
+        let mut pairs = std::thread::scope(|scope| -> io::Result<Vec<(usize, T)>> {
+            let mut handles = Vec::with_capacity(workers - 1);
+            for _ in 1..workers {
+                handles.push(scope.spawn(run_worker));
             }
-            res
-        })
-        .collect::<io::Result<Vec<_>>>()?;
+            let mut result = run_worker();
+            for handle in handles {
+                let worker_items = handle.join().unwrap_or_else(|_| {
+                    Err(io::Error::other("ASR decoder block worker panicked."))
+                })?;
+                if let Ok(all) = &mut result {
+                    all.extend(worker_items);
+                }
+            }
+            result
+        })?;
+        if pairs.len() != count {
+            return Err(invalid());
+        }
+        pairs.sort_unstable_by_key(|(layer, _)| *layer);
+        pairs.into_iter().map(|(_, item)| item).collect()
+    };
     if cancel() {
         return Err(io::Error::from(io::ErrorKind::Interrupted));
     }
@@ -494,20 +534,25 @@ pub(super) fn load_mapped(
             slice_loader.reserve_tensor(&mut remaining, &(prefix.clone() + suffix))?;
         }
     }
-    let (embedding_res, (output_norm_res, blocks_res)) = rayon::join(
-        || slice_loader.projection("dec.token_embd.weight"),
-        || {
-            rayon::join(
-                || slice_loader.vector("dec.output_norm.weight"),
-                || {
-                    load_mapped_blocks(count, &mut || false, |layer| {
-                        let mut s = &slice_loader;
-                        load_decoder_block(&mut s, layer)
-                    })
-                },
-            )
-        },
-    );
+    let (embedding_res, output_norm_res, blocks_res) = std::thread::scope(|scope| {
+        let embedding_handle = scope.spawn(|| slice_loader.projection("dec.token_embd.weight"));
+        let output_norm_handle = scope.spawn(|| slice_loader.vector("dec.output_norm.weight"));
+        let blocks_res = load_mapped_blocks(count, &mut || false, |layer| {
+            let mut s = &slice_loader;
+            load_decoder_block(&mut s, layer)
+        });
+        let embedding_res = embedding_handle.join().unwrap_or_else(|_| {
+            Err(io::Error::other(
+                "ASR decoder embedding intake thread panicked.",
+            ))
+        });
+        let output_norm_res = output_norm_handle.join().unwrap_or_else(|_| {
+            Err(io::Error::other(
+                "ASR decoder output norm intake thread panicked.",
+            ))
+        });
+        (embedding_res, output_norm_res, blocks_res)
+    });
     if cancel() {
         return Err(io::Error::from(io::ErrorKind::Interrupted));
     }

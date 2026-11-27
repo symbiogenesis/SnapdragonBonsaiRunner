@@ -272,10 +272,14 @@ pub(super) fn load_artifacts_mapped(
     check_cancel(cancel)?;
     let (tokenizer, prompt_tokens) = load_tokenizer(&mut index, cancel)?;
     check_cancel(cancel)?;
-    let (encoder_res, decoder_res) = rayon::join(
-        || encoder::load_mapped(&index, mapping, &mut || false),
-        || decoder::load_mapped(&index, mapping, precision, &mut || false),
-    );
+    let (encoder_res, decoder_res) = std::thread::scope(|scope| {
+        let encoder_handle = scope.spawn(|| encoder::load_mapped(&index, mapping, &mut || false));
+        let decoder_res = decoder::load_mapped(&index, mapping, precision, &mut || false);
+        let encoder_res = encoder_handle
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("ASR encoder intake thread panicked.")));
+        (encoder_res, decoder_res)
+    });
     check_cancel(cancel)?;
     let (encoder, frontend) = encoder_res?;
     let decoder = decoder_res?;

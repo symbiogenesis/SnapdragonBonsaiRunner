@@ -553,17 +553,44 @@ fn validate_quant_blocks<const BLOCK_BYTES: usize>(
     bytes: &[u8],
     check: fn(&[u8; BLOCK_BYTES]) -> bool,
 ) -> io::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     const PARALLEL_THRESHOLD_BYTES: usize = 1024 * 1024;
-    if bytes.len() < PARALLEL_THRESHOLD_BYTES {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .clamp(1, threads::MAX_WORKERS);
+    let total_blocks = bytes.len() / BLOCK_BYTES;
+    if bytes.len() < PARALLEL_THRESHOLD_BYTES || workers <= 1 || total_blocks < 2 {
         let valid = bytes.as_chunks::<BLOCK_BYTES>().0.iter().all(check);
         return if valid { Ok(()) } else { Err(invalid()) };
     }
-    use rayon::prelude::*;
-    let chunk_bytes = 16_384 * BLOCK_BYTES;
-    let valid = bytes
-        .par_chunks(chunk_bytes)
-        .all(|chunk| chunk.as_chunks::<BLOCK_BYTES>().0.iter().all(check));
-    if valid { Ok(()) } else { Err(invalid()) }
+    let blocks_per_worker = total_blocks.div_ceil(workers);
+    let chunk_bytes = blocks_per_worker * BLOCK_BYTES;
+    let valid = AtomicBool::new(true);
+    std::thread::scope(|scope| {
+        let mut chunks = bytes.chunks(chunk_bytes);
+        let Some(first) = chunks.next() else {
+            return;
+        };
+        for chunk in chunks {
+            scope.spawn(|| {
+                if !valid.load(Ordering::Acquire) {
+                    return;
+                }
+                if !chunk.as_chunks::<BLOCK_BYTES>().0.iter().all(check) {
+                    valid.store(false, Ordering::Release);
+                }
+            });
+        }
+        if valid.load(Ordering::Acquire) && !first.as_chunks::<BLOCK_BYTES>().0.iter().all(check) {
+            valid.store(false, Ordering::Release);
+        }
+    });
+    if valid.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
 }
 
 fn half(bits: u16) -> io::Result<f32> {
