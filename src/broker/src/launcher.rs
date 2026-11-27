@@ -4287,7 +4287,7 @@ mod tests {
     -> std::io::Result<()> {
         use bonsai_cpu_policy::Bonsai25Variant;
         use serde_json::json;
-        let workers = super::WorkerReadiness::for_version("0.1.38", 4);
+        let workers = super::WorkerReadiness::for_version("0.1.39", 4);
         let variant = Bonsai25Variant::Pq2;
         let model = json!({
             "id": variant.model_id(),
@@ -4404,7 +4404,7 @@ mod tests {
         let variant = Bonsai25Variant::Pq2;
         let workers = super::WorkerReadiness {
             kv_cache: Some(crate::inference::KvCache::Rsq4),
-            ..super::WorkerReadiness::for_version("0.1.38", 4)
+            ..super::WorkerReadiness::for_version("0.1.39", 4)
         };
         for field in [
             "adapter_sha256",

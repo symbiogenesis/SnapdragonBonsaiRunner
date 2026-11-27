@@ -2425,7 +2425,7 @@ mod tests {
         fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
         fs::create_dir_all(&inference).map_err(|error| error.to_string())?;
 
-        let current_archive = "prism-inference-0.1.38-aarch64-pc-windows-msvc.zip";
+        let current_archive = "prism-inference-0.1.39-aarch64-pc-windows-msvc.zip";
         let old_archive = downloads.join("prism-inference-0.1.27-aarch64-pc-windows-msvc.zip");
         let old_partial =
             downloads.join("prism-inference-0.1.27-aarch64-pc-windows-msvc.zip.partial");

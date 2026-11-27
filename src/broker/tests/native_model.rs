@@ -207,7 +207,8 @@ const PQ2_ADAPTER_LIFECYCLE_PROFILE: AdapterProfile = AdapterProfile {
 
 // This delivery needs its independently reviewed source as well as its version.
 // Historical fixed-source workloads retain their original release identities.
-const MEMORY_CONTEXT_REVISION: &str = "50977990398a20a8add2056bfe34ce59e1677510";
+const MEMORY_CONTEXT_REVISION: &str = "d25f70322768bdcaab704cc3a1036a5f6c55ee82";
+const HISTORICAL_0_1_38_REVISION: &str = "50977990398a20a8add2056bfe34ce59e1677510";
 const HISTORICAL_0_1_35_REVISION: &str = "3bc76f135bf23c538b3bb789aef382143ff36839";
 const HISTORICAL_0_1_32_REVISION: &str = "23e24e444a821d4426f65d56c6cf874cf568b0d9";
 const PRECEDING_MEMORY_CONTEXT_REVISION: &str = "89df9aaff9e580d66679f2befe94d471bcf4fc7f";
@@ -216,7 +217,8 @@ const PREVIOUS_MEMORY_CONTEXT_REVISION: &str = "1429a33772089dfd3a50a96c698b9dbe
 const LEGACY_MEMORY_CONTEXT_REVISION: &str = "ac941f2668ae93dba9824002b4597081457aa09f";
 
 fn reviewed_memory_context_release(version: Option<&str>, revision: Option<&str>) -> bool {
-    (version == Some("0.1.38") && revision == Some(MEMORY_CONTEXT_REVISION))
+    (version == Some("0.1.39") && revision == Some(MEMORY_CONTEXT_REVISION))
+        || (version == Some("0.1.38") && revision == Some(HISTORICAL_0_1_38_REVISION))
         || (version == Some("0.1.35") && revision == Some(HISTORICAL_0_1_35_REVISION))
         || (version == Some("0.1.32") && revision == Some(HISTORICAL_0_1_32_REVISION))
         || (version == Some("0.1.30") && revision == Some(PRECEDING_MEMORY_CONTEXT_REVISION))
@@ -307,10 +309,11 @@ fn native_worker_receipts_require_exact_release_and_verified_readiness() {
         "0.1.35",
         "0.1.36",
         "0.1.38",
-        "v0.1.38",
-        "0.1.38-dev",
-        "0.1.38.0",
-        "0.1.038",
+        "0.1.39",
+        "v0.1.39",
+        "0.1.39-dev",
+        "0.1.39.0",
+        "0.1.039",
         "",
     ] {
         assert_worker_receipt_case(Some(version), None, false, false);
@@ -320,7 +323,8 @@ fn native_worker_receipts_require_exact_release_and_verified_readiness() {
 
 #[test]
 fn native_worker_receipts_require_the_reviewed_memory_context_source() {
-    assert_worker_receipt_case(Some("0.1.38"), Some(MEMORY_CONTEXT_REVISION), true, true);
+    assert_worker_receipt_case(Some("0.1.39"), Some(MEMORY_CONTEXT_REVISION), true, true);
+    assert_worker_receipt_case(Some("0.1.38"), Some(HISTORICAL_0_1_38_REVISION), true, true);
     assert_worker_receipt_case(Some("0.1.35"), Some(HISTORICAL_0_1_35_REVISION), true, true);
     assert_worker_receipt_case(Some("0.1.32"), Some(HISTORICAL_0_1_32_REVISION), true, true);
     assert_worker_receipt_case(
@@ -375,6 +379,13 @@ fn native_worker_receipts_require_the_reviewed_memory_context_source() {
     assert_worker_receipt_case(Some("0.1.32"), Some(MEMORY_CONTEXT_REVISION), false, false);
     assert_worker_receipt_case(Some("0.1.34"), Some(MEMORY_CONTEXT_REVISION), false, false);
     assert_worker_receipt_case(Some("0.1.35"), Some(MEMORY_CONTEXT_REVISION), false, false);
+    assert_worker_receipt_case(Some("0.1.38"), Some(MEMORY_CONTEXT_REVISION), false, false);
+    assert_worker_receipt_case(
+        Some("0.1.39"),
+        Some(HISTORICAL_0_1_38_REVISION),
+        false,
+        false,
+    );
     assert_worker_receipt_case(
         Some("0.1.38"),
         Some(HISTORICAL_0_1_35_REVISION),
