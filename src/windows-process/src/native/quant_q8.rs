@@ -548,7 +548,7 @@ pub(crate) fn dot_q8_0_8rows_finite_scales_strips(
 
 /// Exclusive disjoint column-band view into a row-major `[batch, output]` `f32` matrix.
 ///
-/// Created by [`split_row_major_bands`] over non-overlapping column ranges, allowing parallel
+/// Created by `split_row_major_bands` over non-overlapping column ranges, allowing parallel
 /// workers to scatter `[8]` contiguous output floats per token directly into `[batch, output]`
 /// in one barrier without intermediate `transposed_scratch` buffers or locks.
 pub struct RowMajorBand<'a> {
