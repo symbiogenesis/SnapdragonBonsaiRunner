@@ -1617,6 +1617,37 @@ mod tests {
     }
 
     fn run_preparation_batch() -> Result<BTreeMap<String, std::result::Result<(), String>>> {
+        const SHARDS: [&[&str]; 5] = [
+            &["cargo_path_fallback_discovers_cargo_and_restores_path"],
+            &[
+                "fresh_preparation_reaches_committed_bootstrap",
+                "failed_preparation_invalidates_existing_receipt",
+                "ordinary_push_archives_only_committed_policy",
+                "stale_checker_recovers_from_committed_source",
+                "malformed_checker_receipt_recovers_from_committed_source",
+            ],
+            &[
+                "corrupt_checker_recovers_from_committed_source",
+                "missing_checker_receipt_recovers_from_committed_source",
+                "collection_checker_source_recovers_from_committed_source",
+                "collection_checker_digest_recovers_from_committed_source",
+                "unverified_supervisor_triggers_preparation",
+            ],
+            &[
+                "absent_target_directory_triggers_preparation",
+                "missing_recovery_receipt_triggers_preparation",
+                "missing_recovery_helper_triggers_preparation",
+                "stale_recovery_source_triggers_preparation",
+                "corrupt_recovery_helper_triggers_preparation",
+            ],
+            &[
+                "automatic_preparation_invokes_committed_helper_once",
+                "automatic_preparation_rejects_invalid_prepared_outputs",
+                "failed_automatic_recovery_invalidates_existing_receipt",
+                "collection_recovery_source_triggers_preparation",
+                "collection_recovery_digest_triggers_preparation",
+            ],
+        ];
         let temporary = super::super::canonical_path(std::env::temp_dir())?;
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1624,44 +1655,98 @@ mod tests {
             .as_nanos();
         let scratch = temporary.join(format!("bonsai-push-preparation-{nonce}"));
         fs::create_dir(&scratch).map_err(|error| error.to_string())?;
-        let report_path = scratch.join("report.json");
-        let mut work = Work {
-            directory: scratch.clone(),
-            started: Instant::now(),
-            sequence: 0,
-        };
         // This bootstrap adapter requires Windows. Foundation's native CI
         // library lane owns it; the Linux planner does not exercise WinForms.
         let policy = super::super::canonical_path(crate::command::test_workspace_root())?;
-        let script_result = work.script(
-            &policy,
-            &policy,
-            "test_push_sanity.ps1",
-            &["-ReportPath".into(), report_path.clone().into_os_string()],
-        );
-        let outcomes = if report_path.is_file() {
-            let parsed: BTreeMap<String, PreparationOutcome> =
-                serde_json::from_slice(&fs::read(&report_path).map_err(|error| error.to_string())?)
-                    .map_err(|error| error.to_string())?;
-            Ok(parsed
+        let outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> = SHARDS
                 .into_iter()
-                .map(|(name, outcome)| {
-                    (
-                        name,
-                        if outcome.passed {
-                            Ok(())
-                        } else {
-                            Err(outcome
-                                .error
-                                .unwrap_or_else(|| "Push preparation fixture failed.".into()))
+                .enumerate()
+                .map(|(index, cases)| {
+                    let scratch = &scratch;
+                    let policy = &policy;
+                    scope.spawn(
+                        move || -> Result<BTreeMap<String, std::result::Result<(), String>>> {
+                            let shard_dir = scratch.join(format!("shard-{index}"));
+                            fs::create_dir(&shard_dir).map_err(|error| error.to_string())?;
+                            let report_path = shard_dir.join("report.json");
+                            let mut work = Work {
+                                directory: shard_dir,
+                                started: Instant::now(),
+                                sequence: 0,
+                            };
+                            let script_result = work.script(
+                                policy,
+                                policy,
+                                "test_push_sanity.ps1",
+                                &[
+                                    "-Case".into(),
+                                    cases.join(",").into(),
+                                    "-ReportPath".into(),
+                                    report_path.clone().into_os_string(),
+                                ],
+                            );
+                            if report_path.is_file() {
+                                let parsed: BTreeMap<String, PreparationOutcome> =
+                                    serde_json::from_slice(
+                                        &fs::read(&report_path)
+                                            .map_err(|error| error.to_string())?,
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                if parsed.len() != cases.len() {
+                                    return script_result.and_then(|()| {
+                                    Err(format!(
+                                        "Push preparation shard {index} reported {} of {} cases.",
+                                        parsed.len(),
+                                        cases.len()
+                                    ))
+                                });
+                                }
+                                let any_failed = parsed.values().any(|outcome| !outcome.passed);
+                                if script_result.is_err() && !any_failed {
+                                    script_result?;
+                                }
+                                Ok(parsed
+                                    .into_iter()
+                                    .map(|(name, outcome)| {
+                                        (
+                                            name,
+                                            if outcome.passed {
+                                                Ok(())
+                                            } else {
+                                                Err(outcome.error.unwrap_or_else(|| {
+                                                    "Push preparation fixture failed.".into()
+                                                }))
+                                            },
+                                        )
+                                    })
+                                    .collect())
+                            } else {
+                                script_result.and_then(|()| {
+                                Err(format!(
+                                    "Push preparation shard {index} exited without writing report."
+                                ))
+                            })
+                            }
                         },
                     )
                 })
-                .collect())
-        } else {
-            script_result
-                .and_then(|()| Err("Push preparation batch exited without writing report.".into()))
-        };
+                .collect();
+            let mut merged = BTreeMap::new();
+            for handle in handles {
+                let shard = handle
+                    .join()
+                    .map_err(|_| String::from("Push preparation shard thread panicked."))??;
+                for (name, result) in shard {
+                    if merged.insert(name.clone(), result).is_some() {
+                        return Err(format!(
+                            "Duplicate push preparation fixture result for {name}."
+                        ));
+                    }
+                }
+            }
+            Ok(merged)
+        });
         if scratch.parent() != Some(temporary.as_path()) {
             return Err("Push preparation fixture cleanup escaped temp.".into());
         }

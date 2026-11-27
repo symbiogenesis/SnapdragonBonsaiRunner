@@ -1,5 +1,6 @@
 #Requires -Version 7.6
 param([string[]]$Case, [string]$ReportPath)
+$Case = @($Case | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 if (-not [Console]::IsInputRedirected) {
     $forward = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $PSCommandPath)
     if ($Case -and $Case.Count -gt 0) { $forward += @('-Case', ($Case -join ',')) }
@@ -368,7 +369,7 @@ try {
         $selectedCase = if ($Case -and $Case.Count -eq 1) { $Case[0] } else { '' }
         Invoke-CiCases $cases $selectedCase
     } else {
-        $selected = if ($Case -and $Case.Count -gt 0) {
+        [string[]]$selected = if ($Case -and @($Case).Count -gt 0) {
             foreach ($name in $Case) {
                 if (-not $cases.Contains($name)) { throw "Unknown named case: $name" }
             }
@@ -393,7 +394,7 @@ try {
             $results | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $ReportPath -Encoding utf8NoBOM
         }
         if ($failed) { throw 'One or more push sanity fixtures failed.' }
-        "$($selected.Count) focused fixture(s) passed."
+        "$(@($selected).Count) focused fixture(s) passed."
     }
 } finally {
     foreach ($entry in $script:PushTemplateCache.Values) {
