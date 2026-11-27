@@ -61,7 +61,6 @@ not evidence of a browser frontend.
 | `toml` | CI-only manifest parsing with parse/serde/std features. |
 | `ureq` | Synchronous HTTPS for native provisioning, updates and CI. Reuse the workspace pin with defaults, automatic compression and cookies disabled; Windows selects Schannel and system trust through native-tls-no-default and PlatformVerifier, portable checks select Rustls. No new async runtime is required. |
 | `transcribe-cpp` | Static CPU ASR, defaults disabled; reviewed CMake script downloads no source and explicitly enables MSVC optimization. |
-| `simd-json` | Exact optional qualification-only crates.io pin; ordinary requests still use serde_json. |
 | `fearless_simd` | Pinned safe SIMD (`=1.2.0` in Runner speech and the active external runtime, with independent locks). ASR uses it in `validate_pcm` and the Rust `frontend`/`encoder`/`decoder`/`packed` SIMD kernels; TTS uses it in the serving Rust `engine`/`codec` modules. |
 | `bonsai-gguf` | Exact published `crates.io` pin (`=0.1.10`, `default-features = false`): dependency-free bounded cancellable `Read + Seek` GGUF v2/v3 stream index reader (`read_index`, `read_index_cancellable`, `stock_tensor_layout`, `scalar_width`) consumed by `bonsai-speech-asr` and `bonsai-speech-tts`. |
 | `bonsai-native-hash` | Exact published `crates.io` pin (`=0.1.7`): shared Windows CNG / portable SHA-256 streaming boundary consumed directly by `bonsai-windows-credentials`, `bonsai-artifacts`, `bonsai-tools`, `bonsai-speech-asr`, `bonsai-speech-tts`, and `bonsai-ci`, avoiding duplicated CNG FFI handles and reducing direct `sha2` edges to independent dev-test verification. |
@@ -199,34 +198,9 @@ audit before changing any `resvg`/`usvg` pin.
 
 ## JSON selection
 
-Production uses `serde_json`; the optional parser candidate cannot change ordinary
-requests before qualification. The gate requires at least 5% lower equal-weight
-geometric-mean time with no case more than 5% slower in both cold and reused screens.
-Six workloads cover plain/escaped small inputs, 8/32/128-message histories and near-1
-MiB bodies. Timing includes immutable-input preparation, schema/history validation,
-canonical serialization, allocations/copies and destruction. Discard one warmup round;
-rotate order over nine measured rounds. Unicode, duplicate/unknown fields, shapes,
-bounds and canonical bytes must pass before interpreting timings.
-
-### Current candidate and pending gate
-
-The optional `json-candidate` uses the exact crates.io pin and registry checksum
-in [Cargo.lock](../Cargo.lock). `Deserializer::from_tape` recovers/resets tape
-allocation while preserving borrowing and validation.
-
-`padded-tape-serde-reuse` reuses padded input, parser buffers and tape across requests:
-
-| Screen | Included work |
-| --- | --- |
-| Cold | Scratch setup/destruction plus all per-request work below. |
-| Reused | Immutable-body copy, validation, canonical serialization, output destruction and decimal/error fallback; excludes scratch setup/destruction. |
-
-Explicit adapter scales and SIMD parse failures fall back to production parsing:
-correctly rounded SIMD conversion can differ from serde_json's default without
-either being wrong. Supplemental scale cases include fallback cost. The retired main-only
-`json-candidate.yml` workflow ran correctness before the original six-case and supplemental
-5%/5% gates; any case over 5% slower rejects qualification.
-**Both cold/reused screens must pass; qualification remains pending.**
+Production uses `serde_json`. The optional `simd-json` / `json-candidate`
+tape-reuse experiment and the retired main-only `json-candidate.yml` workflow
+have been removed without changing ordinary request parsing.
 
 ## Runtime screening
 

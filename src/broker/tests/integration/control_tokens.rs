@@ -19,18 +19,7 @@ fn prepare(body: &[u8]) -> Result<PendingChat, Rejection> {
         .unwrap();
     let policy = RequestPolicy::new(8080, KEY)?;
     let head = request.into_parts().0;
-    let production = policy.check_head(&head)?.prepare(body);
-    #[cfg(feature = "json-candidate")]
-    {
-        let candidate = policy.check_head(&head)?.prepare_simd_json(body);
-        assert_eq!(candidate.as_ref().err(), production.as_ref().err());
-        if let Ok(candidate) = candidate {
-            let counted = candidate.admit(|_| Ok(1))?;
-            let reference = policy.check_head(&head)?.prepare(body)?.admit(|_| Ok(1))?;
-            assert_eq!(counted.backend_body(), reference.backend_body());
-        }
-    }
-    production
+    policy.check_head(&head)?.prepare(body)
 }
 
 fn rejects(messages: &Value) {

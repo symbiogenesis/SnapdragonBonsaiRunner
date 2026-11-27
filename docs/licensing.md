@@ -38,7 +38,6 @@ licenses, Prism notices and pinned artifacts. Dependency terms apply independent
 | `rayon` 1.12.0, `rayon-core` 1.13.0 and Crossbeam worker queues | MIT OR Apache-2.0 | Retain the selected licenses/attribution for the Rust ASR worker pool and its queue dependencies. |
 | `subtle` 2.6.1 | BSD-3-Clause | Retain copyright, conditions and disclaimer; respect non-endorsement. |
 | `zip` 9.5.1 | MIT | Retain the notice; enabled deflate dependencies also have permissive options. |
-| `simd-json` 0.19.0 | Apache-2.0 OR MIT | Qualification-only published crate; retain its selected license terms and the attribution in NOTICE when redistributing. |
 | `zlib-rs` | Zlib | Retain source notices and identify altered versions. |
 | `unicode-ident` | (MIT OR Apache-2.0) AND Unicode-3.0 | Include Unicode-3.0 notices as well as the selected code license. |
 | `r-efi` | MIT OR Apache-2.0 OR LGPL-2.1-or-later | A permissive alternative is available; LGPL is not required. |

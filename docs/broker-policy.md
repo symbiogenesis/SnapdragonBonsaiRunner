@@ -14,12 +14,6 @@ the canonical request; permissive maps or enums can erase that evidence.
 [Absolute deadlines](https://docs.rs/tokio/1.54.1/tokio/time/fn.timeout_at.html)
 include expiry checks around immediately ready operations. Parser and runtime
 selection rationale lives in the [dependency audit](dependency-audit.md).
-Under the optional qualification-only `json-candidate` feature
-(`src/broker/src/json_candidate_parser.rs`, screening item **#49**), malformed JSON
-syntax and schema deserialization failures return `Rejection::ChatSchema` directly from
-one `simd-json` pass without a duplicate full-body `serde_json` parse (delegating to
-`AuthorizedHead::prepare` only when an explicit `abliteration_scale` field requires exact
-decimal parity). Compiled CI and equivalence checks remain pending.
 
 ## Public request contract
 

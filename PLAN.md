@@ -126,7 +126,7 @@ adoption decisions without displacing native daily-use acceptance.
   (`#8`, `#14`, `#45`–`#51` in the
   [screening ledger](docs/research-register.md#august-to-november-2026-screening-ledger)):
   broker queue-wait closure/`poll_peek` abandonment and 864-interleaving scheduler
-  simulation, `json-candidate` single-pass error classification, UI `50 ms` TCP
+  simulation, UI `50 ms` TCP
   connect slices, `error_ui` frame-zero-clone copy action, Markdown prefix-layout
   retention without in-process UI parsing, incremental `stream.rs` cursor,
   cooperative `speech-tts` `CancelHook` entrypoints, `sampling.rs` `f64`/finite/greedy-argmax
@@ -413,8 +413,7 @@ adoption decisions without displacing native daily-use acceptance.
   Windows process, Job, handle or network enforcement. Include owning CI and
   actual-model acceptance for screening items `#8`, `#49` and `#50` (`AcceptedChat::serve`
   queue-wait cancellation/`poll_peek`, deterministic 864-interleaving simulation without
-  adding `shuttle` to workspace manifests, `json-candidate` single-pass malformed-JSON
-  rejection, UI `50 ms` TCP connect slices, `error_ui` frame-zero-clone copy action,
+  adding `shuttle` to workspace manifests, UI `50 ms` TCP connect slices, `error_ui` frame-zero-clone copy action,
   streaming Markdown prefix-layout retention without UI parsing and incremental TTS
   segmentation).
 - [ ] Qualify actual-model [streaming/audio resources](docs/streaming-resources.md):
@@ -2051,10 +2050,6 @@ Reference audit `#1` (`ClampedL2` GDN Q/K normalization) is closed.
   SIMD kernels, 4-frame frontend and batched causal prefill/encoder; model and
   device qualification remain open); qualify direct `memchr` transport scans
   independently.
-- [ ] Qualify [SIMD-JSON tape reuse](docs/dependency-audit.md#current-candidate-and-pending-gate)
-  in owning main-only CI: Unicode/duplicates/unknowns/shapes/bounds/canonical bytes,
-  at least 5% lower equal-weight geometric-mean time and no case over 5% slower in
-  both cold/reused screens, including scales, before changing the dependency choice.
 
 ## Optional agents
 

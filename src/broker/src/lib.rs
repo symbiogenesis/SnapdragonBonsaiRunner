@@ -36,11 +36,6 @@ pub mod supervisor;
 pub mod transport;
 mod wire;
 
-#[cfg(all(test, feature = "json-candidate"))]
-mod json_candidate;
-#[cfg(feature = "json-candidate")]
-mod json_candidate_parser;
-
 use http::{HeaderMap, HeaderValue, Method, Version, request::Parts, uri::PathAndQuery};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{
@@ -591,25 +586,6 @@ impl AuthorizedHead {
             serde_json::from_slice(body).map_err(|_| Rejection::ChatSchema)?
         };
         self.prepare_chat(&chat)
-    }
-
-    /// Qualify the pinned SIMD-JSON candidate against ordinary request parsing.
-    ///
-    /// Copies and pads the bounded immutable body because SIMD-JSON parses in
-    /// place. The padded tape path avoids a second internal input copy. This
-    /// compatibility entry point starts with fresh scratch; the qualification
-    /// harness also measures repeated requests with reusable parser scratch.
-    /// Schema, history, settings and canonical serialization use the production
-    /// policy. Requests with a decoded `daisyrose_scale` field, and candidate
-    /// parsing failures, use the production parser to retain its exact numeric
-    /// and rejection semantics. No service route selects this parser.
-    ///
-    /// # Errors
-    /// Returns the same value-free rejections as [`Self::prepare`]. Allocation
-    /// failures return [`Rejection::ChatSchema`].
-    #[cfg(feature = "json-candidate")]
-    pub fn prepare_simd_json(self, body: &[u8]) -> Result<PendingChat, Rejection> {
-        json_candidate_parser::JsonCandidateScratch::default().prepare(self, body)
     }
 
     const fn max_body_bytes(&self) -> usize {
@@ -1449,32 +1425,6 @@ pub(crate) mod test_util {
     ) -> Result<Vec<u8>, serde_json::Error> {
         let body = serde_json::to_string(&serde_json::json!({ "data": [model] }))?;
         Ok(http_json_response(&body))
-    }
-}
-
-#[cfg(all(test, feature = "json-candidate"))]
-impl AuthorizedHead {
-    pub(crate) const fn test_head(length: usize) -> Self {
-        Self {
-            length,
-            daisyrose_lora: false,
-            daisyrose_default_scale_tenths: 0,
-            context_tokens: CONTEXT_TOKENS,
-            vision: false,
-            cognitive_controls: false,
-            image_cache: None,
-        }
-    }
-
-    pub(crate) const fn with_daisyrose(mut self, default_scale_tenths: u8) -> Self {
-        self.daisyrose_lora = true;
-        self.daisyrose_default_scale_tenths = default_scale_tenths;
-        self
-    }
-
-    pub(crate) const fn with_cognitive_controls(mut self, enabled: bool) -> Self {
-        self.cognitive_controls = enabled;
-        self
     }
 }
 
