@@ -202,6 +202,36 @@ impl PreparedBatch {
         }
     }
 
+    /// Populate four-position-packed `quads` directly via `fill_quads(first_quad, dst_quads)`
+    /// without building an intermediate `[batch, input]` matrix.
+    pub(super) fn prepare_quads_direct(
+        &mut self,
+        batch: usize,
+        input: usize,
+        workers: usize,
+        fill_quads: &(impl Fn(usize, &mut [[f32; 4]]) + Sync),
+    ) {
+        self.prepare_meta(batch, input);
+        if self.num_quads == 0 || self.input == 0 {
+            self.quads.clear();
+            self.quads_ready = true;
+            return;
+        }
+        let needed = self.num_quads * self.input;
+        self.quads.resize(needed, [0.0; 4]);
+        let flat = self.quads.as_flattened_mut();
+        if workers > 1 && self.num_quads >= 2 && flat.len() >= 8_192 {
+            row_workers::run_aligned(flat, workers, 4 * input, &|elem_off, slice| {
+                let first_quad = elem_off / (4 * input);
+                let (quads_mut, _) = slice.as_chunks_mut::<4>();
+                fill_quads(first_quad, quads_mut);
+            });
+        } else {
+            fill_quads(0, &mut self.quads[..needed]);
+        }
+        self.quads_ready = true;
+    }
+
     /// Populate four-position-packed `quads` on demand using parallel SIMD 4x4 transpose.
     pub(super) fn ensure_quads(&mut self, raw_input: &[f32], workers: usize) {
         if self.quads_ready {
@@ -1250,63 +1280,52 @@ pub(super) fn multiply_single_group_into(
 }
 
 #[inline(always)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "K-blocked 4x16 float matmul accumulates in exact left-to-right column order."
-)]
-fn batch_f32_4rows_quads_block<S: Simd, const Q: usize>(
+fn batch_f32_4rows_quads<S: Simd, const Q: usize>(
     simd: S,
     rows: [&[f32]; 4],
     quads: &[[f32; 4]],
     num_quads: usize,
     q: usize,
-    k_start: usize,
-    k_end: usize,
     transposed_rows: &mut [f32],
 ) {
+    const K_BLOCK: usize = 512;
     let width = rows[0].len();
     let row_stride = num_quads * 4;
-    let mut acc: [[f32x4<S>; 4]; Q] = if k_start == 0 {
-        std::array::from_fn(|_| [f32x4::splat(simd, 0.0_f32); 4])
-    } else {
-        std::array::from_fn(|qi| {
-            std::array::from_fn(|r| {
-                let base = r * row_stride + (q + qi) * 4;
-                f32x4::from_slice(simd, &transposed_rows[base..base + 4])
-            })
-        })
-    };
+    let mut acc: [[f32x4<S>; 4]; Q] = std::array::from_fn(|_| [f32x4::splat(simd, 0.0_f32); 4]);
 
-    let mut col = k_start;
-    while col + 4 <= k_end {
-        let w0: [f32; 4] = f32x4::from_slice(simd, &rows[0][col..col + 4]).into();
-        let w1: [f32; 4] = f32x4::from_slice(simd, &rows[1][col..col + 4]).into();
-        let w2: [f32; 4] = f32x4::from_slice(simd, &rows[2][col..col + 4]).into();
-        let w3: [f32; 4] = f32x4::from_slice(simd, &rows[3][col..col + 4]).into();
-        for lane in 0..4 {
-            let c = col + lane;
+    for k_start in (0..width).step_by(K_BLOCK) {
+        let k_end = (k_start + K_BLOCK).min(width);
+        let mut col = k_start;
+        while col + 4 <= k_end {
+            let w0: [f32; 4] = f32x4::from_slice(simd, &rows[0][col..col + 4]).into();
+            let w1: [f32; 4] = f32x4::from_slice(simd, &rows[1][col..col + 4]).into();
+            let w2: [f32; 4] = f32x4::from_slice(simd, &rows[2][col..col + 4]).into();
+            let w3: [f32; 4] = f32x4::from_slice(simd, &rows[3][col..col + 4]).into();
+            for lane in 0..4 {
+                let c = col + lane;
+                let act: [f32x4<S>; Q] =
+                    std::array::from_fn(|qi| f32x4::from_slice(simd, &quads[(q + qi) * width + c]));
+                let w_lanes = [w0[lane], w1[lane], w2[lane], w3[lane]];
+                for r in 0..4 {
+                    let w = f32x4::splat(simd, w_lanes[r]);
+                    for qi in 0..Q {
+                        acc[qi][r] += w * act[qi];
+                    }
+                }
+            }
+            col += 4;
+        }
+        while col < k_end {
             let act: [f32x4<S>; Q] =
-                std::array::from_fn(|qi| f32x4::from_slice(simd, &quads[(q + qi) * width + c]));
-            let w_lanes = [w0[lane], w1[lane], w2[lane], w3[lane]];
+                std::array::from_fn(|qi| f32x4::from_slice(simd, &quads[(q + qi) * width + col]));
             for r in 0..4 {
-                let w = f32x4::splat(simd, w_lanes[r]);
+                let w = f32x4::splat(simd, rows[r][col]);
                 for qi in 0..Q {
                     acc[qi][r] += w * act[qi];
                 }
             }
+            col += 1;
         }
-        col += 4;
-    }
-    while col < k_end {
-        let act: [f32x4<S>; Q] =
-            std::array::from_fn(|qi| f32x4::from_slice(simd, &quads[(q + qi) * width + col]));
-        for r in 0..4 {
-            let w = f32x4::splat(simd, rows[r][col]);
-            for qi in 0..Q {
-                acc[qi][r] += w * act[qi];
-            }
-        }
-        col += 1;
     }
 
     for r in 0..4 {
@@ -1317,9 +1336,9 @@ fn batch_f32_4rows_quads_block<S: Simd, const Q: usize>(
     }
 }
 
-// Compute all `num_quads` quads for a 4-row block using K_BLOCK=64 4x16 tiling while
-// preserving exact left-to-right non-FMA summation order, storing each row `r`'s quad `q`
-// at `transposed_rows[r * row_stride + q * 4 .. r * row_stride + q * 4 + 4]`.
+// Compute all `num_quads` quads for a 4-row block across K_BLOCK=512 chunks while keeping
+// `Q_BLOCK=4` accumulators in registers (zero reloads) and preserving exact left-to-right
+// non-FMA summation order, storing at `transposed_rows[r * row_stride + q * 4 .. +4]`.
 #[inline(always)]
 fn batch_f32_4rows<S: Simd>(
     simd: S,
@@ -1328,59 +1347,20 @@ fn batch_f32_4rows<S: Simd>(
     num_quads: usize,
     transposed_rows: &mut [f32],
 ) {
-    const K_BLOCK: usize = 64;
     if num_quads == 0 {
         return;
     }
-    let width = rows[0].len();
-    let row_stride = num_quads * 4;
-    if width == 0 {
-        for r in 0..4 {
-            transposed_rows[r * row_stride..r * row_stride + row_stride].fill(0.0);
-        }
-        return;
+    let mut q = 0_usize;
+    while q + 3 < num_quads {
+        batch_f32_4rows_quads::<S, 4>(simd, rows, quads, num_quads, q, transposed_rows);
+        q += 4;
     }
-    for k_start in (0..width).step_by(K_BLOCK) {
-        let k_end = (k_start + K_BLOCK).min(width);
-        let mut q = 0_usize;
-        while q + 3 < num_quads {
-            batch_f32_4rows_quads_block::<S, 4>(
-                simd,
-                rows,
-                quads,
-                num_quads,
-                q,
-                k_start,
-                k_end,
-                transposed_rows,
-            );
-            q += 4;
-        }
-        if q + 1 < num_quads {
-            batch_f32_4rows_quads_block::<S, 2>(
-                simd,
-                rows,
-                quads,
-                num_quads,
-                q,
-                k_start,
-                k_end,
-                transposed_rows,
-            );
-            q += 2;
-        }
-        if q < num_quads {
-            batch_f32_4rows_quads_block::<S, 1>(
-                simd,
-                rows,
-                quads,
-                num_quads,
-                q,
-                k_start,
-                k_end,
-                transposed_rows,
-            );
-        }
+    if q + 1 < num_quads {
+        batch_f32_4rows_quads::<S, 2>(simd, rows, quads, num_quads, q, transposed_rows);
+        q += 2;
+    }
+    if q < num_quads {
+        batch_f32_4rows_quads::<S, 1>(simd, rows, quads, num_quads, q, transposed_rows);
     }
 }
 
@@ -5413,8 +5393,8 @@ mod tests {
             }
         }
 
-        // 2) K_BLOCK=64 4x16 Float GEMM, lazy ensure_quads, and Float channel-major layout.
-        for input in [5_usize, 64, 65, 131] {
+        // 2) K_BLOCK=512 4x16 Float GEMM, lazy ensure_quads, and Float channel-major layout.
+        for input in [5_usize, 64, 65, 131, 513] {
             for output in [3_usize, 9] {
                 let weights_f32: Vec<f32> = (0..output * input)
                     .map(|i| {

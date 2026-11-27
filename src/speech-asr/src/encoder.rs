@@ -451,9 +451,12 @@ impl Encoder {
         let mut prepared = PreparedBatch::default();
         let mut image_a = Vec::new();
         let mut image_b = Vec::new();
-        let mut patches = Vec::new();
         let mut flat_out = Vec::new();
         let mut flat_in = Vec::new();
+        let flat_dim = c.channels * c.mel_bins.div_ceil(8);
+        if layout.audio_rows > 0 {
+            ensure_buffer(&mut flat_in, layout.audio_rows * flat_dim)?;
+        }
         let mut row_offset = 0;
         for chunk in 0..layout.chunks {
             check(cancel)?;
@@ -481,7 +484,6 @@ impl Encoder {
                     channels,
                     workers,
                     &mut prepared,
-                    &mut patches,
                     &mut flat_out,
                     &mut conv_scratch,
                     &mut image_b,
@@ -498,37 +500,39 @@ impl Encoder {
                 layout.rows_per_chunk
             };
             if retained > 0 {
-                let flat_dim = channels * height;
-                ensure_buffer(&mut flat_in, retained * flat_dim)?;
+                let chunk_flat_dim = channels * height;
+                if chunk_flat_dim != flat_dim {
+                    return Err(invalid());
+                }
+                let chunk_flat =
+                    &mut flat_in[row_offset * flat_dim..(row_offset + retained) * flat_dim];
                 for time in 0..retained {
                     check(cancel)?;
-                    let dst = &mut flat_in[time * flat_dim..(time + 1) * flat_dim];
+                    let dst = &mut chunk_flat[time * flat_dim..(time + 1) * flat_dim];
                     for cf in 0..flat_dim {
                         dst[cf] = image_a[cf * width + time];
                     }
                 }
-                prepared.prepare_meta(retained, flat_dim);
-                let chunk_rows =
-                    &mut rows[row_offset * c.hidden..(row_offset + retained) * c.hidden];
-                self.weights.convolution_out.multiply_batch_prepared_into(
-                    &mut prepared,
-                    &flat_in,
-                    workers,
-                    &mut conv_scratch,
-                    chunk_rows,
-                    cancel,
-                )?;
-                for (row, sin_row) in chunk_rows
-                    .chunks_exact_mut(c.hidden)
-                    .zip(self.sinusoids.chunks_exact(c.hidden))
-                {
-                    for (dst, &sin_val) in row.iter_mut().zip(sin_row) {
-                        *dst += sin_val;
-                    }
-                    finite(row)?;
-                }
                 row_offset += retained;
             }
+        }
+        if layout.audio_rows > 0 {
+            prepared.prepare_meta(layout.audio_rows, flat_dim);
+            self.weights.convolution_out.multiply_batch_prepared_into(
+                &mut prepared,
+                &flat_in[..layout.audio_rows * flat_dim],
+                workers,
+                &mut conv_scratch,
+                &mut rows,
+                cancel,
+            )?;
+            add_chunk_sinusoids_parallel(
+                &mut rows,
+                &self.sinusoids,
+                layout.rows_per_chunk,
+                c.hidden,
+                workers,
+            )?;
         }
 
         let num_rows = layout.audio_rows;
@@ -674,6 +678,143 @@ fn channel_major_bias_and_gelu(
 }
 
 #[expect(
+    clippy::inline_always,
+    reason = "fearless_simd dispatch! requires inline(always) to inherit target_feature attributes."
+)]
+#[inline(always)]
+fn add_chunk_sinusoids_simd<S: Simd>(
+    simd: S,
+    slice: &mut [f32],
+    sinusoids: &[f32],
+    first_row: usize,
+    rows_per_chunk: usize,
+    hidden: usize,
+) -> bool {
+    let inf = f32x4::splat(simd, f32::INFINITY);
+    let mut all_finite = true;
+    for (local_r, row) in slice.chunks_exact_mut(hidden).enumerate() {
+        let pos_in_chunk = (first_row + local_r) % rows_per_chunk;
+        let sin_row = &sinusoids[pos_in_chunk * hidden..(pos_in_chunk + 1) * hidden];
+        let (r_chunks, r_tail) = row.as_chunks_mut::<4>();
+        let (s_chunks, s_tail) = sin_row.as_chunks::<4>();
+        for (rc, sc) in r_chunks.iter_mut().zip(s_chunks) {
+            let sum = f32x4::from_slice(simd, rc) + f32x4::from_slice(simd, sc);
+            if !sum.abs().simd_lt(inf).all_true() {
+                all_finite = false;
+            }
+            sum.store_slice(rc);
+        }
+        for (dst, &sin_val) in r_tail.iter_mut().zip(s_tail) {
+            *dst += sin_val;
+            if !dst.is_finite() {
+                all_finite = false;
+            }
+        }
+    }
+    all_finite
+}
+
+fn add_chunk_sinusoids_parallel(
+    rows: &mut [f32],
+    sinusoids: &[f32],
+    rows_per_chunk: usize,
+    hidden: usize,
+    workers: usize,
+) -> io::Result<()> {
+    if rows.is_empty() || rows_per_chunk == 0 {
+        return Ok(());
+    }
+    let level = packed::simd_level();
+    row_workers::try_run_aligned(rows, workers, hidden, &|elem_off, slice| {
+        let first_row = elem_off / hidden;
+        let ok = dispatch!(
+            level,
+            simd => add_chunk_sinusoids_simd(simd, slice, sinusoids, first_row, rows_per_chunk, hidden)
+        );
+        if ok { Ok(()) } else { Err(invalid()) }
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct-to-quads Conv2d im2col writes 4-position quads without an intermediate patch buffer."
+)]
+fn im2col_quads_slice(
+    rounded: &[f32],
+    width: usize,
+    height: usize,
+    channels: usize,
+    out_width: usize,
+    total_patches: usize,
+    first_quad: usize,
+    dst_quads: &mut [[f32; 4]],
+) {
+    let patch_width = 9 * channels;
+    for (local_q, quad_slice) in dst_quads.chunks_exact_mut(patch_width).enumerate() {
+        let q = first_quad + local_q;
+        let base_pos = q * 4;
+        if base_pos + 3 < total_patches {
+            let y0 = base_pos / out_width;
+            let x0 = base_pos % out_width;
+            if x0 + 3 < out_width && x0 > 0 && 2 * (x0 + 3) + 1 < width {
+                let py_opts: [Option<usize>; 3] =
+                    std::array::from_fn(|ky| (2 * y0 + ky).checked_sub(1).filter(|&py| py < height));
+                for ch in 0..channels {
+                    let ch_in_base = ch * height;
+                    let ch_p_base = ch * 9;
+                    for (ky, py_opt) in py_opts.iter().enumerate() {
+                        if let Some(py) = *py_opt {
+                            let in_row =
+                                &rounded[(ch_in_base + py) * width..(ch_in_base + py + 1) * width];
+                            for kx in 0..3 {
+                                let bx = 2 * x0 + kx - 1;
+                                quad_slice[ch_p_base + ky * 3 + kx] = [
+                                    in_row[bx],
+                                    in_row[bx + 2],
+                                    in_row[bx + 4],
+                                    in_row[bx + 6],
+                                ];
+                            }
+                        } else {
+                            quad_slice[ch_p_base + ky * 3..ch_p_base + ky * 3 + 3].fill([0.0; 4]);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+        quad_slice.fill([0.0; 4]);
+        for lane in 0..4 {
+            let pos = base_pos + lane;
+            if pos >= total_patches {
+                break;
+            }
+            let y = pos / out_width;
+            let x = pos % out_width;
+            let py_opts: [Option<usize>; 3] =
+                std::array::from_fn(|ky| (2 * y + ky).checked_sub(1).filter(|&py| py < height));
+            let px_opts: [Option<usize>; 3] =
+                std::array::from_fn(|kx| (2 * x + kx).checked_sub(1).filter(|&px| px < width));
+            for ch in 0..channels {
+                let ch_in_base = ch * height;
+                let ch_p_base = ch * 9;
+                for (ky, py_opt) in py_opts.iter().enumerate() {
+                    if let Some(py) = *py_opt {
+                        let in_row =
+                            &rounded[(ch_in_base + py) * width..(ch_in_base + py + 1) * width];
+                        for (kx, px_opt) in px_opts.iter().enumerate() {
+                            if let Some(px) = *px_opt {
+                                quad_slice[ch_p_base + ky * 3 + kx][lane] = in_row[px];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[expect(
     clippy::too_many_arguments,
     reason = "Reuses batch im2col, rounded input, and channel-major buffers across chunked encoder stages."
 )]
@@ -685,7 +826,6 @@ fn convolve_into_with_threads(
     channels: usize,
     workers: usize,
     prepared: &mut PreparedBatch,
-    patches: &mut Vec<f32>,
     rounded_input: &mut Vec<f32>,
     scratch: &mut Vec<f32>,
     output: &mut Vec<f32>,
@@ -715,56 +855,81 @@ fn convolve_into_with_threads(
         }
     }
 
-    ensure_buffer(patches, total_patches * patch_width)?;
-    if total_patches > 0 && patch_width > 0 {
+    ensure_buffer(output, out_channels * total_patches)?;
+    if linear.weights.is_float() {
         let rounded = &rounded_input[..input_len];
-        let row_stride = out_width * patch_width;
-        row_workers::run_aligned(patches, workers, row_stride, &|elem_off, slice| {
-            let first_y = elem_off / row_stride;
-            for (local_y, y_slice) in slice.chunks_exact_mut(row_stride).enumerate() {
-                let y = first_y + local_y;
-                let py_opts: [Option<usize>; 3] =
-                    std::array::from_fn(|ky| (2 * y + ky).checked_sub(1).filter(|&py| py < height));
-                for (x, patch) in y_slice.chunks_exact_mut(patch_width).enumerate() {
-                    let interior_x = x > 0 && 2 * x + 1 < width;
-                    for channel in 0..channels {
-                        let ch_in_base = channel * height;
-                        let ch_p_base = channel * 9;
-                        for (ky, py_opt) in py_opts.iter().enumerate() {
-                            let row_dst = &mut patch[ch_p_base + ky * 3..ch_p_base + (ky + 1) * 3];
-                            if let Some(py) = *py_opt {
-                                let in_row = &rounded
-                                    [(ch_in_base + py) * width..(ch_in_base + py + 1) * width];
-                                if interior_x {
-                                    row_dst.copy_from_slice(&in_row[2 * x - 1..2 * x + 2]);
-                                } else {
-                                    for (kx, dst) in row_dst.iter_mut().enumerate() {
-                                        *dst = (2 * x + kx)
-                                            .checked_sub(1)
-                                            .filter(|&px| px < width)
-                                            .map_or(0.0, |px| in_row[px]);
+        prepared.prepare_quads_direct(total_patches, patch_width, workers, &|first_quad, dst| {
+            im2col_quads_slice(
+                rounded,
+                width,
+                height,
+                channels,
+                out_width,
+                total_patches,
+                first_quad,
+                dst,
+            );
+        });
+        linear.weights.multiply_batch_channel_major_prepacked_into(
+            prepared,
+            workers,
+            scratch,
+            &mut output[..out_channels * total_patches],
+            cancel,
+        )?;
+    } else {
+        let mut patches = Vec::new();
+        ensure_buffer(&mut patches, total_patches * patch_width)?;
+        if total_patches > 0 && patch_width > 0 {
+            let rounded = &rounded_input[..input_len];
+            let row_stride = out_width * patch_width;
+            row_workers::run_aligned(&mut patches, workers, row_stride, &|elem_off, slice| {
+                let first_y = elem_off / row_stride;
+                for (local_y, y_slice) in slice.chunks_exact_mut(row_stride).enumerate() {
+                    let y = first_y + local_y;
+                    let py_opts: [Option<usize>; 3] = std::array::from_fn(|ky| {
+                        (2 * y + ky).checked_sub(1).filter(|&py| py < height)
+                    });
+                    for (x, patch) in y_slice.chunks_exact_mut(patch_width).enumerate() {
+                        let interior_x = x > 0 && 2 * x + 1 < width;
+                        for channel in 0..channels {
+                            let ch_in_base = channel * height;
+                            let ch_p_base = channel * 9;
+                            for (ky, py_opt) in py_opts.iter().enumerate() {
+                                let row_dst =
+                                    &mut patch[ch_p_base + ky * 3..ch_p_base + (ky + 1) * 3];
+                                if let Some(py) = *py_opt {
+                                    let in_row = &rounded
+                                        [(ch_in_base + py) * width..(ch_in_base + py + 1) * width];
+                                    if interior_x {
+                                        row_dst.copy_from_slice(&in_row[2 * x - 1..2 * x + 2]);
+                                    } else {
+                                        for (kx, dst) in row_dst.iter_mut().enumerate() {
+                                            *dst = (2 * x + kx)
+                                                .checked_sub(1)
+                                                .filter(|&px| px < width)
+                                                .map_or(0.0, |px| in_row[px]);
+                                        }
                                     }
+                                } else {
+                                    row_dst.fill(0.0);
                                 }
-                            } else {
-                                row_dst.fill(0.0);
                             }
                         }
                     }
                 }
-            }
-        });
+            });
+        }
+        prepared.prepare_meta(total_patches, patch_width);
+        linear.weights.multiply_batch_channel_major_prepared_into(
+            prepared,
+            &patches[..total_patches * patch_width],
+            workers,
+            scratch,
+            &mut output[..out_channels * total_patches],
+            cancel,
+        )?;
     }
-
-    prepared.prepare_meta(total_patches, patch_width);
-    ensure_buffer(output, out_channels * total_patches)?;
-    linear.weights.multiply_batch_channel_major_prepared_into(
-        prepared,
-        &patches[..total_patches * patch_width],
-        workers,
-        scratch,
-        &mut output[..out_channels * total_patches],
-        cancel,
-    )?;
     channel_major_bias_and_gelu(
         &mut output[..out_channels * total_patches],
         &linear.bias,
@@ -796,7 +961,6 @@ fn convolve_with_threads(
     cancel: &mut impl FnMut() -> bool,
 ) -> io::Result<Vec<f32>> {
     let mut prepared = PreparedBatch::default();
-    let mut patches = Vec::new();
     let mut flat_out = Vec::new();
     let mut scratch = Vec::new();
     let mut output = Vec::new();
@@ -808,7 +972,6 @@ fn convolve_with_threads(
         channels,
         workers,
         &mut prepared,
-        &mut patches,
         &mut flat_out,
         &mut scratch,
         &mut output,

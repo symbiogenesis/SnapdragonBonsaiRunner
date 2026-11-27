@@ -402,6 +402,41 @@ impl Projection {
         finite(out)
     }
 
+    pub(super) const fn is_float(&self) -> bool {
+        matches!(self.data, Storage::Float(_))
+    }
+
+    /// Compute batched channel-major `[output, batch]` rows from pre-packed finite `quads`,
+    /// omitting redundant input validation when the caller guarantees finite quads and checks `out`.
+    pub(super) fn multiply_batch_channel_major_prepacked_into(
+        &self,
+        prepared: &mut PreparedBatch,
+        workers: usize,
+        scratch: &mut Vec<f32>,
+        out: &mut [f32],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        let batch = prepared.batch();
+        if !self.is_float()
+            || prepared.input() != self.input
+            || out.len() != batch.checked_mul(self.output).ok_or_else(invalid)?
+        {
+            return Err(invalid());
+        }
+        for _ in 0..(batch + self.output) {
+            check(cancel)?;
+        }
+        packed::multiply_batch_channel_major_into(
+            self.as_weight_matrix(),
+            prepared,
+            &[],
+            workers,
+            scratch,
+            out,
+        );
+        Ok(())
+    }
+
     /// Compute batched channel-major `[output, batch]` rows directly using a shared `PreparedBatch`.
     pub(super) fn multiply_batch_channel_major_prepared_into(
         &self,
