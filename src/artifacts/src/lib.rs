@@ -1345,7 +1345,8 @@ fn check_arm64(file: &mut (impl Read + Seek)) -> Result<(), ArtifactError> {
 pub fn validate_external_path(path: &Path) -> Result<(), ArtifactError> {
     #[cfg(windows)]
     {
-        bonsai_windows_credentials::validate_external_path(path).map_err(|_| ArtifactError::Path)
+        bonsai_windows_credentials::validate_external_path_creatable(path)
+            .map_err(|_| ArtifactError::Path)
     }
     #[cfg(not(windows))]
     {
@@ -1927,14 +1928,31 @@ mod tests {
     fn validate_external_path_rejects_git_segments_and_reserved_names() {
         let temp = std::env::temp_dir();
         assert!(validate_external_path(&temp.join("valid-leaf")).is_ok());
+        assert!(validate_external_path(&temp.join("missing-parent").join("valid-leaf")).is_ok());
         assert_eq!(
             validate_external_path(&temp.join(".git").join("leaf")),
             Err(ArtifactError::Path)
         );
-        #[cfg(windows)]
         assert_eq!(
-            validate_external_path(&temp.join("COM1.bin")),
+            validate_external_path(&temp.join("missing-parent").join(".git").join("leaf")),
             Err(ArtifactError::Path)
         );
+        #[cfg(windows)]
+        {
+            assert!(
+                bonsai_windows_credentials::validate_external_path(
+                    &temp.join("missing-parent").join("valid-leaf")
+                )
+                .is_err()
+            );
+            assert_eq!(
+                validate_external_path(&temp.join("COM1.bin")),
+                Err(ArtifactError::Path)
+            );
+            assert_eq!(
+                validate_external_path(&temp.join("missing-parent").join("COM1.bin")),
+                Err(ArtifactError::Path)
+            );
+        }
     }
 }

@@ -63,7 +63,7 @@ pub fn is_app_container() -> io::Result<bool> {
 /// Rejects unsafe paths, unavailable token/drive facts, nonregular files,
 /// reparse points, Git ancestry and failed metadata queries.
 pub fn validate_read_path(path: &Path) -> io::Result<()> {
-    validate_path_inner(path, !is_app_container()?)?;
+    validate_path_inner(path, !is_app_container()?, false)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_attributes() & native::REPARSE_ATTRIBUTE != 0 {
         return Err(invalid("Read access requires an existing regular file."));
@@ -319,10 +319,28 @@ impl PrivateCredentials {
 /// Returns an error for unsupported spelling, a nonlocal drive, unsafe ancestors,
 /// missing intermediate directories, or an unexpected filesystem error.
 pub fn validate_external_path(path: &Path) -> io::Result<()> {
-    validate_path_inner(path, true)
+    validate_path_inner(path, true, false)
 }
 
-fn validate_path_inner(path: &Path, check_root: bool) -> io::Result<()> {
+/// Validates expanded absolute local-drive storage outside Git repositories,
+/// allowing multiple nonexistent trailing segments that the caller will create.
+///
+/// Existing ancestors are still checked for local-drive status, reparse points,
+/// non-directory intermediate segments, and `.git` ancestry; every component
+/// (existing or not) is checked for unsafe/reserved Windows names.
+///
+/// # Errors
+/// Returns an error for unsupported spelling, a nonlocal drive, unsafe or
+/// non-directory existing ancestors, or an unexpected filesystem error.
+pub fn validate_external_path_creatable(path: &Path) -> io::Result<()> {
+    validate_path_inner(path, true, true)
+}
+
+fn validate_path_inner(
+    path: &Path,
+    check_root: bool,
+    allow_missing_ancestors: bool,
+) -> io::Result<()> {
     let spelling = path
         .to_str()
         .ok_or_else(|| invalid("Path must be valid Unicode."))?;
@@ -360,15 +378,23 @@ fn validate_path_inner(path: &Path, check_root: bool) -> io::Result<()> {
     if check_root {
         check_existing(&cursor)?;
     }
+    let mut missing = false;
     for (index, part) in components.iter().enumerate() {
         cursor.push(part);
+        if missing {
+            continue;
+        }
         match check_existing(&cursor) {
             Ok(is_directory) if !is_directory && index + 1 != components.len() => {
                 return Err(invalid("Path ancestor must be a directory."));
             }
             Ok(_) => {}
             Err(error)
-                if error.kind() == io::ErrorKind::NotFound && index + 1 == components.len() => {}
+                if error.kind() == io::ErrorKind::NotFound
+                    && (allow_missing_ancestors || index + 1 == components.len()) =>
+            {
+                missing = true;
+            }
             Err(error) => return Err(error),
         }
     }
