@@ -31,6 +31,25 @@ const _: () = assert!(MAX_POOL_WORKERS <= SLOT_MASK);
 #[repr(align(64))]
 struct CachePadded<T>(T);
 
+#[repr(align(128))]
+struct WorkerWakeSlot {
+    wake_gen: AtomicUsize,
+    parked: AtomicBool,
+    park_mutex: Mutex<()>,
+    park_cv: Condvar,
+}
+
+impl WorkerWakeSlot {
+    fn new() -> Self {
+        Self {
+            wake_gen: AtomicUsize::new(0),
+            parked: AtomicBool::new(false),
+            park_mutex: Mutex::new(()),
+            park_cv: Condvar::new(),
+        }
+    }
+}
+
 thread_local! {
     static IN_ROW_POOL: Cell<bool> = const { Cell::new(false) };
 }
@@ -90,14 +109,12 @@ struct Shared {
     num_chunks: AtomicUsize,
     shutdown: AtomicBool,
     has_panic: AtomicBool,
-    generation: CachePadded<AtomicUsize>,
+    next_gen: CachePadded<AtomicUsize>,
     dispatch_state: CachePadded<AtomicUsize>,
     next_chunk: CachePadded<AtomicUsize>,
     done_gen: [CachePadded<AtomicUsize>; MAX_POOL_WORKERS],
     done_waiting: CachePadded<AtomicBool>,
-    parked_count: CachePadded<AtomicUsize>,
-    park_mutex: Mutex<()>,
-    park_cv: Condvar,
+    wake_slots: [WorkerWakeSlot; MAX_POOL_WORKERS],
     done_mutex: Mutex<()>,
     done_cv: Condvar,
     dispatch_mutex: Mutex<()>,
@@ -106,11 +123,12 @@ struct Shared {
     chunks: [UnsafeCell<ChunkDesc>; MAX_POOL_WORKERS],
 }
 
-// SAFETY: `Shared` synchronizes chunk publication via `generation` (SeqCst/Release)
-// and per-worker direct slot assignment or exclusive atomic chunk claims; each
-// chunk descriptor is claimed by at most one thread over disjoint mutable
-// sub-slices, and `ScopeGuard` keeps all referenced stack data alive until
-// every active worker publishes completion in `done_gen`.
+// SAFETY: `Shared` synchronizes chunk publication via each active worker's
+// `wake_slots[worker_id].wake_gen` (SeqCst/Acquire) and per-worker direct slot
+// assignment or exclusive atomic chunk claims; each chunk descriptor is claimed
+// by at most one thread over disjoint mutable sub-slices, and `ScopeGuard` keeps
+// all referenced stack data alive until every active worker publishes
+// completion in `done_gen`.
 unsafe impl Send for Shared {}
 
 // SAFETY: See `Send` contract above; all concurrent mutations happen through
@@ -124,14 +142,12 @@ impl Shared {
             num_chunks: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             has_panic: AtomicBool::new(false),
-            generation: CachePadded(AtomicUsize::new(0)),
+            next_gen: CachePadded(AtomicUsize::new(0)),
             dispatch_state: CachePadded(AtomicUsize::new(0)),
             next_chunk: CachePadded(AtomicUsize::new(0)),
             done_gen: std::array::from_fn(|_| CachePadded(AtomicUsize::new(0))),
             done_waiting: CachePadded(AtomicBool::new(false)),
-            parked_count: CachePadded(AtomicUsize::new(0)),
-            park_mutex: Mutex::new(()),
-            park_cv: Condvar::new(),
+            wake_slots: std::array::from_fn(|_| WorkerWakeSlot::new()),
             done_mutex: Mutex::new(()),
             done_cv: Condvar::new(),
             dispatch_mutex: Mutex::new(()),
@@ -139,6 +155,14 @@ impl Shared {
             task: UnsafeCell::new(TaskPtr::default()),
             chunks: std::array::from_fn(|_| UnsafeCell::new(ChunkDesc::default())),
         }
+    }
+
+    #[cfg(test)]
+    fn parked_worker_count(&self) -> usize {
+        self.wake_slots[1..self.worker_count]
+            .iter()
+            .filter(|slot| slot.parked.load(Ordering::Acquire))
+            .count()
     }
 
     fn try_claim_slot_for_gen(&self, gen_id: usize, worker_id: usize) -> ClaimedWork {
@@ -207,35 +231,36 @@ enum ClaimedWork {
 
 fn worker_loop(shared: &Shared, worker_id: usize) {
     IN_ROW_POOL.with(|flag| flag.set(true));
+    let slot = &shared.wake_slots[worker_id];
     let mut last_gen = 0_usize;
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
             return;
         }
-        let mut current_gen = shared.generation.0.load(Ordering::Acquire);
+        let mut current_gen = slot.wake_gen.load(Ordering::Acquire);
         if current_gen == last_gen {
             for _ in 0..SPIN_ITERATIONS {
                 if shared.shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                if shared.generation.0.load(Ordering::Relaxed) != last_gen {
-                    current_gen = shared.generation.0.load(Ordering::Acquire);
+                if slot.wake_gen.load(Ordering::Relaxed) != last_gen {
+                    current_gen = slot.wake_gen.load(Ordering::Acquire);
                     break;
                 }
                 std::hint::spin_loop();
             }
         }
         if current_gen == last_gen {
-            shared.parked_count.0.fetch_add(1, Ordering::SeqCst);
-            let mut guard = lock_unpoisoned(&shared.park_mutex);
+            let mut guard = lock_unpoisoned(&slot.park_mutex);
+            slot.parked.store(true, Ordering::SeqCst);
             while !shared.shutdown.load(Ordering::SeqCst) {
-                current_gen = shared.generation.0.load(Ordering::SeqCst);
+                current_gen = slot.wake_gen.load(Ordering::SeqCst);
                 if current_gen != last_gen {
                     break;
                 }
-                guard = wait_unpoisoned(&shared.park_cv, guard);
+                guard = wait_unpoisoned(&slot.park_cv, guard);
             }
-            shared.parked_count.0.fetch_sub(1, Ordering::SeqCst);
+            slot.parked.store(false, Ordering::Release);
             drop(guard);
             if shared.shutdown.load(Ordering::Acquire) {
                 return;
@@ -246,7 +271,7 @@ fn worker_loop(shared: &Shared, worker_id: usize) {
         if claim == ClaimedWork::None {
             continue;
         }
-        // SAFETY: `task` was published prior to incrementing `generation` and
+        // SAFETY: `task` was published prior to incrementing `wake_gen` and
         // stays valid until every active worker publishes `done_gen == current_gen`.
         let task = unsafe { *shared.task.get() };
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| match claim {
@@ -417,7 +442,7 @@ impl NativeRowWorkerPool {
         let direct = chunk_count <= self.shared.worker_count;
         let next_gen = match self
             .shared
-            .generation
+            .next_gen
             .0
             .load(Ordering::Relaxed)
             .wrapping_add(1)
@@ -426,6 +451,7 @@ impl NativeRowWorkerPool {
             0 => 1,
             g => g,
         };
+        self.shared.next_gen.0.store(next_gen, Ordering::Relaxed);
         let task = TaskPtr {
             call: call_closure::<T, F>,
             env: (&raw const *compute).cast::<()>(),
@@ -451,16 +477,12 @@ impl NativeRowWorkerPool {
             active_workers: chunk_count,
         };
 
-        self.shared.generation.0.store(next_gen, Ordering::SeqCst);
-        let parked = self.shared.parked_count.0.load(Ordering::SeqCst);
-        if parked > 0 && active_bg > 0 {
-            let _park = lock_unpoisoned(&self.shared.park_mutex);
-            if direct || active_bg >= parked {
-                self.shared.park_cv.notify_all();
-            } else {
-                for _ in 0..active_bg {
-                    self.shared.park_cv.notify_one();
-                }
+        let wake_end = chunk_count.min(self.shared.worker_count);
+        for slot in &self.shared.wake_slots[1..wake_end] {
+            slot.wake_gen.store(next_gen, Ordering::SeqCst);
+            if slot.parked.load(Ordering::SeqCst) {
+                let _park = lock_unpoisoned(&slot.park_mutex);
+                slot.park_cv.notify_one();
             }
         }
 
@@ -503,9 +525,11 @@ impl NativeRowWorkerPool {
 impl Drop for NativeRowWorkerPool {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
-        {
-            let _guard = lock_unpoisoned(&self.shared.park_mutex);
-            self.shared.park_cv.notify_all();
+        for slot in &self.shared.wake_slots[1..self.shared.worker_count] {
+            if slot.parked.load(Ordering::SeqCst) {
+                let _guard = lock_unpoisoned(&slot.park_mutex);
+                slot.park_cv.notify_one();
+            }
         }
         for handle in self.workers.drain(..) {
             let _ = handle.join();
@@ -521,6 +545,7 @@ mod tests {
     fn shared_hot_atomics_are_cache_line_padded() {
         assert_eq!(align_of::<CachePadded<AtomicUsize>>(), 64);
         assert_eq!(align_of::<CachePadded<AtomicBool>>(), 64);
+        assert_eq!(align_of::<WorkerWakeSlot>(), 128);
     }
 
     #[test]
@@ -541,9 +566,7 @@ mod tests {
         }
         // Let workers park, then wake only a subset.
         let park_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-        while pool.shared.parked_count.0.load(Ordering::Acquire) < 7
-            && std::time::Instant::now() < park_deadline
-        {
+        while pool.shared.parked_worker_count() < 7 && std::time::Instant::now() < park_deadline {
             std::thread::yield_now();
         }
         out.fill(0.0);
@@ -735,6 +758,134 @@ mod tests {
                 u16::try_from(idx).map_or(0.0, f32::from).to_bits()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn partial_team_steady_state_keeps_idle_workers_parked() -> io::Result<()> {
+        let pool = NativeRowWorkerPool::new(16, "test-steady-park")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while pool.shared.parked_worker_count() < 15 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(pool.shared.parked_worker_count(), 15);
+
+        let mut out = vec![0_usize; 96];
+        for iter in 0..64_usize {
+            out.fill(0);
+            pool.run_slice_aligned(&mut out, 6, 16, &|offset, slice| {
+                for (i, slot) in slice.iter_mut().enumerate() {
+                    *slot = offset + i + iter;
+                }
+            });
+            for (idx, &val) in out.iter().enumerate() {
+                assert_eq!(val, idx + iter);
+            }
+            for w in 6..16 {
+                assert_eq!(
+                    pool.shared.wake_slots[w].wake_gen.load(Ordering::Acquire),
+                    0
+                );
+                assert!(pool.shared.wake_slots[w].parked.load(Ordering::Acquire));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rapid_active_worker_oscillation_completes_accurately() -> io::Result<()> {
+        use std::collections::HashSet;
+
+        let pool = NativeRowWorkerPool::new(16, "test-oscillate")?;
+        let mut out = vec![0_usize; 256];
+        let sequence = [1_usize, 6, 8, 16, 2, 6];
+        for round in 0..4_usize {
+            if round == 2 {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                while pool.shared.parked_worker_count() < 15 && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+            }
+            for (step, &active) in sequence.iter().enumerate() {
+                out.fill(0);
+                let threads: Mutex<HashSet<std::thread::ThreadId>> = Mutex::new(HashSet::new());
+                pool.run_slice_aligned(&mut out, active, 16, &|offset, slice| {
+                    lock_unpoisoned(&threads).insert(std::thread::current().id());
+                    for (i, slot) in slice.iter_mut().enumerate() {
+                        *slot = offset + i + active + step;
+                    }
+                });
+                assert_eq!(lock_unpoisoned(&threads).len(), active);
+                for (idx, &val) in out.iter().enumerate() {
+                    assert_eq!(val, idx + active + step);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partial_team_panic_propagates_and_leaves_idle_workers_parked() -> io::Result<()> {
+        let pool = NativeRowWorkerPool::new(8, "test-partial-panic")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while pool.shared.parked_worker_count() < 7 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(pool.shared.parked_worker_count(), 7);
+
+        let coordinator_id = std::thread::current().id();
+        let mut out = vec![0.0_f32; 48];
+        let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let shared_panic = &pool.shared.has_panic;
+            pool.run_aligned(&mut out, 3, 16, &|offset, _slice| {
+                if std::thread::current().id() == coordinator_id {
+                    let wait_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(200);
+                    while !shared_panic.load(Ordering::Acquire)
+                        && std::time::Instant::now() < wait_deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                } else {
+                    assert!(
+                        std::thread::current().id() == coordinator_id,
+                        "deliberate partial worker panic at {offset}"
+                    );
+                }
+            });
+        }));
+        assert!(res.is_err());
+        assert!(!pool.shared.has_panic.load(Ordering::Acquire));
+        for w in 3..8 {
+            assert_eq!(
+                pool.shared.wake_slots[w].wake_gen.load(Ordering::Acquire),
+                0
+            );
+            assert!(pool.shared.wake_slots[w].parked.load(Ordering::Acquire));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_with_mixed_parked_and_spinning_workers_joins_cleanly() -> io::Result<()> {
+        let pool = NativeRowWorkerPool::new(12, "test-mixed-drop")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while pool.shared.parked_worker_count() < 11 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(pool.shared.parked_worker_count(), 11);
+
+        let mut out = vec![0_usize; 64];
+        pool.run_slice_aligned(&mut out, 4, 16, &|offset, slice| {
+            for (i, slot) in slice.iter_mut().enumerate() {
+                *slot = offset + i;
+            }
+        });
+        for w in 4..12 {
+            assert!(pool.shared.wake_slots[w].parked.load(Ordering::Acquire));
+        }
+        drop(pool);
         Ok(())
     }
 }
