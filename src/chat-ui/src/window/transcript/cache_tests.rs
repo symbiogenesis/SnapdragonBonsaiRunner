@@ -157,7 +157,7 @@ fn unchanged_layouts_reuse_cache_and_reasoning_visibility_invalidates_it() {
             message
                 .cache
                 .as_ref()
-                .is_some_and(|cache| cache.reasoning.is_some() == visible)
+                .is_some_and(|cache| !cache.reasoning.is_empty() == visible)
         );
         assert_active_underline_matches_glyphs(message);
         chat.run();
@@ -188,7 +188,7 @@ fn hidden_reasoning_streams_without_cache_updates_and_expands_complete_text() {
             message
                 .cache
                 .as_ref()
-                .is_some_and(|cache| cache.reasoning.is_none())
+                .is_some_and(|cache| cache.reasoning.is_empty())
         );
         assert_active_underline_matches_glyphs(message);
     }
@@ -199,10 +199,7 @@ fn hidden_reasoning_streams_without_cache_updates_and_expands_complete_text() {
     assert_eq!(message.cache_updates, initial_updates + 1);
     assert_eq!(message.body_layouts, 1);
     assert!(message.cache.as_ref().is_some_and(|cache| {
-        cache
-            .reasoning
-            .as_ref()
-            .is_some_and(|reasoning| reasoning.job.text == "Private reasoning 界 🌱")
+        cache.reasoning.len() == 1 && cache.reasoning[0].job.text == "Private reasoning 界 🌱"
     }));
 
     chat.state_mut().messages[0].show_reasoning = false;
@@ -216,10 +213,8 @@ fn hidden_reasoning_streams_without_cache_updates_and_expands_complete_text() {
     let message = &chat.state().messages[0];
     assert_eq!(message.cache_updates, hidden_updates + 1);
     assert!(message.cache.as_ref().is_some_and(|cache| {
-        cache
-            .reasoning
-            .as_ref()
-            .is_some_and(|reasoning| reasoning.job.text == "Private reasoning 界 🌱 later text")
+        cache.reasoning.len() == 1
+            && cache.reasoning[0].job.text == "Private reasoning 界 🌱 later text"
     }));
     assert_active_underline_matches_glyphs(message);
 }
@@ -281,14 +276,15 @@ fn reader_size_reflows_styled_text_reasoning_and_find_once() {
             .iter()
             .any(|section| { section.format.font_id.size.to_bits() == 42.0_f32.to_bits() })
     );
-    assert!(cache.reasoning.as_ref().is_some_and(|reasoning| {
-        reasoning.job.text == "Visible reasoning 🌱"
-            && reasoning
+    assert!(
+        cache.reasoning.len() == 1
+            && cache.reasoning[0].job.text == "Visible reasoning 🌱"
+            && cache.reasoning[0]
                 .job
                 .sections
                 .iter()
                 .all(|section| section.format.font_id == FontId::proportional(21.0))
-    }));
+    );
     assert_active_underline_matches_glyphs(message);
     chat.run();
     assert_eq!(layout_counts(chat.state()), vec![2, 2]);
@@ -344,7 +340,7 @@ fn streamed_reasoning_and_search_only_relayout_affected_message_bodies() {
         chat.state().messages[3]
             .cache
             .as_ref()
-            .is_some_and(|cache| cache.reasoning.is_some())
+            .is_some_and(|cache| !cache.reasoning.is_empty())
     );
 
     chat.state_mut().append(" and another hit", false);
@@ -1033,5 +1029,92 @@ fn incremental_streaming_layout_reuses_completed_chunks_and_preserves_find_offse
         return Err("Expected tail segment");
     };
     assert!(!tail_after.underline.is_empty());
+    Ok(())
+}
+
+#[test]
+fn streaming_reasoning_reuses_settled_paragraph_galleys_and_reflows_on_geometry_change()
+-> Result<(), &'static str> {
+    let mut transcript = Transcript::default();
+    transcript.push(Role::Assistant, "Answer".to_owned());
+    transcript.append(
+        "First thinking paragraph.\n\nSecond thinking paragraph.\n\nActive",
+        true,
+    );
+    transcript.messages[0].show_reasoning = true;
+    let mut chat = harness(transcript);
+    chat.run();
+
+    let message = &chat.state().messages[0];
+    let cache = message.cache.as_ref().ok_or("Expected reasoning cache")?;
+    assert_eq!(cache.reasoning.len(), 3);
+    assert_eq!(cache.reasoning[0].job.text, "First thinking paragraph.");
+    assert_eq!(cache.reasoning[1].job.text, "Second thinking paragraph.");
+    assert_eq!(cache.reasoning[2].job.text, "Active");
+    let first_galley = Arc::clone(&cache.reasoning[0]);
+    let second_galley = Arc::clone(&cache.reasoning[1]);
+    let shaped_before = message.reasoning_galleys_shaped;
+    assert_eq!(shaped_before, 3);
+
+    // Appending tokens to the trailing paragraph only reshapes that active paragraph.
+    for token in [" token", " one", " two"] {
+        chat.state_mut().append(token, true);
+        chat.run();
+    }
+    let message = &chat.state().messages[0];
+    let cache = message
+        .cache
+        .as_ref()
+        .ok_or("Expected updated reasoning cache")?;
+    assert_eq!(cache.reasoning.len(), 3);
+    assert!(Arc::ptr_eq(&first_galley, &cache.reasoning[0]));
+    assert!(Arc::ptr_eq(&second_galley, &cache.reasoning[1]));
+    assert_eq!(cache.reasoning[2].job.text, "Active token one two");
+    assert_eq!(message.reasoning_galleys_shaped, shaped_before + 3);
+
+    // Completing a new paragraph boundary settles the prior active paragraph without touching earlier ones.
+    chat.state_mut().append("\n\nFourth", true);
+    chat.run();
+    let message = &chat.state().messages[0];
+    let cache = message
+        .cache
+        .as_ref()
+        .ok_or("Expected fourth paragraph cache")?;
+    assert_eq!(cache.reasoning.len(), 4);
+    assert!(Arc::ptr_eq(&first_galley, &cache.reasoning[0]));
+    assert!(Arc::ptr_eq(&second_galley, &cache.reasoning[1]));
+    assert_eq!(cache.reasoning[2].job.text, "Active token one two");
+    assert_eq!(cache.reasoning[3].job.text, "Fourth");
+    assert_eq!(message.reasoning_galleys_shaped, shaped_before + 5);
+    let third_galley = Arc::clone(&cache.reasoning[2]);
+
+    // Changing reader text size reflows all reasoning paragraphs cleanly.
+    chat.ctx.data_mut(|data| {
+        data.insert_temp(egui::Id::unique("reading-text-size"), 24.0_f32);
+    });
+    chat.run();
+    let message = &chat.state().messages[0];
+    let cache = message
+        .cache
+        .as_ref()
+        .ok_or("Expected text-size reflowed cache")?;
+    assert_eq!(cache.reasoning.len(), 4);
+    assert!(!Arc::ptr_eq(&first_galley, &cache.reasoning[0]));
+    assert!(!Arc::ptr_eq(&second_galley, &cache.reasoning[1]));
+    assert!(!Arc::ptr_eq(&third_galley, &cache.reasoning[2]));
+    assert_eq!(message.reasoning_galleys_shaped, shaped_before + 9);
+    let size_first = Arc::clone(&cache.reasoning[0]);
+
+    // Changing width also reflows all reasoning paragraphs cleanly.
+    chat.set_size(egui::vec2(360.0, 800.0));
+    chat.run();
+    let message = &chat.state().messages[0];
+    let cache = message
+        .cache
+        .as_ref()
+        .ok_or("Expected width reflowed cache")?;
+    assert_eq!(cache.reasoning.len(), 4);
+    assert!(!Arc::ptr_eq(&size_first, &cache.reasoning[0]));
+    assert_eq!(message.reasoning_galleys_shaped, shaped_before + 13);
     Ok(())
 }

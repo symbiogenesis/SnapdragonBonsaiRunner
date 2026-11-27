@@ -141,9 +141,10 @@ struct LayoutCache {
     highlight_fill: Color32,
     highlight_color: Color32,
     reasoning_bytes: usize,
+    reasoning_settled_bytes: usize,
     segments: Vec<CachedSegment>,
     prefix_anchor: Option<formatting::PrefixAnchor>,
-    reasoning: Option<Arc<egui::Galley>>,
+    reasoning: Vec<Arc<egui::Galley>>,
 }
 
 impl LayoutCache {
@@ -184,6 +185,37 @@ impl LayoutCache {
         }
         None
     }
+}
+
+fn reasoning_paragraph_ranges(text: &str, start: usize) -> (Vec<(usize, usize)>, usize) {
+    if start >= text.len() {
+        return (Vec::new(), start);
+    }
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut chunk_start = start;
+    let mut settled_bytes = start;
+    let mut pos = start;
+    while pos + 1 < bytes.len() {
+        if bytes[pos] == b'\n' && bytes[pos + 1] == b'\n' {
+            let mut gap_end = pos + 2;
+            while bytes.get(gap_end) == Some(&b'\n') {
+                gap_end += 1;
+            }
+            if pos > chunk_start && gap_end < bytes.len() {
+                ranges.push((chunk_start, pos));
+                chunk_start = gap_end;
+                settled_bytes = gap_end;
+            }
+            pos = gap_end;
+        } else {
+            pos += 1;
+        }
+    }
+    if chunk_start < text.len() || ranges.is_empty() {
+        ranges.push((chunk_start, text.len()));
+    }
+    (ranges, settled_bytes)
 }
 
 fn sections_match(a: &[egui::text::LayoutSection], b: &[egui::text::LayoutSection]) -> bool {
@@ -257,6 +289,9 @@ pub(super) struct Message {
     #[cfg(test)]
     #[serde(skip)]
     shaped_galleys: usize,
+    #[cfg(test)]
+    #[serde(skip)]
+    reasoning_galleys_shaped: usize,
     #[cfg(test)]
     #[serde(skip)]
     cache_updates: usize,
@@ -431,6 +466,8 @@ impl Transcript {
             body_layouts: 0,
             #[cfg(test)]
             shaped_galleys: 0,
+            #[cfg(test)]
+            reasoning_galleys_shaped: 0,
             #[cfg(test)]
             cache_updates: 0,
             #[cfg(test)]
@@ -929,60 +966,82 @@ impl Message {
         let reasoning_visible = self.show_reasoning && !self.reasoning.is_empty();
         // Polonius lets a complete cache hit lend self.cache directly while a
         // partial miss ends the borrow and reclaims reusable galley owners below.
-        let (body_unchanged, reasoning_unchanged, underline_unchanged, can_reuse_galleys) =
-            if let Some(cache) = self.cache.as_ref() {
-                let same_geometry = cache.width.to_bits() == width.to_bits()
-                    && cache.pixels_per_point.to_bits() == pixels_per_point.to_bits()
-                    && cache.text_size.to_bits() == text_size.to_bits();
-                let can_reuse_galleys = same_geometry
-                    && cache.color == color
-                    && cache.code_background == code_background
-                    && cache.strong_color == strong_color
-                    && cache.highlights == highlights
-                    && (matches.is_empty()
-                        || (cache.highlight_fill == highlight_fill
-                            && cache.highlight_color == highlight_color));
-                let body_unchanged = can_reuse_galleys
-                    && !markdown_changed
-                    && cache.body_revision == self.body_revision
-                    && cache.pending == self.pending;
-                // Hidden reasoning has no galley. Its streamed bytes and weak
-                // color cannot invalidate the visible body or Find geometry;
-                // opening it still checks the complete current text below.
-                let reasoning_unchanged = !reasoning_visible
-                    || (same_geometry
-                        && cache.reasoning_bytes == self.reasoning.len()
-                        && cache.reasoning_color == reasoning_color);
-                let underline_unchanged = body_unchanged && cache.selected.as_ref() == selected;
-                if body_unchanged
-                    && reasoning_unchanged
-                    && underline_unchanged
-                    && cache.reasoning.is_some() == reasoning_visible
-                {
-                    return cache;
-                }
-                (
-                    body_unchanged,
-                    reasoning_unchanged,
-                    underline_unchanged,
-                    can_reuse_galleys,
-                )
-            } else {
-                (false, false, false, false)
-            };
+        let (
+            body_unchanged,
+            reasoning_unchanged,
+            underline_unchanged,
+            can_reuse_galleys,
+            can_reuse_reasoning,
+        ) = if let Some(cache) = self.cache.as_ref() {
+            let same_geometry = cache.width.to_bits() == width.to_bits()
+                && cache.pixels_per_point.to_bits() == pixels_per_point.to_bits()
+                && cache.text_size.to_bits() == text_size.to_bits();
+            let can_reuse_galleys = same_geometry
+                && cache.color == color
+                && cache.code_background == code_background
+                && cache.strong_color == strong_color
+                && cache.highlights == highlights
+                && (matches.is_empty()
+                    || (cache.highlight_fill == highlight_fill
+                        && cache.highlight_color == highlight_color));
+            let body_unchanged = can_reuse_galleys
+                && !markdown_changed
+                && cache.body_revision == self.body_revision
+                && cache.pending == self.pending;
+            // Hidden reasoning has no galley. Its streamed bytes and weak
+            // color cannot invalidate the visible body or Find geometry;
+            // opening it still checks the complete current text below.
+            let reasoning_unchanged = !reasoning_visible
+                || (same_geometry
+                    && cache.reasoning_bytes == self.reasoning.len()
+                    && cache.reasoning_color == reasoning_color);
+            let can_reuse_reasoning = reasoning_visible
+                && same_geometry
+                && cache.reasoning_color == reasoning_color
+                && !cache.reasoning.is_empty()
+                && self.reasoning.len() >= cache.reasoning_bytes
+                && cache.reasoning_settled_bytes <= self.reasoning.len()
+                && self
+                    .reasoning
+                    .is_char_boundary(cache.reasoning_settled_bytes);
+            let underline_unchanged = body_unchanged && cache.selected.as_ref() == selected;
+            if body_unchanged
+                && reasoning_unchanged
+                && underline_unchanged
+                && !cache.reasoning.is_empty() == reasoning_visible
+            {
+                return cache;
+            }
+            (
+                body_unchanged,
+                reasoning_unchanged,
+                underline_unchanged,
+                can_reuse_galleys,
+                can_reuse_reasoning,
+            )
+        } else {
+            (false, false, false, false, false)
+        };
         #[cfg(test)]
         {
             self.cache_updates += 1;
         }
         // Move reusable owners on a partial update. A complete cache hit above
         // does not reconstruct the cache or adjust any galley's Arc count.
-        let (previous_segments, previous_reasoning, previous_anchor, prev_streaming_chunks) = self
+        let (
+            previous_segments,
+            previous_reasoning,
+            prev_reasoning_settled_bytes,
+            previous_anchor,
+            prev_streaming_chunks,
+        ) = self
             .cache
             .take()
-            .map_or((None, None, None, false), |cache| {
+            .map_or((None, Vec::new(), 0, None, false), |cache| {
                 (
                     Some(cache.segments),
                     cache.reasoning,
+                    cache.reasoning_settled_bytes,
                     cache.prefix_anchor,
                     cache.streaming_chunks,
                 )
@@ -1041,19 +1100,14 @@ impl Message {
                 }
             }
         }
-        let reasoning = if !reasoning_visible {
-            None
-        } else if reasoning_unchanged && let Some(reasoning) = previous_reasoning {
-            Some(reasoning)
+        let (reasoning, reasoning_settled_bytes) = if !reasoning_visible {
+            (Vec::new(), 0)
+        } else if reasoning_unchanged && !previous_reasoning.is_empty() {
+            (previous_reasoning, prev_reasoning_settled_bytes)
         } else {
-            Some(ui.fonts_mut(|fonts| {
-                fonts.layout(
-                    self.reasoning.clone(),
-                    FontId::proportional(text_size * 0.875),
-                    reasoning_color,
-                    width,
-                )
-            }))
+            let reuse_settled =
+                can_reuse_reasoning.then_some((previous_reasoning, prev_reasoning_settled_bytes));
+            self.layout_reasoning(ui, width, text_size, reasoning_color, reuse_settled)
         };
         self.cache.insert(LayoutCache {
             width,
@@ -1071,10 +1125,46 @@ impl Message {
             highlight_fill,
             highlight_color,
             reasoning_bytes: self.reasoning.len(),
+            reasoning_settled_bytes,
             segments,
             prefix_anchor,
             reasoning,
         })
+    }
+
+    fn layout_reasoning(
+        &mut self,
+        ui: &egui::Ui,
+        width: f32,
+        text_size: f32,
+        reasoning_color: Color32,
+        reuse_settled: Option<(Vec<Arc<egui::Galley>>, usize)>,
+    ) -> (Vec<Arc<egui::Galley>>, usize) {
+        let (mut galleys, start) = match reuse_settled {
+            Some((mut settled, settled_bytes)) => {
+                settled.pop();
+                (settled, settled_bytes)
+            }
+            None => (Vec::new(), 0),
+        };
+        let (ranges, settled_bytes) = reasoning_paragraph_ranges(&self.reasoning, start);
+        let font_id = FontId::proportional(text_size * 0.875);
+        for (chunk_start, chunk_end) in ranges {
+            #[cfg(test)]
+            {
+                self.reasoning_galleys_shaped += 1;
+            }
+            let galley = ui.fonts_mut(|fonts| {
+                fonts.layout(
+                    self.reasoning[chunk_start..chunk_end].to_owned(),
+                    font_id.clone(),
+                    reasoning_color,
+                    width,
+                )
+            });
+            galleys.push(galley);
+        }
+        (galleys, settled_bytes)
     }
 
     fn layout_current(
@@ -1101,7 +1191,7 @@ impl Message {
                     || (cache.highlight_fill == style.highlight_fill
                         && cache.highlight_color == style.highlight_color))
                 && cache.selected.as_ref() == selected
-                && cache.reasoning.is_some() == visible_reasoning
+                && !cache.reasoning.is_empty() == visible_reasoning
                 && (!visible_reasoning
                     || (cache.reasoning_bytes == self.reasoning.len()
                         && cache.reasoning_color == style.reasoning_color))
@@ -1304,10 +1394,10 @@ impl Message {
         }
         if !self.reasoning.is_empty() {
             height += MESSAGE_CONTENT_GAP + MESSAGE_ACTION_SIZE;
-            if self.show_reasoning
-                && let Some(reasoning) = &cache.reasoning
-            {
-                height += reasoning.size().y + MESSAGE_CONTENT_GAP;
+            if self.show_reasoning {
+                for reasoning in &cache.reasoning {
+                    height += reasoning.size().y + MESSAGE_CONTENT_GAP;
+                }
             }
         }
         height
@@ -1417,10 +1507,10 @@ impl Message {
                     self.show_reasoning = !self.show_reasoning;
                     child.ctx().request_repaint();
                 }
-                if self.show_reasoning
-                    && let Some(reasoning) = &cache.reasoning
-                {
-                    child.add(egui::Label::new(Arc::clone(reasoning)).selectable(true));
+                if self.show_reasoning {
+                    for reasoning in &cache.reasoning {
+                        child.add(egui::Label::new(Arc::clone(reasoning)).selectable(true));
+                    }
                 }
             }
         }
