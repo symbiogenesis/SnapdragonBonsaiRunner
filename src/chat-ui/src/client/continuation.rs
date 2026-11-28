@@ -36,19 +36,35 @@ const REPETITION_NEEDLE_BYTES: usize = 120;
 const THINKING_HANDOFF_PROMPT: &str = "You have finished your reasoning above. \
 Now write your complete final response directly, without repeating your reasoning.";
 
-const META_PREAMBLES: [&str; 12] = [
+const META_PREAMBLES: [&str; 17] = [
     "continuing from where i left off",
     "continuing from where we left off",
     "continuing from the previous response",
     "continuing seamlessly",
+    "continuing",
     "here is the continuation",
     "here's the continuation",
+    "here is the rest",
+    "here's the rest",
+    "here is the rest of the response",
+    "here's the rest of the response",
     "continuation of the response",
     "continuation",
     "continued",
+    "(continued)",
     "[continued]",
-    "sure, here is the rest",
-    "sure, here's the rest",
+    "the rest",
+];
+
+const POLITE_PREAMBLE_PREFIXES: [&str; 8] = [
+    "sure, ",
+    "sure! ",
+    "of course, ",
+    "of course! ",
+    "certainly, ",
+    "certainly! ",
+    "okay, ",
+    "ok, ",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +84,17 @@ impl OpenFence {
             out.push_str(&self.info);
         }
         out
+    }
+
+    fn language_token(&self) -> &str {
+        self.info.split_whitespace().next().unwrap_or("")
+    }
+
+    fn is_closing_line(&self, line: &str) -> bool {
+        let Some((ch, len, after)) = parse_fence_run(line) else {
+            return false;
+        };
+        ch == self.ch && len >= self.len && after.bytes().all(|b| b == b' ' || b == b'\t')
     }
 }
 
@@ -136,11 +163,19 @@ fn open_fence_state(text: &str) -> Option<OpenFence> {
 }
 
 fn contains_control_marker(text: &str) -> bool {
-    const MARKERS: [&str; 5] = ["<|", "<think", "</think", "<tool_", "</tool_"];
+    const MARKERS: [&str; 6] = ["<|", "<think", "</think", "<tool_", "</tool_", "<tts_"];
     MARKERS.iter().any(|marker| text.contains(marker))
         || text
             .bytes()
             .any(|b| b < b' ' && !matches!(b, b'\n' | b'\r' | b'\t'))
+}
+
+fn message_has_control_marker(message: &Message) -> bool {
+    contains_control_marker(&message.content)
+        || message
+            .reasoning_content
+            .as_deref()
+            .is_some_and(contains_control_marker)
 }
 
 fn build_continuation_prompt(stitched_text: &str, open_fence: Option<&OpenFence>) -> String {
@@ -148,11 +183,17 @@ fn build_continuation_prompt(stitched_text: &str, open_fence: Option<&OpenFence>
         return THINKING_HANDOFF_PROMPT.to_owned();
     }
     let fence_note = open_fence.map_or_else(String::new, |fence| {
-        format!(
-            " You are currently inside an open `{}` fenced block; \
-             do not emit an opening fence or repeat earlier lines.",
-            fence.display_tag()
-        )
+        if fence.language_token().eq_ignore_ascii_case("svg") {
+            " You are currently inside an open ```svg block; emit only the remaining SVG \
+             elements and the closing ``` without restarting <svg> or emitting an opening fence."
+                .to_owned()
+        } else {
+            format!(
+                " You are currently inside an open `{}` fenced block; \
+                 do not emit an opening fence or repeat earlier lines.",
+                fence.display_tag()
+            )
+        }
     });
     let tail = tail_slice(stitched_text, ANCHOR_QUOTE_BYTES);
     if tail.is_empty() || contains_control_marker(tail) {
@@ -169,46 +210,116 @@ fn build_continuation_prompt(stitched_text: &str, open_fence: Option<&OpenFence>
     }
 }
 
-fn strip_preamble_line(text: &str) -> Option<&str> {
-    let newline_pos = text.find('\n')?;
-    let line = text[..newline_pos].trim_end_matches('\r');
-    if line.len() > 80 {
-        return None;
-    }
-    let normalized = line
+fn normalize_preamble_line(line: &str) -> String {
+    let lower = line.trim().to_ascii_lowercase();
+    let without_polite = POLITE_PREAMBLE_PREFIXES
+        .iter()
+        .find_map(|&prefix| lower.strip_prefix(prefix))
+        .unwrap_or(lower.as_str());
+    without_polite
         .trim()
-        .trim_end_matches([':', '-', '—', '.'])
+        .trim_end_matches([':', '-', '—', '.', '…', '!'])
         .trim()
-        .to_ascii_lowercase();
-    if META_PREAMBLES.iter().any(|&p| normalized == p) {
-        Some(text[newline_pos + 1..].trim_start_matches(['\r', '\n']))
-    } else {
-        None
-    }
+        .to_owned()
 }
 
-fn strip_redundant_fence<'a>(text: &'a str, open: &OpenFence) -> &'a str {
+fn is_meta_preamble_line(line: &str) -> bool {
+    if line.len() > 80 {
+        return false;
+    }
+    let normalized = normalize_preamble_line(line);
+    if META_PREAMBLES.iter().any(|&p| normalized == p) {
+        return true;
+    }
+    if let Some(digits) = normalized.strip_prefix("part ") {
+        return (1..=2).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit());
+    }
+    false
+}
+
+fn could_be_preamble_prefix(trimmed: &str) -> bool {
+    if trimmed.len() > 80 {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let without_polite = POLITE_PREAMBLE_PREFIXES
+        .iter()
+        .find_map(|&prefix| lower.strip_prefix(prefix))
+        .unwrap_or(lower.as_str());
+    if POLITE_PREAMBLE_PREFIXES
+        .iter()
+        .any(|&prefix| prefix.starts_with(&lower))
+    {
+        return true;
+    }
+    if META_PREAMBLES
+        .iter()
+        .any(|&p| p.starts_with(without_polite) || without_polite.starts_with(p))
+    {
+        return true;
+    }
+    if "part ".starts_with(without_polite) {
+        return true;
+    }
+    if let Some(rest) = without_polite.strip_prefix("part ") {
+        let trimmed_rest = rest.trim_end_matches([':', '-', '—', '.', '…', '!']);
+        return trimmed_rest.len() <= 2 && trimmed_rest.bytes().all(|b| b.is_ascii_digit());
+    }
+    false
+}
+
+fn strip_preamble_line(text: &str) -> Option<(&str, bool)> {
+    let newline_pos = text.find('\n')?;
+    let line = text[..newline_pos].trim_end_matches('\r');
+    if !is_meta_preamble_line(line) {
+        return None;
+    }
+    let after_first = &text[newline_pos + 1..];
+    let ws_len = after_first
+        .bytes()
+        .take_while(|&b| b == b'\r' || b == b'\n')
+        .count();
+    let extra_newlines = after_first[..ws_len]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count();
+    Some((&after_first[ws_len..], extra_newlines >= 1))
+}
+
+fn strip_redundant_fence<'a>(prev_tail: &str, text: &'a str, open: &OpenFence) -> (&'a str, bool) {
     let leading_newlines = text
         .bytes()
         .take_while(|&b| b == b'\r' || b == b'\n')
         .count();
     let after_newlines = &text[leading_newlines..];
     let Some(newline_pos) = after_newlines.find('\n') else {
-        return text;
+        return (text, false);
     };
     let first_line = &after_newlines[..newline_pos];
     let Some((ch, len, after)) = parse_fence_run(first_line) else {
-        return text;
+        return (text, false);
     };
     if ch != open.ch || len < 3 {
-        return text;
+        return (text, false);
     }
-    let info = after.trim();
-    if info.is_empty() || info.eq_ignore_ascii_case(&open.info) {
-        &after_newlines[newline_pos + 1..]
-    } else {
-        text
+    let open_lang = open.language_token();
+    let cand_lang = after.trim().split_whitespace().next().unwrap_or("");
+    let after_fence = &after_newlines[newline_pos + 1..];
+    if !open_lang.is_empty() {
+        if !cand_lang.is_empty() && cand_lang.eq_ignore_ascii_case(open_lang) {
+            return (after_fence, true);
+        }
+        return (text, false);
     }
+    if cand_lang.is_empty()
+        && !prev_tail.is_empty()
+        && !after_fence.is_empty()
+        && (find_overlap(prev_tail, after_fence) > 0
+            || find_overlap(prev_tail.trim_end(), after_fence.trim_start()) > 0)
+    {
+        return (after_fence, true);
+    }
+    (text, false)
 }
 
 const fn is_word_byte(byte: u8) -> bool {
@@ -246,32 +357,179 @@ fn find_overlap(prev_tail: &str, candidate: &str) -> usize {
     0
 }
 
-fn resolve_seam<'a>(prev_tail: &str, open_fence: Option<&OpenFence>, incoming: &'a str) -> &'a str {
-    let mut rest = incoming;
-    if open_fence.is_none()
-        && let Some(stripped) = strip_preamble_line(rest)
-    {
-        rest = stripped;
-    }
-    if let Some(fence) = open_fence {
-        rest = strip_redundant_fence(rest, fence);
-    }
-    if prev_tail.is_empty() || rest.is_empty() {
+fn strip_leading_ellipsis<'a>(prev_tail: &str, rest: &'a str) -> &'a str {
+    if prev_tail.ends_with('.') || prev_tail.ends_with('…') {
         return rest;
+    }
+    let after = if let Some(after) = rest.strip_prefix("...") {
+        after
+    } else if let Some(after) = rest.strip_prefix('…') {
+        after
+    } else {
+        return rest;
+    };
+    if prev_tail
+        .bytes()
+        .last()
+        .is_some_and(|b| b.is_ascii_whitespace())
+    {
+        after.strip_prefix(' ').unwrap_or(after)
+    } else {
+        after
+    }
+}
+
+fn strip_tail_overlap<'a>(prev_tail: &str, rest: &'a str) -> (&'a str, bool) {
+    if prev_tail.is_empty() || rest.is_empty() {
+        return (rest, false);
     }
     let exact = find_overlap(prev_tail, rest);
     if exact > 0 {
-        return &rest[exact..];
+        return (&rest[exact..], true);
     }
     let trimmed = rest.trim_start();
     let leading_ws = rest.len().saturating_sub(trimmed.len());
     if leading_ws > 0 && leading_ws <= 8 {
         let trimmed_overlap = find_overlap(prev_tail, trimmed);
         if trimmed_overlap > 0 {
-            return &trimmed[trimmed_overlap..];
+            return (&trimmed[trimmed_overlap..], true);
         }
     }
-    rest
+    if prev_tail
+        .bytes()
+        .last()
+        .is_some_and(|b| b.is_ascii_whitespace())
+    {
+        let prev_trimmed = prev_tail.trim_end();
+        if !prev_trimmed.is_empty() {
+            let overlap = find_overlap(prev_trimmed, rest);
+            if overlap > 0 {
+                let after = &rest[overlap..];
+                let after = if prev_tail.ends_with([' ', '\t']) {
+                    after.strip_prefix(' ').unwrap_or(after)
+                } else {
+                    after
+                };
+                return (after, true);
+            }
+            if leading_ws > 0 && leading_ws <= 8 {
+                let trimmed_overlap = find_overlap(prev_trimmed, trimmed);
+                if trimmed_overlap > 0 {
+                    let after = &trimmed[trimmed_overlap..];
+                    let after = if prev_tail.ends_with([' ', '\t']) {
+                        after.strip_prefix(' ').unwrap_or(after)
+                    } else {
+                        after
+                    };
+                    return (after, true);
+                }
+            }
+        }
+    }
+    (rest, false)
+}
+
+fn starts_with_horizontal_rule(text: &str) -> bool {
+    let first_line = text
+        .split('\n')
+        .next()
+        .unwrap_or(text)
+        .trim_end_matches('\r')
+        .trim();
+    let Some(ch) = first_line.bytes().next() else {
+        return false;
+    };
+    if !matches!(ch, b'-' | b'*' | b'_') {
+        return false;
+    }
+    let count = first_line.bytes().filter(|&b| b == ch).count();
+    count >= 3
+        && first_line
+            .bytes()
+            .all(|b| b == ch || b == b' ' || b == b'\t')
+}
+
+fn starts_with_block_heading_or_fence(rest: &str) -> bool {
+    let first_line = rest.split('\n').next().unwrap_or(rest);
+    if parse_fence_run(first_line).is_some() {
+        return true;
+    }
+    let hashes = rest.bytes().take_while(|&b| b == b'#').count();
+    if (1..=6).contains(&hashes)
+        && rest
+            .as_bytes()
+            .get(hashes)
+            .is_some_and(|&b| b == b' ' || b == b'\t')
+    {
+        return true;
+    }
+    rest.contains('\n') && starts_with_horizontal_rule(rest)
+}
+
+fn starts_with_list_or_quote_or_table(rest: &str) -> bool {
+    if rest.starts_with("> ")
+        || rest.starts_with("- ")
+        || rest.starts_with("* ")
+        || rest.starts_with("+ ")
+        || rest.starts_with("| ")
+    {
+        return true;
+    }
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    (1..=3).contains(&digits)
+        && (rest[digits..].starts_with(". ") || rest[digits..].starts_with(") "))
+}
+
+struct SeamResolution<'a> {
+    prefix: &'static str,
+    text: &'a str,
+}
+
+fn resolve_seam<'a>(
+    prev_tail: &str,
+    open_fence: Option<&OpenFence>,
+    incoming: &'a str,
+) -> SeamResolution<'a> {
+    let mut rest = incoming;
+    let mut had_preamble_blank_line = false;
+    if let Some((stripped, blank_line)) = strip_preamble_line(rest) {
+        rest = stripped;
+        had_preamble_blank_line = blank_line;
+    }
+    let mut stripped_redundant_fence = false;
+    if let Some(fence) = open_fence {
+        let (after_fence, stripped) = strip_redundant_fence(prev_tail, rest, fence);
+        rest = after_fence;
+        stripped_redundant_fence = stripped;
+    } else {
+        rest = strip_leading_ellipsis(prev_tail, rest);
+    }
+    let (rest, had_overlap) = strip_tail_overlap(prev_tail, rest);
+
+    let mut prefix = "";
+    if !prev_tail.is_empty() && !rest.is_empty() && !prev_tail.ends_with('\n') {
+        let starts_nl = rest.starts_with('\n') || rest.starts_with('\r');
+        if let Some(fence) = open_fence {
+            let first_line = rest.split('\n').next().unwrap_or(rest);
+            if !starts_nl
+                && (fence.is_closing_line(first_line) || (stripped_redundant_fence && !had_overlap))
+            {
+                prefix = "\n";
+            }
+        } else if !starts_nl {
+            if starts_with_block_heading_or_fence(rest) {
+                prefix = "\n\n";
+            } else if starts_with_list_or_quote_or_table(rest) {
+                prefix = "\n";
+            } else if had_preamble_blank_line
+                && prev_tail.ends_with(['.', '!', '?', ':', ')', '"', '\''])
+            {
+                prefix = "\n\n";
+            }
+        }
+    }
+
+    SeamResolution { prefix, text: rest }
 }
 
 struct SeamFilter {
@@ -293,34 +551,46 @@ impl SeamFilter {
 
     fn potential_preamble_or_fence(&self) -> bool {
         let trimmed = self.buffer.trim_start();
-        if self.open_fence.is_some()
-            && (trimmed.starts_with('`') || trimmed.starts_with('~'))
-            && !self.buffer.contains('\n')
-        {
-            return true;
-        }
-        if self.open_fence.is_none() {
-            if let Some(nl) = self.buffer.find('\n') {
-                let first_line = self.buffer[..nl].trim_end_matches('\r');
-                if first_line.len() <= 80 && strip_preamble_line(&self.buffer).is_some() {
-                    let after_nl = self.buffer[nl + 1..].trim_start_matches(['\r', '\n']);
-                    if after_nl.len() < SEAM_EARLY_FLUSH_BYTES
-                        && (after_nl.is_empty() || self.prev_tail.contains(after_nl))
-                    {
-                        return true;
-                    }
+        if let Some(nl) = self.buffer.find('\n') {
+            if let Some((after_preamble, _)) = strip_preamble_line(&self.buffer) {
+                if self.open_fence.is_some()
+                    && (after_preamble.trim_start().starts_with('`')
+                        || after_preamble.trim_start().starts_with('~'))
+                    && !after_preamble.contains('\n')
+                {
+                    return true;
                 }
-            } else if trimmed.len() <= 80 {
-                let lower = trimmed.to_ascii_lowercase();
-                if META_PREAMBLES
-                    .iter()
-                    .any(|&p| p.starts_with(&lower) || lower.starts_with(p))
+                if after_preamble.len() < SEAM_EARLY_FLUSH_BYTES
+                    && (after_preamble.is_empty()
+                        || after_preamble.starts_with("...")
+                        || after_preamble.starts_with('…')
+                        || self.prev_tail.contains(after_preamble)
+                        || self
+                            .prev_tail
+                            .trim_end()
+                            .contains(after_preamble.trim_start()))
                 {
                     return true;
                 }
             }
+            let first_line = self.buffer[..nl].trim_end_matches('\r');
+            if self.open_fence.is_some()
+                && first_line.is_empty()
+                && !self.buffer[nl + 1..].contains('\n')
+                && (self.buffer[nl + 1..].trim_start().starts_with('`')
+                    || self.buffer[nl + 1..].trim_start().starts_with('~'))
+            {
+                return true;
+            }
+            return false;
         }
-        false
+        if self.open_fence.is_some() && (trimmed.starts_with('`') || trimmed.starts_with('~')) {
+            return true;
+        }
+        if self.open_fence.is_none() && (trimmed.starts_with("...") || trimmed.starts_with('…')) {
+            return true;
+        }
+        could_be_preamble_prefix(trimmed)
     }
 
     fn can_flush_early(&self) -> bool {
@@ -332,7 +602,9 @@ impl SeamFilter {
         }
         let trimmed = self.buffer.trim_start();
         if !trimmed.is_empty()
-            && (self.prev_tail.contains(trimmed) || self.prev_tail.contains(&self.buffer))
+            && (self.prev_tail.contains(trimmed)
+                || self.prev_tail.contains(&self.buffer)
+                || self.prev_tail.trim_end().contains(trimmed))
         {
             return false;
         }
@@ -345,8 +617,11 @@ impl SeamFilter {
         }
         self.resolved = true;
         let out = resolve_seam(&self.prev_tail, self.open_fence.as_ref(), &self.buffer);
-        if !out.is_empty() {
-            emit(out)?;
+        if !out.prefix.is_empty() {
+            emit(out.prefix)?;
+        }
+        if !out.text.is_empty() {
+            emit(out.text)?;
         }
         self.buffer.clear();
         Ok(())
@@ -545,6 +820,13 @@ where
         ));
     }
 
+    if message_has_control_marker(&first_raw) {
+        return Ok((
+            build_stitched_message(stitched_text, stitched_reasoning),
+            Completion::TokenLimit,
+        ));
+    }
+
     let mut wire_history = pending.to_vec();
     fold_turn_appendix_for_wire(&mut wire_history, options.turn_appendix.as_deref());
     wire_history.push(first_raw);
@@ -649,6 +931,9 @@ where
         };
 
         if emitted_chunk.trim().is_empty() {
+            if completion == Completion::Finished && !stitched_text.trim().is_empty() {
+                final_completion = Completion::Finished;
+            }
             break;
         }
         let prior_len = stitched_text.len().saturating_sub(emitted_chunk.len());
@@ -661,6 +946,9 @@ where
         }
         if completion == Completion::Finished {
             final_completion = Completion::Finished;
+            break;
+        }
+        if message_has_control_marker(&raw_msg) {
             break;
         }
 
@@ -1034,7 +1322,7 @@ mod tests {
         })?;
         assert_eq!(out4, "    println!(\"ok\");\n}\n```");
 
-        // Meta-preamble stripped
+        // Meta-preamble stripped; non-newline tail gets clean paragraph break
         let mut out5 = String::new();
         let mut f5 = SeamFilter::new("End of paragraph one.".into(), None);
         f5.push(
@@ -1048,7 +1336,23 @@ mod tests {
             out5.push_str(s);
             Ok(())
         })?;
-        assert_eq!(out5, "Paragraph two begins cleanly.");
+        assert_eq!(out5, "\n\nParagraph two begins cleanly.");
+
+        // If prev_tail already ends with newline, no duplicate blank lines are inserted
+        let mut out5b = String::new();
+        let mut f5b = SeamFilter::new("End of paragraph one.\n\n".into(), None);
+        f5b.push(
+            "Sure, here is the continuation:\n\nParagraph two begins cleanly.",
+            &mut |s| {
+                out5b.push_str(s);
+                Ok(())
+            },
+        )?;
+        f5b.finish(&mut |s| {
+            out5b.push_str(s);
+            Ok(())
+        })?;
+        assert_eq!(out5b, "Paragraph two begins cleanly.");
 
         // Multibyte UTF-8 safety
         let mut out6 = String::new();
@@ -1062,6 +1366,194 @@ mod tests {
             Ok(())
         })?;
         assert_eq!(out6, "が続く。");
+        Ok(())
+    }
+
+    #[test]
+    fn closing_fence_is_preserved_inside_open_rust_and_svg_blocks() -> Result<()> {
+        fn run_filter(prev: &str, open_doc: &str, incoming: &str) -> Result<String> {
+            let fence = open_fence_state(open_doc);
+            let mut out = String::new();
+            let mut filter = SeamFilter::new(prev.into(), fence);
+            filter.push(incoming, &mut |s| {
+                out.push_str(s);
+                Ok(())
+            })?;
+            filter.finish(&mut |s| {
+                out.push_str(s);
+                Ok(())
+            })?;
+            Ok(out)
+        }
+
+        // Open ```rust block closing directly on segment 2 preserves ``` and adds \n when missing
+        let rust_doc = "Example:\n```rust\nfn main() {\n    println!(\"hi\");\n}";
+        let out_rust = run_filter(
+            "    println!(\"hi\");\n}",
+            rust_doc,
+            "```\n\nNext paragraph explains main.",
+        )?;
+        assert_eq!(out_rust, "\n```\n\nNext paragraph explains main.");
+
+        // Open ```svg block closing directly preserves ``` and adds \n when missing
+        let svg_doc = "```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><circle cx=\"5\" cy=\"5\" r=\"4\"/></svg>";
+        let out_svg = run_filter(
+            "<circle cx=\"5\" cy=\"5\" r=\"4\"/></svg>",
+            svg_doc,
+            "```\n\nHere is the icon.",
+        )?;
+        assert_eq!(out_svg, "\n```\n\nHere is the icon.");
+
+        // Bare open ``` block without overlap preserves ``` as closing fence
+        let bare_doc = "```\nsome code\nmore code";
+        let out_bare = run_filter("more code", bare_doc, "```\n\nAfter bare block.")?;
+        assert_eq!(out_bare, "\n```\n\nAfter bare block.");
+
+        // Preamble followed by redundant opening fence inside open ```rust block strips both
+        let out_both = run_filter(
+            "fn main() {\n",
+            "```rust\nfn main() {\n",
+            "Part 2:\n```rust\n    println!(\"ok\");\n}\n```",
+        )?;
+        assert_eq!(out_both, "    println!(\"ok\");\n}\n```");
+
+        // Standalone "Part 2: Architecture" heading is NOT treated as a meta-preamble
+        let out_heading = run_filter(
+            "Section 1 done.",
+            "Section 1 done.",
+            "Part 2: Architecture\nDetails follow.",
+        )?;
+        assert_eq!(out_heading, "Part 2: Architecture\nDetails follow.");
+        Ok(())
+    }
+
+    #[test]
+    fn ellipsis_trailing_space_overlap_and_block_separators() -> Result<()> {
+        fn run_filter_chunks(prev: &str, chunks: &[&str]) -> Result<String> {
+            let mut out = String::new();
+            let mut filter = SeamFilter::new(prev.into(), None);
+            for chunk in chunks {
+                filter.push(chunk, &mut |s| {
+                    out.push_str(s);
+                    Ok(())
+                })?;
+            }
+            filter.finish(&mut |s| {
+                out.push_str(s);
+                Ok(())
+            })?;
+            Ok(out)
+        }
+
+        // Leading continuation ellipsis stripped cleanly
+        assert_eq!(
+            run_filter_chunks("The quick brown ", &["...fox jumps over."])?,
+            "fox jumps over."
+        );
+        assert_eq!(
+            run_filter_chunks("The quick brown", &["… fox jumps."])?,
+            " fox jumps."
+        );
+
+        // Trailing-space prev_tail overlap avoids double space
+        assert_eq!(
+            run_filter_chunks("the quick brown fox ", &["brown fox jumps high."])?,
+            "jumps high."
+        );
+
+        // Markdown heading, list, and table after non-newline-terminated prev_tail
+        assert_eq!(
+            run_filter_chunks("Intro done.", &["## Next Section\nBody here."])?,
+            "\n\n## Next Section\nBody here."
+        );
+        assert_eq!(
+            run_filter_chunks("Items:", &["- First item\n- Second item"])?,
+            "\n- First item\n- Second item"
+        );
+        assert_eq!(
+            run_filter_chunks("Results:", &["| Col A | Col B |\n| --- | --- |"])?,
+            "\n| Col A | Col B |\n| --- | --- |"
+        );
+
+        // Code identifier across boundary is NOT corrupted by space insertion
+        assert_eq!(
+            run_filter_chunks("Use React.", &["Component here."])?,
+            "Component here."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_marker_and_overlap_only_eos_guards() -> Result<()> {
+        // <tts_pad> is excluded from continuation prompt anchor
+        let prompt = build_continuation_prompt("Prose before <tts_pad> marker", None);
+        assert!(!prompt.contains("<tts_pad>"));
+
+        // SVG open fence uses targeted SVG instruction
+        let svg_fence = open_fence_state("```svg\n<svg viewBox=\"0 0 10 10\">");
+        let svg_prompt =
+            build_continuation_prompt("<svg viewBox=\"0 0 10 10\">", svg_fence.as_ref());
+        assert!(svg_prompt.contains("remaining SVG elements"));
+        assert!(svg_prompt.contains("without restarting <svg>"));
+
+        // Model-emitted control marker in raw_msg stops continuation cleanly without failing
+        let (_commands, incoming) = mpsc::channel();
+        let (events, _outgoing) = event_channel();
+        let pending = vec![user_msg("Write")];
+        let mut calls = 0_usize;
+        let (msg, completion) = run_with(
+            &pending,
+            &default_options(4096),
+            65_536,
+            &incoming,
+            &events,
+            |_req, on_text, _| {
+                calls += 1;
+                if calls == 1 {
+                    on_text(Cow::Borrowed("Safe start."))?;
+                    Ok((assistant_msg("Safe start.", None), Completion::TokenLimit))
+                } else {
+                    on_text(Cow::Borrowed(" Trailing <tts_pad> text."))?;
+                    Ok((
+                        assistant_msg(" Trailing <tts_pad> text.", None),
+                        Completion::TokenLimit,
+                    ))
+                }
+            },
+            no_wait,
+        )?;
+        assert_eq!(calls, 2);
+        assert_eq!(completion, Completion::TokenLimit);
+        assert_eq!(msg.content.as_ref(), "Safe start. Trailing <tts_pad> text.");
+
+        // Overlap-only final segment with Completion::Finished settles as Finished
+        let (_commands2, incoming2) = mpsc::channel();
+        let (events2, _outgoing2) = event_channel();
+        let mut calls2 = 0_usize;
+        let (msg2, completion2) = run_with(
+            &pending,
+            &default_options(4096),
+            65_536,
+            &incoming2,
+            &events2,
+            |_req, on_text, _| {
+                calls2 += 1;
+                if calls2 == 1 {
+                    on_text(Cow::Borrowed("Complete thought ending cleanly."))?;
+                    Ok((
+                        assistant_msg("Complete thought ending cleanly.", None),
+                        Completion::TokenLimit,
+                    ))
+                } else {
+                    on_text(Cow::Borrowed("ending cleanly."))?;
+                    Ok((assistant_msg("ending cleanly.", None), Completion::Finished))
+                }
+            },
+            no_wait,
+        )?;
+        assert_eq!(calls2, 2);
+        assert_eq!(completion2, Completion::Finished);
+        assert_eq!(msg2.content.as_ref(), "Complete thought ending cleanly.");
         Ok(())
     }
 
