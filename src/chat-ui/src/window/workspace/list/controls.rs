@@ -23,6 +23,7 @@ pub(super) struct Row<'a> {
     pub(super) conversation: &'a Conversation,
     pub(super) active: bool,
     pub(super) responding: bool,
+    pub(super) queued_count: usize,
     pub(super) copy_available: bool,
     pub(super) availability: Availability,
 }
@@ -72,6 +73,12 @@ impl Row<'_> {
                                     );
                                 },
                             ))
+                        } else if self.queued_count > 0 {
+                            button.right_text(
+                                RichText::new(format!("{} queued", self.queued_count))
+                                    .small()
+                                    .weak(),
+                            )
                         } else {
                             button.right_text(())
                         };

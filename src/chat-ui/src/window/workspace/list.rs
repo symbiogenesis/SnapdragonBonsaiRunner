@@ -66,6 +66,7 @@ impl State {
             conversation,
             active: conversation.id == self.active_conversation,
             responding: self.model.busy() && self.request_conversation == Some(conversation.id),
+            queued_count: self.queued_count_for(conversation.id),
             copy_available: transcript.is_some_and(|transcript| !transcript.messages.is_empty()),
             availability: Availability {
                 select: self.model.workspace_available(),

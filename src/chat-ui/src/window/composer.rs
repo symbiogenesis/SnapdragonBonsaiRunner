@@ -2,6 +2,7 @@
 use super::{INPUT_LIMIT, RichText, State, appearance, controls, draft_buffer, egui, error_ui};
 
 mod microphone;
+mod queue;
 
 impl State {
     fn microphone_button(&mut self, ui: &mut egui::Ui) {
@@ -23,39 +24,36 @@ impl State {
     }
     fn composer_send_controls(&mut self, ui: &mut egui::Ui) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if self.active_conversation_busy() {
-                if ui.button("Stop").clicked() {
-                    self.stop_generation();
-                }
-            } else if self.model == super::ModelLifecycle::Stopped {
-                let can_reload = !self.preview
-                    && !self
-                        .updates
-                        .as_ref()
-                        .is_some_and(super::updates::Updates::installing);
+            if self.model == super::ModelLifecycle::Stopped {
+                let can_reload = !self.preview && !self.updates_installing();
                 if ui
                     .add_enabled(can_reload, controls::primary_button(ui, "Reload model"))
                     .clicked()
                 {
                     self.retry();
                 }
-            } else {
+            } else if self.model.busy() {
                 let has_content =
                     !self.input.trim().is_empty() || !self.draft_attachments.is_empty();
                 let vision_ok = !self.has_unsent_or_history_media() || self.vision_available;
-                let can_send =
-                    self.model == super::ModelLifecycle::Ready && has_content && vision_ok;
+                let queue_full = self.queued_messages.len() >= super::MAX_QUEUED_MESSAGES;
+                let can_queue = !self.preview
+                    && !self.updates_installing()
+                    && has_content
+                    && vision_ok
+                    && !queue_full;
                 let response = ui
-                    .add_enabled(can_send, controls::primary_button(ui, "Send  ↑"))
-                    .on_hover_text("Send message · Enter");
-                let response = if let Some(title) = self.background_generation_title() {
+                    .add_enabled(can_queue, controls::primary_button(ui, "Queue  ↑"))
+                    .on_hover_text("Queue message · Enter");
+                let response = if queue_full && has_content {
                     response.on_disabled_hover_ui(|ui| {
                         ui.set_max_width(ui.spacing().tooltip_width);
                         ui.label(format!(
-                            "Wait for ‘{title}’ to finish responding before sending."
+                            "Up to {} messages can be queued at once.",
+                            super::MAX_QUEUED_MESSAGES
                         ));
                     })
-                } else if self.model == super::ModelLifecycle::Ready && has_content && !vision_ok {
+                } else if has_content && !vision_ok {
                     response.on_disabled_hover_ui(|ui| {
                         ui.set_max_width(ui.spacing().tooltip_width);
                         ui.label(
@@ -66,11 +64,74 @@ impl State {
                     response
                 };
                 if response.clicked() {
+                    self.queue_draft();
+                }
+                if self.active_conversation_busy() && ui.button("Stop").clicked() {
+                    self.stop_generation();
+                }
+            } else {
+                let has_content =
+                    !self.input.trim().is_empty() || !self.draft_attachments.is_empty();
+                let vision_ok = !self.has_unsent_or_history_media() || self.vision_available;
+                let can_send =
+                    self.model == super::ModelLifecycle::Ready && has_content && vision_ok;
+                let response = ui
+                    .add_enabled(can_send, controls::primary_button(ui, "Send  ↑"))
+                    .on_hover_text("Send message · Enter");
+                let response =
+                    if self.model == super::ModelLifecycle::Ready && has_content && !vision_ok {
+                        response.on_disabled_hover_ui(|ui| {
+                            ui.set_max_width(ui.spacing().tooltip_width);
+                            ui.label(
+                                "Images and videos require the vision projector (mmproj). Remove media attachments or relaunch without --no-mmproj.",
+                            );
+                        })
+                    } else {
+                        response
+                    };
+                if response.clicked() {
                     self.submit();
                 }
             }
             self.microphone_button(ui);
         });
+    }
+
+    fn composer_queued_messages(&mut self, ui: &mut egui::Ui) {
+        let active = self.active_conversation;
+        let items: Vec<queue::ItemView<'_>> = self
+            .queued_messages
+            .iter()
+            .filter(|item| item.conversation_id == active)
+            .map(|item| queue::ItemView {
+                id: item.id,
+                text: item.text.as_str(),
+                attachment_count: item.attachments.len(),
+                first_attachment_name: item
+                    .attachments
+                    .first()
+                    .map(crate::attachment_import::Attachment::name),
+            })
+            .collect();
+        let can_send_next = !self.preview
+            && self.model == super::ModelLifecycle::Ready
+            && !self.updates_installing();
+        let can_edit = self.input.is_empty() && self.draft_attachments.is_empty();
+        let action = queue::panel(
+            ui,
+            active,
+            &items,
+            self.queue_paused,
+            can_send_next,
+            can_edit,
+        );
+        match action {
+            Some(queue::Action::SendNext) => self.send_next_queued_for_active(),
+            Some(queue::Action::ClearAll) => self.clear_queued_messages_for_active(),
+            Some(queue::Action::Edit(id)) => self.edit_queued_message(id),
+            Some(queue::Action::Remove(id)) => self.remove_queued_message(id),
+            None => {}
+        }
     }
 
     pub(super) fn composer(&mut self, ui: &mut egui::Ui) {
@@ -83,6 +144,7 @@ impl State {
                 if !self.audio_file_error {
                     self.audio_file_status(ui);
                 }
+                self.composer_queued_messages(ui);
                 egui::Frame::new()
                     .fill(ui.visuals().faint_bg_color)
                     .corner_radius(14)
@@ -150,7 +212,7 @@ impl State {
 
     const fn composer_hint(&self) -> &'static str {
         if self.model.busy() {
-            "Draft your next message…"
+            "Queue your next message…"
         } else if self.model.ready() {
             "Ask anything…"
         } else if matches!(self.model, super::ModelLifecycle::Stopped) {
@@ -246,7 +308,12 @@ impl State {
     fn composer_actions(&mut self, ui: &mut egui::Ui) {
         // Keep the send group out of a narrow remainder beside
         // the audio controls, including with the collapsed rail.
-        let separate_send_row = ui.available_width() < 420.0;
+        let separate_send_row = ui.available_width()
+            < if self.active_conversation_busy() {
+                480.0
+            } else {
+                420.0
+            };
         ui.horizontal_wrapped(|ui| {
             self.attachment_menu_button(ui);
             self.read_aloud_controls(ui);

@@ -95,8 +95,17 @@ const INPUT_LIMIT: usize = 1_048_576;
 const VOICE_LIMIT: usize = 1_024;
 const MAX_DIAGNOSTICS: usize = 128;
 const MAX_DIAGNOSTIC_CHARS: usize = 4_096;
+pub(super) const MAX_QUEUED_MESSAGES: usize = 8;
 pub(super) const CONVERSATION_DELETED_NOTICE_DURATION: Duration = Duration::from_secs(4);
 const DIALOG_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone)]
+pub(super) struct QueuedMessage {
+    pub(super) id: u64,
+    pub(super) conversation_id: u64,
+    pub(super) text: String,
+    pub(super) attachments: Vec<crate::attachment_import::Attachment>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DialogCloseState {
@@ -198,7 +207,10 @@ struct State {
     active_conversation: u64,
     request_conversation: Option<u64>,
     auto_continue: bool,
-    routing_request: bool,
+    routed_conversation: Option<u64>,
+    queued_messages: VecDeque<QueuedMessage>,
+    next_queued_message: u64,
+    queue_paused: bool,
     next_conversation: u64,
     rename_conversation: Option<(u64, String)>,
     delete_conversation: Option<u64>,
@@ -382,7 +394,10 @@ impl State {
             active_conversation: 1,
             request_conversation: None,
             auto_continue: true,
-            routing_request: false,
+            routed_conversation: None,
+            queued_messages: VecDeque::new(),
+            next_queued_message: 1,
+            queue_paused: false,
             next_conversation: 2,
             rename_conversation: None,
             delete_conversation: None,
@@ -845,8 +860,29 @@ impl State {
             || self.history_has_media_up_to(self.committed.len())
     }
 
+    pub(super) fn updates_installing(&self) -> bool {
+        self.updates
+            .as_ref()
+            .is_some_and(updates::Updates::installing)
+    }
+
+    pub(super) const fn is_routing_request(&self) -> bool {
+        self.routed_conversation.is_some()
+    }
+
+    pub(super) fn queued_count_for(&self, conversation_id: u64) -> usize {
+        self.queued_messages
+            .iter()
+            .filter(|item| item.conversation_id == conversation_id)
+            .count()
+    }
+
     fn submit(&mut self) {
-        self.submit_turn(None);
+        if self.model == ModelLifecycle::Generating {
+            self.queue_draft();
+        } else {
+            self.submit_turn(None);
+        }
     }
 
     fn submit_turn(&mut self, retry: Option<u64>) {
@@ -870,10 +906,37 @@ impl State {
             return;
         }
         let text = self.input.trim().to_owned();
-        if self.dictation_requested {
-            self.stop_speech();
+        let attachments = if retry.is_some() {
+            self.draft_attachments.clone()
         } else {
-            self.stop_speech_output();
+            self.take_draft_attachments()
+        };
+        match self.send_prepared_turn(text, attachments, retry) {
+            Ok(()) => {
+                self.input.clear();
+                self.input_revision = self.input_revision.wrapping_add(1);
+                self.place_composer_cursor(0);
+            }
+            Err(attachments) => {
+                if retry.is_none() {
+                    self.set_draft_attachments(attachments);
+                }
+            }
+        }
+    }
+
+    fn send_prepared_turn(
+        &mut self,
+        text: String,
+        attachments: Vec<crate::attachment_import::Attachment>,
+        retry: Option<u64>,
+    ) -> Result<(), Vec<crate::attachment_import::Attachment>> {
+        if !self.is_routing_request() {
+            if self.dictation_requested {
+                self.stop_speech();
+            } else {
+                self.stop_speech_output();
+            }
         }
         clear_and_shrink_buffer(&mut self.last_answer);
         clear_and_shrink_buffer(&mut self.retained_draft);
@@ -885,8 +948,7 @@ impl State {
             .get(self.output_budget)
             .copied()
             .unwrap_or(4096);
-        let (wire_text, images) =
-            crate::attachment_import::format_user_turn(&text, &self.draft_attachments);
+        let (wire_text, images) = crate::attachment_import::format_user_turn(&text, &attachments);
         let memory = self.memory.resolve(&self.committed, &wire_text);
         let system_appendix = memory.pinned_appendix.map(std::sync::Arc::<str>::from);
         let turn_appendix = memory.triggered_appendix.map(std::sync::Arc::<str>::from);
@@ -908,17 +970,18 @@ impl State {
             .is_err()
         {
             self.fail("The model worker stopped. Close and restart the app.");
-            return;
+            return Err(attachments);
         }
+        let conversation_id = self.active_or_routed_conversation();
         if let Some(conversation) = self
             .conversations
             .iter_mut()
-            .find(|conversation| conversation.id == self.active_conversation)
+            .find(|conversation| conversation.id == conversation_id)
             && !conversation.renamed
             && self.transcript.messages.is_empty()
         {
             let title_source = if text.is_empty() {
-                self.draft_attachments
+                attachments
                     .first()
                     .map_or("Attachment", crate::attachment_import::Attachment::name)
             } else {
@@ -934,22 +997,231 @@ impl State {
         if let Some(id) = retry {
             self.transcript.restart_turn(id, self.committed.len());
         } else {
-            let attachments = self.take_draft_attachments();
             self.transcript
                 .start_turn_with_attachments(text, attachments, self.committed.len());
         }
-        self.request_conversation = Some(self.active_conversation);
-        self.touch_conversation(self.active_conversation);
+        self.request_conversation = Some(conversation_id);
+        self.touch_conversation(conversation_id);
         self.recovery_flush_now = true;
-        self.input.clear();
-        self.input_revision = self.input_revision.wrapping_add(1);
-        self.place_composer_cursor(0);
         self.model = ModelLifecycle::Generating;
         self.awaiting_first_token = true;
         // A turn begun without speech stays silent even if preparation finishes
         // mid-answer. Only an explicit read or a later turn may start playback.
         self.streaming_suppressed = !self.speech_output;
         self.set_status("Responding…", false);
+        Ok(())
+    }
+
+    pub(super) fn queue_draft(&mut self) {
+        if self.preview {
+            self.set_status(
+                "Preview only. Launch the app normally to chat with your local model.",
+                false,
+            );
+            return;
+        }
+        if self.model != ModelLifecycle::Generating
+            || self.updates_installing()
+            || (self.input.trim().is_empty() && self.draft_attachments.is_empty())
+        {
+            return;
+        }
+        if !self.vision_available && self.has_unsent_or_history_media() {
+            self.set_status(
+                "Images and videos require the vision projector (mmproj). Remove media attachments or relaunch without --no-mmproj.",
+                true,
+            );
+            return;
+        }
+        if self.queued_messages.len() >= MAX_QUEUED_MESSAGES {
+            self.conversation_notice = Some(ConversationNotice::auto_dismiss(
+                "Message queue is full (up to 8 messages).",
+                Duration::from_secs(4),
+            ));
+            return;
+        }
+        let text = self.input.trim().to_owned();
+        let attachments = self.take_draft_attachments();
+        let id = self.next_queued_message;
+        self.next_queued_message = self.next_queued_message.wrapping_add(1);
+        self.queued_messages.push_back(QueuedMessage {
+            id,
+            conversation_id: self.active_conversation,
+            text,
+            attachments,
+        });
+        self.queue_paused = false;
+        self.attachment_notice = None;
+        self.input.clear();
+        self.input_revision = self.input_revision.wrapping_add(1);
+        self.place_composer_cursor(0);
+        self.touch_conversation(self.active_conversation);
+        self.focus_composer = true;
+    }
+
+    fn dispatch_next_queued_message(&mut self) {
+        if self.preview || self.model != ModelLifecycle::Ready || self.updates_installing() {
+            return;
+        }
+        while let Some(item) = self.queued_messages.pop_front() {
+            if !self
+                .conversations
+                .iter()
+                .any(|conversation| conversation.id == item.conversation_id)
+            {
+                continue;
+            }
+            let target_id = item.conversation_id;
+            let previous_owner = self.request_conversation;
+            let needs_restore = previous_owner != Some(target_id);
+            let mut deferred = None;
+            let mut item_slot = Some(item);
+            self.with_conversation(target_id, |state| {
+                let Some(queued) = item_slot.take() else {
+                    return;
+                };
+                let has_media = queued
+                    .attachments
+                    .iter()
+                    .any(crate::attachment_import::Attachment::is_media)
+                    || state.history_has_media_up_to(state.committed.len());
+                if !state.vision_available && has_media {
+                    state.set_status(
+                        "Images and videos require the vision projector (mmproj). Remove media attachments or relaunch without --no-mmproj.",
+                        true,
+                    );
+                    deferred = Some(queued);
+                    return;
+                }
+                if needs_restore
+                    && state
+                        .commands
+                        .send(Command::RestoreChat(state.committed.clone()))
+                        .is_err()
+                {
+                    state.fail("The model worker stopped. Close and restart the app.");
+                    deferred = Some(queued);
+                    return;
+                }
+                let id = queued.id;
+                let conversation_id = queued.conversation_id;
+                let text_backup = queued.text.clone();
+                match state.send_prepared_turn(queued.text, queued.attachments, None) {
+                    Ok(()) => {
+                        state.restore_history = target_id != state.active_conversation;
+                    }
+                    Err(attachments) => {
+                        deferred = Some(QueuedMessage {
+                            id,
+                            conversation_id,
+                            text: text_backup,
+                            attachments,
+                        });
+                    }
+                }
+            });
+            if let Some(undispatched) = deferred {
+                self.queued_messages.push_front(undispatched);
+                self.queue_paused = true;
+            }
+            break;
+        }
+        if self.queued_messages.is_empty() {
+            self.queue_paused = false;
+        }
+    }
+
+    pub(super) fn send_next_queued_for_active(&mut self) {
+        if self.preview || self.model != ModelLifecycle::Ready || self.updates_installing() {
+            return;
+        }
+        let Some(pos) = self
+            .queued_messages
+            .iter()
+            .position(|item| item.conversation_id == self.active_conversation)
+        else {
+            return;
+        };
+        let Some(item) = self.queued_messages.remove(pos) else {
+            return;
+        };
+        let has_media = item
+            .attachments
+            .iter()
+            .any(crate::attachment_import::Attachment::is_media)
+            || self.history_has_media_up_to(self.committed.len());
+        if !self.vision_available && has_media {
+            self.queued_messages.insert(pos, item);
+            self.queue_paused = true;
+            self.set_status(
+                "Images and videos require the vision projector (mmproj). Remove media attachments or relaunch without --no-mmproj.",
+                true,
+            );
+            return;
+        }
+        self.restore_selected_history();
+        if self.model != ModelLifecycle::Ready {
+            self.queued_messages.insert(pos, item);
+            self.queue_paused = true;
+            return;
+        }
+        self.queue_paused = false;
+        let id = item.id;
+        let conversation_id = item.conversation_id;
+        let text_backup = item.text.clone();
+        if let Err(attachments) = self.send_prepared_turn(item.text, item.attachments, None) {
+            self.queued_messages.insert(
+                pos,
+                QueuedMessage {
+                    id,
+                    conversation_id,
+                    text: text_backup,
+                    attachments,
+                },
+            );
+            self.queue_paused = true;
+        }
+    }
+
+    pub(super) fn edit_queued_message(&mut self, id: u64) {
+        if !self.input.is_empty() || !self.draft_attachments.is_empty() {
+            return;
+        }
+        let Some(pos) = self
+            .queued_messages
+            .iter()
+            .position(|item| item.id == id && item.conversation_id == self.active_conversation)
+        else {
+            return;
+        };
+        let Some(item) = self.queued_messages.remove(pos) else {
+            return;
+        };
+        self.input = item.text;
+        self.input_revision = self.input_revision.wrapping_add(1);
+        self.set_draft_attachments(item.attachments);
+        self.place_composer_cursor(self.input.chars().count());
+        self.focus_composer = true;
+        self.touch_conversation(self.active_conversation);
+        if self.queued_messages.is_empty() {
+            self.queue_paused = false;
+        }
+    }
+
+    pub(super) fn remove_queued_message(&mut self, id: u64) {
+        self.queued_messages.retain(|item| item.id != id);
+        if self.queued_messages.is_empty() {
+            self.queue_paused = false;
+        }
+    }
+
+    pub(super) fn clear_queued_messages_for_active(&mut self) {
+        let active = self.active_conversation;
+        self.queued_messages
+            .retain(|item| item.conversation_id != active);
+        if self.queued_messages.is_empty() {
+            self.queue_paused = false;
+        }
     }
 
     fn new_chat(&mut self) {
@@ -1006,6 +1278,9 @@ impl State {
         if self.commands.send(Command::Stop).is_err() {
             self.fail("The model worker stopped. Close and restart the app.");
             return;
+        }
+        if !self.queued_messages.is_empty() {
+            self.queue_paused = true;
         }
         self.stop_speech();
         self.with_request_conversation(|state| {
@@ -1170,7 +1445,7 @@ impl State {
     }
 
     fn fail_current_conversation(&mut self, message: &str) {
-        if !self.routing_request {
+        if !self.is_routing_request() {
             self.stop_speech();
         }
         let mutating_turn = matches!(
@@ -1196,7 +1471,7 @@ impl State {
     }
 
     fn reject(&mut self, message: &str, text: &str, retry_required: bool) {
-        if !self.routing_request
+        if !self.is_routing_request()
             && let Some(id) = self.request_conversation
             && id != self.active_conversation
         {
@@ -1247,7 +1522,7 @@ impl State {
             }
             return;
         }
-        if !self.routing_request {
+        if !self.is_routing_request() {
             self.stop_speech();
         }
         self.model = if retry_required {
@@ -1311,6 +1586,17 @@ impl State {
         if !self.model.accepts(&event) {
             return;
         }
+        let finished = matches!(event, Event::Complete(Completion::Finished));
+        let pauses_queue = matches!(
+            event,
+            Event::Complete(Completion::TokenLimit)
+                | Event::Stopping(_)
+                | Event::Stopped
+                | Event::ModelStopped
+                | Event::Rejected { .. }
+                | Event::Retryable(_)
+                | Event::Failed(_)
+        );
         if matches!(
             self.model,
             ModelLifecycle::Generating
@@ -1322,6 +1608,12 @@ impl State {
             self.with_request_conversation(|state| state.apply_model_event(event));
         } else {
             self.apply_model_event(event);
+        }
+        if pauses_queue && !self.queued_messages.is_empty() {
+            self.queue_paused = true;
+        }
+        if finished && !self.queue_paused {
+            self.dispatch_next_queued_message();
         }
         self.restore_selected_history();
     }
@@ -1518,7 +1810,7 @@ impl State {
     }
 
     fn stopping_response(&mut self, text: &str) {
-        if !self.routing_request {
+        if !self.is_routing_request() {
             self.stop_speech();
         }
         let stopping_model = self.model == ModelLifecycle::StoppingModel;
@@ -2399,6 +2691,9 @@ impl State {
         let Some(updates) = &mut self.updates else {
             return;
         };
+        if !self.queued_messages.is_empty() {
+            self.queue_paused = true;
+        }
         updates.wait_for_stop();
         self.stop_speech();
         if matches!(

@@ -759,12 +759,17 @@ fn background_generation_keeps_composer_and_conversation_navigation_available() 
             .focus();
         chat.run();
         chat.get_by_role_and_label(egui::Role::MultilineTextInput, "Message")
-            .type_text("Owner's next draft");
+            .type_text("Owner's queued followup");
         chat.run();
         chat.key_press(egui::Key::Enter);
         chat.run();
-        assert_eq!(chat.state().app.input, "Owner's next draft");
+        assert_eq!(chat.state().app.input, "");
+        assert_eq!(chat.state().app.queued_messages.len(), 1);
         assert!(chat.state().commands.try_recv().is_err());
+        chat.get_by_role_and_label(egui::Role::MultilineTextInput, "Message")
+            .type_text("Owner's next draft");
+        chat.run();
+        assert_eq!(chat.state().app.input, "Owner's next draft");
         open_sidebar(&mut chat, size);
         chat.get_by_role_and_label(egui::Role::Button, "+ New conversation")
             .click();
@@ -775,8 +780,6 @@ fn background_generation_keeps_composer_and_conversation_navigation_available() 
         chat.run();
         chat.get_by_role_and_label(egui::Role::MultilineTextInput, "Message")
             .type_text("Draft in another chat");
-        chat.run();
-        chat.key_press(egui::Key::Enter);
         chat.run();
         chat.state_mut()
             .app
@@ -798,27 +801,17 @@ fn background_generation_keeps_composer_and_conversation_navigation_available() 
             .rect();
         let notices: Vec<_> = chat
             .get_all_by_label(
-                "Responding in ‘Original question’. You can draft here while you wait.",
+                "Responding in ‘Original question’. You can queue messages here while you wait.",
             )
             .map(|node| node.rect())
             .collect();
         assert_eq!(notices.len(), 1);
         assert!(notices[0].top() >= composer_rect.bottom());
         assert!(
-            chat.get_by_role_and_label(egui::Role::Button, "Send  ↑")
+            !chat
+                .get_by_role_and_label(egui::Role::Button, "Queue  ↑")
                 .accesskit_node()
                 .is_disabled()
-        );
-        chat.ctx
-            .global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
-        chat.get_by_role_and_label(egui::Role::Button, "Send  ↑")
-            .hover();
-        chat.run();
-        assert!(
-            chat.query_by_label(
-                "Wait for ‘Original question’ to finish responding before sending."
-            )
-            .is_some()
         );
         chat.key_press(egui::Key::Escape);
         chat.run();
@@ -830,6 +823,7 @@ fn background_generation_keeps_composer_and_conversation_navigation_available() 
         chat.run();
         assert_eq!(chat.state().app.active_conversation, owner);
         assert_eq!(chat.state().app.input, "Owner's next draft");
+        assert!(chat.get_by_label("1 queued message").rect().is_positive());
         assert!(
             chat.state()
                 .app
@@ -2277,4 +2271,162 @@ fn audio_file_completion_leaves_editable_prompt_in_composer_before_send() {
         chat.state().commands.try_recv(),
         Ok(Command::Send { text, .. }) if text == "Draft from audio with edits"
     ));
+}
+
+#[test]
+fn queued_messages_strip_edit_remove_clear_sidebar_badge_and_send_next() {
+    for size in [[1180.0, 860.0], [480.0, 480.0]] {
+        let mut chat = harness(size, false);
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::from(size));
+        chat.state_mut().app.input = "First prompt".into();
+        chat.state_mut().app.submit();
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::Send { .. })
+        ));
+        chat.run();
+
+        let queue_rect = chat
+            .get_by_role_and_label(egui::Role::Button, "Queue  ↑")
+            .rect();
+        let stop_rect = chat
+            .get_by_role_and_label(egui::Role::Button, "Stop")
+            .rect();
+        assert!(bounds.contains_rect(queue_rect));
+        assert!(bounds.contains_rect(stop_rect));
+
+        let composer = chat.get_by_role_and_label(egui::Role::MultilineTextInput, "Message");
+        composer.focus();
+        composer.type_text("Queued via Enter");
+        chat.run();
+        chat.key_press(egui::Key::Enter);
+        chat.run();
+
+        let composer = chat.get_by_role_and_label(egui::Role::MultilineTextInput, "Message");
+        composer.type_text("Queued via button");
+        chat.run();
+        chat.get_by_role_and_label(egui::Role::Button, "Queue  ↑")
+            .click();
+        chat.run();
+
+        assert_eq!(chat.state().app.queued_messages.len(), 2);
+        assert!(chat.get_by_label("2 queued messages").rect().is_positive());
+        assert!(
+            chat.get_by_label("1. Queued via Enter")
+                .rect()
+                .is_positive()
+        );
+        assert!(
+            chat.get_by_label("2. Queued via button")
+                .rect()
+                .is_positive()
+        );
+
+        // Edit is disabled while composer has unsent text, and enabled when empty.
+        let composer = chat.get_by_role_and_label(egui::Role::MultilineTextInput, "Message");
+        composer.type_text("Unsent text");
+        chat.run();
+        assert!(
+            chat.get_by_role_and_label(egui::Role::Button, "Edit queued message 1")
+                .accesskit_node()
+                .is_disabled()
+        );
+        chat.state_mut().app.input.clear();
+        chat.run();
+        assert!(
+            !chat
+                .get_by_role_and_label(egui::Role::Button, "Edit queued message 1")
+                .accesskit_node()
+                .is_disabled()
+        );
+        chat.get_by_role_and_label(egui::Role::Button, "Edit queued message 1")
+            .click();
+        chat.run();
+        assert_eq!(chat.state().app.input, "Queued via Enter");
+        assert_eq!(chat.state().app.queued_messages.len(), 1);
+        assert!(chat.get_by_label("1 queued message").rect().is_positive());
+
+        // Re-queue edited item, then remove an item and test Clear + Send next.
+        chat.get_by_role_and_label(egui::Role::Button, "Queue  ↑")
+            .click();
+        chat.run();
+        assert_eq!(chat.state().app.queued_messages.len(), 2);
+
+        chat.get_by_role_and_label(egui::Role::Button, "Remove queued message 1")
+            .click();
+        chat.run();
+        assert_eq!(chat.state().app.queued_messages.len(), 1);
+        assert!(
+            chat.get_by_label("1. Queued via Enter")
+                .rect()
+                .is_positive()
+        );
+
+        let owner = chat.state().app.active_conversation;
+        // Stop generation in owner so it is paused with 1 queued message, then
+        // switch to a new conversation and verify the inactive sidebar badge.
+        chat.state_mut()
+            .app
+            .model_event(Event::Text("Partial answer".into()));
+        chat.get_by_role_and_label(egui::Role::Button, "Stop")
+            .click();
+        chat.run();
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::Stop)
+        ));
+        chat.state_mut()
+            .app
+            .model_event(Event::Stopping("First prompt".into()));
+        chat.state_mut().app.model_event(Event::Stopped);
+        chat.run();
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::RestoreChat(_))
+        ));
+        open_sidebar(&mut chat, size);
+        chat.get_by_role_and_label(egui::Role::Button, "+ New conversation")
+            .click();
+        chat.run();
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::NewChat)
+        ));
+        open_sidebar(&mut chat, size);
+        chat.get_by_role_and_label(egui::Role::Button, "First prompt 1 queued")
+            .click();
+        chat.run();
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::RestoreChat(_))
+        ));
+        assert_eq!(chat.state().app.active_conversation, owner);
+        assert!(
+            chat.get_by_label("1 queued message · Paused")
+                .rect()
+                .is_positive()
+        );
+        chat.get_by_role_and_label(egui::Role::Button, "Send next queued message")
+            .click();
+        chat.run();
+        assert!(matches!(
+            chat.state().commands.try_recv(),
+            Ok(Command::Send { text, .. }) if text == "Queued via Enter"
+        ));
+        assert!(chat.state().app.queued_messages.is_empty());
+
+        // Queue another item and verify Clear removes it.
+        let composer = chat.get_by_role_and_label(egui::Role::MultilineTextInput, "Message");
+        composer.focus();
+        composer.type_text("To be cleared");
+        chat.run();
+        chat.key_press(egui::Key::Enter);
+        chat.run();
+        assert_eq!(chat.state().app.queued_messages.len(), 1);
+        chat.get_by_role_and_label(egui::Role::Button, "Clear queued messages")
+            .click();
+        chat.run();
+        assert!(chat.state().app.queued_messages.is_empty());
+        assert!(chat.query_by_label("1 queued message").is_none());
+    }
 }

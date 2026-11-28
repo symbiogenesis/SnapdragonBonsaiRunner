@@ -259,12 +259,7 @@ impl State {
     }
 
     pub(super) fn active_or_routed_conversation(&self) -> u64 {
-        if self.routing_request {
-            self.request_conversation
-                .unwrap_or(self.active_conversation)
-        } else {
-            self.active_conversation
-        }
+        self.routed_conversation.unwrap_or(self.active_conversation)
     }
 
     pub(super) fn touch_conversation(&mut self, id: u64) {
@@ -286,26 +281,19 @@ impl State {
         }
     }
 
-    // Event routing swaps only conversation content. The actual selection, Find
-    // state in its transcript, and live composer cursor/focus stay with the user.
-    pub(super) fn with_request_conversation(&mut self, action: impl FnOnce(&mut Self)) {
-        if self.routing_request {
+    // Event routing and background queue dispatch swap only conversation content.
+    // The actual selection, Find state in its transcript, and live composer
+    // cursor/focus stay with the user.
+    pub(super) fn with_conversation(&mut self, target: u64, action: impl FnOnce(&mut Self)) {
+        if self.routed_conversation.is_some() || target == self.active_conversation {
             action(self);
             return;
         }
-        let Some(owner) = self
-            .request_conversation
-            .filter(|id| *id != self.active_conversation)
-        else {
-            action(self);
-            return;
-        };
         let Some(index) = self
             .conversations
             .iter()
-            .position(|value| value.id == owner)
+            .position(|value| value.id == target)
         else {
-            action(self);
             return;
         };
         let Some(mut saved) = self.conversations[index].saved.take() else {
@@ -323,11 +311,11 @@ impl State {
             self.warning,
             self.status_detail.clone(),
         );
-        self.routing_request = true;
+        self.routed_conversation = Some(target);
         action(self);
-        self.routing_request = false;
-        // Late rejections and completion races can update a hidden transcript
-        // without changing the global stop/restart status currently on screen.
+        self.routed_conversation = None;
+        // Late rejections, completion races and failed background dispatches can
+        // update a hidden transcript without losing global stop/restart/error status.
         let changed = previous.0 != self.model
             || previous.1 != self.status
             || previous.2 != self.warning
@@ -343,7 +331,7 @@ impl State {
         if let Some(conversation) = self
             .conversations
             .iter_mut()
-            .find(|value| value.id == owner)
+            .find(|value| value.id == target)
         {
             conversation.saved = Some(saved);
             conversation.invalidate_json_cache();
@@ -357,6 +345,29 @@ impl State {
             self.status = status;
             self.status_detail = detail;
             self.warning = warning;
+        }
+    }
+
+    pub(super) fn with_request_conversation(&mut self, action: impl FnOnce(&mut Self)) {
+        if self.routed_conversation.is_some() {
+            action(self);
+            return;
+        }
+        let Some(owner) = self
+            .request_conversation
+            .filter(|id| *id != self.active_conversation)
+        else {
+            action(self);
+            return;
+        };
+        if self
+            .conversations
+            .iter()
+            .any(|value| value.id == owner && value.saved.is_some())
+        {
+            self.with_conversation(owner, action);
+        } else if !self.conversations.iter().any(|value| value.id == owner) {
+            action(self);
         }
     }
 
@@ -411,10 +422,10 @@ impl State {
 
     pub(super) fn generation_status(&self) -> String {
         if let Some(title) = self.background_generation_title() {
-            return format!("Responding in ‘{title}’. You can draft here while you wait.");
+            return format!("Responding in ‘{title}’. You can queue messages here while you wait.");
         }
         format!(
-            "{} You can draft your next message while you wait.",
+            "{} You can queue your next message while you wait.",
             self.status
         )
     }
@@ -500,6 +511,11 @@ impl State {
                 original_index,
                 created_empty_placeholder,
             });
+        }
+        self.queued_messages
+            .retain(|item| item.conversation_id != id);
+        if self.queued_messages.is_empty() {
+            self.queue_paused = false;
         }
         self.recovery_dirty = true;
         self.recovery_flush_now = true;
