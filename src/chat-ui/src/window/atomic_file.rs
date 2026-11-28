@@ -443,6 +443,82 @@ mod tests {
         );
         assert_eq!(fatal_attempts, 1);
 
+        // is_transient_windows_file_error recognizes 5 and 33 as well as 32.
+        for code in [5_i32, 32, 33] {
+            assert!(is_transient_windows_file_error(&io::Error::from_raw_os_error(code)));
+        }
+        assert!(!is_transient_windows_file_error(&io::Error::from_raw_os_error(2)));
+
+        // retry_transient_io exhausts after 4 attempts (3 backoffs + 1 final attempt).
+        let mut exhausted_attempts = 0_usize;
+        let exhausted = retry_transient_io(|| {
+            exhausted_attempts += 1;
+            Err(io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(exhausted.as_ref().err().and_then(io::Error::raw_os_error), Some(5));
+        assert_eq!(exhausted_attempts, TRANSIENT_BACKOFF_MS.len() + 1);
+
+        // open_exclusive_temp stages: make_path error, validate_temp error, non-AlreadyExists error,
+        // and 4-collision AlreadyExists exhaustion.
+        let make_err = open_exclusive_temp(
+            &dir.join("target.json"),
+            |_| Ok(()),
+            |_| Err(io::Error::new(io::ErrorKind::InvalidInput, "bad name")),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("expected make_path error"))?;
+        assert_eq!(make_err.stage, Stage::ValidateTemporary);
+
+        let val_err = open_exclusive_temp(
+            &dir.join("target.json"),
+            |_| Err(io::Error::new(io::ErrorKind::InvalidInput, "rejected temp")),
+            pending_path,
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("expected validate_temp error"))?;
+        assert_eq!(val_err.stage, Stage::ValidateTemporary);
+
+        let missing_dir = dir.join("no-such-parent").join("target.json");
+        let mut non_exist_calls = 0_usize;
+        let create_err = open_exclusive_temp(&missing_dir, |_| Ok(()), |p| {
+            non_exist_calls += 1;
+            pending_path(p)
+        })
+        .err()
+        .ok_or_else(|| io::Error::other("expected CreateTemporary error"))?;
+        assert_eq!(create_err.stage, Stage::CreateTemporary);
+        assert_eq!(non_exist_calls, 1);
+
+        let mut col_calls = 0_usize;
+        let exhausted_col = open_exclusive_temp(&dir.join("target.json"), |_| Ok(()), |_| {
+            col_calls += 1;
+            Ok(existing.clone())
+        })
+        .err()
+        .ok_or_else(|| io::Error::other("expected collision exhaustion"))?;
+        assert_eq!(exhausted_col.stage, Stage::CreateTemporary);
+        assert_eq!(exhausted_col.error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(col_calls, MAX_CREATE_ATTEMPTS);
+
+        // replace_with failure during Replace removes its temporary staging file cleanly.
+        let occupied_dir_target = dir.join("dir-target");
+        fs::create_dir(&occupied_dir_target)?;
+        let rep_err = replace_with(
+            &occupied_dir_target,
+            b"payload",
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("expected Replace error on directory target"))?;
+        assert_eq!(rep_err.stage, Stage::Replace);
+        let leftovers: Vec<_> = fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("dir-target."))
+            .collect();
+        assert!(leftovers.is_empty());
+
         fs::remove_dir_all(dir)
     }
 }

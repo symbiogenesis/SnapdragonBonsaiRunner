@@ -232,6 +232,41 @@ impl Session {
             let _joined = worker.join();
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_bounded() -> (Self, BoundedQueueHold) {
+        let (sender, receiver) = command_queue::channel();
+        let (_outgoing, events) = mpsc::channel();
+        let current_input = Arc::new(AtomicU64::new(NO_INPUT));
+        (
+            Self {
+                commands: Commands {
+                    sender,
+                    current_output: Arc::new(AtomicU64::new(0)),
+                    current_input: Arc::clone(&current_input),
+                },
+                events,
+                current_input,
+                worker: None,
+            },
+            BoundedQueueHold(receiver),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_overflow_for_test(&self) -> Result<(), SendError> {
+        self.commands.send(Command::OutputOverflow)
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct BoundedQueueHold(command_queue::Receiver);
+
+#[cfg(test)]
+impl BoundedQueueHold {
+    pub(crate) fn close(self) {
+        drop(self.0);
+    }
 }
 impl Drop for Session {
     fn drop(&mut self) {

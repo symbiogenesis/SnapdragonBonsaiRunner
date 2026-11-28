@@ -125,6 +125,30 @@ impl Export {
         self.shared.picker.cancel(&self.shared.cancelled);
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture_pending() -> io::Result<Self> {
+        let (raster_tx, _raster_rx) = mpsc::sync_channel::<Result<Arc<[u8]>, &'static str>>(1);
+        let shared = Arc::new(Shared::default());
+        let worker_shared = Arc::clone(&shared);
+        let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("bonsai-image-export-fixture".to_owned())
+            .spawn(move || {
+                while !worker_shared.cancelled.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                let _ = outcome_tx.send(Outcome::Cancelled);
+            })?;
+        Ok(Self {
+            shared,
+            outcome: outcome_rx,
+            raster_tx: Some(raster_tx),
+            raster: None,
+            worker: Some(worker),
+            finished: false,
+        })
+    }
+
     /// Drives pending rasterization and returns the latest export status without blocking.
     pub(crate) fn poll(&mut self) -> Outcome {
         if self.finished {
@@ -607,5 +631,80 @@ mod tests {
         export.cancel();
         assert!(matches!(wait_outcome(&mut export), Outcome::Cancelled));
         Ok(())
+    }
+
+    #[test]
+    fn export_handles_invalid_busy_retry_and_unavailable_admissions() -> io::Result<()> {
+        let dir = unique_test_dir("admission")?;
+        let svg: Arc<str> = Arc::from(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="navy"/></svg>"#,
+        );
+
+        // Admission::InvalidInput -> UNRENDERABLE_IMAGE without opening picker save.
+        let ctx_invalid = egui::Context::default();
+        let _respond_invalid = Service::fixture(&ctx_invalid);
+        let mut invalid_export = Export::start_with_selection(
+            &ctx_invalid,
+            Selection {
+                path: dir.join("empty.png"),
+                format: Format::Png,
+            },
+            Arc::from(""),
+        )?;
+        match wait_outcome(&mut invalid_export) {
+            Outcome::Failed(message) => assert_eq!(message, UNRENDERABLE_IMAGE),
+            _ => return Err(io::Error::other("expected UNRENDERABLE_IMAGE on empty SVG")),
+        }
+
+        // Admission::Busy -> PendingRaster::Retry, then Ticket once queue clears -> Saved.
+        let ctx_busy = egui::Context::default();
+        let respond_busy = Service::fixture(&ctx_busy);
+        let service = Service::get(&ctx_busy)
+            .ok_or_else(|| io::Error::other("missing fixture service"))?;
+        let mut filler = Vec::new();
+        while let Admission::Admitted(ticket) = service.request(Arc::from("filler")) {
+            filler.push(ticket);
+        }
+        let target = dir.join("retried.png");
+        let mut busy_export = Export::start_with_selection(
+            &ctx_busy,
+            Selection {
+                path: target.clone(),
+                format: Format::Png,
+            },
+            Arc::clone(&svg),
+        )?;
+        assert!(matches!(busy_export.poll(), Outcome::Pending));
+        if let Some(first) = filler.pop() {
+            let _ = respond_busy();
+            service.release(first);
+        }
+        assert!(matches!(busy_export.poll(), Outcome::Pending));
+        // Drain remaining filler requests so the retry ticket reaches the responder.
+        for _ in 0..filler.len() {
+            let _ = respond_busy();
+        }
+        assert_eq!(&*respond_busy()?, &*svg);
+        match wait_outcome(&mut busy_export) {
+            Outcome::Saved(saved) => assert_eq!(saved, target),
+            _ => return Err(io::Error::other("expected Saved after Busy retry")),
+        }
+
+        // Admission::Unavailable -> RASTER_FAILED.
+        service.reject();
+        let mut unavail_export = Export::start_with_selection(
+            &ctx_busy,
+            Selection {
+                path: dir.join("unavail.png"),
+                format: Format::Png,
+            },
+            Arc::clone(&svg),
+        )?;
+        match wait_outcome(&mut unavail_export) {
+            Outcome::Failed(message) => assert_eq!(message, RASTER_FAILED),
+            _ => return Err(io::Error::other("expected RASTER_FAILED on Unavailable")),
+        }
+
+        fs::remove_dir_all(dir)
     }
 }

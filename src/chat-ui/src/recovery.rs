@@ -682,4 +682,26 @@ mod tests {
         fs::remove_dir(directory)?;
         Ok(())
     }
+
+    #[test]
+    fn recovery_save_with_oversize_and_erase_full_channel_return_busy() -> io::Result<()> {
+        let (store, controlled) = Recovery::controlled();
+        // Oversized payload > MAX_BYTES returns Busy without disconnecting.
+        assert_eq!(
+            store.save_with(|| Ok(vec![b'x'; MAX_BYTES + 1]))?,
+            DispatchStatus::Busy
+        );
+        // Empty payload also returns Busy without disconnecting.
+        assert_eq!(store.save_with(|| Ok(Vec::new()))?, DispatchStatus::Busy);
+
+        // Fill the capacity-1 command channel, then erase() returns Busy (not Disconnected).
+        assert_eq!(store.erase(), DispatchStatus::Queued);
+        assert_eq!(store.erase(), DispatchStatus::Busy);
+
+        // Draining the queued command unblocks again; dropping receiver yields Disconnected.
+        let _cmd = controlled.incoming.try_recv().map_err(io::Error::other)?;
+        drop(controlled);
+        assert_eq!(store.erase(), DispatchStatus::Disconnected);
+        Ok(())
+    }
 }

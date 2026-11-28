@@ -1628,4 +1628,46 @@ mod tests {
         assert!(last.can_continue(&recovered.committed));
         Ok(())
     }
+
+    #[test]
+    fn poll_recovery_handles_erase_disconnect_and_busy_save_status() -> io::Result<()> {
+        // Busy save keeps recovery_dirty = true without disconnecting.
+        let mut s = state();
+        let (store, controlled) = crate::recovery::Recovery::controlled();
+        assert_eq!(store.erase(), crate::recovery::DispatchStatus::Queued);
+        s.recovery = Some(store);
+        s.save_conversations = true;
+        s.recovery_dirty = true;
+        s.recovery_flush_now = true;
+        // Occupy capacity-1 channel or fill via queued save? `save_with` uses TrySendError::Full -> Busy.
+        s.poll_recovery();
+        assert!(s.recovery.is_some());
+        assert!(s.recovery_dirty);
+
+        // Drain queued command and drop worker -> Disconnected on save_with triggers disconnect_recovery.
+        let _ = controlled.next_completion()?;
+        drop(controlled);
+        s.recovery_flush_now = true;
+        s.poll_recovery();
+        assert!(s.recovery.is_none());
+        assert!(!s.recovery_dirty);
+
+        // Disconnected on erase() also calls disconnect_recovery.
+        let mut s_erase = state();
+        let (erase_store, erase_ctrl) = crate::recovery::Recovery::controlled();
+        assert_eq!(
+            erase_store.erase(),
+            crate::recovery::DispatchStatus::Queued
+        );
+        s_erase.recovery = Some(erase_store);
+        s_erase.recovery_erase_pending = true;
+        let _ = erase_ctrl.next_completion()?;
+        drop(erase_ctrl);
+        s_erase.recovery_flush_now = true;
+        s_erase.poll_recovery();
+        assert!(s_erase.recovery.is_none());
+        assert!(!s_erase.recovery_erase_pending);
+        assert!(s_erase.recovery_notice.starts_with("Could not"));
+        Ok(())
+    }
 }

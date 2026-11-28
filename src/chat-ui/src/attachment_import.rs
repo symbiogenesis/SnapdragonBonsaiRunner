@@ -376,6 +376,30 @@ impl Session {
         self.shared.picker.cancel(&self.shared.cancelled);
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture_pending() -> io::Result<(Self, Arc<Shared>)> {
+        let shared = Arc::new(Shared::default());
+        let worker_shared = Arc::clone(&shared);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("bonsai-attachment-fixture-test".to_owned())
+            .spawn(move || {
+                while !worker_shared.cancelled.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                let _ = tx.try_send(Outcome::Cancelled);
+            })?;
+        Ok((
+            Self {
+                shared: Arc::clone(&shared),
+                receiver: rx,
+                worker: Some(worker),
+                complete: false,
+            },
+            shared,
+        ))
+    }
+
     pub(crate) fn poll(&mut self) -> Option<Outcome> {
         if self.complete {
             return None;
@@ -784,5 +808,44 @@ mod tests {
                 Arc::from("data:image/png;base64,CCCC"),
             ]
         );
+    }
+
+    #[test]
+    fn session_cancel_marks_shared_flag_without_dropping_active_worker_until_polled()
+    -> io::Result<()> {
+        use super::{Ordering, Session, mpsc, thread};
+        use std::time::Duration;
+        let shared = Arc::new(Shared::default());
+        let worker_shared = Arc::clone(&shared);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("bonsai-attachment-cancel-test".to_owned())
+            .spawn(move || {
+                while !worker_shared.cancelled.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                let _ = tx.try_send(Outcome::Cancelled);
+            })?;
+        let mut session = Session {
+            shared: Arc::clone(&shared),
+            receiver: rx,
+            worker: Some(worker),
+            complete: false,
+        };
+        assert!(session.poll().is_none());
+        session.cancel();
+        assert!(shared.cancelled.load(Ordering::Acquire));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut polled = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(outcome) = session.poll() {
+                polled = Some(outcome);
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(polled, Some(Outcome::Cancelled));
+        assert!(session.poll().is_none());
+        Ok(())
     }
 }

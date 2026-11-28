@@ -740,6 +740,35 @@ impl Updates {
         self.close_requested
     }
 
+    #[cfg(test)]
+    pub(super) fn fixture_ready_to_close() -> Self {
+        let root = std::env::temp_dir().join("Bonsai-updates-close-fixture");
+        Self {
+            installation: Installation {
+                tool: root.join("maintenance/bonsai-tools.exe"),
+                root: root.clone(),
+                handoff: root.join("session.update.json"),
+                portable: false,
+            },
+            task: None,
+            version: None,
+            release_identity: None,
+            downloaded: false,
+            queued: true,
+            confirming: false,
+            confirmed: true,
+            waiting_for_stop: false,
+            cleanup_unconfirmed: false,
+            notified: false,
+            deferred: false,
+            close_requested: true,
+            next_check: Instant::now() + CHECK_INTERVAL,
+            status: String::new(),
+            error: None,
+            error_offline: false,
+        }
+    }
+
     /// Normal close authorizes only the exact portable update previously
     /// deferred with Later. An unfinished download never delays app shutdown.
     pub(super) fn approve_on_close(&mut self) -> bool {
@@ -2103,6 +2132,56 @@ mod tests {
         assert!(retained_path.exists());
         fs::remove_file(retained_path.join("request.json"))?;
         fs::remove_dir(retained_path)?;
+
+        // Idempotent UpdateScratch::cleanup and partial file set (request.json only).
+        let mut partial_only = UpdateScratch::create()?;
+        let partial_path = partial_only.path()?.to_owned();
+        fs::write(partial_path.join("request.json"), b"{}")?;
+        partial_only.cleanup();
+        assert!(!partial_path.exists());
+        assert!(partial_only.path().is_err());
+        partial_only.cleanup();
+
+        // Process::stop idempotency and wait_for_exit rejection after stop.
+        let tool_spec = ToolProcessSpec {
+            executable: PathBuf::from(r"C:\Windows\System32\where.exe"),
+            arguments: vec!["where.exe".into()],
+            working_directory: std::env::temp_dir(),
+            stdout: std::env::temp_dir().join(format!("BonsaiUpdOut-{}.txt", std::process::id())),
+            stderr: std::env::temp_dir().join(format!("BonsaiUpdErr-{}.txt", std::process::id())),
+            environment: BTreeMap::new(),
+        };
+        if let Ok(owned) = OwnedProcess::start_tool(&tool_spec) {
+            let owned_scratch = UpdateScratch::create()?;
+            let owned_path = owned_scratch.path()?.to_owned();
+            let mut proc_guard = Process::new(owned, &owned_scratch);
+            proc_guard.stop(Duration::from_secs(2))?;
+            proc_guard.stop(Duration::from_secs(2))?;
+            assert!(proc_guard.wait_for_exit(Duration::from_millis(10)).is_err());
+            drop(proc_guard);
+            drop(owned_scratch);
+            assert!(!owned_path.exists());
+        }
+        let _ = fs::remove_file(tool_spec.stdout);
+        let _ = fs::remove_file(tool_spec.stderr);
+
+        // Pre-cancelled execute() returns error cleanly and cleans its UpdateScratch.
+        let installation = Installation {
+            tool: PathBuf::from(r"C:\Windows\System32\where.exe"),
+            root: std::env::temp_dir(),
+            handoff: std::env::temp_dir().join("handoff.json"),
+            portable: true,
+        };
+        let cancelled = AtomicBool::new(true);
+        let cancel_err = execute(
+            &installation,
+            Operation::Check,
+            None,
+            None,
+            false,
+            &cancelled,
+        );
+        assert!(cancel_err.is_err());
         Ok(())
     }
 }

@@ -855,4 +855,39 @@ fn wire_bounds_svg_dimensions_span_budget_and_plain_fallback_align() {
     };
     assert_eq!(super::wire::encode("abc", &invalid_doc), parse("abc"));
     assert_eq!(super::wire::encode("", &invalid_doc), parse(""));
+
+    // 5. Additional SVG intrinsic dimension bounds, multi-SVG span flushing, and wire::encode fallback.
+    for (w, h) in [
+        (f32::NAN, 10.0),
+        (10.0, f32::NAN),
+        (f32::INFINITY, 10.0),
+        (10.0, f32::NEG_INFINITY),
+        (0.0, 10.0),
+        (-1.0, 10.0),
+        (10.0, 0.0005),
+        (10.0, 2.0e7),
+    ] {
+        assert!(!svg::valid_intrinsic_dimensions(w, h));
+        assert!(svg::target_dimensions_for_test(w, h, 256, 256, MAX_RASTER_PIXELS).is_none());
+    }
+
+    let ok_chunk = "*a* ".repeat(super::MAX_STYLE_SPANS / 20);
+    let multi_svg_ok = format!(
+        "{ok_chunk}\n\n```svg\n{SAMPLE_SVG}\n```\n\n{ok_chunk}\n\n```svg\n{SAMPLE_SVG}\n```\n\n{ok_chunk}"
+    );
+    assert_eq!(parse_document(&multi_svg_ok).segments.len(), 5);
+    assert!(parse(&multi_svg_ok).starts_with(b"BMD2"));
+
+    let over_chunk = "*a* ".repeat(super::MAX_STYLE_SPANS / 10);
+    let multi_svg_over = format!(
+        "{over_chunk}\n\n```svg\n{SAMPLE_SVG}\n```\n\n{over_chunk}\n\n```svg\n{SAMPLE_SVG}\n```\n\n{over_chunk}"
+    );
+    assert_eq!(parse_document(&multi_svg_over).segments.len(), 1);
+    assert!(parse(&multi_svg_over).starts_with(b"BMD1"));
+
+    let too_long = "x".repeat(MAX_MARKDOWN_BYTES + 1);
+    assert!(super::wire::encode(&too_long, &parse_document("x")).is_empty());
+
+    let expanded_doc = parse_document("abcdef");
+    assert_eq!(super::wire::encode("a", &expanded_doc), parse("a"));
 }

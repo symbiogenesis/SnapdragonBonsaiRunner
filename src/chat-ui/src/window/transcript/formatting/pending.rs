@@ -535,4 +535,77 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn pending_admission_handles_invalid_busy_retry_and_unavailable() -> std::io::Result<()> {
+        let mut initial = Pending::default();
+        initial.asynchronous_fixture = true;
+        let mut harness = Harness::builder().with_size([200.0, 100.0]).build_ui_state(
+            |ui, (pending, source, responder, enabled): &mut (Pending, String, Option<_>, bool)| {
+                if pending.service.is_none() {
+                    *responder = Some(Service::fixture(ui.ctx()));
+                    let _ = Service::get_or_init(&mut pending.service, ui.ctx());
+                    return;
+                }
+                if *enabled {
+                    let _ = pending.refresh(ui, 1, source, false);
+                }
+            },
+            (initial, "retryable markdown".to_owned(), None, false),
+        );
+        let respond = Service::get(&harness.ctx)
+            .ok_or_else(|| std::io::Error::other("missing service"))?;
+
+        // Saturate MAX_REQUESTS before enabling refresh so Admission::Busy is hit deterministically.
+        let mut fillers = Vec::new();
+        while let crate::markdown_service::Admission::Admitted(t) = respond.request(Arc::from("f"))
+        {
+            fillers.push(t);
+        }
+        harness.state_mut().3 = true;
+        harness.step();
+        assert!(!harness.state().0.failed());
+        assert!(harness.state().0.ticket.is_none());
+        assert!(harness.state().0.request_dirty);
+        assert!(harness.ctx.has_requested_repaint());
+
+        // Drain and release one filler slot so Busy transitions into Admitted(ticket) on next step.
+        if let Some(responder) = harness.state().2.as_ref() {
+            let _ = responder();
+        }
+        if let Some(first) = fillers.pop() {
+            respond.release(first);
+        }
+        harness.step();
+        assert!(!harness.state().0.failed());
+        assert!(harness.state().0.ticket.is_some());
+
+        // InvalidInput (source > MAX_SOURCE_BYTES == MAX_MARKDOWN_BYTES) sets failed = true immediately.
+        let oversized = "x".repeat(MAX_MARKDOWN_BYTES + 1);
+        let mut invalid_init = Pending::default();
+        invalid_init.asynchronous_fixture = true;
+        invalid_init.service = Some(Arc::clone(&respond));
+        invalid_init.revision = Some(9);
+        invalid_init.request_dirty = true;
+        let mut invalid_harness = Harness::builder().with_size([200.0, 100.0]).build_ui_state(
+            move |ui, pending: &mut Pending| {
+                let _ = pending.refresh(ui, 9, &oversized, false);
+            },
+            invalid_init,
+        );
+        invalid_harness.step();
+        assert!(invalid_harness.state().failed());
+        assert!(!invalid_harness.state().request_dirty);
+
+        // Unavailable fails permanently without remaining dirty.
+        respond.reject();
+        harness.state_mut().0.ticket = None;
+        harness.state_mut().0.revision = None;
+        harness.state_mut().1 = "after reject".to_owned();
+        harness.step();
+        assert!(harness.state().0.failed());
+        assert!(!harness.state().0.request_dirty);
+        drop(harness);
+        Ok(())
+    }
 }

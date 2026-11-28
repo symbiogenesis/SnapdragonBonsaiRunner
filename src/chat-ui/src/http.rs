@@ -995,18 +995,83 @@ mod tests {
         });
         let retried = super::connect_loopback(
             retry_port,
-            std::time::Duration::from_millis(400),
+            std::time::Duration::from_secs(2),
             || std::time::Duration::from_millis(20),
             || Ok::<(), &'static str>(()),
         );
-        if delayed_server
+        delayed_server
             .join()
-            .map_err(|_| std::io::Error::other("delayed server panicked"))?
-            .is_ok()
-            && ready.load(std::sync::atomic::Ordering::Acquire)
-        {
-            assert!(retried.is_ok());
+            .map_err(|_| std::io::Error::other("delayed server panicked"))??;
+        assert!(ready.load(std::sync::atomic::Ordering::Acquire));
+        assert!(retried.is_ok());
+
+        // Direct checks for retry_transient_connect classification and wait_interruptible.
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(super::retry_transient_connect(&std::io::Error::new(
+                kind,
+                "transient"
+            )));
         }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert!(!super::retry_transient_connect(&std::io::Error::new(
+                kind,
+                "non-transient"
+            )));
+        }
+
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(matches!(
+            super::wait_interruptible(
+                std::time::Duration::from_millis(10),
+                future,
+                &mut || std::time::Duration::from_millis(5),
+                &mut || Ok::<(), &'static str>(()),
+            ),
+            Ok(true)
+        ));
+
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap_or_else(std::time::Instant::now);
+        assert!(matches!(
+            super::wait_interruptible(
+                std::time::Duration::from_millis(50),
+                expired,
+                &mut || std::time::Duration::from_millis(5),
+                &mut || Ok::<(), &'static str>(()),
+            ),
+            Ok(false)
+        ));
+        assert!(matches!(
+            super::wait_interruptible(
+                std::time::Duration::from_millis(50),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                &mut || std::time::Duration::ZERO,
+                &mut || Ok::<(), &'static str>(()),
+            ),
+            Ok(false)
+        ));
+
+        let mut polls = 0_usize;
+        let started = std::time::Instant::now();
+        let interrupted = super::wait_interruptible(
+            std::time::Duration::from_secs(5),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            &mut || std::time::Duration::from_millis(5),
+            &mut || {
+                polls += 1;
+                if polls >= 2 { Err("cancelled") } else { Ok(()) }
+            },
+        );
+        assert_eq!(interrupted.err(), Some(super::Error::Interrupted("cancelled")));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         Ok(())
     }
 }

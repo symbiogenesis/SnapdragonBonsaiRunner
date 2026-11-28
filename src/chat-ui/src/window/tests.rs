@@ -1791,6 +1791,90 @@ fn close_requested_with_active_dialog_defers_close_until_worker_finishes_or_time
     assert!(state.defer_close_for_dialogs(&ctx, false));
     assert_eq!(state.dialog_close, DialogCloseState::TimedOut);
     assert!(!state.defer_close_for_dialogs(&ctx, true));
+
+    // Drain any commands emitted during the non-pass checks above before inspecting per-pass output.
+    ctx.begin_pass(egui::RawInput::default());
+    let mut drained = ctx.end_pass();
+    drained.textures_delta.clear();
+
+    // Additional dialog session types, repaint delay, Escape cancellation, second close_requested,
+    // cancel_attachment_import retention, and poll_updates close suppression while Waiting.
+    state.audio_import = None;
+    state.dialog_close = DialogCloseState::Idle;
+    let (att, att_shared) = crate::attachment_import::Session::fixture_pending()?;
+    state.attachment_import = Some(att);
+    assert!(state.has_active_dialog_session());
+    ctx.begin_pass(egui::RawInput::default());
+    assert!(state.defer_close_for_dialogs(&ctx, true));
+    let mut first_wait = ctx.end_pass();
+    first_wait.textures_delta.clear();
+    assert_eq!(state.next_repaint_delay(), Duration::from_millis(10));
+
+    // Second close_requested before deadline stays Waiting and emits CancelClose,
+    // and poll_updates suppresses ViewportCommand::Close while Waiting.
+    state.updates = Some(updates::Updates::fixture_ready_to_close());
+    ctx.begin_pass(egui::RawInput::default());
+    assert!(state.defer_close_for_dialogs(&ctx, true));
+    state.poll_updates(&ctx);
+    let mut pass_during_wait = ctx.end_pass();
+    pass_during_wait.textures_delta.clear();
+    let cmds_during_wait = &pass_during_wait.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(cmds_during_wait.contains(&egui::ViewportCommand::CancelClose));
+    assert!(!cmds_during_wait.contains(&egui::ViewportCommand::Close));
+    assert!(matches!(
+        state.dialog_close,
+        DialogCloseState::Waiting { .. }
+    ));
+
+    // cancel_attachment_import keeps session until poll_attachment_import reaps the worker.
+    state.cancel_attachment_import();
+    assert!(state.attachment_import.is_some());
+    assert!(
+        att_shared
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    while state.attachment_import.is_some() && Instant::now() < reap_deadline {
+        state.poll_attachment_import(&ctx);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(state.attachment_import.is_none());
+
+    // Once active dialog ends, poll_updates emits ViewportCommand::Close when Waiting transitions.
+    ctx.begin_pass(egui::RawInput::default());
+    assert!(state.defer_close_for_dialogs(&ctx, false));
+    assert_eq!(state.dialog_close, DialogCloseState::Idle);
+    state.poll_updates(&ctx);
+    let mut pass_after_wait = ctx.end_pass();
+    pass_after_wait.textures_delta.clear();
+    let cmds_after_wait = &pass_after_wait.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(cmds_after_wait.contains(&egui::ViewportCommand::Close));
+
+    // image_export has_active_dialog_session and non-blocking Escape cancellation.
+    let img_export = crate::image_export::Export::fixture_pending()?;
+    state.image_export = Some(img_export);
+    assert!(state.has_active_dialog_session());
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..egui::RawInput::default()
+    });
+    state.handle_escape(&ctx);
+    let mut escape_pass = ctx.end_pass();
+    escape_pass.textures_delta.clear();
+    assert!(state.image_export.is_some());
+    let export_reap = Instant::now() + Duration::from_secs(2);
+    while state.image_export.is_some() && Instant::now() < export_reap {
+        state.poll_image_export(&ctx);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(state.image_export.is_none());
     Ok(())
 }
 
@@ -1802,7 +1886,8 @@ fn speech_disconnect_stops_per_frame_alerts_and_oversized_read_aloud_preserves_s
     state.speech_output = true;
     state.speech_input = true;
 
-    // Oversized message fails pre-check in toggle_read_aloud without disabling speech.
+    // Oversized message, whitespace-only, and NUL-containing messages fail toggle_read_aloud
+    // pre-check without disabling speech.
     state.model = ModelLifecycle::Generating;
     state
         .transcript
@@ -1814,6 +1899,21 @@ fn speech_disconnect_stops_per_frame_alerts_and_oversized_read_aloud_preserves_s
     assert!(state.speech_output);
     assert!(state.speech_input);
     assert!(state.speech_notice);
+
+    // Whitespace-only is filtered before speech_command without raising an error notice,
+    // while NUL-containing text fails toggle_read_aloud pre-check and raises speech_notice.
+    for (invalid_body, expect_notice) in [("   \n\t", false), ("hello\0world", true)] {
+        state.speech_notice = false;
+        state.model = ModelLifecycle::Generating;
+        state.transcript.push(Role::Assistant, invalid_body.to_owned());
+        state.model_event(Event::Complete(Completion::Finished));
+        let invalid_id = state.transcript.messages.last().map_or(0, |m| m.id);
+        state.toggle_read_aloud(invalid_id);
+        assert!(state.speech.is_some());
+        assert!(state.speech_output);
+        assert!(state.speech_input);
+        assert_eq!(state.speech_notice, expect_notice);
+    }
 
     // PayloadTooLarge from speech_command keeps speech enabled.
     state.speech_notice = false;
@@ -1840,5 +1940,31 @@ fn speech_disconnect_stops_per_frame_alerts_and_oversized_read_aloud_preserves_s
     assert!(!state.speech_notice);
     state.drain_speech_events();
     assert!(!state.speech_notice);
+
+    // SendError::QueueFull keeps self.speech.is_some(), preserves flags, and sets busy notice.
+    let (bounded, hold) = speech::Session::fixture_bounded();
+    bounded.set_input_generation(Some(1));
+    for _ in 0..64 {
+        bounded.send_overflow_for_test().map_err(io::Error::other)?;
+    }
+    state.speech = Some(bounded);
+    state.speech_output = true;
+    state.speech_input = true;
+    state.speech_notice = false;
+    assert!(!state.speech_command(speech::Command::PrepareInput { generation: 1 }));
+    assert!(state.speech.is_some());
+    assert!(state.speech_output);
+    assert!(state.speech_input);
+    assert!(state.speech_notice);
+    assert!(state.speech_status.contains("busy"));
+
+    // SendError::Disconnected directly from speech_command clears self.speech immediately,
+    // and calling speech_command with self.speech == None returns false.
+    hold.close();
+    assert!(!state.speech_command(speech::Command::StopSpeaking));
+    assert!(state.speech.is_none());
+    assert!(!state.speech_output);
+    assert!(!state.speech_input);
+    assert!(!state.speech_command(speech::Command::StopSpeaking));
     Ok(())
 }

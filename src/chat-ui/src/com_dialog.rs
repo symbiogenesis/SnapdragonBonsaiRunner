@@ -664,6 +664,36 @@ mod tests {
             .spawn(|| {})?;
         assert!(join_thread_bounded(finished, Duration::from_secs(1)));
         assert!(Cancel::default().join_bounded(Duration::from_millis(10)));
+
+        // Cancel::cancel reaps an already-finished closer handle without leaking/panicking,
+        // and join_bounded returns false when a stuck closer exceeds its deadline.
+        let finished_closer = thread::Builder::new()
+            .name("bonsai-finished-closer-test".to_owned())
+            .spawn(|| {})?;
+        while !finished_closer.is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let reaper = Cancel(Mutex::new(CancelState {
+            active: None,
+            closer: Some(finished_closer),
+        }));
+        let cancelled = AtomicBool::new(false);
+        reaper.cancel(&cancelled);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(reaper.join_bounded(Duration::from_millis(10)));
+
+        let (stuck_tx, stuck_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let stuck_closer = thread::Builder::new()
+            .name("bonsai-stuck-closer-test".to_owned())
+            .spawn(move || {
+                let _ = stuck_rx.recv();
+            })?;
+        let timed_out = Cancel(Mutex::new(CancelState {
+            active: None,
+            closer: Some(stuck_closer),
+        }));
+        assert!(!timed_out.join_bounded(Duration::from_millis(20)));
+        let _released = stuck_tx.send(());
         Ok(())
     }
 }

@@ -991,6 +991,33 @@ mod tests {
             failed_job.poll().map(|o| &o.result),
             Some(&Err(DiffError::WorkerFailed))
         );
+        assert!(!DiffError::WorkerFailed.to_string().is_empty());
+
+        // Disconnected channel when already cancelled resolves to Err(DiffError::Cancelled), not WorkerFailed.
+        let (cancel_tx, cancel_rx) =
+            std::sync::mpsc::sync_channel::<super::BranchDiffOutcome>(1);
+        drop(cancel_tx);
+        let mut cancelled_disconnect_job = BranchDiffJob {
+            generation: 10,
+            left_source: BranchDiffSource {
+                origin: BranchDiffOrigin::Draft { conversation_id: 1 },
+                title: "Left".to_owned(),
+                text: "a".to_owned(),
+            },
+            right_source: BranchDiffSource {
+                origin: BranchDiffOrigin::Draft { conversation_id: 1 },
+                title: "Right".to_owned(),
+                text: "b".to_owned(),
+            },
+            cancel: Arc::new(AtomicBool::new(true)),
+            receiver: cancel_rx,
+            worker: None,
+            completed: None,
+        };
+        assert_eq!(
+            cancelled_disconnect_job.poll().map(|o| &o.result),
+            Some(&Err(DiffError::Cancelled))
+        );
         Ok(())
     }
 }

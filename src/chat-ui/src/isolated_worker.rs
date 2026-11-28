@@ -511,5 +511,15 @@ mod tests {
             TeardownOutcome::QuarantineNeeded
         );
         assert_eq!(stop_calls, 4);
+
+        // Failed relay with wait_clean = true still invokes stop_process before deciding.
+        assert_eq!(
+            decide_teardown(false, true, || {
+                stop_calls += 1;
+                true
+            }),
+            TeardownOutcome::Confirmed
+        );
+        assert_eq!(stop_calls, 5);
     }
 }

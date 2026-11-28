@@ -4816,4 +4816,60 @@ mod tests {
         assert_eq!(streamed, "Alpha end. Beta done.");
         Ok(())
     }
+
+    #[test]
+    fn check_broker_and_commands_fails_immediately_when_owned_broker_has_exited() -> io::Result<()>
+    {
+        use bonsai_windows_process::OwnedProcess;
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "Bonsai-ExitedBrokerCheck-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir)?;
+        let stdout = dir.join("stdout.txt");
+        let stderr = dir.join("stderr.txt");
+        let broker = OwnedProcess::start_tool(&bonsai_windows_process::ToolProcessSpec {
+            executable: std::path::PathBuf::from(r"C:\Windows\System32\where.exe"),
+            arguments: vec!["where.exe".into()],
+            working_directory: dir.clone(),
+            stdout,
+            stderr,
+            environment: std::collections::BTreeMap::new(),
+        })?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while broker.try_wait()?.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(broker.try_wait()?.is_some());
+
+        let check_err = super::check_broker_and_commands(&cmd_rx, Some(&broker)).err();
+        assert_eq!(
+            check_err,
+            Some(Failure::Message("The local model stopped unexpectedly."))
+        );
+
+        let addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::LOCALHOST,
+            1,
+        ));
+        let conn_err = super::connect_interruptible_with_broker(
+            addr,
+            std::time::Duration::from_millis(50),
+            &cmd_rx,
+            Some(&broker),
+        )
+        .err();
+        assert_eq!(
+            conn_err,
+            Some(Failure::Message("The local model stopped unexpectedly."))
+        );
+
+        let _ = broker.stop(std::time::Duration::from_secs(1));
+        std::fs::remove_dir_all(dir)
+    }
 }

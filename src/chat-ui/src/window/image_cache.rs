@@ -908,4 +908,57 @@ mod tests {
         assert!(!state.has_pending());
         assert!(state.is_rejected(&PrehashedSvg::from_str("")));
     }
+
+    #[test]
+    fn busy_and_unavailable_admissions_distinguish_retry_from_terminal_failure() {
+        let sample = PrehashedSvg::from_str(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="green"/></svg>"#,
+        );
+        let unavail = PrehashedSvg::from_str(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="blue"/></svg>"#,
+        );
+        let fillers = Vec::new();
+        let mut harness = Harness::builder()
+            .with_size([160.0, 120.0])
+            .with_context_setup(super::super::configure)
+            .build_ui_state(
+                move |ui, (cache, fillers, _responder): &mut (ImageCache, Vec<Ticket>, Option<_>)| {
+                    if let Some(service) = Service::get(ui.ctx()) {
+                        if fillers.is_empty() && !service.unavailable() {
+                            while let Admission::Admitted(t) = service.request(Arc::from("busy")) {
+                                fillers.push(t);
+                            }
+                            let busy_slot = cache.get_or_request(
+                                ui.ctx(),
+                                &sample,
+                                egui::vec2(64.0, 64.0),
+                            );
+                            assert!(matches!(busy_slot, RasterSlot::Loading { .. }));
+                            assert!(cache.entries.is_empty());
+                            assert!(!cache.is_rejected(&sample));
+                            assert!(ui.ctx().has_requested_repaint());
+
+                            service.reject();
+                            let fail_slot = cache.get_or_request(
+                                ui.ctx(),
+                                &unavail,
+                                egui::vec2(64.0, 64.0),
+                            );
+                            assert!(matches!(fail_slot, RasterSlot::FallbackSource));
+                            assert!(cache.entries.iter().any(|e| {
+                                e.svg == unavail && matches!(e.state, SlotState::Failed)
+                            }));
+                            assert!(cache.is_rejected(&unavail));
+                        }
+                    } else {
+                        *_responder = Some(Service::fixture(ui.ctx()));
+                    }
+                },
+                (ImageCache::default(), fillers, None),
+            );
+        harness.step();
+        harness.step();
+        let (state, _, _) = harness.state();
+        assert!(state.entries.iter().any(|e| matches!(e.state, SlotState::Failed)));
+    }
 }

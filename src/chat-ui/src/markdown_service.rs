@@ -859,4 +859,36 @@ mod tests {
         assert!(!can_restart_worker(false, true, false, true, 0));
         Ok(())
     }
+
+    #[test]
+    fn admission_and_fail_ticket_edge_cases_preserve_ready_results_and_bounds() -> io::Result<()> {
+        let context = egui::Context::default();
+        let (service, _pending) = Service::inert(&context);
+        let Admission::Admitted(done_ticket) = service.request(Arc::from("ready")) else {
+            return Err(io::Error::other("Expected admitted ticket"));
+        };
+        service.shared.complete(done_ticket, b"ok".to_vec());
+        service.shared.fail_ticket(done_ticket);
+        assert!(matches!(service.poll(done_ticket), Status::Ready(_)));
+
+        // Channel full before MAX_REQUESTS returns Busy and cleans provisional results entry.
+        let (full_tx, full_rx) = mpsc::sync_channel(0);
+        let bounded = Service {
+            shared: Arc::new(Shared::default()),
+            requests: full_tx,
+            worker: Mutex::new(None),
+        };
+        assert_eq!(bounded.request(Arc::from("queued")), Admission::Busy);
+        assert!(bounded.shared.state().results.is_empty());
+        drop(full_rx);
+
+        // Exhausted ticket counter (state.next == u64::MAX) returns Unavailable.
+        service.shared.state().next = u64::MAX;
+        assert!(service.unavailable());
+        assert_eq!(
+            service.request(Arc::from("overflow")),
+            Admission::Unavailable
+        );
+        Ok(())
+    }
 }
