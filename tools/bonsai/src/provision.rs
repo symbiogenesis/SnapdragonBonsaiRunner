@@ -2512,6 +2512,48 @@ mod tests {
         cleanup_obsolete_inference_installations(&root, current_commit, target)?;
         assert!(!inference.join(ro_commit).exists());
 
+        // Actively open/locked obsolete download and installation exe are deferred (Ok(())),
+        // while unlocked obsolete siblings are removed.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            let locked_dl = downloads.join("prism-inference-0.1.24-aarch64-pc-windows-msvc.zip");
+            let unlocked_dl = downloads.join("prism-inference-0.1.23-aarch64-pc-windows-msvc.zip");
+            fs::write(&locked_dl, b"dl").map_err(|e| e.to_string())?;
+            fs::write(&unlocked_dl, b"dl").map_err(|e| e.to_string())?;
+            let dl_guard = OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&locked_dl)
+                .map_err(|e| e.to_string())?;
+
+            let locked_commit = "3429a33772089dfd3a50a96c698b9dbe0b36836c";
+            let unlocked_commit = "4429a33772089dfd3a50a96c698b9dbe0b36836d";
+            let locked_exe = inference.join(locked_commit).join(target).join("prism-inference.exe");
+            let unlocked_exe = inference.join(unlocked_commit).join(target).join("prism-inference.exe");
+            fs::create_dir_all(locked_exe.parent().ok_or("missing parent")?)
+                .map_err(|e| e.to_string())?;
+            fs::create_dir_all(unlocked_exe.parent().ok_or("missing parent")?)
+                .map_err(|e| e.to_string())?;
+            fs::write(&locked_exe, b"exe").map_err(|e| e.to_string())?;
+            fs::write(&unlocked_exe, b"exe").map_err(|e| e.to_string())?;
+            let exe_guard = OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&locked_exe)
+                .map_err(|e| e.to_string())?;
+
+            cleanup_obsolete_inference_downloads(&root, current_archive)?;
+            cleanup_obsolete_inference_installations(&root, current_commit, target)?;
+            assert!(locked_dl.exists());
+            assert!(!unlocked_dl.exists());
+            assert!(locked_exe.exists());
+            assert!(!inference.join(unlocked_commit).exists());
+
+            drop(dl_guard);
+            drop(exe_guard);
+        }
+
         fs::remove_dir_all(root).map_err(|error| error.to_string())
     }
 

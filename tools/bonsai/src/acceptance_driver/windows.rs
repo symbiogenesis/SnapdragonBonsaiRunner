@@ -238,6 +238,10 @@ fn supervise(
     }
     // Preserve non-empty stderr/stdout capture directories for caller diagnostics.
     capture_guard.disarm();
+    finalize_supervise_outcome(result, cleanup_error)
+}
+
+fn finalize_supervise_outcome<T>(result: crate::Result<T>, cleanup_error: Option<String>) -> crate::Result<T> {
     let output = result?;
     if let Some(error) = cleanup_error {
         return Err(error);
@@ -726,5 +730,18 @@ mod tests {
         external(&root)?;
         fs::remove_dir_all(&root).map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    #[test]
+    fn finalize_supervise_outcome_preserves_primary_error_over_cleanup() {
+        assert_eq!(
+            finalize_supervise_outcome::<i32>(Err("primary".into()), Some("cleanup".into())),
+            Err("primary".into())
+        );
+        assert_eq!(
+            finalize_supervise_outcome(Ok(7), Some("cleanup".into())),
+            Err("cleanup".into())
+        );
+        assert_eq!(finalize_supervise_outcome(Ok(7), None), Ok(7));
     }
 }

@@ -277,15 +277,33 @@ impl Context {
         if remove_stderr.is_ok() {
             stderr_guard.disarm();
         }
-        result?;
-        cleanup?;
-        if let Some(error) = retain_error {
-            return Err(error);
-        }
-        remove_stdout.map_err(|e| e.to_string())?;
-        remove_stderr.map_err(|e| e.to_string())?;
-        response
+        finalize_owner_result(
+            result,
+            cleanup,
+            retain_error,
+            remove_stdout,
+            remove_stderr,
+            response,
+        )
     }
+}
+
+fn finalize_owner_result<T>(
+    result: Result<()>,
+    cleanup: Result<()>,
+    retain_error: Option<String>,
+    remove_stdout: std::io::Result<()>,
+    remove_stderr: std::io::Result<()>,
+    response: Result<T>,
+) -> Result<T> {
+    result?;
+    cleanup?;
+    if let Some(error) = retain_error {
+        return Err(error);
+    }
+    remove_stdout.map_err(|e| e.to_string())?;
+    remove_stderr.map_err(|e| e.to_string())?;
+    response
 }
 fn original(request: &Value) -> Result<Value> {
     ci_guard()?;
@@ -705,5 +723,82 @@ pub(super) fn run(request: &Value) -> Result<Value> {
         Some("bundle-owner-finalize") => finalize(request),
         Some("bundle-capture") => capture(request),
         _ => Err("Unknown owner operation.".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finalize_owner_result;
+    use std::io;
+
+    #[test]
+    fn finalize_owner_result_enforces_exact_error_precedence() {
+        assert_eq!(
+            finalize_owner_result(
+                Err("primary".into()),
+                Err("cleanup".into()),
+                Some("retain".into()),
+                Err(io::Error::other("stdout")),
+                Err(io::Error::other("stderr")),
+                Ok(1),
+            )
+            .err()
+            .as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            finalize_owner_result(
+                Ok(()),
+                Err("cleanup".into()),
+                Some("retain".into()),
+                Err(io::Error::other("stdout")),
+                Err(io::Error::other("stderr")),
+                Ok(1),
+            )
+            .err()
+            .as_deref(),
+            Some("cleanup")
+        );
+        assert_eq!(
+            finalize_owner_result(
+                Ok(()),
+                Ok(()),
+                Some("retain".into()),
+                Err(io::Error::other("stdout")),
+                Err(io::Error::other("stderr")),
+                Ok(1),
+            )
+            .err()
+            .as_deref(),
+            Some("retain")
+        );
+        assert!(
+            finalize_owner_result(
+                Ok(()),
+                Ok(()),
+                None,
+                Err(io::Error::other("stdout-err")),
+                Err(io::Error::other("stderr-err")),
+                Ok(1),
+            )
+            .err()
+            .is_some_and(|e| e.contains("stdout-err"))
+        );
+        assert!(
+            finalize_owner_result(
+                Ok(()),
+                Ok(()),
+                None,
+                Ok(()),
+                Err(io::Error::other("stderr-err")),
+                Ok(1),
+            )
+            .err()
+            .is_some_and(|e| e.contains("stderr-err"))
+        );
+        assert_eq!(
+            finalize_owner_result(Ok(()), Ok(()), None, Ok(()), Ok(()), Ok(42)).ok(),
+            Some(42)
+        );
     }
 }

@@ -1839,6 +1839,141 @@ mod tests {
                 .len(),
             1
         );
+
+        // metadata_attempt retries 429 and truncated 200, succeeds on valid 200,
+        // and rejects oversize & 404 fatally without retrying.
+        let (meta_uri, meta_server) = sequence_server(vec![
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nab",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n{\"ok\":1}",
+        ])?;
+        let meta_res = run_with_retry_budget(
+            4,
+            Duration::from_millis(10),
+            until,
+            &mut || Ok(()),
+            |checkpoint| match owned_with_abort(
+                new_agent(true),
+                until,
+                checkpoint,
+                |agent, cancelled| {
+                    metadata_attempt(agent, &meta_uri, &[], until, 1024, cancelled, 0, true)
+                },
+                |outcome| matches!(outcome, RetryOutcome::Retry { .. }),
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => RetryOutcome::Fatal(error),
+            },
+        )?;
+        assert_eq!(meta_res.body, b"{\"ok\":1}");
+        assert_eq!(
+            meta_server
+                .join()
+                .map_err(|_| "Meta server panicked.")??
+                .len(),
+            3
+        );
+
+        let (over_uri, over_server) = sequence_server(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\nConnection: close\r\n\r\n",
+        ])?;
+        let over_res = run_with_retry_budget(
+            3,
+            Duration::from_millis(10),
+            until,
+            &mut || Ok(()),
+            |checkpoint| match owned_with_abort(
+                new_agent(true),
+                until,
+                checkpoint,
+                |agent, cancelled| {
+                    metadata_attempt(agent, &over_uri, &[], until, 1024, cancelled, 0, true)
+                },
+                |outcome| matches!(outcome, RetryOutcome::Retry { .. }),
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => RetryOutcome::Fatal(error),
+            },
+        );
+        assert!(over_res.is_err());
+        assert_eq!(
+            over_server
+                .join()
+                .map_err(|_| "Oversize server panicked.")??
+                .len(),
+            1
+        );
+
+        // is_retryable_http_status, is_transient_io_error, parse_http_date, and retry cancellation/exhaustion
+        for s in [408_u16, 429, 500, 599] {
+            assert!(is_retryable_http_status(s));
+        }
+        for s in [200_u16, 400, 403, 404, 499, 600] {
+            assert!(!is_retryable_http_status(s));
+        }
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            assert!(is_transient_io_error(&std::io::Error::from(kind)));
+        }
+        assert!(!is_transient_io_error(&std::io::Error::from(
+            std::io::ErrorKind::InvalidData
+        )));
+
+        assert!(parse_http_date("Thu, 29 Feb 2024 12:34:56 GMT").is_some());
+        assert!(parse_http_date("Sat, 29 Feb 2025 12:34:56 GMT").is_none());
+        assert!(parse_http_date("Mon, 29 Feb 2100 12:34:56 GMT").is_none());
+        assert!(parse_http_date("Tue, 29 Feb 2000 12:34:56 GMT").is_some());
+        assert!(parse_http_date("Thu, 01 Foo 2024 12:34:56 GMT").is_none());
+        assert!(parse_http_date("Thu, 01 Jan 2024 25:00:00 GMT").is_none());
+        assert!(parse_http_date("Thu, 01 Jan 2024 12:34:56 UTC").is_none());
+        assert!(parse_retry_after("Wed, 01 Jan 2099 00:00:00 GMT").is_some_and(|d| !d.is_zero()));
+
+        // run_with_retry_budget cancellation during chunked 50ms sleep wakes promptly
+        let mut sleep_checks = 0_usize;
+        let started_cancel = Instant::now();
+        let cancelled_res = run_with_retry_budget(
+            3,
+            Duration::from_millis(500),
+            Instant::now() + Duration::from_secs(10),
+            &mut || {
+                sleep_checks += 1;
+                if sleep_checks >= 3 {
+                    Err("user cancelled".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| -> RetryOutcome<()> {
+                RetryOutcome::Retry {
+                    error: "transient".into(),
+                    retry_after: Some(Duration::from_secs(2)),
+                }
+            },
+        );
+        assert_eq!(cancelled_res.err().as_deref(), Some("user cancelled"));
+        assert!(started_cancel.elapsed() < Duration::from_millis(500));
+
+        // Exhaustion runs max_retries + 1 attempts
+        let mut exh = 0_usize;
+        let exh_res = run_with_retry_budget(
+            2,
+            Duration::from_millis(1),
+            Instant::now() + Duration::from_secs(5),
+            &mut || Ok(()),
+            |_| -> RetryOutcome<()> {
+                exh += 1;
+                RetryOutcome::Retry {
+                    error: "always 503".into(),
+                    retry_after: Some(Duration::from_millis(1)),
+                }
+            },
+        );
+        assert_eq!(exh, 3);
+        assert_eq!(exh_res.err().as_deref(), Some("always 503"));
         Ok(())
     }
 }

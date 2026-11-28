@@ -391,4 +391,102 @@ mod tests {
         assert_eq!(immediate_attempts, 1);
         assert!(non_retryable.is_err());
     }
+
+    #[test]
+    fn fs_guard_rejects_junctions_clears_readonly_on_rename_and_cleans_atomic_errors()
+    -> crate::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "Bonsai-FsGuardEdge-{}",
+            crate::startup_process::unique()
+        ));
+        fs::create_dir(&root).map_err(|e| e.to_string())?;
+        let mut root_guard = TempDirGuard::new(root.clone());
+
+        // 1. is_windows_sharing_or_access raw codes 5, 32, 33 vs 2 (NotFound)
+        for code in [5_i32, 32, 33] {
+            assert!(is_windows_sharing_or_access(&io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        assert!(!is_windows_sharing_or_access(
+            &io::Error::from_raw_os_error(2)
+        ));
+
+        // 2. remove_file_with_retry returns Ok(()) on NotFound
+        remove_file_with_retry(&root.join("missing.tmp")).map_err(|e| e.to_string())?;
+
+        // 3. remove_dir_all_with_retry refuses a Windows directory junction and preserves target
+        let target = root.join("target");
+        let sentinel = target.join("sentinel.txt");
+        let junction = root.join("junction");
+        fs::create_dir(&target).map_err(|e| e.to_string())?;
+        fs::write(&sentinel, b"keep").map_err(|e| e.to_string())?;
+        let mklink = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &junction.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        assert!(mklink.status.success(), "mklink /J failed");
+        let j_err = remove_dir_all_with_retry(&junction)
+            .err()
+            .ok_or("junction removal unexpectedly succeeded")?;
+        assert!(j_err.to_string().contains("redirected directory"));
+        assert!(sentinel.exists());
+        fs::remove_dir(&junction).map_err(|e| e.to_string())?;
+
+        // 4. rename_with_retry clears DOS read-only on `to` and succeeds
+        let from_file = root.join("from.json");
+        let to_file = root.join("to.json");
+        fs::write(&from_file, b"updated").map_err(|e| e.to_string())?;
+        fs::write(&to_file, b"original").map_err(|e| e.to_string())?;
+        let mut perms = fs::metadata(&to_file)
+            .map_err(|e| e.to_string())?
+            .permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&to_file, perms).map_err(|e| e.to_string())?;
+        rename_with_retry(&from_file, &to_file).map_err(|e| e.to_string())?;
+        assert_eq!(
+            fs::read(&to_file).map_err(|e| e.to_string())?,
+            b"updated"
+        );
+
+        // 5. write_atomic_bytes & write_new_atomic_bytes error paths leave 0 .partial files
+        assert_eq!(
+            write_atomic_bytes(Path::new("C:\\"), b"x")
+                .err()
+                .map(|e| e.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+        assert_eq!(
+            write_new_atomic_bytes(Path::new("C:\\"), b"x")
+                .err()
+                .map(|e| e.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+
+        let occupied_dir = root.join("occupied-dir");
+        fs::create_dir(&occupied_dir).map_err(|e| e.to_string())?;
+        assert!(write_atomic_bytes(&occupied_dir, b"fail").is_err());
+
+        assert!(write_new_atomic_bytes(&to_file, b"collide").is_err());
+        assert_eq!(
+            fs::read(&to_file).map_err(|e| e.to_string())?,
+            b"updated"
+        );
+
+        let partials = fs::read_dir(&root)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "partial"))
+            .count();
+        assert_eq!(partials, 0);
+
+        root_guard.cleanup().map_err(|e| e.to_string())?;
+        Ok(())
+    }
 }

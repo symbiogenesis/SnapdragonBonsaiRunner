@@ -864,6 +864,23 @@ mod tests {
         );
         assert_eq!(masked_check.err().as_deref(), Some("primary error"));
 
+        // result=Ok + write_result=Err still cleans scratch and returns write_result
+        let w_scratch_path = root.join("w-scratch");
+        let w_scratch = ScratchDir::create(w_scratch_path.clone())?;
+        let w_err = finalize_audit(&non_dir_output, json!({"status": "ok"}), Ok(()), Some(w_scratch));
+        assert!(w_err.is_err());
+        assert!(!w_scratch_path.exists());
+
+        // is_retryable_cleanup_error raw codes 5, 32, 33 vs 2
+        for code in [5_i32, 32, 33] {
+            assert!(is_retryable_cleanup_error(&io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        assert!(!is_retryable_cleanup_error(
+            &io::Error::from_raw_os_error(2)
+        ));
+
         remove_dir_all_with_retry(&root)?;
         Ok(())
     }
@@ -996,6 +1013,134 @@ mod tests {
         ));
 
         assert!(!redact_secret(&format!("failed with {secret}"), secret).contains(secret));
+        assert_eq!(redact_secret("no secret here", ""), "no secret here");
+
+        // Error branches in endpoint_with:
+        // (a) metadata 302 redirect -> fatal without retry
+        // (b) 302 missing Location -> fatal without retry
+        // (c) 302 rejected validate_redirect -> fatal with secret redacted
+        // (d) archive SHA-256 mismatch -> fatal without retry & .partial cleaned
+        // (e) archive oversize -> fatal without retry & .partial cleaned
+        // (f) 503 exhaustion across attempts
+        let err_listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let err_addr = err_listener.local_addr().map_err(|e| e.to_string())?;
+        let err_replies = vec![
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+            "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://untrusted.example.invalid/{secret}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nwrongzip".to_owned(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 32\r\nConnection: close\r\n\r\n0123456789abcdef0123456789abcdef".to_owned(),
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+        ];
+        let err_server = std::thread::spawn(move || -> crate::Result<usize> {
+            let mut count = 0_usize;
+            for reply in err_replies {
+                let (mut stream, _) = err_listener.accept().map_err(|e| e.to_string())?;
+                let _ = read_http_request(&mut stream)?;
+                stream.write_all(reply.as_bytes()).map_err(|e| e.to_string())?;
+                count += 1;
+            }
+            Ok(count)
+        });
+
+        let bad_zip = root.join("bad.zip");
+        // (a) metadata redirect
+        assert!(
+            endpoint_with(
+                &agent,
+                &format!("http://{err_addr}/a"),
+                secret,
+                None,
+                64,
+                &payload_sha,
+                until,
+                |_| Ok(()),
+            )
+            .is_err()
+        );
+        // (b) missing Location on 302
+        assert!(
+            endpoint_with(
+                &agent,
+                &format!("http://{err_addr}/b"),
+                secret,
+                Some(&bad_zip),
+                64,
+                &payload_sha,
+                until,
+                |_| Ok(()),
+            )
+            .is_err()
+        );
+        // (c) rejected validate_redirect with secret redacted
+        let redir_err = endpoint_with(
+            &agent,
+            &format!("http://{err_addr}/c"),
+            secret,
+            Some(&bad_zip),
+            64,
+            &payload_sha,
+            until,
+            |_| Ok(()),
+        )
+        .err()
+        .ok_or("expected redirect validation error")?;
+        assert!(!redir_err.contains(secret));
+        // (d) SHA-256 mismatch
+        assert!(
+            endpoint_with(
+                &agent,
+                &format!("http://{err_addr}/d"),
+                secret,
+                Some(&bad_zip),
+                payload_len,
+                &payload_sha,
+                until,
+                |_| Ok(()),
+            )
+            .is_err()
+        );
+        // (e) oversize
+        assert!(
+            endpoint_with(
+                &agent,
+                &format!("http://{err_addr}/e"),
+                secret,
+                Some(&bad_zip),
+                16,
+                &payload_sha,
+                until,
+                |_| Ok(()),
+            )
+            .is_err()
+        );
+        // (f) 503 exhaustion (4 attempts)
+        assert!(
+            endpoint_with(
+                &agent,
+                &format!("http://{err_addr}/f"),
+                secret,
+                None,
+                64,
+                &payload_sha,
+                until,
+                |_| Ok(()),
+            )
+            .is_err()
+        );
+        assert!(!bad_zip.exists());
+        let leftover_partials = fs::read_dir(&root)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "partial"))
+            .count();
+        assert_eq!(leftover_partials, 0);
+        assert_eq!(err_server.join().map_err(|_| "err server panicked")??, 9);
         Ok(())
     }
 }

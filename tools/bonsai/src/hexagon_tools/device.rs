@@ -1225,6 +1225,57 @@ mod tests {
             assert!(scratch.exists());
         }
         assert!(!scratch.exists());
+
+        // Deadline expiring before max_attempts stops early; max_attempts == 0 fails cleanly.
+        let mut deadline_attempts = 0_usize;
+        let dl_err = stop_with_bound(
+            |_| -> std::result::Result<(), &str> {
+                deadline_attempts += 1;
+                Err("busy")
+            },
+            100,
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+        );
+        assert!(dl_err.is_err());
+        assert!(deadline_attempts < 100);
+
+        let zero_err = stop_with_bound(
+            |_| -> std::result::Result<(), &str> { Ok(()) },
+            0,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        );
+        assert!(zero_err.is_err());
+
+        // ScratchDir::drop refuses to delete a directory junction
+        let j_root = std::env::temp_dir().join(format!(
+            "bonsai-hex-junction-{}",
+            startup_process::unique()
+        ));
+        let j_target = j_root.join("target");
+        let j_link = j_root.join("link");
+        let sentinel = j_target.join("keep.txt");
+        fs::create_dir_all(&j_target).map_err(|e| e.to_string())?;
+        fs::write(&sentinel, b"keep").map_err(|e| e.to_string())?;
+        let mklink = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &j_link.to_string_lossy(),
+                &j_target.to_string_lossy(),
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        assert!(mklink.status.success(), "mklink /J failed");
+        drop(ScratchDir(j_link.clone()));
+        assert!(j_link.exists());
+        assert!(sentinel.exists());
+        let _ = fs::remove_dir(&j_link);
+        let _ = fs::remove_dir_all(&j_root);
         Ok(())
     }
 }
