@@ -11,8 +11,6 @@ use bonsai_artifacts::{is_redirect, validate_external_path};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::identity::Hasher;
-
 const MAX_METADATA_BYTES: u64 = 32_768;
 const FILES: &[&str] = &[
     "bin/bonsai-chat.exe",
@@ -208,16 +206,27 @@ fn verify_file(directory: &Path, entry: &PackageFile) -> crate::Result<()> {
     if file.metadata().map_err(|error| error.to_string())?.len() != entry.bytes {
         return Err(format!("Package byte length mismatch: {}", entry.name));
     }
-    let mut digest = Hasher::new()?;
-    let mut buffer = vec![0; 65_536];
-    loop {
-        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count])?;
-    }
-    if digest.finalize_hex()? != entry.sha256 {
+    #[cfg(windows)]
+    let mapped = bonsai_windows_credentials::try_hash_locked_file_mapped(
+        &file,
+        entry.bytes,
+        &mut crate::startup_cancel::checkpoint,
+        |error| error.to_string(),
+    )?;
+    #[cfg(not(windows))]
+    let mapped: Option<[u8; 32]> = None;
+    let matched = if let Some(digest) = mapped {
+        crate::identity::hex(&digest) == entry.sha256
+    } else {
+        let (_, digest) = crate::identity::hash_reader_checked(
+            &mut file,
+            Some(entry.bytes),
+            None,
+            &mut crate::startup_cancel::checkpoint,
+        )?;
+        digest == entry.sha256
+    };
+    if !matched {
         return Err(format!("Package SHA-256 mismatch: {}", entry.name));
     }
     if entry.name.starts_with("bin/") {
@@ -225,6 +234,101 @@ fn verify_file(directory: &Path, entry: &PackageFile) -> crate::Result<()> {
         crate::startup_cache::assert_arm64(&path)?;
     }
     Ok(())
+}
+
+fn verify_files_parallel(directory: &Path, files: &[PackageFile]) -> crate::Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    if files.len() <= 1 {
+        for entry in files {
+            verify_file(directory, entry)?;
+        }
+        return Ok(());
+    }
+    let workers = files.len().min(4);
+    let next = AtomicUsize::new(0);
+    let peer_cancelled = Arc::new(AtomicBool::new(false));
+    let worker_task = || -> Vec<(usize, crate::Result<()>)> {
+        crate::startup_cancel::with_peer_cancellation(&peer_cancelled, || {
+            let mut local = Vec::new();
+            loop {
+                if peer_cancelled.load(Ordering::Acquire) {
+                    break;
+                }
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(entry) = files.get(index) else {
+                    break;
+                };
+                let result = verify_file(directory, entry);
+                let failed = result.is_err();
+                local.push((index, result));
+                if failed {
+                    peer_cancelled.store(true, Ordering::Release);
+                    break;
+                }
+            }
+            local
+        })
+    };
+    let groups = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers - 1);
+        for worker in 1..workers {
+            if let Ok(handle) = std::thread::Builder::new()
+                .name(format!("package-verify-{worker}"))
+                .spawn_scoped(scope, worker_task)
+            {
+                handles.push(handle);
+            }
+        }
+        let mut results = Vec::with_capacity(handles.len() + 1);
+        results.push(worker_task());
+        for handle in handles {
+            match handle.join() {
+                Ok(items) => results.push(items),
+                Err(_) => {
+                    peer_cancelled.store(true, Ordering::Release);
+                    results.push(vec![(
+                        0,
+                        Err("Package verification worker stopped unexpectedly.".into()),
+                    )]);
+                }
+            }
+        }
+        results
+    });
+    let mut ordered: Vec<Option<crate::Result<()>>> = vec![None; files.len()];
+    for items in groups {
+        for (index, result) in items {
+            if let Some(slot) = ordered.get_mut(index)
+                && (slot.is_none()
+                    || slot.as_ref().is_some_and(|existing| {
+                        existing.as_ref().is_err_and(|msg| {
+                            msg == "Startup operation cancelled after a peer failed."
+                        })
+                    }))
+            {
+                *slot = Some(result);
+            }
+        }
+    }
+    for entry in &ordered {
+        if let Some(Err(error)) = entry
+            && error != "Startup operation cancelled after a peer failed."
+        {
+            return Err(error.clone());
+        }
+    }
+    for entry in ordered {
+        match entry {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Err(error),
+            None => return Err("Package verification was cancelled.".into()),
+        }
+    }
+    crate::startup_cancel::checkpoint()
 }
 
 fn filenames(schema: u64) -> crate::Result<&'static [&'static str]> {
@@ -339,8 +443,8 @@ fn checked(directory: &Path, manifest_sha256: &str) -> crate::Result<Value> {
         if !names.contains(&entry.name.as_str()) || !seen.insert(&entry.name) {
             return Err("Invalid or repeated package filename.".into());
         }
-        verify_file(directory, entry)?;
     }
+    verify_files_parallel(directory, &manifest.files)?;
     inventory(directory, names)?;
     Ok(json!({
         "Directory": directory, "ManifestSha256": manifest_sha256,

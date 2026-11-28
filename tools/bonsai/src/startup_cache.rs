@@ -49,9 +49,19 @@ fn source_file(path: &Path) -> crate::Result<File> {
 pub(crate) fn digest_file(path: &Path) -> crate::Result<String> {
     crate::startup_cancel::checkpoint()?;
     let mut file = source_file(path)?;
+    let length = file.metadata().map_err(|error| error.to_string())?.len();
+    #[cfg(windows)]
+    if let Some(digest) = bonsai_windows_credentials::try_hash_locked_file_mapped(
+        &file,
+        length,
+        &mut crate::startup_cancel::checkpoint,
+        |error| error.to_string(),
+    )? {
+        return Ok(crate::identity::hex(&digest));
+    }
     crate::identity::hash_reader_checked(
         &mut file,
-        None,
+        Some(length),
         None,
         &mut crate::startup_cancel::checkpoint,
     )

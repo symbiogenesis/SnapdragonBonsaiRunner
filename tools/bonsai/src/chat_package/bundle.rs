@@ -112,12 +112,35 @@ fn supports_bundle(file: &mut File) -> crate::Result<bool> {
     }
 }
 
-fn unpack(executable: &Path, directory: &Path) -> crate::Result<Value> {
-    let (mut archive, digest) = archive(executable)?;
+fn verify_launcher_prefix_with(
+    mut archive: ZipArchive<File>,
+    expected_tool: &Path,
+) -> crate::Result<()> {
     let prefix = archive
         .by_index(0)
         .map_err(|error| error.to_string())?
         .header_start();
+    let tool = super::open(expected_tool)?;
+    if prefix != tool.metadata().map_err(|error| error.to_string())?.len() {
+        return Err("Bundle launcher length differs.".into());
+    }
+    let mut image = archive.into_inner();
+    image.rewind().map_err(|error| error.to_string())?;
+    let mut image = image.take(prefix);
+    let (_, launcher_digest) = crate::identity::hash_reader_checked(
+        &mut image,
+        Some(prefix),
+        None,
+        &mut crate::startup_cancel::checkpoint,
+    )?;
+    if launcher_digest != crate::startup_cache::digest_file(expected_tool)? {
+        return Err("Bundle launcher differs from its embedded maintenance executable.".into());
+    }
+    Ok(())
+}
+
+fn unpack(executable: &Path, directory: &Path) -> crate::Result<Value> {
+    let (mut archive, digest) = archive(executable)?;
     fs::create_dir(directory.join("bin")).map_err(|error| error.to_string())?;
     for index in 0..archive.len() {
         crate::startup_cancel::checkpoint()?;
@@ -138,28 +161,7 @@ fn unpack(executable: &Path, directory: &Path) -> crate::Result<Value> {
     if package["Manifest"]["schemaVersion"] != 2 {
         return Err("Bundling requires a schema-2 package.".into());
     }
-    let tool = super::open(&directory.join("bin/bonsai-tools.exe"))?;
-    if prefix != tool.metadata().map_err(|error| error.to_string())?.len() {
-        return Err("Bundle launcher length differs.".into());
-    }
-    let mut image = archive.into_inner();
-    image.rewind().map_err(|error| error.to_string())?;
-    let mut image = image.take(prefix);
-    let mut hash = crate::identity::Hasher::new()?;
-    let mut buffer = vec![0; 1024 * 1024];
-    loop {
-        crate::startup_cancel::checkpoint()?;
-        let count = image.read(&mut buffer).map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count])?;
-    }
-    if hash.finalize_hex()?
-        != crate::startup_cache::digest_file(&directory.join("bin/bonsai-tools.exe"))?
-    {
-        return Err("Bundle launcher differs from its embedded maintenance executable.".into());
-    }
+    verify_launcher_prefix_with(archive, &directory.join("bin/bonsai-tools.exe"))?;
     Ok(package)
 }
 
@@ -228,6 +230,18 @@ fn create(directory: &Path, digest: &str, output: &Path) -> crate::Result<Value>
 }
 
 fn extract(executable: &Path, installation: &Path) -> crate::Result<Value> {
+    let (archive, digest) = archive(executable)?;
+    if fs::exists(installation.join("active.json")).map_err(|error| error.to_string())? {
+        let mut receipt = super::installed(installation)?;
+        if receipt["ManifestSha256"] == digest {
+            let tool = PathBuf::from(receipt["Directory"].as_str().ok_or("Missing directory.")?)
+                .join("bin/bonsai-tools.exe");
+            verify_launcher_prefix_with(archive, &tool)?;
+            receipt["InstallationDirectory"] = json!(installation);
+            return Ok(receipt);
+        }
+    }
+    drop(archive);
     let stage = Stage::new(installation)?;
     let package = unpack(executable, &stage.0)?;
     let digest = package["ManifestSha256"]
@@ -236,6 +250,29 @@ fn extract(executable: &Path, installation: &Path) -> crate::Result<Value> {
     let mut receipt = super::management::activate(installation, Some((&stage.0, digest)))?;
     receipt["InstallationDirectory"] = json!(installation);
     Ok(receipt)
+}
+
+/// Pre-extracts a verified staged portable bundle into its versioned cache
+/// directory so restarting to apply the update can reuse the verified files.
+///
+/// # Errors
+/// Rejects invalid bundle archives, tampered cache entries, and extraction failures.
+pub fn preextract_staged_bundle(executable: &Path) -> crate::Result<String> {
+    let (_, digest) = archive(executable)?;
+    let installation = crate::data_dir::default_subpath("application-bundles")
+        .map_err(|_| "Bundled chat requires LOCALAPPDATA.".to_owned())?
+        .join(&digest[..24]);
+    extract(executable, &installation)?;
+    Ok(digest)
+}
+
+/// Returns the 24-character bundle directory prefix for a staged portable bundle,
+/// if it can be inspected cleanly.
+#[must_use]
+pub fn bundle_prefix(executable: &Path) -> Option<String> {
+    archive(executable)
+        .ok()
+        .map(|(_, digest)| digest[..24].to_owned())
 }
 
 /// Creates, inspects or extracts a verified single-file distribution.
@@ -331,6 +368,24 @@ mod tests {
         let installation = root.join("new installation");
         let receipt = extract(&executable, &installation)?;
         assert_eq!(extract(&executable, &installation)?, receipt);
+        assert!(
+            !fs::read_dir(&installation)
+                .map_err(|error| error.to_string())?
+                .any(|entry| {
+                    entry.is_ok_and(|item| {
+                        item.file_name()
+                            .to_string_lossy()
+                            .starts_with("package-stage-")
+                    })
+                })
+        );
+        // Tampering with the executable's launcher prefix must still be rejected
+        // on the already-extracted fast path.
+        let mut modified_launcher = fs::read(&executable).map_err(|error| error.to_string())?;
+        modified_launcher[200] ^= 1;
+        let altered = root.join("altered-launcher.exe");
+        fs::write(&altered, modified_launcher).map_err(|error| error.to_string())?;
+        assert!(extract(&altered, &installation).is_err());
         let cached = PathBuf::from(receipt["Directory"].as_str().ok_or("Missing directory.")?);
         fs::write(cached.join("NOTICE"), b"tampered").map_err(|error| error.to_string())?;
         assert!(extract(&executable, &installation).is_err());
