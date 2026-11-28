@@ -1292,6 +1292,7 @@ fn serve_broker(
                         &pending,
                         &options,
                         context_tokens,
+                        config.prompt_reuse,
                         commands,
                         events,
                         Some(broker),

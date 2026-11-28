@@ -6,7 +6,7 @@
 //! keeping `wire_history`'s raw prefix intact for `PromptReuse`.
 
 use super::{
-    CONTEXT_LIMIT_MESSAGE, Command, Completion, Event, EventSender, Failure, Message,
+    CONTEXT_LIMIT_MESSAGE, Command, Completion, Event, EventSender, Failure, Message, PromptReuse,
     RATE_LIMIT_MESSAGE, ResponseOptions, Result, check_commands, combined_turn_text,
     generate_with_stream_hooks, notify, serialize_request_with_options,
 };
@@ -18,11 +18,12 @@ use std::{
     time::Duration,
 };
 
-const MAX_TOTAL_SEGMENTS: u32 = 16;
-const MIN_CONTINUATION_TOKENS: u32 = 128;
+const MAX_TOTAL_SEGMENTS: u32 = 32;
+const MIN_CONTINUATION_TOKENS: u32 = 64;
 const MAX_STITCHED_BYTES: usize = 768 * 1024;
 const MAX_WIRE_HISTORY_MESSAGES: usize = 127;
-const MAX_CONTEXT_STEPDOWNS: usize = 4;
+const MAX_CONTEXT_STEPDOWNS: usize = 6;
+const MAX_RATE_LIMIT_RETRIES: usize = 3;
 const ESTIMATOR_HEADROOM_TOKENS: usize = 128;
 const SEAM_TAIL_BYTES: usize = 256;
 const SEAM_HOLD_MAX_BYTES: usize = 256;
@@ -32,6 +33,8 @@ const RATE_LIMIT_WAIT_MS: u64 = 1_050;
 const RATE_LIMIT_SLICE_MS: u64 = 25;
 const REPETITION_WINDOW_BYTES: usize = 16 * 1024;
 const REPETITION_NEEDLE_BYTES: usize = 120;
+const REPETITION_LONG_NEEDLE_BYTES: usize = 256;
+const REPETITION_INTRA_NEEDLE_BYTES: usize = 64;
 
 const THINKING_HANDOFF_PROMPT: &str = "You have finished your reasoning above. \
 Now write your complete final response directly, without repeating your reasoning.";
@@ -649,11 +652,43 @@ impl SeamFilter {
     }
 }
 
+fn count_non_overlapping(haystack: &str, needle: &str, max_count: usize) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut search_from = 0;
+    let mut matches = 0_usize;
+    while let Some(offset) = haystack[search_from..].find(needle) {
+        matches += 1;
+        if matches >= max_count {
+            return matches;
+        }
+        search_from += offset + needle.len();
+    }
+    matches
+}
+
 fn is_repetition_loop(prior_text: &str, prev_chunk: &str, new_chunk: &str) -> bool {
     let prev_trimmed = prev_chunk.trim();
     let new_trimmed = new_chunk.trim();
     if prev_trimmed.len() >= 32 && new_trimmed == prev_trimmed {
         return true;
+    }
+    if new_chunk.len() >= 512 {
+        let intra_needle = tail_slice(new_chunk, REPETITION_INTRA_NEEDLE_BYTES);
+        if intra_needle.trim().len() >= 32 && count_non_overlapping(new_chunk, intra_needle, 4) >= 4
+        {
+            return true;
+        }
+    }
+    let haystack = tail_slice(prior_text, REPETITION_WINDOW_BYTES);
+    if new_chunk.len() >= REPETITION_LONG_NEEDLE_BYTES
+        && prior_text.len() >= REPETITION_LONG_NEEDLE_BYTES
+    {
+        let long_needle = tail_slice(new_chunk, REPETITION_LONG_NEEDLE_BYTES);
+        if long_needle.trim().len() >= REPETITION_NEEDLE_BYTES && haystack.contains(long_needle) {
+            return true;
+        }
     }
     if new_chunk.len() < REPETITION_NEEDLE_BYTES || prior_text.len() < REPETITION_NEEDLE_BYTES * 2 {
         return false;
@@ -662,17 +697,7 @@ fn is_repetition_loop(prior_text: &str, prev_chunk: &str, new_chunk: &str) -> bo
     if needle.trim().len() < 40 {
         return false;
     }
-    let haystack = tail_slice(prior_text, REPETITION_WINDOW_BYTES);
-    let mut search_from = 0;
-    let mut matches = 0usize;
-    while let Some(offset) = haystack[search_from..].find(needle) {
-        matches += 1;
-        if matches >= 2 {
-            return true;
-        }
-        search_from += offset + needle.len();
-    }
-    false
+    count_non_overlapping(haystack, needle, 2) >= 2
 }
 
 fn next_chunk_budget(
@@ -715,12 +740,17 @@ fn sleep_interruptible(commands: &Receiver<Command>, total_ms: u64) -> Result<()
     check_commands(commands)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Continuation worker runs against explicit broker connection and prompt-reuse policy."
+)]
 pub(super) fn run(
     port: u16,
     key: &str,
     pending: &[Message],
     options: &ResponseOptions,
     context_tokens: usize,
+    prompt_reuse: PromptReuse,
     commands: &Receiver<Command>,
     events: &EventSender,
     broker: Option<&OwnedProcess>,
@@ -729,6 +759,7 @@ pub(super) fn run(
         pending,
         options,
         context_tokens,
+        prompt_reuse,
         commands,
         events,
         |request, on_text, on_reasoning| {
@@ -748,12 +779,16 @@ pub(super) fn run(
     )
 }
 
-fn prepare_continuation_options(base: &ResponseOptions, chunk_budget: u32) -> ResponseOptions {
+fn prepare_continuation_options(
+    base: &ResponseOptions,
+    chunk_budget: u32,
+    prompt_reuse: PromptReuse,
+) -> ResponseOptions {
     let mut cont = base.clone();
     cont.max_completion_tokens = chunk_budget;
     cont.turn_appendix = None;
     if cont.enable_thinking {
-        if cont.cognitive_controls {
+        if cont.cognitive_controls && prompt_reuse.enabled() {
             // Preserve `enable_thinking: true` and `reasoning_effort` so the
             // system prompt stays byte-identical for KV+GDN prefix reuse.
             cont.reasoning_budget_override = Some(1);
@@ -773,10 +808,39 @@ fn build_stitched_message(stitched_text: String, stitched_reasoning: String) -> 
     }
 }
 
+fn compacted_wire_history(
+    base_wire_history: &[Message],
+    stitched_text: &str,
+    stitched_reasoning: &str,
+    cont_prompt: &str,
+) -> Option<Vec<Message>> {
+    if base_wire_history.len().saturating_add(2) > MAX_WIRE_HISTORY_MESSAGES {
+        return None;
+    }
+    let mut compacted = Vec::with_capacity(base_wire_history.len() + 2);
+    compacted.extend_from_slice(base_wire_history);
+    compacted.push(build_stitched_message(
+        stitched_text.to_owned(),
+        stitched_reasoning.to_owned(),
+    ));
+    compacted.push(Message {
+        role: "user",
+        content: cont_prompt.into(),
+        reasoning_content: None,
+        images: Arc::default(),
+    });
+    Some(compacted)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Test-injectable worker loop separates generation and rate-limit wait hooks."
+)]
 fn run_with<G, S>(
     pending: &[Message],
     options: &ResponseOptions,
     context_tokens: usize,
+    prompt_reuse: PromptReuse,
     commands: &Receiver<Command>,
     events: &EventSender,
     mut generate: G,
@@ -827,31 +891,65 @@ where
         ));
     }
 
-    let mut wire_history = pending.to_vec();
-    fold_turn_appendix_for_wire(&mut wire_history, options.turn_appendix.as_deref());
-    wire_history.push(first_raw);
+    let mut base_wire_history = pending.to_vec();
+    fold_turn_appendix_for_wire(&mut base_wire_history, options.turn_appendix.as_deref());
+
+    let mut wire_history = if prompt_reuse.enabled() {
+        let mut history = base_wire_history.clone();
+        history.push(first_raw);
+        history
+    } else {
+        Vec::new()
+    };
 
     let mut prev_emitted_chunk = stitched_text.clone();
+    let mut observed_budget_ceiling: Option<u32> = None;
     let mut final_completion = Completion::TokenLimit;
 
     for segment in 2..=MAX_TOTAL_SEGMENTS {
         check_commands(commands)?;
-        if stitched_text.len().saturating_add(stitched_reasoning.len()) >= MAX_STITCHED_BYTES
-            || wire_history.len().saturating_add(1) > MAX_WIRE_HISTORY_MESSAGES
-        {
+        if stitched_text.len().saturating_add(stitched_reasoning.len()) >= MAX_STITCHED_BYTES {
             break;
         }
 
         let open_fence = open_fence_state(&stitched_text);
         let cont_prompt = build_continuation_prompt(&stitched_text, open_fence.as_ref());
-        wire_history.push(Message {
-            role: "user",
-            content: cont_prompt.into(),
-            reasoning_content: None,
-            images: Arc::default(),
-        });
 
-        let Some(mut chunk_budget) = next_chunk_budget(
+        if prompt_reuse.enabled() {
+            if wire_history.len().saturating_add(1) > MAX_WIRE_HISTORY_MESSAGES {
+                if wire_history.len() > base_wire_history.len().saturating_add(1)
+                    && let Some(compacted) = compacted_wire_history(
+                        &base_wire_history,
+                        &stitched_text,
+                        &stitched_reasoning,
+                        &cont_prompt,
+                    )
+                {
+                    wire_history = compacted;
+                } else {
+                    break;
+                }
+            } else {
+                wire_history.push(Message {
+                    role: "user",
+                    content: cont_prompt.clone().into(),
+                    reasoning_content: None,
+                    images: Arc::default(),
+                });
+            }
+        } else {
+            let Some(compacted) = compacted_wire_history(
+                &base_wire_history,
+                &stitched_text,
+                &stitched_reasoning,
+                &cont_prompt,
+            ) else {
+                break;
+            };
+            wire_history = compacted;
+        }
+
+        let Some(initial_budget) = next_chunk_budget(
             &wire_history,
             options.system_appendix.as_deref(),
             context_tokens,
@@ -859,17 +957,53 @@ where
         ) else {
             break;
         };
+        let mut chunk_budget =
+            observed_budget_ceiling.map_or(initial_budget, |ceil| initial_budget.min(ceil));
+        if chunk_budget < MIN_CONTINUATION_TOKENS {
+            break;
+        }
 
         notify(events, Event::Continuing(segment))?;
 
         let mut stepdowns = 0_usize;
-        let mut rate_retried = false;
+        let mut rate_retries = 0_usize;
+        let mut compacted_on_serialize = !prompt_reuse.enabled();
         let mut chunk_result: Option<(Message, Completion, String)> = None;
 
         loop {
-            let cont_options = prepare_continuation_options(options, chunk_budget);
-            let Ok(request) = serialize_request_with_options(&wire_history, &cont_options) else {
-                break;
+            let cont_options = prepare_continuation_options(options, chunk_budget, prompt_reuse);
+            let request = match serialize_request_with_options(&wire_history, &cont_options) {
+                Ok(bytes) => bytes,
+                Err(_)
+                    if !compacted_on_serialize
+                        && wire_history.len() > base_wire_history.len().saturating_add(2) =>
+                {
+                    compacted_on_serialize = true;
+                    let Some(compacted) = compacted_wire_history(
+                        &base_wire_history,
+                        &stitched_text,
+                        &stitched_reasoning,
+                        &cont_prompt,
+                    ) else {
+                        break;
+                    };
+                    wire_history = compacted;
+                    let Some(recomputed) = next_chunk_budget(
+                        &wire_history,
+                        options.system_appendix.as_deref(),
+                        context_tokens,
+                        options.max_completion_tokens,
+                    ) else {
+                        break;
+                    };
+                    chunk_budget =
+                        observed_budget_ceiling.map_or(recomputed, |ceil| recomputed.min(ceil));
+                    if chunk_budget < MIN_CONTINUATION_TOKENS {
+                        break;
+                    }
+                    continue;
+                }
+                Err(_) => break,
             };
 
             let prev_tail = tail_slice(&stitched_text, SEAM_TAIL_BYTES).to_owned();
@@ -914,9 +1048,14 @@ where
                 {
                     stepdowns += 1;
                     chunk_budget /= 2;
+                    observed_budget_ceiling = Some(
+                        observed_budget_ceiling.map_or(chunk_budget, |prev| prev.min(chunk_budget)),
+                    );
                 }
-                Err(Failure::Rejected(RATE_LIMIT_MESSAGE)) if !rate_retried => {
-                    rate_retried = true;
+                Err(Failure::Rejected(RATE_LIMIT_MESSAGE))
+                    if rate_retries < MAX_RATE_LIMIT_RETRIES =>
+                {
+                    rate_retries += 1;
                     wait_rate_limit(commands, RATE_LIMIT_WAIT_MS)?;
                 }
                 Err(Failure::Rejected(_)) => {
@@ -952,7 +1091,9 @@ where
             break;
         }
 
-        wire_history.push(raw_msg);
+        if prompt_reuse.enabled() {
+            wire_history.push(raw_msg);
+        }
         prev_emitted_chunk = emitted_chunk;
     }
 
@@ -1031,6 +1172,7 @@ mod tests {
             &pending,
             &default_options(4096),
             32_768,
+            PromptReuse::Latest,
             &incoming,
             &events,
             |_req, on_text, _on_reasoning| {
@@ -1086,6 +1228,7 @@ mod tests {
             &pending,
             &default_options(4096),
             65_536,
+            PromptReuse::Latest,
             &incoming,
             &events,
             |req, on_text, _on_reasoning| {
@@ -1152,6 +1295,7 @@ mod tests {
             &pending,
             &opts,
             65_536,
+            PromptReuse::Latest,
             &incoming,
             &events,
             |req, on_text, on_reasoning| {
@@ -1227,6 +1371,7 @@ mod tests {
             &pending,
             &opts,
             65_536,
+            PromptReuse::Latest,
             &incoming,
             &events,
             |req, on_text, on_reasoning| {
@@ -1505,6 +1650,7 @@ mod tests {
             &pending,
             &default_options(4096),
             65_536,
+            PromptReuse::Disabled,
             &incoming,
             &events,
             |_req, on_text, _| {
@@ -1534,6 +1680,7 @@ mod tests {
             &pending,
             &default_options(4096),
             65_536,
+            PromptReuse::Disabled,
             &incoming2,
             &events2,
             |_req, on_text, _| {
@@ -1570,6 +1717,7 @@ mod tests {
             &pending,
             &default_options(4096),
             8_192,
+            PromptReuse::Latest,
             &incoming,
             &events,
             |req, on_text, _| {
@@ -1616,6 +1764,7 @@ mod tests {
             &pending,
             &default_options(4096),
             65_536,
+            PromptReuse::Disabled,
             &incoming,
             &events,
             |_req, on_text, _| {
@@ -1649,6 +1798,7 @@ mod tests {
             &pending,
             &default_options(4096),
             131_072,
+            PromptReuse::Latest,
             &incoming,
             &events,
             |_req, on_text, _| {
@@ -1672,6 +1822,7 @@ mod tests {
             &pending,
             &default_options(4096),
             131_072,
+            PromptReuse::Latest,
             &incoming_loop,
             &events_loop,
             |_req, on_text, _| {
@@ -1693,6 +1844,7 @@ mod tests {
             &pending,
             &default_options(4096),
             262_144,
+            PromptReuse::Latest,
             &incoming2,
             &events2,
             |_req, on_text, _| {
@@ -1720,6 +1872,7 @@ mod tests {
             &pending,
             &default_options(4096),
             65_536,
+            PromptReuse::Latest,
             &incoming,
             &events,
             |_req, on_text, _| {
@@ -1746,5 +1899,256 @@ mod tests {
             "First segment streamed. Partial second segment exceeding buffer."
         );
         assert_eq!(parts, vec![2]);
+    }
+
+    #[test]
+    fn prompt_reuse_disabled_compacts_wire_history_and_disables_continuation_thinking() -> Result<()>
+    {
+        let (_commands, incoming) = mpsc::channel();
+        let (events, _outgoing) = event_channel();
+        let pending = vec![user_msg("Write a long essay")];
+        let mut opts = default_options(4096);
+        opts.enable_thinking = true;
+        opts.cognitive_controls = true;
+
+        let mut seen_requests = Vec::new();
+        let mut step = 0_usize;
+        let (msg, completion) = run_with(
+            &pending,
+            &opts,
+            65_536,
+            PromptReuse::Disabled,
+            &incoming,
+            &events,
+            |req, on_text, on_reasoning| {
+                step += 1;
+                let json: serde_json::Value =
+                    serde_json::from_slice(&req).map_err(|_| Failure::Message("invalid JSON"))?;
+                seen_requests.push(json);
+                match step {
+                    1 => {
+                        on_reasoning(Cow::Borrowed("Thought process"))?;
+                        on_text(Cow::Borrowed("Alpha ends at boundary."))?;
+                        Ok((
+                            assistant_msg("Alpha ends at boundary.", Some("Thought process")),
+                            Completion::TokenLimit,
+                        ))
+                    }
+                    2 => {
+                        on_text(Cow::Borrowed("at boundary. Beta continues cleanly."))?;
+                        Ok((
+                            assistant_msg("at boundary. Beta continues cleanly.", None),
+                            Completion::TokenLimit,
+                        ))
+                    }
+                    3 => {
+                        on_text(Cow::Borrowed(" Gamma follows."))?;
+                        Ok((
+                            assistant_msg(" Gamma follows.", None),
+                            Completion::TokenLimit,
+                        ))
+                    }
+                    _ => {
+                        on_text(Cow::Borrowed(" Delta finishes."))?;
+                        Ok((
+                            assistant_msg(" Delta finishes.", None),
+                            Completion::Finished,
+                        ))
+                    }
+                }
+            },
+            no_wait,
+        )?;
+
+        assert_eq!(completion, Completion::Finished);
+        assert_eq!(seen_requests.len(), 4);
+        assert_eq!(
+            msg.content.as_ref(),
+            "Alpha ends at boundary. Beta continues cleanly. Gamma follows. Delta finishes."
+        );
+        for req in &seen_requests[1..] {
+            // Compaction keeps wire_history at base_len (1) + 2 = 3, plus 1 system message = 4
+            assert_eq!(req["messages"].as_array().map(Vec::len), Some(4));
+            // Without PromptReuse, thinking is disabled cleanly instead of 1-token handoff
+            assert_eq!(req["enable_thinking"], false);
+            assert!(req.get("reasoning_budget").is_none());
+        }
+        // Subsequent compacted requests carry cleaned stitched text without the raw overlap
+        assert_eq!(
+            seen_requests[2]["messages"][2]["content"],
+            "Alpha ends at boundary. Beta continues cleanly."
+        );
+        assert_eq!(
+            seen_requests[2]["messages"][2]["reasoning_content"],
+            "Thought process"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_reuse_latest_compacts_when_approaching_wire_message_limit() -> Result<()> {
+        let (_commands, incoming) = mpsc::channel();
+        let (events, _outgoing) = event_channel();
+        // 61 prior turns (122) + 1 current user = 123 messages (+ 1 system = 124 on wire)
+        let mut pending = Vec::with_capacity(123);
+        for i in 0..61 {
+            pending.push(user_msg(&format!("U{i}")));
+            pending.push(assistant_msg(&format!("A{i}"), None));
+        }
+        pending.push(user_msg("Long final prompt"));
+
+        let mut msg_counts = Vec::new();
+        let mut step = 0_usize;
+        let (msg, completion) = run_with(
+            &pending,
+            &default_options(4096),
+            65_536,
+            PromptReuse::Latest,
+            &incoming,
+            &events,
+            |req, on_text, _| {
+                step += 1;
+                let json: serde_json::Value =
+                    serde_json::from_slice(&req).map_err(|_| Failure::Message("invalid JSON"))?;
+                msg_counts.push(json["messages"].as_array().map_or(0, Vec::len));
+                if step < 4 {
+                    let chunk = format!(" Seg{step} unique text.");
+                    on_text(Cow::Borrowed(&chunk))?;
+                    Ok((assistant_msg(&chunk, None), Completion::TokenLimit))
+                } else {
+                    on_text(Cow::Borrowed(" Final Seg4."))?;
+                    Ok((assistant_msg(" Final Seg4.", None), Completion::Finished))
+                }
+            },
+            no_wait,
+        )?;
+
+        assert_eq!(completion, Completion::Finished);
+        // Step 1: 124 (123+sys); Step 2: 126; Step 3: 128; Step 4 compacts to 126 (125+sys)!
+        assert_eq!(msg_counts, vec![124, 126, 128, 126]);
+        assert_eq!(
+            msg.content.as_ref(),
+            " Seg1 unique text. Seg2 unique text. Seg3 unique text. Final Seg4."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sticky_budget_ceiling_and_multi_rate_limit_retries() -> Result<()> {
+        let (_commands, incoming) = mpsc::channel();
+        let (events, _outgoing) = event_channel();
+        let pending = vec![user_msg("Long task")];
+        let mut budgets = Vec::new();
+        let mut call = 0_usize;
+        let mut waited = 0_u64;
+
+        let (msg, completion) = run_with(
+            &pending,
+            &default_options(4096),
+            131_072,
+            PromptReuse::Disabled,
+            &incoming,
+            &events,
+            |req, on_text, _| {
+                call += 1;
+                let json: serde_json::Value =
+                    serde_json::from_slice(&req).map_err(|_| Failure::Message("invalid JSON"))?;
+                let budget = json["max_completion_tokens"]
+                    .as_u64()
+                    .ok_or_else(|| Failure::Message("missing max_completion_tokens"))?;
+                budgets.push(budget);
+                match call {
+                    1 => {
+                        on_text(Cow::Borrowed("Part one."))?;
+                        Ok((assistant_msg("Part one.", None), Completion::TokenLimit))
+                    }
+                    // Segment 2 hits 413 on 4096, steps down to 2048
+                    2 => Err(Failure::Rejected(CONTEXT_LIMIT_MESSAGE)),
+                    3 => {
+                        on_text(Cow::Borrowed(" Part two."))?;
+                        Ok((assistant_msg(" Part two.", None), Completion::TokenLimit))
+                    }
+                    // Segment 3 starts at sticky ceiling 2048 (no 4096 retry!) and survives 2x 429
+                    4 | 5 => Err(Failure::Rejected(RATE_LIMIT_MESSAGE)),
+                    _ => {
+                        on_text(Cow::Borrowed(" Part three."))?;
+                        Ok((assistant_msg(" Part three.", None), Completion::Finished))
+                    }
+                }
+            },
+            |_commands, ms| {
+                waited += ms;
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(completion, Completion::Finished);
+        assert_eq!(budgets, vec![4096, 4096, 2048, 2048, 2048, 2048]);
+        assert_eq!(waited, RATE_LIMIT_WAIT_MS * 2);
+        assert_eq!(msg.content.as_ref(), "Part one. Part two. Part three.");
+        Ok(())
+    }
+
+    #[test]
+    fn long_tail_and_intra_chunk_degeneration_stop_cleanly() -> Result<()> {
+        let (_commands, incoming) = mpsc::channel();
+        let (events, _outgoing) = event_channel();
+        let pending = vec![user_msg("Long repeat")];
+        let shared_long = "A".repeat(140) + &"B".repeat(140);
+        let mut calls = 0_usize;
+        let (_msg, comp) = run_with(
+            &pending,
+            &default_options(4096),
+            131_072,
+            PromptReuse::Disabled,
+            &incoming,
+            &events,
+            |_req, on_text, _| {
+                calls += 1;
+                let text = if calls == 1 {
+                    format!("Intro prose. {shared_long} Middle transition.")
+                } else {
+                    format!("New bridge. {shared_long}")
+                };
+                on_text(Cow::Borrowed(&text))?;
+                Ok((assistant_msg(&text, None), Completion::TokenLimit))
+            },
+            no_wait,
+        )?;
+        assert_eq!(comp, Completion::TokenLimit);
+        // Stopped immediately after segment 2 due to 256-byte long-tail single repeat!
+        assert_eq!(calls, 2);
+
+        // Intra-chunk degeneration loop stops immediately on segment 2 without issuing segment 3
+        let (_commands2, incoming2) = mpsc::channel();
+        let (events2, _outgoing2) = event_channel();
+        let mut calls2 = 0_usize;
+        let degen_unit = "The system loops endlessly on the exact same clause without progress. ";
+        let degen_chunk = degen_unit.repeat(10);
+        let (_msg2, comp2) = run_with(
+            &pending,
+            &default_options(4096),
+            131_072,
+            PromptReuse::Disabled,
+            &incoming2,
+            &events2,
+            |_req, on_text, _| {
+                calls2 += 1;
+                if calls2 == 1 {
+                    on_text(Cow::Borrowed("Normal opening."))?;
+                    Ok((
+                        assistant_msg("Normal opening.", None),
+                        Completion::TokenLimit,
+                    ))
+                } else {
+                    on_text(Cow::Borrowed(&degen_chunk))?;
+                    Ok((assistant_msg(&degen_chunk, None), Completion::TokenLimit))
+                }
+            },
+            no_wait,
+        )?;
+        assert_eq!(comp2, Completion::TokenLimit);
+        assert_eq!(calls2, 2);
+        Ok(())
     }
 }
