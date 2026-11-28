@@ -1,6 +1,6 @@
 # Portable application binaries carry their CRT; users install no VC++ runtime.
-# Parallel rustc frontend (-Z threads=8) and bundled rust-lld (-C linker-features=+lld)
-# speed up large single-crate builds and Windows ARM64 links on pinned 1.102-nightly;
-# remove or migrate -Z threads / -Z unstable-options when moving to beta/stable.
+# Parallel rustc frontend (-Z threads=8) and bundled rust-lld speed up large
+# single-crate builds and Windows ARM64 links on pinned 1.102-nightly;
+# remove or migrate -Z threads to --jobs-frontend when moving to beta/stable.
 [target.aarch64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static", "-Z", "threads=8", "-Z", "unstable-options", "-C", "linker-features=+lld"]
+rustflags = ["-C", "target-feature=+crt-static", "-Z", "threads=8", "-C", "linker=rust-lld", "-C", "linker-flavor=lld-link"]
