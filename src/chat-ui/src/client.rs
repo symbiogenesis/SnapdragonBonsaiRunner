@@ -4569,4 +4569,251 @@ mod tests {
         let _removed = std::fs::remove_dir_all(root);
         Ok(())
     }
+
+    #[test]
+    fn wire_cognitive_fields_honors_reasoning_budget_override_only_with_cognitive_controls() {
+        let base = super::ResponseOptions {
+            max_completion_tokens: 4096,
+            enable_thinking: true,
+            cognitive_controls: true,
+            cognitive: super::CognitiveOptions {
+                thinking_budget: super::ThinkingBudgetMode::Balanced,
+                ..super::CognitiveOptions::default()
+            },
+            reasoning_budget_override: Some(1),
+            ..super::ResponseOptions::default()
+        };
+        let fields = super::WireCognitiveFields::from_options(&base);
+        assert_eq!(fields.reasoning_budget, Some(1));
+
+        let concise = super::ResponseOptions {
+            cognitive: super::CognitiveOptions {
+                thinking_budget: super::ThinkingBudgetMode::Concise,
+                ..super::CognitiveOptions::default()
+            },
+            ..base.clone()
+        };
+        assert_eq!(
+            super::WireCognitiveFields::from_options(&concise).reasoning_budget,
+            Some(1)
+        );
+
+        let rollback = super::ResponseOptions {
+            cognitive_controls: false,
+            ..base
+        };
+        assert_eq!(
+            super::WireCognitiveFields::from_options(&rollback).reasoning_budget,
+            None
+        );
+    }
+
+    #[test]
+    fn exchange_with_hooks_aborts_on_text_error_and_retains_suppressed_reasoning() -> io::Result<()>
+    {
+        use std::{
+            borrow::Cow,
+            io::{Cursor, Write},
+        };
+
+        struct MemConn {
+            written: Vec<u8>,
+            reader: Cursor<Vec<u8>>,
+        }
+        impl Read for MemConn {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.reader.read(buf)
+            }
+        }
+        impl Write for MemConn {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Hidden thought\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Visible\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let http_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            sse_body.len(),
+            sse_body
+        );
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        // 1. Suppress reasoning stream while retaining raw reasoning_content on Message
+        let mut conn1 = MemConn {
+            written: Vec::new(),
+            reader: Cursor::new(http_resp.as_bytes().to_vec()),
+        };
+        let mut seen_text = String::new();
+        let (msg, completion, _) = super::exchange_with_hooks(
+            &mut conn1,
+            8080,
+            "key",
+            b"{}",
+            false,
+            &rx,
+            &mut |text: Cow<'_, str>| {
+                seen_text.push_str(&text);
+                Ok(())
+            },
+            &mut |_reasoning: Cow<'_, str>| Ok(()),
+        )
+        .map_err(|_| io::Error::other("unexpected exchange failure"))?;
+        assert_eq!(completion, Completion::Finished);
+        assert_eq!(seen_text, "Visible");
+        assert_eq!(msg.content.as_ref(), "Visible");
+        assert_eq!(msg.reasoning_content.as_deref(), Some("Hidden thought"));
+
+        // 2. Error in on_text aborts immediately
+        let mut conn2 = MemConn {
+            written: Vec::new(),
+            reader: Cursor::new(http_resp.into_bytes()),
+        };
+        let err = super::exchange_with_hooks(
+            &mut conn2,
+            8080,
+            "key",
+            b"{}",
+            false,
+            &rx,
+            &mut |_text: Cow<'_, str>| Err(Failure::Stopped),
+            &mut |_reasoning: Cow<'_, str>| Ok(()),
+        );
+        assert_eq!(err.err(), Some(Failure::Stopped));
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_run_end_to_end_over_loopback_http_handles_413_429_and_length()
+    -> io::Result<()> {
+        use std::{
+            io::Write,
+            net::{Ipv4Addr, TcpListener},
+            sync::Arc,
+        };
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> io::Result<Vec<u32>> {
+            let mut max_tokens = Vec::new();
+            let responses = [
+                (
+                    "200 OK",
+                    "",
+                    "text/event-stream",
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Alpha end.\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                ),
+                (
+                    "413 Payload Too Large",
+                    "",
+                    "application/json",
+                    "{\"error\":{\"code\":\"context_length_exceeded\"}}",
+                ),
+                (
+                    "429 Too Many Requests",
+                    "Retry-After: 1\r\n",
+                    "application/json",
+                    "{\"error\":{\"code\":\"rate_limit_exceeded\"}}",
+                ),
+                (
+                    "200 OK",
+                    "",
+                    "text/event-stream",
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Alpha end. Beta done.\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                ),
+            ];
+            for (status, extra_headers, ctype, body) in responses {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+                let mut buf = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte)?;
+                    buf.push(byte[0]);
+                }
+                let head = std::str::from_utf8(&buf).unwrap_or("");
+                let content_len = head
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("Content-Length:")
+                            .or_else(|| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut req_body = vec![0_u8; content_len];
+                stream.read_exact(&mut req_body)?;
+                let json: serde_json::Value = serde_json::from_slice(&req_body)
+                    .map_err(|_| io::Error::other("invalid JSON"))?;
+                if let Some(cap) = json["max_completion_tokens"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                {
+                    max_tokens.push(cap);
+                }
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\n{extra_headers}Content-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes())?;
+            }
+            Ok(max_tokens)
+        });
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let (events, outgoing) = super::event_channel();
+        let pending = vec![Message {
+            role: "user",
+            content: "Write a multi-part reply".into(),
+            reasoning_content: None,
+            images: Arc::default(),
+        }];
+        let options = super::ResponseOptions {
+            max_completion_tokens: 4096,
+            ..super::ResponseOptions::default()
+        };
+        let (msg, completion) = super::continuation::run(
+            port,
+            "test-key",
+            &pending,
+            &options,
+            8_192,
+            super::PromptReuse::Latest,
+            &rx,
+            &events,
+            None,
+        )
+        .map_err(|e| io::Error::other(format!("continuation::run failed: {e:?}")))?;
+        let max_tokens = server
+            .join()
+            .map_err(|_| io::Error::other("server panicked"))??;
+
+        assert_eq!(completion, Completion::Finished);
+        assert_eq!(msg.content.as_ref(), "Alpha end. Beta done.");
+        assert_eq!(max_tokens, vec![4096, 4096, 2048, 2048]);
+        let mut streamed = String::new();
+        for ev in outgoing.try_iter() {
+            if let Event::Text(delta) = ev {
+                streamed.push_str(&delta);
+            }
+        }
+        assert_eq!(streamed, "Alpha end. Beta done.");
+        Ok(())
+    }
 }

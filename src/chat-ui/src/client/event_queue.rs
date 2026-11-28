@@ -102,6 +102,7 @@ impl EventSender {
                 .events
                 .iter_mut()
                 .rev()
+                .take_while(|queued| !matches!(queued, Event::Stage(_)))
                 .find(|queued| matches!(queued, Event::Continuing(_)))
             {
                 *existing = Event::Continuing(part);

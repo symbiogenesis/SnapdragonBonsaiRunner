@@ -308,3 +308,132 @@ fn event_sender_invokes_repaint_wakeup_on_posted_events_and_drop() -> Result<()>
     drop(receiver);
     Ok(())
 }
+
+#[test]
+fn continuing_coalesces_per_stage_without_consuming_control_reserve() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Coalescing across intervening Text/Reasoning on a stream-full queue leaves room for Committed+Complete.
+    let (sender, receiver) = channel();
+    fill(&sender)?;
+    for part in 2..=34_u32 {
+        sender
+            .send(Event::Continuing(part))
+            .map_err(|()| Failure::Shutdown)?;
+    }
+    sender
+        .send(Event::Committed(vec![Message {
+            role: "assistant",
+            content: "Final".into(),
+            reasoning_content: None,
+            images: Arc::default(),
+        }]))
+        .map_err(|()| Failure::Shutdown)?;
+    sender
+        .send(Event::Complete(Completion::Finished))
+        .map_err(|()| Failure::Shutdown)?;
+    assert_eq!(
+        receiver.try_iter().take(STREAM_EVENTS).count(),
+        STREAM_EVENTS
+    );
+    assert!(matches!(receiver.try_recv(), Ok(Event::Continuing(34))));
+    assert!(matches!(receiver.try_recv(), Ok(Event::Committed(_))));
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(Event::Complete(Completion::Finished))
+    ));
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+    // Stage-boundary isolation: Review's Continuing never overwrites Draft's undrained Continuing.
+    let (sender_stage, receiver_stage) = channel();
+    for event in [
+        Event::Stage("Draft"),
+        Event::Text("d1".into()),
+        Event::Continuing(2),
+        Event::Draft("d1 d2".into()),
+        Event::Stage("Review"),
+        Event::Text("r1".into()),
+        Event::Continuing(2),
+        Event::Continuing(3),
+    ] {
+        sender_stage.send(event).map_err(|()| Failure::Shutdown)?;
+    }
+    let events: Vec<_> = receiver_stage.try_iter().collect();
+    assert_eq!(events.len(), 7);
+    assert!(matches!(events[0], Event::Stage("Draft")));
+    assert!(matches!(&events[1], Event::Text(t) if t == "d1"));
+    assert!(matches!(events[2], Event::Continuing(2)));
+    assert!(matches!(&events[3], Event::Draft(t) if t == "d1 d2"));
+    assert!(matches!(events[4], Event::Stage("Review")));
+    assert!(matches!(&events[5], Event::Text(t) if t == "r1"));
+    assert!(matches!(events[6], Event::Continuing(3)));
+
+    // Full queue without an existing Continuing in the current stage drops silently (Ok),
+    // while other control events return Err(()), and dropped receiver still fails closed.
+    let (sender_full, receiver_full) = channel();
+    fill(&sender_full)?;
+    sender_full
+        .send(Event::Continuing(2))
+        .map_err(|()| Failure::Shutdown)?;
+    sender_full
+        .send(Event::Stage("New stage"))
+        .map_err(|()| Failure::Shutdown)?;
+    for _ in 0..(CONTROL_RESERVE - 2) {
+        sender_full
+            .send(Event::Stage("Reserved"))
+            .map_err(|()| Failure::Shutdown)?;
+    }
+    assert_eq!(sender_full.send(Event::Continuing(2)), Ok(()));
+    assert_eq!(sender_full.send(Event::Stopped), Err(()));
+    drop(receiver_full);
+    assert_eq!(sender_full.send(Event::Continuing(3)), Err(()));
+
+    // Coalescing invokes repaint outside the queue lock and keeps stream_bytes = 0 while
+    // separating adjacent Event::Text deltas.
+    let wakeups = Arc::new(AtomicUsize::new(0));
+    let probe_wakeups = Arc::clone(&wakeups);
+    let (sender_wake, receiver_wake) = channel_with_repaint(Arc::new(|| {}));
+    let shared = Arc::clone(&sender_wake.0);
+    sender_wake.0.lock().map_err(|_| Failure::Shutdown)?.repaint = Some(Arc::new(move || {
+        assert!(
+            shared.try_lock().is_ok(),
+            "Continuing coalescing repaint must run outside the queue lock"
+        );
+        probe_wakeups.fetch_add(1, Ordering::Relaxed);
+    }));
+    sender_wake
+        .send(Event::Text("a".into()))
+        .map_err(|()| Failure::Shutdown)?;
+    sender_wake
+        .send(Event::Continuing(2))
+        .map_err(|()| Failure::Shutdown)?;
+    let mut drained = Vec::new();
+    assert_eq!(
+        receiver_wake.drain_into(&mut drained, 8),
+        Ok((false, false))
+    );
+    assert_eq!(wakeups.load(Ordering::Relaxed), 1);
+    sender_wake
+        .send(Event::Continuing(3))
+        .map_err(|()| Failure::Shutdown)?;
+    sender_wake
+        .send(Event::Continuing(4))
+        .map_err(|()| Failure::Shutdown)?;
+    assert_eq!(wakeups.load(Ordering::Relaxed), 2);
+    sender_wake
+        .send(Event::Text("b".into()))
+        .map_err(|()| Failure::Shutdown)?;
+    assert_eq!(
+        sender_wake
+            .0
+            .lock()
+            .map_err(|_| Failure::Shutdown)?
+            .stream_bytes,
+        1
+    );
+    let events_wake: Vec<_> = receiver_wake.try_iter().collect();
+    assert_eq!(events_wake.len(), 2);
+    assert!(matches!(events_wake[0], Event::Continuing(4)));
+    assert!(matches!(&events_wake[1], Event::Text(t) if t == "b"));
+    Ok(())
+}

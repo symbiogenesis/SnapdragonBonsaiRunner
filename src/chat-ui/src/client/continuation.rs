@@ -2194,4 +2194,687 @@ mod tests {
         assert_eq!(calls2, 2);
         Ok(())
     }
+
+    #[test]
+    fn fence_parsing_prompt_and_control_marker_edge_cases() -> Result<()> {
+        // Tilde fences, 4-backtick outer fences, info-string backticks, 4-space indent, CRLF, trailing tokens
+        let tilde = open_fence_state("Intro\r\n~~~~python extra\r\ncode\r\n");
+        assert_eq!(
+            tilde.as_ref().map(|f| (f.ch, f.len, f.info.as_str())),
+            Some(('~', 4, "python extra"))
+        );
+        // 3 tildes cannot close a 4-tilde fence
+        assert!(open_fence_state("~~~~python\ncode\n~~~\nmore").is_some());
+        // 4-tilde fence closes it
+        assert!(open_fence_state("~~~~python\ncode\n~~~~  \t\r\n").is_none());
+        // Nested ``` inside ````markdown does not close the outer fence
+        let outer = open_fence_state("````markdown\n```rust\nfn x() {}\n```\nstill inside");
+        assert_eq!(
+            outer.as_ref().map(|f| (f.ch, f.len, f.info.as_str())),
+            Some(('`', 4, "markdown"))
+        );
+        // Closing fence with non-whitespace trailing text does not close
+        assert!(open_fence_state("```rust\ncode\n```rust\nmore").is_some());
+        // Inline backtick in info string never opens a fence; 4-space indent never opens a fence
+        assert!(open_fence_state("```code``` inline").is_none());
+        assert!(open_fence_state("    ```rust\n    code").is_none());
+
+        // Non-SVG open fence prompt includes display_tag; whitespace-only text gives THINKING_HANDOFF_PROMPT
+        let non_svg_prompt = build_continuation_prompt("fn x() {", outer.as_ref());
+        assert!(non_svg_prompt.contains("````markdown"));
+        assert_eq!(
+            build_continuation_prompt("   \n\t", outer.as_ref()),
+            THINKING_HANDOFF_PROMPT
+        );
+
+        // Control marker checks (markers + C0 bytes vs allowed whitespace)
+        for bad in [
+            "<|im_end|>",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tts_pad>",
+            "nul\0byte",
+            "bell\x07",
+            "esc\x1b",
+        ] {
+            assert!(contains_control_marker(bad), "expected marker in {bad:?}");
+        }
+        assert!(!contains_control_marker("normal\ttext\r\nnext line"));
+        assert!(message_has_control_marker(&assistant_msg(
+            "clean",
+            Some("hidden </think> leak")
+        )));
+
+        // Control marker or empty/whitespace on segment 1 stops immediately in 1 call
+        for seg1 in [
+            assistant_msg("clean", Some("<|endoftext|>")),
+            assistant_msg("prefix <tool_call>x", None),
+            assistant_msg("", None),
+            assistant_msg("   \n\t", Some("  \n")),
+        ] {
+            let (_commands, incoming) = mpsc::channel();
+            let (events, _outgoing) = event_channel();
+            let pending = vec![user_msg("Hi")];
+            let mut calls = 0_usize;
+            let (_msg, comp) = run_with(
+                &pending,
+                &default_options(4096),
+                65_536,
+                PromptReuse::Latest,
+                &incoming,
+                &events,
+                |_req, _on_text, _| {
+                    calls += 1;
+                    Ok((seg1.clone(), Completion::TokenLimit))
+                },
+                no_wait,
+            )?;
+            assert_eq!(calls, 1);
+            assert_eq!(comp, Completion::TokenLimit);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn seam_filter_preamble_fence_overlap_and_block_separator_branches() -> Result<()> {
+        fn run_chunks(prev: &str, open_doc: Option<&str>, chunks: &[&str]) -> Result<String> {
+            let fence = open_doc.and_then(open_fence_state);
+            let mut out = String::new();
+            let mut filter = SeamFilter::new(prev.into(), fence);
+            for c in chunks {
+                filter.push(c, &mut |s| {
+                    out.push_str(s);
+                    Ok(())
+                })?;
+            }
+            filter.finish(&mut |s| {
+                out.push_str(s);
+                Ok(())
+            })?;
+            Ok(out)
+        }
+
+        // Preamble boundaries: >80 byte line preserved, Part 12 stripped, Part 123 / Part 2a preserved
+        assert!(!is_meta_preamble_line(&"a".repeat(81)));
+        assert!(is_meta_preamble_line("Part 12:"));
+        assert!(!is_meta_preamble_line("Part 123:"));
+        assert!(!is_meta_preamble_line("Part 2a:"));
+
+        // Token-by-token streaming of polite preamble vs genuine polite prose
+        assert_eq!(
+            run_chunks(
+                "Sentence one.",
+                None,
+                &["Sure, ", "here's ", "the continuation:\r\n\r\n", "Next para."]
+            )?,
+            "\n\nNext para."
+        );
+        assert_eq!(
+            run_chunks(
+                "Sentence one.",
+                None,
+                &["Sure, ", "I think ", "this works well in practice."]
+            )?,
+            "Sure, I think this works well in practice."
+        );
+        // Single-newline preamble or non-sentence-ending prev_tail does NOT insert \n\n
+        assert_eq!(
+            run_chunks("Sentence one.", None, &["Continuing:\nNext line."])?,
+            "Next line."
+        );
+        assert_eq!(
+            run_chunks("working on", None, &["Continuing:\n\nnext step."])?,
+            "next step."
+        );
+
+        // Redundant fence branches: leading newlines, bare fence with overlap, mismatched lang/char,
+        // stripped fence without overlap adds \n, incoming without newline
+        assert_eq!(
+            run_chunks(
+                "fn a() {\n",
+                Some("```rust\nfn a() {\n"),
+                &["\r\n```rust\n    x();"]
+            )?,
+            "    x();"
+        );
+        assert_eq!(
+            run_chunks("let v = 1;", Some("```\nlet v = 1;"), &["```\nlet v = 1;\nlet w = 2;"])?,
+            "\nlet w = 2;"
+        );
+        assert_eq!(
+            run_chunks("fn a() {", Some("```rust\nfn a() {"), &["```python\nprint(1)"])?,
+            "```python\nprint(1)"
+        );
+        assert_eq!(
+            run_chunks("fn a() {", Some("```rust\nfn a() {"), &["~~~rust\nfn b() {}"])?,
+            "~~~rust\nfn b() {}"
+        );
+        assert_eq!(
+            run_chunks("fn a() {", Some("```rust\nfn a() {"), &["```rust\n    y();"])?,
+            "\n    y();"
+        );
+        assert_eq!(
+            run_chunks("fn a() {", Some("```rust\nfn a() {"), &["no_newline_yet"])?,
+            "no_newline_yet"
+        );
+
+        // Overlap & ellipsis rules
+        // >= 12 bytes mid-word overlap matches
+        assert_eq!(
+            run_chunks("prefix_abcdefghijklm", None, &["abcdefghijklm_next"])?,
+            "_next"
+        );
+        // 4-5 char standalone word NOT stripped; 6-11 char non-boundary NOT stripped
+        assert_eq!(run_chunks("that ", None, &["that stays"])?, "that stays");
+        assert_eq!(run_chunks("foobar", None, &["bar baz"])?, "bar baz");
+        // 1..=8 leading spaces before overlap stripped; 9+ preserved
+        assert_eq!(
+            run_chunks("alpha beta gamma", None, &["        beta gamma delta"])?,
+            " delta"
+        );
+        assert_eq!(
+            run_chunks("alpha beta gamma", None, &["         beta gamma delta"])?,
+            "         beta gamma delta"
+        );
+        // prev_tail ending in \n or \t + combined trailing/leading spaces
+        assert_eq!(
+            run_chunks("alpha beta\n", None, &["alpha beta gamma"])?,
+            " gamma"
+        );
+        assert_eq!(
+            run_chunks("alpha beta\t", None, &["   alpha beta gamma"])?,
+            "gamma"
+        );
+        // Ellipsis preserved after '.' or '…'
+        assert_eq!(run_chunks("Wait.", None, &["...more"])?, "...more");
+        assert_eq!(run_chunks("Wait…", None, &["…more"])?, "…more");
+        assert_eq!(run_chunks("Wait ", None, &["... next"])?, "next");
+
+        // Block separators
+        assert_eq!(
+            run_chunks("Intro.", None, &["```rust\nfn x() {}"])?,
+            "\n\n```rust\nfn x() {}"
+        );
+        assert_eq!(
+            run_chunks("Intro.", None, &["---\nSection"])?,
+            "\n\n---\nSection"
+        );
+        assert_eq!(run_chunks("Intro.", None, &["---"])?, "---");
+        assert_eq!(run_chunks("Intro.", None, &["> Quote"])?, "\n> Quote");
+        assert_eq!(run_chunks("Intro.", None, &["* Bullet"])?, "\n* Bullet");
+        assert_eq!(run_chunks("Intro.", None, &["+ Plus"])?, "\n+ Plus");
+        assert_eq!(run_chunks("Intro.", None, &["1. First"])?, "\n1. First");
+        assert_eq!(run_chunks("Intro.", None, &["12) Twelfth"])?, "\n12) Twelfth");
+        assert_eq!(
+            run_chunks("Intro.", None, &["####### TooDeep"])?,
+            "####### TooDeep"
+        );
+        assert_eq!(run_chunks("Intro.", None, &["#NoSpace"])?, "#NoSpace");
+        assert_eq!(
+            run_chunks("Intro.", None, &["\nAlready newline"])?,
+            "\nAlready newline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn seam_filter_hold_timing_max_hold_and_stream_error_propagation() -> Result<()> {
+        // Early-flush timing: <24 bytes held, >=24 non-overlap flushed before finish,
+        // >=24 matching prev_tail held until divergence, post-resolution streams immediately.
+        let mut emitted = Vec::new();
+        let mut filter = SeamFilter::new("alpha beta gamma delta epsilon".into(), None);
+        filter.push("short", &mut |s| {
+            emitted.push(s.to_owned());
+            Ok(())
+        })?;
+        assert!(emitted.is_empty());
+
+        let mut f_overlap = SeamFilter::new("alpha beta gamma delta epsilon".into(), None);
+        let mut overlap_emitted = Vec::new();
+        f_overlap.push("alpha beta gamma delta eps", &mut |s| {
+            overlap_emitted.push(s.to_owned());
+            Ok(())
+        })?;
+        assert!(overlap_emitted.is_empty());
+        f_overlap.push("ilon zeta eta theta iota kappa!", &mut |s| {
+            overlap_emitted.push(s.to_owned());
+            Ok(())
+        })?;
+        assert_eq!(overlap_emitted.concat(), " zeta eta theta iota kappa!");
+        // Post-resolution push emits immediately without buffering
+        f_overlap.push("!", &mut |s| {
+            overlap_emitted.push(s.to_owned());
+            Ok(())
+        })?;
+        assert_eq!(overlap_emitted.last().map(String::as_str), Some("!"));
+
+        // Chunked preamble + open fence hold and blank line + fence hold
+        let open_rust = open_fence_state("```rust\nfn main() {\n");
+        let mut f_pre = SeamFilter::new("fn main() {\n".into(), open_rust.clone());
+        let mut pre_out = String::new();
+        for c in ["Part 2:\n", "```", "rust\n", "    let x = 1;"] {
+            f_pre.push(c, &mut |s| {
+                pre_out.push_str(s);
+                Ok(())
+            })?;
+        }
+        f_pre.finish(&mut |s| {
+            pre_out.push_str(s);
+            Ok(())
+        })?;
+        assert_eq!(pre_out, "    let x = 1;");
+
+        let mut f_blank = SeamFilter::new("fn main() {\n".into(), open_rust);
+        let mut blank_out = String::new();
+        for c in ["\n", "```rust", "\n    let y = 2;"] {
+            f_blank.push(c, &mut |s| {
+                blank_out.push_str(s);
+                Ok(())
+            })?;
+        }
+        f_blank.finish(&mut |s| {
+            blank_out.push_str(s);
+            Ok(())
+        })?;
+        assert_eq!(blank_out, "    let y = 2;");
+
+        // SEAM_HOLD_MAX_BYTES forces flush even when buffer stays a substring of prev_tail
+        let tail = "x".repeat(SEAM_HOLD_MAX_BYTES);
+        let mut f_max = SeamFilter::new(tail, None);
+        let mut max_out = Vec::new();
+        f_max.push(&"x".repeat(SEAM_HOLD_MAX_BYTES - 1), &mut |s| {
+            max_out.push(s.to_owned());
+            Ok(())
+        })?;
+        assert!(!f_max.resolved);
+        f_max.push("Z", &mut |s| {
+            max_out.push(s.to_owned());
+            Ok(())
+        })?;
+        assert!(f_max.resolved);
+        assert_eq!(max_out, vec!["Z"]);
+
+        // Emit error during SeamFilter::push and SeamFilter::finish is captured in stream_err and propagated
+        let pending = vec![user_msg("Trigger receiver close")];
+        for flush_in_finish in [false, true] {
+            let (_cmds, inc) = mpsc::channel();
+            let (ev, out) = event_channel();
+            let mut out_opt = Some(out);
+            let mut call = 0_usize;
+            let err_res = run_with(
+                &pending,
+                &default_options(4096),
+                65_536,
+                PromptReuse::Disabled,
+                &inc,
+                &ev,
+                |_req, on_text, _| {
+                    call += 1;
+                    if call == 1 {
+                        on_text(Cow::Borrowed("Initial segment."))?;
+                        Ok((
+                            assistant_msg("Initial segment.", None),
+                            Completion::TokenLimit,
+                        ))
+                    } else {
+                        drop(out_opt.take());
+                        let delta = if flush_in_finish {
+                            "tiny"
+                        } else {
+                            "Enough non-overlapping text to flush immediately!"
+                        };
+                        on_text(Cow::Borrowed(delta))?;
+                        Ok((assistant_msg(delta, None), Completion::Finished))
+                    }
+                },
+                no_wait,
+            );
+            assert_eq!(err_res.err(), Some(Failure::Shutdown));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn repetition_loop_direct_window_and_long_chunk_verbatim_repeat() -> Result<()> {
+        // Direct is_repetition_loop branches
+        assert!(is_repetition_loop(
+            "prior",
+            "  Exact chunk >= 32 bytes repeating.  ",
+            "Exact chunk >= 32 bytes repeating."
+        ));
+        assert!(!is_repetition_loop(
+            &" ".repeat(600),
+            "short",
+            &" ".repeat(600)
+        ));
+        // Legitimate repeat outside the 16 KiB window is NOT flagged
+        let needle = "A distinct factual summary sentence that appeared much earlier in the document. ".repeat(2);
+        let old_prior = format!("{needle}{}{needle}{}", "x".repeat(REPETITION_WINDOW_BYTES + 512), "y".repeat(256));
+        assert!(!is_repetition_loop(&old_prior, "prev", &needle));
+
+        // >256-byte repeated chunk bypasses 256-byte SeamFilter and hits prev_trimmed == new_trimmed
+        let (_commands, incoming) = mpsc::channel();
+        let (events, _outgoing) = event_channel();
+        let pending = vec![user_msg("Long repeat")];
+        let long_chunk = format!(
+            "{} END_MARKER_UNIQUE_1234567890",
+            "Alpha beta gamma delta epsilon zeta. ".repeat(8)
+        );
+        assert!(long_chunk.len() > SEAM_TAIL_BYTES);
+        let mut calls = 0_usize;
+        let (_msg, comp) = run_with(
+            &pending,
+            &default_options(4096),
+            131_072,
+            PromptReuse::Latest,
+            &incoming,
+            &events,
+            |_req, on_text, _| {
+                calls += 1;
+                on_text(Cow::Borrowed(&long_chunk))?;
+                Ok((assistant_msg(&long_chunk, None), Completion::TokenLimit))
+            },
+            no_wait,
+        )?;
+        assert_eq!(comp, Completion::TokenLimit);
+        assert_eq!(calls, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_budgets_caps_compaction_retries_and_cancellations() -> Result<()> {
+        // 1. next_chunk_budget returns None when headroom < 64 or base_cap < 64 or system_appendix fills context
+        assert_eq!(next_chunk_budget(&[user_msg("hi")], None, 1024, 32), None);
+        let big_appendix = "word ".repeat(2000);
+        assert_eq!(
+            next_chunk_budget(&[user_msg("hi")], Some(&big_appendix), 1024, 512),
+            None
+        );
+
+        // 2. MAX_STITCHED_BYTES cap stops cleanly without calling segment 2
+        let (_cmds_cap, inc_cap) = mpsc::channel();
+        let (ev_cap, _out_cap) = event_channel();
+        let huge_reasoning = "r".repeat(MAX_STITCHED_BYTES - 5);
+        let mut cap_calls = 0_usize;
+        let (_msg_cap, comp_cap) = continue_after_token_limit(
+            &[user_msg("Hi")],
+            assistant_msg("short", Some(&huge_reasoning)),
+            &default_options(4096),
+            262_144,
+            PromptReuse::Disabled,
+            &inc_cap,
+            &ev_cap,
+            |_req, on_text, _| {
+                cap_calls += 1;
+                on_text(Cow::Borrowed("more"))?;
+                Ok((assistant_msg("more", None), Completion::TokenLimit))
+            },
+            no_wait,
+        )?;
+        assert_eq!(comp_cap, Completion::TokenLimit);
+        assert_eq!(cap_calls, 0);
+
+        // 3. base_wire_history >= MAX_WIRE_HISTORY_MESSAGES stops cleanly in both Latest & Disabled
+        let mut deep_pending = Vec::with_capacity(MAX_WIRE_HISTORY_MESSAGES);
+        for i in 0..MAX_WIRE_HISTORY_MESSAGES {
+            deep_pending.push(user_msg(&format!("U{i}")));
+        }
+        for reuse in [PromptReuse::Latest, PromptReuse::Disabled] {
+            let (_c, inc) = mpsc::channel();
+            let (ev, out) = event_channel();
+            let mut calls = 0_usize;
+            let (_m, comp) = continue_after_token_limit(
+                &deep_pending,
+                assistant_msg("Seg1.", None),
+                &default_options(4096),
+                131_072,
+                reuse,
+                &inc,
+                &ev,
+                |_req, _, _| {
+                    calls += 1;
+                    Ok((assistant_msg("unused", None), Completion::Finished))
+                },
+                no_wait,
+            )?;
+            assert_eq!(comp, Completion::TokenLimit);
+            assert_eq!(calls, 0);
+            assert_eq!(collect_streamed(&out).2, Vec::<u32>::new());
+        }
+
+        // 4. Serialize-failure fallback compaction under PromptReuse::Latest when wire_history > MAX_REQUEST (1 MiB)
+        //    seg1 + seg2 fit individually (520 KiB each), but uncompacted wire_history (1040 KiB) > 1 MiB;
+        //    compaction drops duplicate raw reasoning so Step 3 succeeds with 4 messages!
+        let (_c_ser, inc_ser) = mpsc::channel();
+        let (ev_ser, _out_ser) = event_channel();
+        let big_reasoning = "t".repeat(520 * 1024);
+        let mut ser_calls = 0_usize;
+        let mut msg_counts = Vec::new();
+        let (msg_ser, comp_ser) = run_with(
+            &[user_msg("Compact me")],
+            &default_options(4096),
+            1_048_576,
+            PromptReuse::Latest,
+            &inc_ser,
+            &ev_ser,
+            |req, on_text, on_reasoning| {
+                ser_calls += 1;
+                let json: serde_json::Value =
+                    serde_json::from_slice(&req).map_err(|_| Failure::Message("invalid JSON"))?;
+                msg_counts.push(json["messages"].as_array().map_or(0, Vec::len));
+                match ser_calls {
+                    1 => {
+                        on_reasoning(Cow::Borrowed(&big_reasoning))?;
+                        on_text(Cow::Borrowed("Part one."))?;
+                        Ok((
+                            assistant_msg("Part one.", Some(&big_reasoning)),
+                            Completion::TokenLimit,
+                        ))
+                    }
+                    2 => {
+                        on_text(Cow::Borrowed(" Part two."))?;
+                        Ok((
+                            assistant_msg(" Part two.", Some(&big_reasoning)),
+                            Completion::TokenLimit,
+                        ))
+                    }
+                    _ => {
+                        on_text(Cow::Borrowed(" Part three."))?;
+                        Ok((assistant_msg(" Part three.", None), Completion::Finished))
+                    }
+                }
+            },
+            no_wait,
+        )?;
+        assert_eq!(comp_ser, Completion::Finished);
+        assert_eq!(ser_calls, 3);
+        // Step 1: 2 msgs, Step 2: 4 msgs, Step 3 exceeded 512 KiB with 6 msgs -> compacted to 4 msgs!
+        assert_eq!(msg_counts, vec![2, 4, 4]);
+        assert_eq!(msg_ser.content.as_ref(), "Part one. Part two. Part three.");
+
+        // 5. Exhausting MAX_CONTEXT_STEPDOWNS (6) and budget / 2 < MIN_CONTINUATION_TOKENS (64)
+        let (_c_exh, inc_exh) = mpsc::channel();
+        let (ev_exh, _out_exh) = event_channel();
+        let mut c413 = 0_usize;
+        let (_m413, comp413) = continue_after_token_limit(
+            &[user_msg("413")],
+            assistant_msg("Part 1.", None),
+            &default_options(4096),
+            131_072,
+            PromptReuse::Disabled,
+            &inc_exh,
+            &ev_exh,
+            |_req, _, _| {
+                c413 += 1;
+                Err(Failure::Rejected(CONTEXT_LIMIT_MESSAGE))
+            },
+            no_wait,
+        )?;
+        assert_eq!(comp413, Completion::TokenLimit);
+        assert_eq!(c413, MAX_CONTEXT_STEPDOWNS + 1);
+
+        let (_c_min, inc_min) = mpsc::channel();
+        let (ev_min, _out_min) = event_channel();
+        let mut c96 = 0_usize;
+        let (_m96, comp96) = continue_after_token_limit(
+            &[user_msg("413-min")],
+            assistant_msg("Part 1.", None),
+            &default_options(96),
+            131_072,
+            PromptReuse::Disabled,
+            &inc_min,
+            &ev_min,
+            |_req, _, _| {
+                c96 += 1;
+                Err(Failure::Rejected(CONTEXT_LIMIT_MESSAGE))
+            },
+            no_wait,
+        )?;
+        assert_eq!(comp96, Completion::TokenLimit);
+        assert_eq!(c96, 1);
+
+        let (_c_429, inc_429) = mpsc::channel();
+        let (ev_429, _out_429) = event_channel();
+        let mut c429 = 0_usize;
+        let mut waits429 = 0_usize;
+        let (_m429, comp429) = continue_after_token_limit(
+            &[user_msg("429")],
+            assistant_msg("Part 1.", None),
+            &default_options(4096),
+            131_072,
+            PromptReuse::Disabled,
+            &inc_429,
+            &ev_429,
+            |_req, _, _| {
+                c429 += 1;
+                Err(Failure::Rejected(RATE_LIMIT_MESSAGE))
+            },
+            |_cmds, _ms| {
+                waits429 += 1;
+                Ok(())
+            },
+        )?;
+        assert_eq!(comp429, Completion::TokenLimit);
+        assert_eq!(c429, MAX_RATE_LIMIT_RETRIES + 1);
+        assert_eq!(waits429, MAX_RATE_LIMIT_RETRIES);
+
+        // 6. sleep_interruptible wakes promptly on Stop / StopModel / Shutdown
+        for (cmd, expected) in [
+            (Command::Stop, Failure::Stopped),
+            (Command::StopModel, Failure::ModelStopped),
+            (Command::Shutdown, Failure::Shutdown),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            tx.send(cmd)
+                .map_err(|_| Failure::Message("channel send failed"))?;
+            let started = std::time::Instant::now();
+            assert_eq!(sleep_interruptible(&rx, 5_000), Err(expected));
+            assert!(started.elapsed() < Duration::from_millis(500));
+        }
+
+        // 7. Fatal errors on segment 2 propagate Err instead of committing partial
+        for fatal in [
+            Failure::Message("boom"),
+            Failure::ModelStopped,
+            Failure::Shutdown,
+        ] {
+            let (_c, inc) = mpsc::channel();
+            let (ev, _out) = event_channel();
+            let err = continue_after_token_limit(
+                &[user_msg("fatal")],
+                assistant_msg("Part 1.", None),
+                &default_options(4096),
+                65_536,
+                PromptReuse::Disabled,
+                &inc,
+                &ev,
+                |_req, _, _| Err(fatal),
+                no_wait,
+            );
+            assert_eq!(err.err(), Some(fatal));
+        }
+
+        // 8. Pre-segment Command::Stop aborts before Event::Continuing(2) or request 2
+        let (tx_pre, rx_pre) = mpsc::channel();
+        let (ev_pre, out_pre) = event_channel();
+        tx_pre
+            .send(Command::Stop)
+            .map_err(|_| Failure::Message("send failed"))?;
+        let mut pre_calls = 0_usize;
+        let pre_res = continue_after_token_limit(
+            &[user_msg("pre-stop")],
+            assistant_msg("Part 1.", None),
+            &default_options(4096),
+            65_536,
+            PromptReuse::Disabled,
+            &rx_pre,
+            &ev_pre,
+            |_req, _, _| {
+                pre_calls += 1;
+                Ok((assistant_msg("unused", None), Completion::Finished))
+            },
+            no_wait,
+        );
+        assert_eq!(pre_res.err(), Some(Failure::Stopped));
+        assert_eq!(pre_calls, 0);
+        assert!(collect_streamed(&out_pre).2.is_empty());
+
+        // 9. Thinking-only seg 1 + empty seg 2 Finished stays Completion::TokenLimit
+        let (_c_th, inc_th) = mpsc::channel();
+        let (ev_th, _out_th) = event_channel();
+        let (msg_th, comp_th) = continue_after_token_limit(
+            &[user_msg("think")],
+            assistant_msg("", Some("reasoning only")),
+            &default_options(4096),
+            65_536,
+            PromptReuse::Disabled,
+            &inc_th,
+            &ev_th,
+            |_req, _, _| Ok((assistant_msg("", None), Completion::Finished)),
+            no_wait,
+        )?;
+        assert_eq!(comp_th, Completion::TokenLimit);
+        assert_eq!(msg_th.reasoning_content.as_deref(), Some("reasoning only"));
+
+        // 10. fold_turn_appendix_for_wire preserves images & avoids duplicating turn_appendix under Disabled
+        let mut user_with_img = user_msg("Look at this");
+        user_with_img.images = Arc::from([Arc::from("data:image/png;base64,AA==")]);
+        let mut opts_app = default_options(4096);
+        opts_app.turn_appendix = Some(Arc::from("[Attached note]"));
+        let (_c_app, inc_app) = mpsc::channel();
+        let (ev_app, _out_app) = event_channel();
+        let mut seen_app = Vec::new();
+        let (_m_app, comp_app) = continue_after_token_limit(
+            &[user_with_img],
+            assistant_msg("First.", None),
+            &opts_app,
+            65_536,
+            PromptReuse::Disabled,
+            &inc_app,
+            &ev_app,
+            |req, on_text, _| {
+                let json: serde_json::Value =
+                    serde_json::from_slice(&req).map_err(|_| Failure::Message("invalid JSON"))?;
+                seen_app.push(json);
+                on_text(Cow::Borrowed(" Second."))?;
+                Ok((assistant_msg(" Second.", None), Completion::Finished))
+            },
+            no_wait,
+        )?;
+        assert_eq!(comp_app, Completion::Finished);
+        let u_msg = &seen_app[0]["messages"][1];
+        assert!(
+            u_msg["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|p| p["type"] == "image_url"))
+        );
+        assert!(
+            !seen_app[0]["messages"][3]["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("[Attached note]"))
+        );
+        Ok(())
+    }
 }
