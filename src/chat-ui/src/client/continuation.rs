@@ -729,7 +729,7 @@ fn fold_turn_appendix_for_wire(wire_history: &mut [Message], turn_appendix: Opti
     }
 }
 
-fn sleep_interruptible(commands: &Receiver<Command>, total_ms: u64) -> Result<()> {
+pub(super) fn sleep_interruptible(commands: &Receiver<Command>, total_ms: u64) -> Result<()> {
     let mut waited = 0_u64;
     while waited < total_ms {
         check_commands(commands)?;
@@ -844,7 +844,7 @@ fn run_with<G, S>(
     commands: &Receiver<Command>,
     events: &EventSender,
     mut generate: G,
-    mut wait_rate_limit: S,
+    wait_rate_limit: S,
 ) -> Result<(Message, Completion)>
 where
     G: FnMut(
@@ -876,6 +876,49 @@ where
             Completion::Finished,
         ));
     }
+
+    continue_after_token_limit(
+        pending,
+        first_raw,
+        options,
+        context_tokens,
+        prompt_reuse,
+        commands,
+        events,
+        generate,
+        wait_rate_limit,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared continuation loop preserves exact wire prefix, context budget, and stream hooks."
+)]
+pub(super) fn continue_after_token_limit<G, S>(
+    pending: &[Message],
+    first_raw: Message,
+    options: &ResponseOptions,
+    context_tokens: usize,
+    prompt_reuse: PromptReuse,
+    commands: &Receiver<Command>,
+    events: &EventSender,
+    mut generate: G,
+    mut wait_rate_limit: S,
+) -> Result<(Message, Completion)>
+where
+    G: FnMut(
+        Vec<u8>,
+        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+    ) -> Result<(Message, Completion)>,
+    S: FnMut(&Receiver<Command>, u64) -> Result<()>,
+{
+    let mut stitched_text = first_raw.content.to_string();
+    let stitched_reasoning = first_raw
+        .reasoning_content
+        .as_deref()
+        .unwrap_or_default()
+        .to_owned();
 
     if stitched_text.trim().is_empty() && stitched_reasoning.trim().is_empty() {
         return Ok((

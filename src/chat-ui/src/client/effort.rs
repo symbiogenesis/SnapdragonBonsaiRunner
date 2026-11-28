@@ -2,12 +2,12 @@
 
 use super::{
     Command, Completion, Event, EventSender, ExtraEffortStrategy, Failure, MAX_REQUEST, Message,
-    ResponseOptions, Result, check_commands, generate_with_options, notify, request_byte_limit,
-    serialize_request_with_options, sse::ConfidenceSummary,
+    PromptReuse, ResponseOptions, Result, check_commands, generate_with_stream_hooks, notify,
+    request_byte_limit, serialize_request_with_options, sse::ConfidenceSummary,
 };
 use bonsai_windows_process::OwnedProcess;
 use serde::Serialize;
-use std::sync::mpsc::Receiver;
+use std::{borrow::Cow, sync::mpsc::Receiver};
 
 const PLAN: &str = "Extra effort: Planning (1/3)";
 const DRAFT: &str = "Extra effort: Drafting (2/3)";
@@ -16,32 +16,44 @@ const RSA_DRAFT_A: &str = "Extra effort: Draft A (1/3)";
 const RSA_DRAFT_B: &str = "Extra effort: Draft B (2/3)";
 const RSA_SYNTHESIZE: &str = "Extra effort: Synthesizing (3/3)";
 
-/// Perform no more than three calls under one cancellation signal.
+/// Perform no more than three logical passes under one cancellation signal.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Extra effort shares broker connection, context capacity, and continuation policy."
+)]
 pub(super) fn run(
     port: u16,
     key: &str,
     pending: &[Message],
     options: &ResponseOptions,
+    auto_continue: bool,
+    context_tokens: usize,
+    prompt_reuse: PromptReuse,
     commands: &Receiver<Command>,
     events: &EventSender,
     broker: Option<&OwnedProcess>,
 ) -> Result<(Message, Completion)> {
-    run_with_detailed(
+    run_with_stream_hooks(
         pending,
         options,
+        auto_continue,
+        context_tokens,
+        prompt_reuse,
         commands,
         events,
-        |request, stop_on_collapse| {
-            generate_with_options(
+        |request, stop_on_collapse, on_text, on_reasoning| {
+            generate_with_stream_hooks(
                 port,
                 key,
                 request,
                 stop_on_collapse,
                 commands,
-                events,
                 broker,
+                on_text,
+                on_reasoning,
             )
         },
+        super::continuation::sleep_interruptible,
     )
 }
 
@@ -61,12 +73,11 @@ struct RsaCandidates<'a> {
     draft_b_mean_logprob: Option<String>,
 }
 
-fn bounded_stage_request<T: Serialize>(
+fn bounded_stage_messages<T: Serialize>(
     pending: &[Message],
     instruction: &str,
     payload: &T,
-    options: &ResponseOptions,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<Message>> {
     let mut fresh = pending.to_vec();
     let task = fresh
         .last_mut()
@@ -107,7 +118,7 @@ fn bounded_stage_request<T: Serialize>(
     }
     drop(working);
     task.content = content.into();
-    serialize_request_with_options(&fresh, options)
+    Ok(fresh)
 }
 
 #[cfg(test)]
@@ -117,7 +128,8 @@ fn stage_request(
     working: Working<'_>,
     options: ResponseOptions,
 ) -> Result<Vec<u8>> {
-    bounded_stage_request(pending, instruction, &working, &options)
+    let stage_messages = bounded_stage_messages(pending, instruction, &working)?;
+    serialize_request_with_options(&stage_messages, &options)
 }
 
 #[cfg(test)]
@@ -134,33 +146,157 @@ fn run_with(
     })
 }
 
+#[cfg(test)]
 fn run_with_detailed(
-    pending: &[Message],
-    options: &ResponseOptions,
-    commands: &Receiver<Command>,
-    events: &EventSender,
-    generate: impl FnMut(Vec<u8>, bool) -> Result<(Message, Completion, Option<ConfidenceSummary>)>,
-) -> Result<(Message, Completion)> {
-    match options.cognitive.extra_effort_strategy {
-        ExtraEffortStrategy::PlanDraftReview => {
-            run_plan_draft_review(pending, options, commands, events, generate)
-        }
-        ExtraEffortStrategy::MultiDraftSynthesis => {
-            run_multi_draft_synthesis(pending, options, commands, events, generate)
-        }
-    }
-}
-
-fn run_plan_draft_review(
     pending: &[Message],
     options: &ResponseOptions,
     commands: &Receiver<Command>,
     events: &EventSender,
     mut generate: impl FnMut(Vec<u8>, bool) -> Result<(Message, Completion, Option<ConfidenceSummary>)>,
 ) -> Result<(Message, Completion)> {
+    run_with_stream_hooks(
+        pending,
+        options,
+        false,
+        65_536,
+        PromptReuse::Disabled,
+        commands,
+        events,
+        |request, stop_on_collapse, _on_text, _on_reasoning| generate(request, stop_on_collapse),
+        |_commands, _ms| Ok(()),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Stage execution shares stream hooks, continuation policy, and cancellation."
+)]
+fn run_stage_with_continuation<G, S>(
+    stage_messages: &[Message],
+    stage_options: &ResponseOptions,
+    stop_on_collapse: bool,
+    auto_continue: bool,
+    context_tokens: usize,
+    prompt_reuse: PromptReuse,
+    commands: &Receiver<Command>,
+    events: &EventSender,
+    generate: &mut G,
+    wait_rate_limit: &mut S,
+) -> Result<(Message, Completion, Option<ConfidenceSummary>)>
+where
+    G: FnMut(
+        Vec<u8>,
+        bool,
+        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+    ) -> Result<(Message, Completion, Option<ConfidenceSummary>)>,
+    S: FnMut(&Receiver<Command>, u64) -> Result<()>,
+{
+    let request = serialize_request_with_options(stage_messages, stage_options)?;
+    let (msg, completion, conf) = {
+        let mut on_text =
+            |delta: Cow<'_, str>| -> Result<()> { events.stream_text(delta, false, commands) };
+        let mut on_reasoning =
+            |delta: Cow<'_, str>| -> Result<()> { events.stream_text(delta, true, commands) };
+        generate(request, stop_on_collapse, &mut on_text, &mut on_reasoning)?
+    };
+    if !auto_continue || completion != Completion::TokenLimit {
+        return Ok((msg, completion, conf));
+    }
+    let (stitched, cont_completion) = super::continuation::continue_after_token_limit(
+        stage_messages,
+        msg,
+        stage_options,
+        context_tokens,
+        prompt_reuse,
+        commands,
+        events,
+        |cont_req, on_text, on_reasoning| {
+            let (cont_msg, cont_comp, _) = generate(cont_req, false, on_text, on_reasoning)?;
+            Ok((cont_msg, cont_comp))
+        },
+        |cmds, ms| wait_rate_limit(cmds, ms),
+    )?;
+    Ok((stitched, cont_completion, conf))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Test-injectable Extra effort loop threads stream hooks and continuation policy."
+)]
+fn run_with_stream_hooks<G, S>(
+    pending: &[Message],
+    options: &ResponseOptions,
+    auto_continue: bool,
+    context_tokens: usize,
+    prompt_reuse: PromptReuse,
+    commands: &Receiver<Command>,
+    events: &EventSender,
+    generate: G,
+    wait_rate_limit: S,
+) -> Result<(Message, Completion)>
+where
+    G: FnMut(
+        Vec<u8>,
+        bool,
+        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+    ) -> Result<(Message, Completion, Option<ConfidenceSummary>)>,
+    S: FnMut(&Receiver<Command>, u64) -> Result<()>,
+{
+    match options.cognitive.extra_effort_strategy {
+        ExtraEffortStrategy::PlanDraftReview => run_plan_draft_review(
+            pending,
+            options,
+            auto_continue,
+            context_tokens,
+            prompt_reuse,
+            commands,
+            events,
+            generate,
+            wait_rate_limit,
+        ),
+        ExtraEffortStrategy::MultiDraftSynthesis => run_multi_draft_synthesis(
+            pending,
+            options,
+            auto_continue,
+            context_tokens,
+            prompt_reuse,
+            commands,
+            events,
+            generate,
+            wait_rate_limit,
+        ),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Plan -> Draft -> Review shares continuation policy across Draft and Review stages."
+)]
+fn run_plan_draft_review<G, S>(
+    pending: &[Message],
+    options: &ResponseOptions,
+    auto_continue: bool,
+    context_tokens: usize,
+    prompt_reuse: PromptReuse,
+    commands: &Receiver<Command>,
+    events: &EventSender,
+    mut generate: G,
+    mut wait_rate_limit: S,
+) -> Result<(Message, Completion)>
+where
+    G: FnMut(
+        Vec<u8>,
+        bool,
+        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+    ) -> Result<(Message, Completion, Option<ConfidenceSummary>)>,
+    S: FnMut(&Receiver<Command>, u64) -> Result<()>,
+{
     check_commands(commands)?;
     notify(events, Event::Stage(PLAN))?;
-    let request = bounded_stage_request(
+    let plan_messages = bounded_stage_messages(
         pending,
         "Make a compact plan for the original task: identify its constraints and consider distinct \
          approaches. Use at most 300 words of visible notes. Do not write the final answer yet.",
@@ -168,9 +304,19 @@ fn run_plan_draft_review(
             plan: None,
             draft: None,
         },
-        options,
     )?;
-    let (plan, completion, _) = generate(request, false)?;
+    let (plan, completion, _) = run_stage_with_continuation(
+        &plan_messages,
+        options,
+        false,
+        false,
+        context_tokens,
+        prompt_reuse,
+        commands,
+        events,
+        &mut generate,
+        &mut wait_rate_limit,
+    )?;
     check_commands(commands)?;
     if completion == Completion::TokenLimit {
         notify(
@@ -189,7 +335,7 @@ fn run_plan_draft_review(
 
     check_commands(commands)?;
     notify(events, Event::Stage(DRAFT))?;
-    let request = bounded_stage_request(
+    let draft_messages = bounded_stage_messages(
         pending,
         "Write a complete draft answering the original task. Consult the generated plan as \
          working notes, checking it against the original constraints and source material.",
@@ -197,9 +343,19 @@ fn run_plan_draft_review(
             plan: Some(&plan.content),
             draft: None,
         },
-        options,
     )?;
-    let (draft, completion, _) = generate(request, false)?;
+    let (draft, completion, _) = run_stage_with_continuation(
+        &draft_messages,
+        options,
+        false,
+        auto_continue,
+        context_tokens,
+        prompt_reuse,
+        commands,
+        events,
+        &mut generate,
+        &mut wait_rate_limit,
+    )?;
     check_commands(commands)?;
     if completion == Completion::TokenLimit {
         notify(events, Event::Stage("Draft incomplete; review skipped"))?;
@@ -215,7 +371,7 @@ fn run_plan_draft_review(
 
     check_commands(commands)?;
     notify(events, Event::Stage(REVIEW))?;
-    let request = bounded_stage_request(
+    let review_messages = bounded_stage_messages(
         pending,
         "Review the generated draft against the original task, user constraints and source material. \
          Produce a targeted revision. Preserve good passages; return the complete revised answer \
@@ -224,9 +380,19 @@ fn run_plan_draft_review(
             plan: Some(&plan.content),
             draft: Some(&draft.content),
         },
-        options,
     )?;
-    let (revision, completion, _) = generate(request, false)?;
+    let (revision, completion, _) = run_stage_with_continuation(
+        &review_messages,
+        options,
+        false,
+        auto_continue,
+        context_tokens,
+        prompt_reuse,
+        commands,
+        events,
+        &mut generate,
+        &mut wait_rate_limit,
+    )?;
     check_commands(commands)?;
     if completion == Completion::TokenLimit {
         notify(
@@ -248,13 +414,30 @@ fn format_confidence(summary: Option<ConfidenceSummary>) -> Option<String> {
     summary.map(|item| format!("{:.3}", item.mean_logprob))
 }
 
-fn run_multi_draft_synthesis(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "RSA synthesis shares continuation policy across Draft A and Synthesis stages."
+)]
+fn run_multi_draft_synthesis<G, S>(
     pending: &[Message],
     options: &ResponseOptions,
+    auto_continue: bool,
+    context_tokens: usize,
+    prompt_reuse: PromptReuse,
     commands: &Receiver<Command>,
     events: &EventSender,
-    mut generate: impl FnMut(Vec<u8>, bool) -> Result<(Message, Completion, Option<ConfidenceSummary>)>,
-) -> Result<(Message, Completion)> {
+    mut generate: G,
+    mut wait_rate_limit: S,
+) -> Result<(Message, Completion)>
+where
+    G: FnMut(
+        Vec<u8>,
+        bool,
+        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+    ) -> Result<(Message, Completion, Option<ConfidenceSummary>)>,
+    S: FnMut(&Receiver<Command>, u64) -> Result<()>,
+{
     if pending.last().is_none_or(|message| message.role != "user") {
         return Err(Failure::Rejected(
             "Extra effort requires a user task. Start a new conversation.",
@@ -267,8 +450,18 @@ fn run_multi_draft_synthesis(
         temperature_nudge: 0.0,
         ..options.clone()
     };
-    let req_a = serialize_request_with_options(pending, &opt_a)?;
-    let (draft_a, comp_a, conf_a) = generate(req_a, false)?;
+    let (draft_a, comp_a, conf_a) = run_stage_with_continuation(
+        pending,
+        &opt_a,
+        false,
+        auto_continue,
+        context_tokens,
+        prompt_reuse,
+        commands,
+        events,
+        &mut generate,
+        &mut wait_rate_limit,
+    )?;
     check_commands(commands)?;
     if draft_a.content.trim().is_empty() {
         return Err(Failure::Rejected(
@@ -291,9 +484,19 @@ fn run_multi_draft_synthesis(
         temperature_nudge: if options.cognitive_controls { 0.1 } else { 0.0 },
         ..options.clone()
     };
-    let req_b = serialize_request_with_options(pending, &opt_b)?;
     let stop_b = options.cognitive_controls && options.reset_on_cancel;
-    let draft_b_outcome = match generate(req_b, stop_b) {
+    let draft_b_outcome = match run_stage_with_continuation(
+        pending,
+        &opt_b,
+        stop_b,
+        false,
+        context_tokens,
+        prompt_reuse,
+        commands,
+        events,
+        &mut generate,
+        &mut wait_rate_limit,
+    ) {
         Ok((draft_b, comp_b, conf_b)) => {
             check_commands(commands)?;
             if comp_b == Completion::Finished
@@ -333,7 +536,7 @@ fn run_multi_draft_synthesis(
         temperature_nudge: 0.0,
         ..options.clone()
     };
-    let req_synth = bounded_stage_request(
+    let synth_messages = bounded_stage_messages(
         pending,
         "Synthesize ONE superior, self-consistent final answer from Draft A and Draft B below. \
          Verify claims against the authoritative task, resolve any contradictions, combine stronger \
@@ -344,9 +547,19 @@ fn run_multi_draft_synthesis(
             draft_a_mean_logprob: format_confidence(conf_a),
             draft_b_mean_logprob: format_confidence(conf_b),
         },
-        &opt_synth,
     )?;
-    let (synthesis, comp_s, _) = generate(req_synth, false)?;
+    let (synthesis, comp_s, _) = run_stage_with_continuation(
+        &synth_messages,
+        &opt_synth,
+        false,
+        auto_continue,
+        context_tokens,
+        prompt_reuse,
+        commands,
+        events,
+        &mut generate,
+        &mut wait_rate_limit,
+    )?;
     check_commands(commands)?;
     if comp_s == Completion::TokenLimit || synthesis.content.trim().is_empty() {
         notify(

@@ -491,3 +491,203 @@ fn rsa_multi_draft_shares_identical_prompt_prefix_synthesizes_and_handles_collap
     assert_eq!(comp3, Completion::TokenLimit);
     Ok(())
 }
+
+#[test]
+fn plan_draft_review_auto_continues_truncated_draft_and_review() -> Result<()> {
+    let (_commands, incoming) = mpsc::channel();
+    let (events, outgoing) = crate::client::event_channel();
+    let pending = task();
+    let options = ResponseOptions {
+        max_completion_tokens: 4096,
+        enable_thinking: false,
+        ..ResponseOptions::default()
+    };
+    let mut step = 0_usize;
+    let (answer, completion) = run_with_stream_hooks(
+        &pending,
+        &options,
+        true,
+        65_536,
+        PromptReuse::Disabled,
+        &incoming,
+        &events,
+        |_req, _stop, on_text, _| {
+            step += 1;
+            match step {
+                1 => {
+                    on_text(Cow::Borrowed("Plan: outline."))?;
+                    Ok((
+                        message("assistant", "Plan: outline."),
+                        Completion::Finished,
+                        None,
+                    ))
+                }
+                2 => {
+                    on_text(Cow::Borrowed("Draft part one."))?;
+                    Ok((
+                        message("assistant", "Draft part one."),
+                        Completion::TokenLimit,
+                        None,
+                    ))
+                }
+                3 => {
+                    on_text(Cow::Borrowed(" Draft part two."))?;
+                    Ok((
+                        message("assistant", " Draft part two."),
+                        Completion::Finished,
+                        None,
+                    ))
+                }
+                4 => {
+                    on_text(Cow::Borrowed("Revised part one."))?;
+                    Ok((
+                        message("assistant", "Revised part one."),
+                        Completion::TokenLimit,
+                        None,
+                    ))
+                }
+                _ => {
+                    on_text(Cow::Borrowed(" Revised part two."))?;
+                    Ok((
+                        message("assistant", " Revised part two."),
+                        Completion::Finished,
+                        None,
+                    ))
+                }
+            }
+        },
+        |_commands, _ms| Ok(()),
+    )?;
+    assert_eq!(step, 5);
+    assert_eq!(completion, Completion::Finished);
+    assert_eq!(
+        answer.content.as_ref(),
+        "Revised part one. Revised part two."
+    );
+    let notifications: Vec<_> = outgoing.try_iter().collect();
+    assert!(notifications.iter().any(|event| {
+        matches!(event, Event::Draft(text) if text == "Draft part one. Draft part two.")
+    }));
+
+    // Plan truncation still stops cleanly without continuing.
+    let (_commands2, incoming2) = mpsc::channel();
+    let (events2, _outgoing2) = crate::client::event_channel();
+    let mut step2 = 0_usize;
+    let plan_truncated = run_with_stream_hooks(
+        &pending,
+        &options,
+        true,
+        65_536,
+        PromptReuse::Disabled,
+        &incoming2,
+        &events2,
+        |_req, _stop, on_text, _| {
+            step2 += 1;
+            on_text(Cow::Borrowed("Partial plan"))?;
+            Ok((
+                message("assistant", "Partial plan"),
+                Completion::TokenLimit,
+                None,
+            ))
+        },
+        |_commands, _ms| Ok(()),
+    );
+    assert_eq!(step2, 1);
+    assert!(matches!(plan_truncated, Err(Failure::Rejected(_))));
+    Ok(())
+}
+
+#[test]
+fn rsa_multi_draft_auto_continues_draft_a_and_synthesis() -> Result<()> {
+    let (_commands, incoming) = mpsc::channel();
+    let (events, outgoing) = crate::client::event_channel();
+    let pending = task();
+    let options = ResponseOptions {
+        max_completion_tokens: 2048,
+        enable_thinking: false,
+        cognitive_controls: true,
+        cognitive: CognitiveOptions {
+            extra_effort_strategy: ExtraEffortStrategy::MultiDraftSynthesis,
+            ..CognitiveOptions::default()
+        },
+        ..ResponseOptions::default()
+    };
+    let mut step = 0_usize;
+    let (answer, completion) = run_with_stream_hooks(
+        &pending,
+        &options,
+        true,
+        65_536,
+        PromptReuse::Latest,
+        &incoming,
+        &events,
+        |_req, _stop, on_text, _| {
+            step += 1;
+            match step {
+                1 => {
+                    on_text(Cow::Borrowed("Draft A opening."))?;
+                    Ok((
+                        message("assistant", "Draft A opening."),
+                        Completion::TokenLimit,
+                        Some(ConfidenceSummary {
+                            tokens: 64,
+                            mean_logprob: -0.2,
+                            min_window_logprob: Some(-0.4),
+                            collapsed: false,
+                        }),
+                    ))
+                }
+                2 => {
+                    on_text(Cow::Borrowed(" Draft A ending."))?;
+                    Ok((
+                        message("assistant", " Draft A ending."),
+                        Completion::Finished,
+                        None,
+                    ))
+                }
+                3 => {
+                    on_text(Cow::Borrowed("Draft B complete."))?;
+                    Ok((
+                        message("assistant", "Draft B complete."),
+                        Completion::Finished,
+                        Some(ConfidenceSummary {
+                            tokens: 64,
+                            mean_logprob: -0.9,
+                            min_window_logprob: Some(-1.1),
+                            collapsed: false,
+                        }),
+                    ))
+                }
+                4 => {
+                    on_text(Cow::Borrowed("Synthesis part one."))?;
+                    Ok((
+                        message("assistant", "Synthesis part one."),
+                        Completion::TokenLimit,
+                        None,
+                    ))
+                }
+                _ => {
+                    on_text(Cow::Borrowed(" Synthesis part two."))?;
+                    Ok((
+                        message("assistant", " Synthesis part two."),
+                        Completion::Finished,
+                        None,
+                    ))
+                }
+            }
+        },
+        |_commands, _ms| Ok(()),
+    )?;
+    assert_eq!(step, 5);
+    assert_eq!(completion, Completion::Finished);
+    assert_eq!(
+        answer.content.as_ref(),
+        "Synthesis part one. Synthesis part two."
+    );
+    let notifications: Vec<_> = outgoing.try_iter().collect();
+    // Draft A's initial confidence (-0.2 > -0.9) is preserved across its continuation.
+    assert!(notifications.iter().any(|event| {
+        matches!(event, Event::Draft(text) if text == "Draft A opening. Draft A ending.")
+    }));
+    Ok(())
+}

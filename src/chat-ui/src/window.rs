@@ -1440,7 +1440,11 @@ impl State {
                 self.touch_conversation(self.active_or_routed_conversation());
             }
             Event::Continuing(part) => {
-                self.set_status(&format!("Continuing response (part {part})…"), false);
+                let status = match self.stage {
+                    Some(stage) => format!("{stage} — continuing (part {part})…"),
+                    None => format!("Continuing response (part {part})…"),
+                };
+                self.set_status(&status, false);
             }
             Event::Committed(history) => {
                 self.commit_history(history);

@@ -1388,6 +1388,13 @@ mod tests {
         state.model_event(client::Event::Continuing(2));
         assert_eq!(state.model, ModelLifecycle::Generating);
         assert_eq!(state.status, "Continuing response (part 2)…");
+        state.stage = Some("Extra effort: Drafting (2/3)");
+        state.model_event(client::Event::Continuing(3));
+        assert_eq!(
+            state.status,
+            "Extra effort: Drafting (2/3) — continuing (part 3)…"
+        );
+        state.stage = None;
         assert!(!state.warning);
         assert!(state.active_alerts().is_empty());
         state.model_event(client::Event::Text(" Part two.".into()));
