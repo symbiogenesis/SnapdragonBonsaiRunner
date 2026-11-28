@@ -828,7 +828,7 @@ mod tests {
                 259,
                 260,
                 |_| Some(abs.clone()),
-                || Some((32767, 32768, abs))
+                || Some((32767, 32768, abs.clone()))
             ),
             None
         );
