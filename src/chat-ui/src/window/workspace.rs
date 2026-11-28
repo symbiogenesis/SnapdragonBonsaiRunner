@@ -57,6 +57,12 @@ pub(super) struct CachedConversationJson {
     pub(super) json: std::sync::Arc<[u8]>,
 }
 
+pub(in crate::window) struct DeletedConversation {
+    conversation: Conversation,
+    original_index: usize,
+    created_empty_placeholder: bool,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Conversation {
@@ -441,18 +447,22 @@ impl State {
             self.active_conversation = id;
             self.load_conversation(snapshot);
             self.recovery_dirty = true;
+            self.recovery_flush_now = true;
         }
     }
 
     pub(super) fn remove_conversation(&mut self, id: u64) {
-        if !self.can_remove_conversation(id)
-            || !self
-                .conversations
-                .iter()
-                .any(|conversation| conversation.id == id)
-        {
+        if !self.can_remove_conversation(id) {
             return;
         }
+        let Some(original_index) = self
+            .conversations
+            .iter()
+            .position(|conversation| conversation.id == id)
+        else {
+            return;
+        };
+        let mut created_empty_placeholder = false;
         if id == self.active_conversation {
             if let Some(next) = self
                 .conversations
@@ -467,22 +477,86 @@ impl State {
             } else {
                 self.update_worker_conversation(Command::NewChat);
                 self.stop_speech();
+                self.save_conversation();
                 self.clear_conversation();
                 self.active_conversation = self.next_conversation;
                 self.next_conversation = self.next_conversation.saturating_add(1);
                 self.conversations
                     .insert(0, Conversation::new(self.active_conversation));
+                created_empty_placeholder = true;
                 if self.model.ready() {
                     self.set_status("Ready for a new conversation.", false);
                 }
             }
         }
-        self.conversations
-            .retain(|conversation| conversation.id != id);
+        if let Some(current_index) = self
+            .conversations
+            .iter()
+            .position(|conversation| conversation.id == id)
+        {
+            let removed = self.conversations.remove(current_index);
+            self.recently_deleted = Some(DeletedConversation {
+                conversation: removed,
+                original_index,
+                created_empty_placeholder,
+            });
+        }
         self.recovery_dirty = true;
+        self.recovery_flush_now = true;
         self.conversation_notice = Some(super::ConversationNotice::auto_dismiss(
             "Conversation deleted.",
             super::CONVERSATION_DELETED_NOTICE_DURATION,
         ));
+    }
+
+    pub(in crate::window) fn undo_delete_conversation(&mut self) -> bool {
+        if !self.model.workspace_available() {
+            return false;
+        }
+        let Some(mut deleted) = self.recently_deleted.take() else {
+            return false;
+        };
+        let id = deleted.conversation.id;
+        if deleted.conversation.saved.is_none()
+            || self
+                .conversations
+                .iter()
+                .any(|conversation| conversation.id == id)
+        {
+            return false;
+        }
+        let sole_empty_placeholder = deleted.created_empty_placeholder
+            && self.conversations.len() == 1
+            && self.conversations[0].id == self.active_conversation
+            && !self.conversations[0].renamed
+            && self.conversations[0].title == "New conversation"
+            && self.transcript.messages.is_empty()
+            && self.committed.is_empty()
+            && self.input.is_empty()
+            && self.draft_attachments.is_empty()
+            && self.last_answer.is_empty()
+            && self.retained_draft.is_empty();
+        if sole_empty_placeholder {
+            let Some(snapshot) = deleted.conversation.saved.take() else {
+                return false;
+            };
+            deleted.conversation.invalidate_json_cache();
+            self.conversations.clear();
+            self.conversations.push(deleted.conversation);
+            self.active_conversation = id;
+            self.next_conversation = self.next_conversation.max(id.saturating_add(1));
+            self.update_worker_conversation(Command::RestoreChat(snapshot.committed.clone()));
+            self.stop_speech();
+            self.load_conversation(snapshot);
+            self.conversation_notice = None;
+            self.recovery_dirty = true;
+            self.recovery_flush_now = true;
+            return true;
+        }
+        let insert_at = deleted.original_index.min(self.conversations.len());
+        self.conversations.insert(insert_at, deleted.conversation);
+        self.next_conversation = self.next_conversation.max(id.saturating_add(1));
+        self.switch_conversation(id);
+        true
     }
 }

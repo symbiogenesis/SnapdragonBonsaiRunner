@@ -555,6 +555,9 @@ impl State {
                 .clear_dismissed(super::error_ui::AlertKind::Recovery);
             self.recovery_dirty = self.save_conversations;
             self.recovery_erase_pending = !self.save_conversations;
+            if !self.save_conversations {
+                self.recently_deleted = None;
+            }
             self.last_recovery_save = Instant::now()
                 .checked_sub(Duration::from_secs(3))
                 .unwrap_or_else(Instant::now);
@@ -566,6 +569,18 @@ impl State {
             .clone_into(&mut self.recovery_notice);
         }
         ui.label(RichText::new("Saves automatically with Windows user encryption in your model data folder. Restores drafts and completed history on the next launch. Turning this off removes the saved copy and keeps saving off on future launches. Your window, appearance and voice preferences remain saved on this device.").small().weak());
+        if self.recently_deleted.is_some() {
+            ui.add_space(6.0);
+            if ui
+                .add_enabled(
+                    self.model.workspace_available(),
+                    egui::Button::new("Restore last deleted conversation"),
+                )
+                .clicked()
+            {
+                self.undo_delete_conversation();
+            }
+        }
         if !self.recovery_notice.is_empty() {
             ui.label(RichText::new(&self.recovery_notice).small());
         }
@@ -2425,6 +2440,61 @@ mod tests {
                 .salvage_workspace(&serde_json::to_vec(&wrong_version).map_err(io::Error::other)?)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn undo_delete_restores_active_inactive_and_last_conversation_and_sets_immediate_flush()
+    -> io::Result<()> {
+        // 1. Deleting the sole (last) conversation and undoing replaces the empty placeholder.
+        let mut s = state();
+        s.input = "Keep this unsent draft".to_owned();
+        s.transcript.push(Role::User, "Sole question".to_owned());
+        s.transcript.push(Role::Assistant, "Sole answer".to_owned());
+        s.committed = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "Sole question"},
+            {"role": "assistant", "content": "Sole answer"},
+        ]))
+        .map_err(io::Error::other)?;
+        let sole_id = s.active_conversation;
+        s.conversations[0].title = "Sole title".to_owned();
+        s.conversations[0].renamed = true;
+        s.recovery_flush_now = false;
+        s.remove_conversation(sole_id);
+        assert!(s.recovery_flush_now);
+        assert_ne!(s.active_conversation, sole_id);
+        assert_eq!(s.conversations.len(), 1);
+        assert!(s.transcript.messages.is_empty());
+
+        s.recovery_flush_now = false;
+        assert!(s.undo_delete_conversation());
+        assert!(s.recovery_flush_now);
+        assert_eq!(s.active_conversation, sole_id);
+        assert_eq!(s.conversations.len(), 1);
+        assert_eq!(s.conversations[0].title, "Sole title");
+        assert_eq!(s.input, "Keep this unsent draft");
+        assert_eq!(s.committed.len(), 2);
+        assert!(s.transcript.plain_text().contains("Sole answer"));
+        assert!(s.conversation_notice.is_none());
+
+        // 2. Deleting an inactive conversation and undoing restores it at its original list index.
+        s.recovery_flush_now = false;
+        s.new_chat();
+        assert!(s.recovery_flush_now);
+        let second_id = s.active_conversation;
+        s.transcript.push(Role::User, "Second".to_owned());
+        s.recovery_flush_now = false;
+        s.remove_conversation(sole_id);
+        assert!(s.recovery_flush_now);
+        assert_eq!(s.conversations.len(), 1);
+        assert!(s.undo_delete_conversation());
+        assert_eq!(s.conversations.len(), 2);
+        assert_eq!(s.active_conversation, sole_id);
+        assert_eq!(s.conversations[1].id, sole_id);
+        assert_eq!(s.conversations[0].id, second_id);
+
+        // 3. Undo is one-shot once consumed.
+        assert!(!s.undo_delete_conversation());
         Ok(())
     }
 }

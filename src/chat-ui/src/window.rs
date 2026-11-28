@@ -202,6 +202,7 @@ struct State {
     next_conversation: u64,
     rename_conversation: Option<(u64, String)>,
     delete_conversation: Option<u64>,
+    recently_deleted: Option<workspace::DeletedConversation>,
     edit_message: Option<iteration::EditMessage>,
     branch_comparison: Option<iteration::BranchComparison>,
     branch_diff_generation: u64,
@@ -385,6 +386,7 @@ impl State {
             next_conversation: 2,
             rename_conversation: None,
             delete_conversation: None,
+            recently_deleted: None,
             edit_message: None,
             branch_comparison: None,
             branch_diff_generation: 0,
@@ -938,6 +940,7 @@ impl State {
         }
         self.request_conversation = Some(self.active_conversation);
         self.touch_conversation(self.active_conversation);
+        self.recovery_flush_now = true;
         self.input.clear();
         self.input_revision = self.input_revision.wrapping_add(1);
         self.place_composer_cursor(0);
@@ -971,6 +974,7 @@ impl State {
         self.active_conversation = id;
         self.clear_conversation();
         self.recovery_dirty = true;
+        self.recovery_flush_now = true;
         if self.model == ModelLifecycle::Ready {
             self.set_status("Ready for a new conversation.", false);
         }
@@ -1451,6 +1455,7 @@ impl State {
             Event::Committed(history) => {
                 self.commit_history(history);
                 self.touch_conversation(self.active_or_routed_conversation());
+                self.recovery_flush_now = true;
             }
             Event::Complete(completion) => {
                 self.awaiting_first_token = false;
@@ -2533,6 +2538,17 @@ impl State {
         if let Some(notice) = self.conversation_notice {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(notice.text).small());
+                if notice.text == "Conversation deleted."
+                    && self.recently_deleted.is_some()
+                    && ui
+                        .add_enabled(
+                            self.model.workspace_available(),
+                            egui::Button::new("Undo").small(),
+                        )
+                        .clicked()
+                {
+                    self.undo_delete_conversation();
+                }
                 if ui.small_button("Dismiss").clicked() {
                     self.conversation_notice = None;
                 }

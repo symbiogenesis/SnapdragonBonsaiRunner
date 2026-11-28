@@ -740,3 +740,26 @@ fn deleted_conversation_notice_auto_dismisses_and_supports_manual_dismiss() {
             .is_some()
     );
 }
+
+#[test]
+fn deleted_conversation_notice_undo_restores_conversation_and_clears_notice() {
+    let mut chat = harness([1080.0, 780.0], 16.0);
+    let original_id = chat.state().app.active_conversation;
+    chat.state_mut().app.input = "Recoverable draft".to_owned();
+    chat.state_mut().app.new_chat();
+    let second_id = chat.state().app.active_conversation;
+    chat.state_mut().app.remove_conversation(original_id);
+    chat.run();
+
+    assert_eq!(chat.state().app.conversations.len(), 1);
+    assert_eq!(chat.state().app.active_conversation, second_id);
+    assert!(chat.query_by_label("Conversation deleted.").is_some());
+    chat.get_by_role_and_label(egui::Role::Button, "Undo")
+        .click();
+    chat.run();
+
+    assert!(chat.query_by_label("Conversation deleted.").is_none());
+    assert_eq!(chat.state().app.conversations.len(), 2);
+    assert_eq!(chat.state().app.active_conversation, original_id);
+    assert_eq!(chat.state().app.input, "Recoverable draft");
+}

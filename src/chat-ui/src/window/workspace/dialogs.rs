@@ -27,6 +27,7 @@ impl State {
                     conversation.renamed = true;
                     conversation.invalidate_json_cache();
                     self.touch_conversation(id);
+                    self.recovery_flush_now = true;
                 }
             }
             Decision::Cancel => {}
@@ -94,7 +95,7 @@ fn delete_prompt(ctx: &egui::Context, title: &str, can_remove: bool) -> Decision
         ui.heading("Delete conversation?");
         ui.add_space(12.0);
         ui.label(RichText::new(title).strong());
-        ui.label("This conversation and its unsent draft will be removed. This cannot be undone.");
+        ui.label("This conversation and its unsent draft will be removed. You can undo the most recent deletion during this session.");
         ui.add_space(16.0);
         ui.horizontal(|ui| {
             if ui.button("Keep conversation").clicked() {
