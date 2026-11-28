@@ -141,25 +141,28 @@ releases prompt capacity; only a fresh launch/Retry can change selected memory c
 
 ### Application updates
 
-Current-source portable builds check GitHub after startup and every 15 minutes and automatically
-download the highest newer numeric version, including published prereleases.
-The native Settings view shows the version, update status and one action for the
-current state: check, download/retry or restart to update. It opens no additional
-settings area. Discovery exhausts at most three pages of 100 releases; a full
-final page fails explicitly because catalog completeness is unknown. Drafts are
-excluded, and invalid newest assets never cause fallback. GitHub SHA-256
-identities, the release manifest, checksum inventory
-and tag/source revision must agree before download or use.
+Current-source portable builds check GitHub shortly after startup (after a 10-second delay so
+model and UI initialization do not contend) and every 15 minutes at below-normal CPU priority, and
+automatically download the highest newer numeric version, including published prereleases.
+The native Settings view shows the version, update status (including live download phase and
+byte progress, or deferred close-install status after choosing **Later**) and one action for the
+current state: check, download/retry or restart to update. It opens no additional settings area.
+Discovery exhausts at most three pages of 100 releases; a full final page fails explicitly because
+catalog completeness is unknown. Drafts are excluded, and invalid newest assets never cause
+fallback. GitHub SHA-256 identities, the release manifest, checksum inventory
+and tag/source revision are fetched concurrently and must agree before download or use.
 
 Metadata requests use the shared native Rust HTTPS client with Windows Schannel,
 credential-free HTTPS URLs at every hop, at most three redirects, the GitHub JSON
 media type, application User-Agent and an explicit API version. Read-only discovery
 uses a fixed
-six-slot disk cache binding each body to its exact URL and SHA-256. It prefers
+six-slot disk cache binding each body to its exact URL and SHA-256 without holding
+the cache lock across network transfers. It prefers
 `If-None-Match`, with `If-Modified-Since` as a fallback; a valid 304 reuses the bounded
 body without a cache rewrite. This user-writable cache cannot authenticate release
 publication: download, queue, launcher and replacement-helper gates request fresh
-catalog, manifest, checksum and source metadata unconditionally. During discovery,
+catalog, manifest, checksum and source metadata unconditionally (with bounded retries
+for transient HTTP/network failures). During discovery,
 manifest and checksum bodies can be reused only when their length and SHA-256 match
 the revalidated catalog. Requests advertise gzip and identity; native decoding
 independently bounds the compressed and expanded bodies at 2 MiB. The HTTP client
@@ -168,12 +171,18 @@ No authentication, conversation or model data accompanies
 these requests.
 Network and HTTP failures persist an exponential cooldown across helper processes,
 honoring `Retry-After` and exhausted GitHub rate-limit reset instructions. Failed
-requests never fall back to cached success or immediately retry. Offline or
+discovery requests never fall back to cached success or immediately retry; explicit
+manual checks and confirmed download/replacement gates probe past stale local offline
+cooldowns while continuing to honor server-directed rate-limit cooldowns. Offline or
 no-internet update failures do not surface in the shared chat-area alert panel
 and appear only as a small inline notice in the Settings update area.
 
-After the download is verified, a nonmodal nudge offers **Restart to update** or
-**Later** without interrupting typing or generation. A pending-update badge stays
+After the download is verified, portable updates best-effort pre-extract the staged
+bundle so restarting can reuse verified cached files without redundant decompression,
+and obsolete staged updates and bundle caches are pruned best-effort when idle.
+A nonmodal nudge offers **Restart to update** or
+**Later** without interrupting typing or generation, and transitions into a compact
+inline status strip during teardown. A pending-update badge stays
 on the bottom-left Settings button. Choosing restart from the nudge or Settings
 opens one shared native confirmation popup; **Restart and update** authorizes
 immediate installation, while **Cancel** leaves the app running without authorizing
@@ -189,9 +198,11 @@ owned model, speech and UI teardown. Explicit immediate installation or a normal
 close with the deferred update authorizes only that release. The launcher consumes
 its launch-specific handoff after fresh publication/staging verification and starts
 only the verified replacement
-helper. This bounded helper runs from the staged new bundle, independently
-revalidates publication and staged bytes, copies and verifies a sibling file, and
-atomically replaces the original after its launcher exits. Changed originals,
+helper. This bounded helper runs from the staged new bundle, waits cleanly on the
+exiting launcher process handle when supplied, independently
+revalidates publication and staged bytes, copies and verifies a sibling file using
+mapped CNG hashing when available, and
+atomically replaces the original with adaptive backoff after its launcher exits. Changed originals,
 network/verification failures or exhausted sharing retries retain the old file.
 Immediate replacement reopens with the same launch options and user data directory;
 deferred-close replacement skips restart. The handoff and helper explicitly carry

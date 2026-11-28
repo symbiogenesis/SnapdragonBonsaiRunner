@@ -53,18 +53,22 @@ representation and rollback options are in the
 
 ## Update and remove
 
-Portable builds check GitHub at startup and every 15 minutes; **Settings >
-Application** also offers a manual check. Discovery selects the highest numeric
-version, including prereleases, from a bounded catalog, excluding drafts and
-older versions. An incomplete catalog or invalid newest release fails without
-falling back. Conditional requests reuse unchanged metadata; failures honor
+Portable builds check GitHub 10 seconds after startup and every 15 minutes at below-normal
+background priority; **Settings > Application** also offers a manual check (which probes
+past stale local offline cooldowns while still honoring server rate limits). Discovery
+selects the highest numeric version, including prereleases, from a bounded catalog,
+excluding drafts and older versions. An incomplete catalog or invalid newest release fails
+without falling back. Conditional requests reuse unchanged metadata; failures honor
 server backoff and never count as successful checks.
 
-Settings shows the current version, update status and one relevant action without
-opening another settings area. The app downloads and verifies the asset digest,
-manifest, checksums and tag/source identity in the background. A quiet nudge offers
-**Restart to update** and **Later** while typing and generation continue. The
-Settings badge also shows that an update is ready.
+Settings shows the current version, update status (with live download phase and byte
+progress, or deferred close-install status) and one relevant action without opening another
+settings area. The app downloads and verifies the asset digest, manifest, checksums and
+tag/source identity in the background, pre-extracts the verified portable bundle for fast
+restart, and prunes obsolete staged updates and bundle caches best-effort. A quiet nudge
+offers **Restart to update** and **Later** while typing and generation continue, and shows
+a compact inline status strip while stopping to update. The Settings badge also shows that
+an update is ready.
 
 Choosing **Restart to update** from the nudge or Settings opens one confirmation
 popup. **Restart and update** closes, replaces and reopens the app with its original
