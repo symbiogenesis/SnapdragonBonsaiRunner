@@ -135,6 +135,28 @@ pub(crate) fn remove_dir_all_with_retry(path: &Path) -> io::Result<()> {
     )
 }
 
+/// Removes an empty non-redirected directory `path`, clearing read-only attributes and retrying on Windows locks.
+pub(crate) fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
+    retry_windows_sharing(
+        || match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(metadata) if bonsai_artifacts::is_redirect(&metadata) => {
+                Err(io::Error::other("Refusing to remove redirected directory."))
+            }
+            Ok(_) => match fs::remove_dir(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+        },
+        || {
+            #[cfg(windows)]
+            clear_readonly(path);
+        },
+    )
+}
+
 /// Removes a temporary or `.partial` file on drop unless explicitly disarmed.
 pub(crate) struct TempFileGuard(Option<PathBuf>);
 

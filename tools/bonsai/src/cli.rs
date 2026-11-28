@@ -188,11 +188,8 @@ pub fn chat(arguments: &[OsString]) -> crate::Result<Value> {
         );
     }
     if !request.contains_key("DataDirectory") {
-        let data = PathBuf::from(
-            std::env::var_os("LOCALAPPDATA")
-                .ok_or("Supply --data-directory or set LOCALAPPDATA.")?,
-        )
-        .join("SwiftBonsai2");
+        let data = crate::data_dir::default_data_directory()
+            .map_err(|_| "Supply --data-directory or set LOCALAPPDATA.".to_owned())?;
         request.insert(
             "DataDirectory".into(),
             serde_json::to_value(data).map_err(|error| error.to_string())?,
@@ -257,11 +254,8 @@ pub fn installed_chat(arguments: &[OsString]) -> crate::Result<Value> {
         }
     }
     if !options.contains_key("DataDirectory") {
-        let data = PathBuf::from(
-            std::env::var_os("LOCALAPPDATA")
-                .ok_or("Supply --data-directory or set LOCALAPPDATA.")?,
-        )
-        .join("SwiftBonsai2");
+        let data = crate::data_dir::default_data_directory()
+            .map_err(|_| "Supply --data-directory or set LOCALAPPDATA.".to_owned())?;
         options.insert(
             "DataDirectory".into(),
             serde_json::to_value(data).map_err(|error| error.to_string())?,
@@ -561,6 +555,30 @@ mod tests {
         let inside_git = repo.join("request.json");
         std::fs::write(&inside_git, b"{}").map_err(|error| error.to_string())?;
         assert!(file_request(&inside_git, 64).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn default_data_directory_uses_snapdragon_bonsai_when_omitted() -> crate::Result<()> {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            let expected = serde_json::to_value(
+                PathBuf::from(local_app_data).join(crate::data_dir::DEFAULT_DIR_NAME),
+            )
+            .map_err(|error| error.to_string())?;
+            let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("Missing repository root.")?;
+            let chat_request = chat(&[
+                "--repository-root".into(),
+                repo_root.as_os_str().to_os_string(),
+            ])?;
+            assert_eq!(chat_request["DataDirectory"], expected);
+            let installed_root = std::env::temp_dir().join("Bonsai default installed dir");
+            let installed_request =
+                installed_chat(&["--installation-directory".into(), installed_root.into()])?;
+            assert_eq!(installed_request["options"]["DataDirectory"], expected);
+        }
         Ok(())
     }
 }

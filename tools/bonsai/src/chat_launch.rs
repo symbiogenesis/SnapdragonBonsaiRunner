@@ -1733,16 +1733,32 @@ pub fn run(value: Value) -> crate::Result<Value> {
     let _instance = if request.speech_models_only {
         None
     } else {
-        let directory = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .ok_or("LOCALAPPDATA is required for native chat admission.")?
-            .join("SwiftBonsai2");
-        let Some(guard) = instance::acquire(&directory)? else {
+        let default_directory = crate::data_dir::default_data_directory()
+            .map_err(|_| "LOCALAPPDATA is required for native chat admission.".to_owned())?;
+        let Some(guard) = instance::acquire(&default_directory)? else {
             return Ok(json!({
                 "Status": "already-running",
-                "Message": "Swift Bonsai 2 is already starting or running. No second instance was opened."
+                "Message": "Snapdragon Bonsai is already starting or running. No second instance was opened."
             }));
         };
+        if crate::data_dir::is_default_data_directory(&request.data_directory, &default_directory)
+            && let Some(legacy_directory) = crate::data_dir::legacy_data_directory()
+            && crate::data_dir::legacy_dir_exists(&legacy_directory)?
+        {
+            let Some(legacy_guard) = instance::acquire(&legacy_directory)? else {
+                return Ok(json!({
+                    "Status": "already-running",
+                    "Message": "Snapdragon Bonsai is already starting or running. No second instance was opened."
+                }));
+            };
+            let exe = std::env::current_exe().ok();
+            crate::data_dir::migrate_directory_with_lock_release(
+                &legacy_directory,
+                &default_directory,
+                exe.as_deref(),
+                || drop(legacy_guard),
+            )?;
+        }
         Some(guard)
     };
     let plan = prepare_for_host(

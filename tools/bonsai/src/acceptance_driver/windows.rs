@@ -413,7 +413,7 @@ fn ptq1() -> crate::Result<Value> {
         if !["1", "4"].contains(&row_workers.as_str()) {
             return Err("Select one exact Rust capture row-worker count.".into());
         }
-        let request = json!({"operation":"capture","kind":"ptq1","repositoryDirectory":required("GITHUB_WORKSPACE")?,"captureMode":capture_mode,"dataDirectory":PathBuf::from(required("LOCALAPPDATA")?).join("SwiftBonsai2"),"captureToolsDirectory":temporary.join("SwiftBonsai-Ptq1CaptureTools"),"workBudgetSeconds":bridge.case_seconds,"workDeadlineTick":bridge.work_deadline,"rustBackend":required("BONSAI_PTQ1_RUST_BACKEND")?,"rowWorkers":row_workers.parse::<u64>().map_err(|_|"Invalid row-worker count.")?,"adapterCondition":required("BONSAI_PTQ1_ADAPTER_CONDITION")?});
+        let request = json!({"operation":"capture","kind":"ptq1","repositoryDirectory":required("GITHUB_WORKSPACE")?,"captureMode":capture_mode,"dataDirectory":crate::data_dir::default_data_directory().map_err(|_| "Required owner environment is missing: LOCALAPPDATA")?,"captureToolsDirectory":temporary.join("SwiftBonsai-Ptq1CaptureTools"),"workBudgetSeconds":bridge.case_seconds,"workDeadlineTick":bridge.work_deadline,"rustBackend":required("BONSAI_PTQ1_RUST_BACKEND")?,"rowWorkers":row_workers.parse::<u64>().map_err(|_|"Invalid row-worker count.")?,"adapterCondition":required("BONSAI_PTQ1_ADAPTER_CONDITION")?});
         // The child's existing typed planner validates all capture controls before
         // any model work. Its caller identity is this retained native supervisor.
         crate::native_qualification::run(

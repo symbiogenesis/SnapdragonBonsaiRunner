@@ -271,11 +271,9 @@ pub fn current_is_bundled() -> crate::Result<bool> {
 pub(crate) fn update_identity() -> crate::Result<(PathBuf, String)> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let (_, digest) = archive(&executable)?;
-    let root = PathBuf::from(
-        std::env::var_os("LOCALAPPDATA").ok_or("Bundled chat requires LOCALAPPDATA.")?,
-    )
-    .join("SwiftBonsai2/application-bundles")
-    .join(&digest[..24]);
+    let root = crate::data_dir::default_subpath("application-bundles")
+        .map_err(|_| "Bundled chat requires LOCALAPPDATA.".to_owned())?
+        .join(&digest[..24]);
     Ok((root, digest))
 }
 
@@ -292,11 +290,9 @@ pub fn launch(arguments: &[OsString]) -> crate::Result<Value> {
     }
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let (_, digest) = archive(&executable)?;
-    let installation = PathBuf::from(
-        std::env::var_os("LOCALAPPDATA").ok_or("Bundled chat requires LOCALAPPDATA.")?,
-    )
-    .join("SwiftBonsai2/application-bundles")
-    .join(&digest[..24]);
+    let installation = crate::data_dir::default_subpath("application-bundles")
+        .map_err(|_| "Bundled chat requires LOCALAPPDATA.".to_owned())?
+        .join(&digest[..24]);
     let mut options = vec![
         OsString::from("--installation-directory"),
         installation.clone().into_os_string(),

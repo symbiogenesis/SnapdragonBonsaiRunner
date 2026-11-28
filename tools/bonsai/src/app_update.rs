@@ -127,10 +127,8 @@ fn installation(root: &Path, require_current_exe: bool) -> crate::Result<Value> 
 }
 
 fn cache_root() -> crate::Result<PathBuf> {
-    let root = PathBuf::from(
-        std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is required for updates.")?,
-    )
-    .join("SwiftBonsai2/updates");
+    let root = crate::data_dir::default_subpath("updates")
+        .map_err(|_| "LOCALAPPDATA is required for updates.".to_owned())?;
     external(&root)?;
     fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     external(&root)?;
@@ -142,6 +140,38 @@ fn staged(version: &str) -> crate::Result<PathBuf> {
     let directory = cache_root()?.join(version);
     external(&directory)?;
     Ok(directory)
+}
+
+fn staged_for_replacement_in(
+    current_updates: &Path,
+    legacy_updates: Option<&Path>,
+    version: &str,
+) -> crate::Result<Option<PathBuf>> {
+    Version::parse(version)?;
+    let current = current_updates.join(version);
+    if external(&current).is_ok() && current.join("verified-release.json").is_file() {
+        return Ok(Some(current));
+    }
+    if let Some(legacy_updates) = legacy_updates {
+        let legacy = legacy_updates.join(version);
+        if external(&legacy).is_ok() && legacy.join("verified-release.json").is_file() {
+            return Ok(Some(legacy));
+        }
+    }
+    Ok(None)
+}
+
+fn staged_for_replacement(version: &str) -> crate::Result<PathBuf> {
+    Version::parse(version)?;
+    let current_updates = crate::data_dir::default_subpath("updates")
+        .map_err(|_| "LOCALAPPDATA is required for updates.".to_owned())?;
+    let legacy_updates = crate::data_dir::legacy_subpath("updates");
+    if let Some(existing) =
+        staged_for_replacement_in(&current_updates, legacy_updates.as_deref(), version)?
+    {
+        return Ok(existing);
+    }
+    staged(version)
 }
 
 fn discover(working: &Path) -> crate::Result<(bool, Option<Candidate>)> {

@@ -279,7 +279,7 @@ pub(super) fn replace(request: &Replacement) -> crate::Result<Value> {
         &mut crate::startup_cancel::checkpoint,
     )?;
     validate_restart_arguments(request)?;
-    let directory = super::staged(&request.version)?;
+    let directory = super::staged_for_replacement(&request.version)?;
     let _lock = crate::startup_cache::lock_file(&directory.join("update.lock"))?;
     let candidate = super::published_portable_release(&request.version, &directory)?;
     let published = super::verified_portable_release(&candidate, &directory)?;

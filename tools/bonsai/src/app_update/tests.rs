@@ -403,3 +403,42 @@ fn release_catalog_requires_complete_pages_and_retains_later_newest_release() ->
     );
     Ok(())
 }
+
+#[test]
+fn replacement_stage_lookup_prefers_current_dir_and_falls_back_to_legacy_updates()
+-> crate::Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "Bonsai-Replace-Stage-{}",
+        crate::startup_process::unique()
+    ));
+    external(&root)?;
+    let current_updates = root.join("SnapdragonBonsai/updates");
+    let legacy_updates = root.join("SwiftBonsai2/updates");
+    let version = Version::parse(env!("CARGO_PKG_VERSION"))?.next_for_test()?;
+    let current_ver = current_updates.join(&version);
+    let legacy_ver = legacy_updates.join(&version);
+    fs::create_dir_all(&current_ver).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&legacy_ver).map_err(|error| error.to_string())?;
+
+    assert!(staged_for_replacement_in(&current_updates, Some(&legacy_updates), "invalid").is_err());
+    assert_eq!(
+        staged_for_replacement_in(&current_updates, Some(&legacy_updates), &version)?,
+        None
+    );
+
+    fs::write(legacy_ver.join("verified-release.json"), b"{}")
+        .map_err(|error| error.to_string())?;
+    assert_eq!(
+        staged_for_replacement_in(&current_updates, Some(&legacy_updates), &version)?,
+        Some(legacy_ver.clone())
+    );
+
+    fs::write(current_ver.join("verified-release.json"), b"{}")
+        .map_err(|error| error.to_string())?;
+    assert_eq!(
+        staged_for_replacement_in(&current_updates, Some(&legacy_updates), &version)?,
+        Some(current_ver)
+    );
+
+    crate::fs_guard::remove_dir_all_with_retry(&root).map_err(|error| error.to_string())
+}

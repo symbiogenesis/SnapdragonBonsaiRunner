@@ -575,8 +575,7 @@ fn capture_arms(
     for role in ["baseline", "candidate"] {
         context.tool("artifact",&json!({"operation":"arm64","path":member(packet_root,&packet["arms"][role]["executable"]["path"])?}),2,100)?;
     }
-    let data = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("Missing LOCALAPPDATA.")?)
-        .join("SwiftBonsai2");
+    let data = crate::data_dir::default_data_directory().map_err(|_| "Missing LOCALAPPDATA.")?;
     let plan=context.tool("cpu-check-plan",&json!({"operation":"plan","dataDirectory":data,"profile":"swift-pq2-assessment","useAbliterateLora":true,"useRepackedPtq1":false}),5,100)?;
     subset(
         &plan["Policy"],

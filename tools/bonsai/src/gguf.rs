@@ -199,9 +199,7 @@ fn resolve(explicit: Option<PathBuf>, data: Option<PathBuf>) -> crate::Result<To
     }
     let data = data
         .or_else(|| std::env::var_os("BONSAI_DATA_DIRECTORY").map(PathBuf::from))
-        .or_else(|| {
-            std::env::var_os("LOCALAPPDATA").map(|path| PathBuf::from(path).join("SwiftBonsai2"))
-        })
+        .or_else(|| crate::data_dir::default_data_directory().ok())
         .ok_or("Select dataDirectory or an explicit GGUF executable.")?;
     external(&data)?;
     let runtime = pin(INFERENCE)?;
