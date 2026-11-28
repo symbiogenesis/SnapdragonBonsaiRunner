@@ -1024,18 +1024,17 @@ fn apply_portable_after_exit(handoff: &Path, value: Value) -> crate::Result<Valu
                 .map_err(|_| "Portable restart arguments must be Unicode.".to_owned())
         })
         .collect::<crate::Result<Vec<_>>>()?;
-    let mut request = json!({"operation": "replace-portable", "target": target,
-        "previousSha256": previous_sha256, "version": queued.version, "arguments": arguments,
-        "releaseIdentity": queued.release_identity, "restart": queued.restart});
-    #[cfg(windows)]
-    if let Ok(creation) = bonsai_windows_process::current_process_creation_time() {
-        request["launcherPid"] = std::process::id().into();
-        request["launcherCreationTimeFileTime"] = creation.into();
-    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
         use std::process::{Command, Stdio};
+        let mut request = json!({"operation": "replace-portable", "target": target,
+            "previousSha256": previous_sha256, "version": queued.version, "arguments": arguments,
+            "releaseIdentity": queued.release_identity, "restart": queued.restart});
+        if let Ok(creation) = bonsai_windows_process::current_process_creation_time() {
+            request["launcherPid"] = std::process::id().into();
+            request["launcherCreationTimeFileTime"] = creation.into();
+        }
         // Owned UI, model and speech jobs have stopped. Only this fixed helper
         // outlives the launcher, briefly, to replace its locked executable.
         fs::remove_file(handoff).map_err(|error| error.to_string())?;
@@ -1058,7 +1057,14 @@ fn apply_portable_after_exit(handoff: &Path, value: Value) -> crate::Result<Valu
     }
     #[cfg(not(windows))]
     {
-        let _ = (immutable, request, handoff, stage_lock);
+        let _ = (
+            immutable,
+            target,
+            previous_sha256,
+            arguments,
+            handoff,
+            stage_lock,
+        );
         Err("Portable replacement requires Windows.".into())
     }
 }

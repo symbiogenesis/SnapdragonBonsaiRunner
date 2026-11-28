@@ -34,8 +34,22 @@ pub(super) struct Replacement {
     pub(super) restart: bool,
     // Newer launchers pass their process identity so replacement waits cleanly
     // for handle exit instead of polling blindly against sharing violations.
+    #[cfg_attr(
+        not(windows),
+        allow(
+            dead_code,
+            reason = "Deserialized for wire compatibility; parent-process wait runs only on Windows."
+        )
+    )]
     #[serde(default)]
     pub(super) launcher_pid: Option<u32>,
+    #[cfg_attr(
+        not(windows),
+        allow(
+            dead_code,
+            reason = "Deserialized for wire compatibility; parent-process wait runs only on Windows."
+        )
+    )]
     #[serde(default)]
     pub(super) launcher_creation_time_file_time: Option<u64>,
 }
@@ -202,24 +216,27 @@ fn copy_and_replace(
     })();
     let result = copied.and_then(|()| {
         destination.rewind().map_err(|error| error.to_string())?;
-        let mut stopped = None;
         #[cfg(windows)]
-        let mapped = bonsai_windows_credentials::try_hash_locked_file_mapped(
-            &destination,
-            asset.bytes,
-            &mut || {
-                checkpoint().map_err(|error| {
-                    stopped = Some(error);
-                    io::Error::new(io::ErrorKind::Interrupted, "cancelled")
-                })
-            },
-            |error| error,
-        );
+        let mapped = {
+            let mut stopped = None;
+            let mapped = bonsai_windows_credentials::try_hash_locked_file_mapped(
+                &destination,
+                asset.bytes,
+                &mut || {
+                    checkpoint().map_err(|error| {
+                        stopped = Some(error);
+                        io::Error::new(io::ErrorKind::Interrupted, "cancelled")
+                    })
+                },
+                |error| error,
+            );
+            if let Some(error) = stopped {
+                return Err(error);
+            }
+            mapped
+        };
         #[cfg(not(windows))]
         let mapped: io::Result<Option<[u8; 32]>> = Ok(None);
-        if let Some(error) = stopped {
-            return Err(error);
-        }
         let actual_sha256 = match mapped {
             Ok(Some(digest)) => crate::identity::hex(&digest),
             Ok(None) => {
