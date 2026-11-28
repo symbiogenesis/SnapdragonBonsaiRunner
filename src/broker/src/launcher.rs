@@ -2641,7 +2641,10 @@ async fn wait_ready_models(
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<Vec<u8>, LaunchError> {
     run_startup_with_timeout(shutdown, async {
+        #[cfg(not(test))]
         const READINESS_POLL_BACKOFF_MS: [u64; 4] = [5, 10, 20, 50];
+        #[cfg(test)]
+        const READINESS_POLL_BACKOFF_MS: [u64; 4] = [1, 2, 5, 10];
         let mut poll_step = 0_usize;
         loop {
             guard.check()?;

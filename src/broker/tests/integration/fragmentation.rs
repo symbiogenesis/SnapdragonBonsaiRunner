@@ -380,44 +380,71 @@ fn assert_success_with(
 
 #[test]
 fn every_single_wire_split_preserves_the_complete_count_and_generation_pipeline() {
-    run(async {
-        let policy = chat_policy();
-        let expected_auth = format!("Authorization: Bearer {BACKEND_KEY}\r\n");
-        let requests = [request(false), request(true)];
-        let count_responses = [response(COUNT, false, false), response(COUNT, false, true)];
-        let generation_responses = [
-            [response(JSON, false, false), response(JSON, false, true)],
-            [response(SSE, true, false), response(SSE, true, true)],
-        ];
-        // Vary one endpoint at a time: linear coverage of every boundary instead
-        // of a redundant Cartesian product. Both framing modes get controls.
+    let policy = chat_policy();
+    let expected_auth = format!("Authorization: Bearer {BACKEND_KEY}\r\n");
+    let requests = [request(false), request(true)];
+    let count_responses = [response(COUNT, false, false), response(COUNT, false, true)];
+    let generation_responses = [
+        [response(JSON, false, false), response(JSON, false, true)],
+        [response(SSE, true, false), response(SSE, true, true)],
+    ];
+    // Vary one endpoint at a time: linear coverage of every boundary instead
+    // of a redundant Cartesian product. Both framing modes get controls.
+    let outcomes = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(12);
         for streaming in [false, true] {
             let req = &requests[usize::from(streaming)];
-            let mut expected_body: Option<Vec<u8>> = None;
             for chunked in [false, true] {
                 let count_resp = &count_responses[usize::from(chunked)];
                 let gen_resp = &generation_responses[usize::from(streaming)][usize::from(chunked)];
                 let lengths = [req.len(), count_resp.len(), gen_resp.len()];
                 for (endpoint, length) in lengths.into_iter().enumerate() {
-                    for boundary in 1..length {
-                        let mut exchange =
-                            Exchange::with_wires(req.clone(), count_resp.clone(), gen_resp.clone());
-                        exchange.split(endpoint, boundary);
-                        let outcome = exchange.finish_with_policy(&policy).await;
-                        let body = assert_success_with(
-                            &outcome,
-                            streaming,
-                            &expected_auth,
-                            expected_body.as_deref(),
-                        );
-                        if expected_body.is_none() {
-                            expected_body = Some(body);
-                        }
-                    }
+                    let policy = &policy;
+                    let expected_auth = &expected_auth;
+                    handles.push(scope.spawn(move || {
+                        let mut expected_body: Option<Vec<u8>> = None;
+                        run(async {
+                            for boundary in 1..length {
+                                let mut exchange = Exchange::with_wires(
+                                    req.clone(),
+                                    count_resp.clone(),
+                                    gen_resp.clone(),
+                                );
+                                exchange.split(endpoint, boundary);
+                                let outcome = exchange.finish_with_policy(policy).await;
+                                let body = assert_success_with(
+                                    &outcome,
+                                    streaming,
+                                    expected_auth,
+                                    expected_body.as_deref(),
+                                );
+                                if expected_body.is_none() {
+                                    expected_body = Some(body);
+                                }
+                            }
+                        });
+                        (streaming, expected_body.unwrap())
+                    }));
                 }
             }
         }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
     });
+    for streaming in [false, true] {
+        let mut expected: Option<&[u8]> = None;
+        for (arm_streaming, body) in &outcomes {
+            if *arm_streaming == streaming {
+                if let Some(first) = expected {
+                    assert_eq!(body.as_slice(), first);
+                } else {
+                    expected = Some(body.as_slice());
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -438,98 +465,160 @@ fn cooperative_one_byte_reads_and_writes_preserve_utf8_and_terminal_framing() {
 
 #[test]
 fn every_truncated_count_prefix_reports_stage_without_generation() {
-    run(async {
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
         for chunked in [false, true] {
             let reply = response(COUNT, false, chunked);
-            for end in 0..reply.len() {
-                let outcome = Exchange::with_replies(
-                    false,
-                    reply[..end].to_vec(),
-                    response(JSON, false, chunked),
-                )
-                .finish()
-                .await;
-                let expected = if end < parts(&reply).0.len() {
-                    BackendError::WireSyntax
-                } else {
-                    BackendError::Body
-                };
-                assert_eq!(outcome.result, Err(ServeError::Backend(expected)));
-                assert_eq!(outcome.calls, 1);
-                assert_stage_failure(
-                    &outcome.states[0].borrow().written,
-                    "backend_token_count_failed",
-                );
-                assert_eq!(outcome.states[2].borrow().written, [0_u8; 0]);
-                assert_eq!(outcome.states[2].borrow().read_polls, 0);
+            let gen_reply = response(JSON, false, chunked);
+            let chunk_size = reply.len().div_ceil(4).max(1);
+            for start in (0..reply.len()).step_by(chunk_size) {
+                let end_limit = (start + chunk_size).min(reply.len());
+                let reply = reply.clone();
+                let gen_reply = gen_reply.clone();
+                handles.push(scope.spawn(move || {
+                    run(async {
+                        let header_len = parts(&reply).0.len();
+                        for end in start..end_limit {
+                            let outcome = Exchange::with_replies(
+                                false,
+                                reply[..end].to_vec(),
+                                gen_reply.clone(),
+                            )
+                            .finish()
+                            .await;
+                            let expected = if end < header_len {
+                                BackendError::WireSyntax
+                            } else {
+                                BackendError::Body
+                            };
+                            assert_eq!(outcome.result, Err(ServeError::Backend(expected)));
+                            assert_eq!(outcome.calls, 1);
+                            assert_stage_failure(
+                                &outcome.states[0].borrow().written,
+                                "backend_token_count_failed",
+                            );
+                            assert_eq!(outcome.states[2].borrow().written, [0_u8; 0]);
+                            assert_eq!(outcome.states[2].borrow().read_polls, 0);
+                        }
+                    });
+                }));
             }
-            assert_success(&Exchange::new(false, chunked).finish().await, false);
+            handles.push(scope.spawn(move || {
+                run(async {
+                    assert_success(&Exchange::new(false, chunked).finish().await, false);
+                });
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
         }
     });
 }
 
 #[test]
 fn every_truncated_json_reply_rejects_before_forwarding_backend_payload() {
-    run(async {
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
         for chunked in [false, true] {
+            let count_reply = response(COUNT, false, chunked);
             let reply = response(JSON, false, chunked);
-            for end in 0..reply.len() {
-                let outcome = Exchange::with_replies(
-                    false,
-                    response(COUNT, false, chunked),
-                    reply[..end].to_vec(),
-                )
-                .finish()
-                .await;
-                let expected = if end < parts(&reply).0.len() {
-                    ServeError::Backend(BackendError::WireSyntax)
-                } else {
-                    ServeError::Response(ResponseError::BackendIo)
-                };
-                assert_eq!(outcome.result, Err(expected));
-                assert_eq!(outcome.calls, 2);
-                let client = outcome.states[0].borrow();
-                if end < parts(&reply).0.len() {
-                    assert_stage_failure(&client.written, "backend_generation_failed");
-                } else {
-                    assert_eq!(client.written, [0_u8; 0]);
-                }
+            let chunk_size = reply.len().div_ceil(4).max(1);
+            for start in (0..reply.len()).step_by(chunk_size) {
+                let end_limit = (start + chunk_size).min(reply.len());
+                let count_reply = count_reply.clone();
+                let reply = reply.clone();
+                handles.push(scope.spawn(move || {
+                    run(async {
+                        let header_len = parts(&reply).0.len();
+                        for end in start..end_limit {
+                            let outcome = Exchange::with_replies(
+                                false,
+                                count_reply.clone(),
+                                reply[..end].to_vec(),
+                            )
+                            .finish()
+                            .await;
+                            let expected = if end < header_len {
+                                ServeError::Backend(BackendError::WireSyntax)
+                            } else {
+                                ServeError::Response(ResponseError::BackendIo)
+                            };
+                            assert_eq!(outcome.result, Err(expected));
+                            assert_eq!(outcome.calls, 2);
+                            let client = outcome.states[0].borrow();
+                            if end < header_len {
+                                assert_stage_failure(&client.written, "backend_generation_failed");
+                            } else {
+                                assert_eq!(client.written, [0_u8; 0]);
+                            }
+                        }
+                    });
+                }));
             }
-            assert_success(&Exchange::new(false, chunked).finish().await, false);
+            handles.push(scope.spawn(move || {
+                run(async {
+                    assert_success(&Exchange::new(false, chunked).finish().await, false);
+                });
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
         }
     });
 }
 
 #[test]
 fn every_truncated_sse_reply_omits_successful_downstream_terminal_framing() {
-    run(async {
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
         for chunked in [false, true] {
+            let count_reply = response(COUNT, false, chunked);
             let reply = response(SSE, true, chunked);
-            for end in 0..reply.len() {
-                let outcome = Exchange::with_replies(
-                    true,
-                    response(COUNT, false, chunked),
-                    reply[..end].to_vec(),
-                )
-                .finish()
-                .await;
-                let head_complete = end >= parts(&reply).0.len();
-                let expected = if head_complete {
-                    ServeError::Response(ResponseError::BackendIo)
-                } else {
-                    ServeError::Backend(BackendError::WireSyntax)
-                };
-                assert_eq!(outcome.result, Err(expected));
-                assert_eq!(outcome.calls, 2);
-                let client = outcome.states[0].borrow();
-                if head_complete {
-                    assert!(!parts(&client.written).1.ends_with(b"0\r\n\r\n"));
-                } else {
-                    assert_stage_failure(&client.written, "backend_generation_failed");
-                }
+            let chunk_size = reply.len().div_ceil(4).max(1);
+            for start in (0..reply.len()).step_by(chunk_size) {
+                let end_limit = (start + chunk_size).min(reply.len());
+                let count_reply = count_reply.clone();
+                let reply = reply.clone();
+                handles.push(scope.spawn(move || {
+                    run(async {
+                        let header_len = parts(&reply).0.len();
+                        for end in start..end_limit {
+                            let outcome = Exchange::with_replies(
+                                true,
+                                count_reply.clone(),
+                                reply[..end].to_vec(),
+                            )
+                            .finish()
+                            .await;
+                            let head_complete = end >= header_len;
+                            let expected = if head_complete {
+                                ServeError::Response(ResponseError::BackendIo)
+                            } else {
+                                ServeError::Backend(BackendError::WireSyntax)
+                            };
+                            assert_eq!(outcome.result, Err(expected));
+                            assert_eq!(outcome.calls, 2);
+                            let client = outcome.states[0].borrow();
+                            if head_complete {
+                                assert!(!parts(&client.written).1.ends_with(b"0\r\n\r\n"));
+                            } else {
+                                assert_stage_failure(&client.written, "backend_generation_failed");
+                            }
+                        }
+                    });
+                }));
             }
-            assert_success(&Exchange::new(true, chunked).finish().await, true);
+            handles.push(scope.spawn(move || {
+                run(async {
+                    assert_success(&Exchange::new(true, chunked).finish().await, true);
+                });
+            }));
         }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+    run(async {
         // Retain the raw three-byte, one-byte-read regression as well as the
         // complete SSE prefix sweep: an input without [DONE] cannot invent it.
         let exchange = Exchange::with_replies(

@@ -402,8 +402,7 @@ fn fully_received_policy_rejections_report_canonical_size_and_invalid_requests()
     });
 }
 
-#[test]
-fn backend_failures_before_response_report_counting_or_generation_stage() {
+fn run_backend_failure_cases() {
     run(async {
         let private = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 18\r\n\r\nprivate diagnostic";
         for (streams, calls, error, code) in [
@@ -467,30 +466,14 @@ fn backend_failures_before_response_report_counting_or_generation_stage() {
 }
 
 #[test]
-fn backend_failure_diagnostics_preserve_stage_and_redact_private_values() {
-    use std::process::{Command, Stdio};
+fn backend_failures_before_response_report_counting_or_generation_stage() {
+    run_backend_failure_cases();
+}
 
-    // Direct writes to stderr bypass libtest's capture. Replay only the named,
-    // already bounded in-memory fixture in a child; no environment mutation or
-    // recursive invocation of this test is needed.
-    let child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "supervisor::backend_failures_before_response_report_counting_or_generation_stage",
-            "--nocapture",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let output = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let stderr = String::from_utf8(output.stderr).unwrap();
+#[test]
+fn backend_failure_diagnostics_preserve_stage_and_redact_private_values() {
+    let ((), stderr) =
+        bonsai_broker::supervisor::capture_backend_failures(run_backend_failure_cases);
     let observed = stderr
         .lines()
         .map(|line| {

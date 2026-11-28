@@ -199,18 +199,58 @@ where
     result
 }
 
+fn write_backend_failure(
+    writer: &mut impl std::io::Write,
+    stage: &str,
+    error: BackendError,
+    started: Instant,
+) {
+    let _recorded = writeln!(
+        writer,
+        "Local model request failed: stage={stage}, error={error:?}, elapsed_ms={}.",
+        started.elapsed().as_millis()
+    );
+}
+
+std::thread_local! {
+    static FAILURE_CAPTURE: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Captures redacted backend failure diagnostics emitted on the current thread during `work`.
+pub fn capture_backend_failures<R>(work: impl FnOnce() -> R) -> (R, String) {
+    struct Restore(Option<Vec<u8>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FAILURE_CAPTURE.with_borrow_mut(|slot| {
+                *slot = self.0.take();
+            });
+        }
+    }
+
+    let prior = FAILURE_CAPTURE.with_borrow_mut(|slot| slot.replace(Vec::new()));
+    let _restore = Restore(prior);
+    let output = work();
+    let captured = FAILURE_CAPTURE.with_borrow_mut(|slot| slot.take().unwrap_or_default());
+    let text = String::from_utf8_lossy(&captured).into_owned();
+    (output, text)
+}
+
 // Retain the failure category before a client write or teardown can obscure it.
 // BackendError contains only fixed classifications, never upstream bytes,
 // prompts, credentials or native I/O messages. Expected context rejection is
 // handled above without recording a model failure.
 fn note_backend_failure(stage: &str, error: BackendError, started: Instant) {
-    use std::io::Write as _;
-
-    let _recorded = writeln!(
-        std::io::stderr().lock(),
-        "Local model request failed: stage={stage}, error={error:?}, elapsed_ms={}.",
-        started.elapsed().as_millis()
-    );
+    let handled = FAILURE_CAPTURE.with_borrow_mut(|slot| {
+        if let Some(buffer) = slot.as_mut() {
+            write_backend_failure(buffer, stage, error, started);
+            true
+        } else {
+            false
+        }
+    });
+    if !handled {
+        write_backend_failure(&mut std::io::stderr().lock(), stage, error, started);
+    }
 }
 
 async fn receive_admitted<C>(

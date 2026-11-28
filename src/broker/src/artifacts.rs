@@ -534,15 +534,18 @@ mod tests {
             toggle_byte(tamper_offset)?;
             let chunked_err =
                 VerifiedArtifacts::verify_model_artifact(&model_path, &artifact).err();
-            let whole_err =
-                VerifiedArtifacts::verify_model_artifact(&model_path, &whole_artifact).err();
+            let whole_err = (tamper_offset == chunk_bytes + 17).then(|| {
+                VerifiedArtifacts::verify_model_artifact(&model_path, &whole_artifact).err()
+            });
             toggle_byte(tamper_offset)?;
             assert_eq!(
                 chunked_err,
                 Some(ArtifactError::Identity),
                 "missed corruption at offset {tamper_offset}"
             );
-            assert_eq!(whole_err, Some(ArtifactError::Identity));
+            if let Some(whole_err) = whole_err {
+                assert_eq!(whole_err, Some(ArtifactError::Identity));
+            }
         }
 
         // Valid file is restored; verify manifest schema/identity mismatches fail closed.

@@ -2183,12 +2183,16 @@ mod tests {
     #[test]
     fn thread_completion_wait_exited_times_out_cleanly_and_wakes_on_exit_guard_drop() {
         let completion = ThreadCompletion::new();
-        assert!(!completion.wait_exited(Duration::from_millis(10)));
+        assert!(!completion.wait_exited(Duration::from_millis(1)));
         let wake_completion = Arc::clone(&completion);
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let worker_started = Arc::clone(&started);
         let handle = std::thread::spawn(move || {
             let _guard = ExitGuard(wake_completion);
-            std::thread::sleep(Duration::from_millis(5));
+            worker_started.wait();
+            std::thread::sleep(Duration::from_millis(1));
         });
+        started.wait();
         assert!(completion.wait_exited(Duration::from_secs(2)));
         let _ = handle.join();
     }
