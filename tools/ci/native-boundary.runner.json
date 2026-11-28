@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "checked-in-native-retirement-boundary",
   "repository": "runner",
-  "sourceRevision": "397a295ed29c39858bf3187089cddbce23780d28",
+  "sourceRevision": "9ff2bcaea6f576c566196bc452ea34c65868b947",
   "exclusions": [
     {
       "path": ".git",
@@ -99,14 +99,14 @@
     },
     {
       "path": "Cargo.lock",
-      "bytes": 132253,
-      "sha256": "bc0c80fefa21a9d47821e8cc5bae11e4656dcecd382a9636c28cd198d7cc256e",
+      "bytes": 137676,
+      "sha256": "42ba5afad6dea8a43b313616e0072c97d7edb1969c429cb1909cf9dd43074b7a",
       "family": "native-asr"
     },
     {
       "path": "Cargo.toml",
-      "bytes": 5670,
-      "sha256": "63526555bb7797ca1e71d0de68205dae268ba3a6ecd84da55bce7eee38d7cf78",
+      "bytes": 5671,
+      "sha256": "acaaa0518d9658996f3311053ec6007c21c3b91ea6848ca43ce5a9b7648d4e4e",
       "family": "msvc-unwind"
     },
     {
