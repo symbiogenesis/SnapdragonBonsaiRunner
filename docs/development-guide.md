@@ -282,15 +282,19 @@ recovery and model history keep the original response bytes.
 **Continue response** and **Retry response** appear directly beneath an identified
 interrupted or reply-length-capped answer, and **Retry response** appears beneath
 an identified unanswered prompt (**Continue response** stays on the latest
-incomplete answer in context). When a visible reply reaches the selected output cap
-and the broker-reported context window has estimated capacity for a continuation and
-reply reservation, Swift automatically sends that continuation turn without raising a
-model alert, preserving your draft, cursor and active read-aloud stream. If the
-context window lacks room (or an unanswered automatic continuation is stopped or
-rejected for capacity), the capped turn settles cleanly with **Continue response**
-and **Retry response** available on its card. The original prompt can also remain in
-the composer for editing; these controls preserve whatever
-is currently in the composer. An unanswered prompt keeps its existing card when
+incomplete answer in context). When a standard (non-Extra-effort) reply reaches the
+selected output cap and **Auto-continue long responses** is enabled (default on in
+**Settings → Response → Advanced response controls**), Swift seamlessly continues
+within context capacity (up to 16 segments) inside one continuous message card without
+raising a model alert, preserving your draft, cursor and active read-aloud stream.
+The worker preserves KV/recurrent prefix reuse across segments (using a one-token
+thinking handoff when cognitive controls are active, or disabling thinking on publisher
+rollback), filters seam overlaps/preambles/redundant open fences, and adaptively
+clamps or steps down remaining token headroom. If the response settles at a context,
+segment, or repetition guard (or when auto-continue is disabled), the turn settles
+cleanly with **Continue response** and **Retry response** available on its card. The
+original prompt can also remain in the composer for editing; these controls preserve
+whatever is currently in the composer. An unanswered prompt keeps its existing card when
 retried. Starting a different message removes that prompt's retry control.
 During model preparation or teardown, message footer controls stay disabled. After confirmed
 teardown, the card first offers **Reload model**; reloading never sends a
@@ -317,7 +321,7 @@ closes the popup; Enter cannot send the background draft.
 | --- | --- |
 | **Thinking** | Off. Enables reasoning on the next response and every Extra effort pass. |
 | **Extra effort** | Off. Makes at most three sequential plan/draft/review calls. Stage labels and complete drafts stay visible; a truncated revision does not replace a complete draft. Quality gains remain unproven. |
-| **Reply length** | 4,096 reasoning-inclusive tokens. Advanced controls also offer 512/1,024/2,048, subject to exact context admission and the 64-token reserve. |
+| **Reply length** | 4,096 reasoning-inclusive tokens per segment. Advanced controls also offer 512/1,024/2,048, subject to exact context admission and the 64-token reserve, plus per-conversation **Auto-continue long responses** (on by default). |
 | **Adapter strength** | 1.3 for the pinned adapter; advanced controls offer 0–2 in 0.1 steps. Zero disables its correction for that response. Effects on quality remain experimental. |
 
 **Context:** estimates the next Send, including committed history and reasoning,
