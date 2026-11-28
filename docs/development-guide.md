@@ -282,15 +282,22 @@ recovery and model history keep the original response bytes.
 **Continue response** and **Retry response** appear directly beneath an identified
 interrupted or reply-length-capped answer, and **Retry response** appears beneath
 an identified unanswered prompt (**Continue response** stays on the latest
-incomplete answer in context). When a standard (non-Extra-effort) reply reaches the
-selected output cap and **Auto-continue long responses** is enabled (default on in
+incomplete answer in context). When a reply reaches the selected output cap and
+**Auto-continue long responses** is enabled (default on in
 **Settings → Response → Advanced response controls**), Swift seamlessly continues
-within context capacity (up to 16 segments) inside one continuous message card without
-raising a model alert, preserving your draft, cursor and active read-aloud stream.
-The worker preserves KV/recurrent prefix reuse across segments (using a one-token
-thinking handoff when cognitive controls are active, or disabling thinking on publisher
-rollback), filters seam overlaps/preambles/redundant open fences, and adaptively
-clamps or steps down remaining token headroom. If the response settles at a context,
+within context capacity (up to 32 segments and `768 KiB` stitched text) inside one
+continuous message card without raising a model alert, preserving your draft, cursor
+and active read-aloud stream. In **Extra effort**, Draft, Review, Draft A, and
+Synthesis stages also auto-continue while preserving stage status labels and initial
+confidence (Plan and speculative Draft B stay single-pass). The worker adapts its
+wire history to `PromptReuse`: keeping an append-only prefix when `PromptReuse` is
+enabled (with a one-token thinking handoff when cognitive controls are active, and
+automatic compaction near message/byte bounds), or coalescing segments into one
+stitched assistant turn with `enable_thinking = false` when `PromptReuse` is disabled.
+It preserves closing fences while stripping preambles, redundant opening fences,
+ellipses, and overlaps, inserts safe SVG/Markdown block separators, enforces a sticky
+context stepdown ceiling and multi-retry 429 backoff, and stops cleanly on
+degeneration, repetition, byte, or context limits. If the response settles at a context,
 segment, or repetition guard (or when auto-continue is disabled), the turn settles
 cleanly with **Continue response** and **Retry response** available on its card. The
 original prompt can also remain in the composer for editing; these controls preserve
