@@ -14,6 +14,14 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 pub(crate) fn replace(file: &File, target: &Path) -> io::Result<()> {
+    replace_with_retry_sleep(file, target, std::thread::sleep)
+}
+
+fn replace_with_retry_sleep(
+    file: &File,
+    target: &Path,
+    sleep: impl FnMut(std::time::Duration),
+) -> io::Result<()> {
     let mut name: Vec<_> = target.as_os_str().encode_wide().collect();
     if !target.is_absolute() || name.is_empty() || name.len() > 32_767 || name.contains(&0) {
         return Err(super::invalid(
@@ -53,25 +61,29 @@ pub(crate) fn replace(file: &File, target: &Path) -> io::Result<()> {
     unsafe { ptr::copy_nonoverlapping(name.as_ptr().cast::<u8>(), destination, encoded_bytes) };
     let required = u32::try_from(required)
         .map_err(|_| super::invalid("Replacement buffer exceeds Windows bounds."))?;
-    crate::retry_transient_win32(false, || {
-        // SAFETY: The borrowed File and aligned information buffer remain alive
-        // throughout this synchronous call. FileNameLength counts exactly the
-        // copied UTF-16 path bytes, excluding the explicit terminator; RootDirectory is null for the
-        // absolute path. Windows checks DELETE access and all sharing constraints.
-        if unsafe {
-            SetFileInformationByHandle(
-                file.as_raw_handle(),
-                FileRenameInfo,
-                information.as_ptr().cast(),
-                required,
-            )
-        } == 0
-        {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    })
+    crate::retry_transient_win32_with(
+        false,
+        || {
+            // SAFETY: The borrowed File and aligned information buffer remain alive
+            // throughout this synchronous call. FileNameLength counts exactly the
+            // copied UTF-16 path bytes, excluding the explicit terminator; RootDirectory is null for the
+            // absolute path. Windows checks DELETE access and all sharing constraints.
+            if unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    FileRenameInfo,
+                    information.as_ptr().cast(),
+                    required,
+                )
+            } == 0
+            {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+        sleep,
+    )
 }
 
 #[cfg(test)]
@@ -79,7 +91,7 @@ mod tests {
     use super::*;
     use std::fs::{self, OpenOptions};
     use std::os::windows::fs::OpenOptionsExt as _;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_SHARE_READ};
 
     #[test]
@@ -110,20 +122,21 @@ mod tests {
             )
             .open(&source_path)?;
 
-        // Hold an unshared lock on dest_path briefly so SetFileInformationByHandle hits ERROR_SHARING_VIOLATION then recovers.
-        let lock = OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(&dest_path)?;
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(15));
-            drop(lock);
-        });
-        replace(&source_file, &dest_path)?;
+        // Hold an unshared lock on dest_path so the first SetFileInformationByHandle hits
+        // ERROR_SHARING_VIOLATION, then release on retry backoff.
+        let mut lock = Some(
+            OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&dest_path)?,
+        );
+        let mut retries = 0_usize;
+        replace_with_retry_sleep(&source_file, &dest_path, |_| {
+            retries += 1;
+            drop(lock.take());
+        })?;
         drop(source_file);
-        releaser
-            .join()
-            .map_err(|_| io::Error::other("releaser panicked"))?;
+        assert_eq!(retries, 1);
         assert_eq!(fs::read(&dest_path)?, b"new-bytes");
         assert!(!source_path.exists());
         fs::remove_dir_all(&root)?;

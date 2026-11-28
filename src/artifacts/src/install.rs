@@ -158,6 +158,13 @@ fn stage_runtime_inner(
 }
 
 fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
+    remove_dir_all_with_retry_sleep(path, std::thread::sleep)
+}
+
+fn remove_dir_all_with_retry_sleep(
+    path: &Path,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> std::io::Result<()> {
     const MAX_ATTEMPTS: usize = 6;
     const BASE_DELAY_MS: u64 = 5;
     let mut attempt = 0_usize;
@@ -172,7 +179,7 @@ fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
                 let shift = u32::try_from(attempt).unwrap_or(u32::MAX);
                 let delay_ms =
                     BASE_DELAY_MS.saturating_mul(1_u64.checked_shl(shift).unwrap_or(u64::MAX));
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(160)));
+                sleep(std::time::Duration::from_millis(delay_ms.min(160)));
                 attempt += 1;
             }
             Err(error) => return Err(error),
@@ -260,7 +267,7 @@ fn extract<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn remove_dir_all_with_retry_recovers_from_transient_lock_and_fails_on_not_found()
@@ -286,18 +293,18 @@ mod tests {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt as _;
-            let locked = OpenOptions::new()
-                .read(true)
-                .share_mode(0)
-                .open(&locked_path)?;
-            let releaser = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(15));
-                drop(locked);
-            });
-            remove_dir_all_with_retry(&root)?;
-            releaser
-                .join()
-                .map_err(|_| std::io::Error::other("releaser panicked"))?;
+            let mut locked = Some(
+                OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .open(&locked_path)?,
+            );
+            let mut retries = 0_usize;
+            remove_dir_all_with_retry_sleep(&root, |_| {
+                retries += 1;
+                drop(locked.take());
+            })?;
+            assert_eq!(retries, 1);
             assert!(!root.exists());
         }
         #[cfg(not(windows))]

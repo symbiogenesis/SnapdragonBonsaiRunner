@@ -212,7 +212,16 @@ fn is_transient_win32_error(error: &io::Error, include_dir_not_empty: bool) -> b
 #[forbid(unsafe_code)]
 pub(crate) fn retry_transient_win32<T>(
     include_dir_not_empty: bool,
+    operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    retry_transient_win32_with(include_dir_not_empty, operation, std::thread::sleep)
+}
+
+#[forbid(unsafe_code)]
+pub(crate) fn retry_transient_win32_with<T>(
+    include_dir_not_empty: bool,
     mut operation: impl FnMut() -> io::Result<T>,
+    mut sleep: impl FnMut(Duration),
 ) -> io::Result<T> {
     const MAX_ATTEMPTS: usize = 6;
     const BASE_DELAY_MS: u64 = 5;
@@ -227,7 +236,7 @@ pub(crate) fn retry_transient_win32<T>(
                 let shift = u32::try_from(attempt).unwrap_or(u32::MAX);
                 let delay_ms =
                     BASE_DELAY_MS.saturating_mul(1_u64.checked_shl(shift).unwrap_or(u64::MAX));
-                std::thread::sleep(Duration::from_millis(delay_ms.min(160)));
+                sleep(Duration::from_millis(delay_ms.min(160)));
                 attempt += 1;
             }
             Err(error) => return Err(error),
@@ -2805,66 +2814,105 @@ mod maintenance_tests {
     fn retry_transient_win32_retries_transient_codes_and_stops_on_permanent() -> io::Result<()> {
         for code in [5, 32, 33] {
             let mut attempts = 0_usize;
-            let result = retry_transient_win32(false, || {
-                attempts += 1;
-                if attempts < 3 {
-                    Err(io::Error::from_raw_os_error(code))
-                } else {
-                    Ok(code)
-                }
-            })?;
+            let mut sleeps = Vec::new();
+            let result = retry_transient_win32_with(
+                false,
+                || {
+                    attempts += 1;
+                    if attempts < 3 {
+                        Err(io::Error::from_raw_os_error(code))
+                    } else {
+                        Ok(code)
+                    }
+                },
+                |delay| sleeps.push(delay),
+            )?;
             assert_eq!(result, code);
             assert_eq!(attempts, 3);
+            assert_eq!(
+                sleeps,
+                vec![Duration::from_millis(5), Duration::from_millis(10)]
+            );
         }
 
         let mut dir_attempts = 0_usize;
-        let dir_result = retry_transient_win32(true, || {
-            dir_attempts += 1;
-            if dir_attempts < 2 {
-                Err(io::Error::from_raw_os_error(145))
-            } else {
-                Ok(())
-            }
-        });
+        let mut dir_sleeps = Vec::new();
+        let dir_result = retry_transient_win32_with(
+            true,
+            || {
+                dir_attempts += 1;
+                if dir_attempts < 2 {
+                    Err(io::Error::from_raw_os_error(145))
+                } else {
+                    Ok(())
+                }
+            },
+            |delay| dir_sleeps.push(delay),
+        );
         assert!(dir_result.is_ok());
         assert_eq!(dir_attempts, 2);
+        assert_eq!(dir_sleeps, vec![Duration::from_millis(5)]);
 
         let mut file_145_attempts = 0_usize;
-        let file_145 = retry_transient_win32::<()>(false, || {
-            file_145_attempts += 1;
-            Err(io::Error::from_raw_os_error(145))
-        });
+        let file_145 = retry_transient_win32_with::<()>(
+            false,
+            || {
+                file_145_attempts += 1;
+                Err(io::Error::from_raw_os_error(145))
+            },
+            |_| {},
+        );
         assert!(file_145.is_err());
         assert_eq!(file_145_attempts, 1);
 
         let mut perm_attempts = 0_usize;
-        let perm = retry_transient_win32::<()>(true, || {
-            perm_attempts += 1;
-            Err(io::Error::from_raw_os_error(2))
-        });
+        let perm = retry_transient_win32_with::<()>(
+            true,
+            || {
+                perm_attempts += 1;
+                Err(io::Error::from_raw_os_error(2))
+            },
+            |_| {},
+        );
         assert!(perm.is_err());
         assert_eq!(perm_attempts, 1);
 
         // ErrorKind::PermissionDenied without raw OS error is not retried
         let mut kind_only_attempts = 0_usize;
-        let kind_only = retry_transient_win32::<()>(true, || {
-            kind_only_attempts += 1;
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "no os code",
-            ))
-        });
+        let kind_only = retry_transient_win32_with::<()>(
+            true,
+            || {
+                kind_only_attempts += 1;
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "no os code",
+                ))
+            },
+            |_| {},
+        );
         assert!(kind_only.is_err());
         assert_eq!(kind_only_attempts, 1);
 
         // Exhaustion caps at 6 attempts and returns the last transient error
         let mut exhaust_attempts = 0_usize;
-        let exhausted = retry_transient_win32::<()>(false, || {
-            exhaust_attempts += 1;
-            Err(io::Error::from_raw_os_error(32))
-        });
+        let mut exhaust_sleeps = Vec::new();
+        let exhausted = retry_transient_win32_with::<()>(
+            false,
+            || {
+                exhaust_attempts += 1;
+                Err(io::Error::from_raw_os_error(32))
+            },
+            |delay| exhaust_sleeps.push(delay),
+        );
         assert_eq!(exhausted.err().and_then(|e| e.raw_os_error()), Some(32));
         assert_eq!(exhaust_attempts, 6);
+        assert_eq!(
+            exhaust_sleeps,
+            [5_u64, 10, 20, 40, 80]
+                .into_iter()
+                .map(Duration::from_millis)
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 }

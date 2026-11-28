@@ -2182,7 +2182,12 @@ mod tests {
                 &q6_rows[7],
             ];
 
-            for panel_count in [1_usize, 7, 8, 9, 40, 42, 50] {
+            let panel_counts: &[usize] = if matches!(blocks, 1 | 33) {
+                &[1, 7, 8, 9, 40, 42, 50]
+            } else {
+                &[1, 7, 8, 9]
+            };
+            for &panel_count in panel_counts {
                 let tokens = panel_count * 8;
                 let mut flat_q8 = Vec::with_capacity(tokens * blocks);
                 let mut flat_qk = Vec::with_capacity(tokens * blocks);

@@ -716,18 +716,21 @@ mod tests {
 
         let dir = temp_dir("terminate-tree")?;
         let lock_path = dir.join("chat.lock");
-        let mut child = spawn_holding_lock(&lock_path, "cmd /d /c ping -n 30 127.0.0.1 >nul")?;
+        let mut child = spawn_holding_lock(&lock_path, "ping -n 30 127.0.0.1 >nul")?;
         let child_pid = child.id();
         let child_creation = super::super::process_creation_time(child_pid)?;
 
-        // Wait briefly for the nested `cmd` / `ping` descendant to appear.
+        // Wait briefly for the `cmd` -> `ping` descendant to appear.
         let mut descendants = Vec::new();
-        for _ in 0..40 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut step = Duration::from_millis(1);
+        while Instant::now() < deadline {
             descendants = collect_descendants(child_pid, child_creation)?;
             if !descendants.is_empty() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(step);
+            step = (step * 2).min(Duration::from_millis(5));
         }
         assert!(!descendants.is_empty());
 

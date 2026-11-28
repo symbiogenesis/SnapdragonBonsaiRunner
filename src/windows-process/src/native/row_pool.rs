@@ -106,6 +106,7 @@ unsafe fn call_closure<T: Send, F: Fn(usize, &mut [T]) + Sync>(
 
 struct Shared {
     worker_count: usize,
+    spin_iterations: usize,
     num_chunks: AtomicUsize,
     shutdown: AtomicBool,
     has_panic: AtomicBool,
@@ -136,9 +137,10 @@ unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
 impl Shared {
-    fn new(worker_count: usize) -> Self {
+    fn new(worker_count: usize, spin_iterations: usize) -> Self {
         Self {
             worker_count,
+            spin_iterations,
             num_chunks: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             has_panic: AtomicBool::new(false),
@@ -239,7 +241,7 @@ fn worker_loop(shared: &Shared, worker_id: usize) {
         }
         let mut current_gen = slot.wake_gen.load(Ordering::Acquire);
         if current_gen == last_gen {
-            for _ in 0..SPIN_ITERATIONS {
+            for _ in 0..shared.spin_iterations {
                 if shared.shutdown.load(Ordering::Relaxed) {
                     return;
                 }
@@ -307,7 +309,7 @@ struct ScopeGuard<'a> {
 impl Drop for ScopeGuard<'_> {
     fn drop(&mut self) {
         let mut idx = 1_usize;
-        for _ in 0..SPIN_ITERATIONS {
+        for _ in 0..self.shared.spin_iterations {
             while idx < self.active_workers
                 && self.shared.done_gen[idx].0.load(Ordering::Acquire) == self.gen_id
             {
@@ -350,8 +352,16 @@ pub(crate) struct NativeRowWorkerPool {
 
 impl NativeRowWorkerPool {
     pub(crate) fn new(worker_count: usize, name_prefix: &str) -> io::Result<Self> {
+        Self::new_with_spin(worker_count, name_prefix, SPIN_ITERATIONS)
+    }
+
+    fn new_with_spin(
+        worker_count: usize,
+        name_prefix: &str,
+        spin_iterations: usize,
+    ) -> io::Result<Self> {
         let count = worker_count.clamp(1, MAX_POOL_WORKERS);
-        let shared = Arc::new(Shared::new(count));
+        let shared = Arc::new(Shared::new(count, spin_iterations));
         let mut pool = Self {
             shared: Arc::clone(&shared),
             workers: Vec::with_capacity(count.saturating_sub(1)),
@@ -550,7 +560,7 @@ mod tests {
 
     #[test]
     fn partial_active_workers_and_park_wake_cycles_complete_accurately() -> io::Result<()> {
-        let pool = NativeRowWorkerPool::new(8, "test-partial-row")?;
+        let pool = NativeRowWorkerPool::new_with_spin(8, "test-partial-row", 64)?;
         let mut out = vec![0.0_f32; 128];
         for active in [1_usize, 2, 3, 5, 8, 2, 4] {
             out.fill(0.0);
@@ -763,7 +773,7 @@ mod tests {
 
     #[test]
     fn partial_team_steady_state_keeps_idle_workers_parked() -> io::Result<()> {
-        let pool = NativeRowWorkerPool::new(16, "test-steady-park")?;
+        let pool = NativeRowWorkerPool::new_with_spin(16, "test-steady-park", 64)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         while pool.shared.parked_worker_count() < 15 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
@@ -796,7 +806,7 @@ mod tests {
     fn rapid_active_worker_oscillation_completes_accurately() -> io::Result<()> {
         use std::collections::HashSet;
 
-        let pool = NativeRowWorkerPool::new(16, "test-oscillate")?;
+        let pool = NativeRowWorkerPool::new_with_spin(16, "test-oscillate", 64)?;
         let mut out = vec![0_usize; 256];
         let sequence = [1_usize, 6, 8, 16, 2, 6];
         for round in 0..4_usize {
@@ -827,7 +837,7 @@ mod tests {
 
     #[test]
     fn partial_team_panic_propagates_and_leaves_idle_workers_parked() -> io::Result<()> {
-        let pool = NativeRowWorkerPool::new(8, "test-partial-panic")?;
+        let pool = NativeRowWorkerPool::new_with_spin(8, "test-partial-panic", 64)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         while pool.shared.parked_worker_count() < 7 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
@@ -869,7 +879,7 @@ mod tests {
 
     #[test]
     fn shutdown_with_mixed_parked_and_spinning_workers_joins_cleanly() -> io::Result<()> {
-        let pool = NativeRowWorkerPool::new(12, "test-mixed-drop")?;
+        let pool = NativeRowWorkerPool::new_with_spin(12, "test-mixed-drop", 64)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         while pool.shared.parked_worker_count() < 11 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
