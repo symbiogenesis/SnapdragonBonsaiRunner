@@ -1,7 +1,7 @@
 //! Focused orchestration checks with synthetic completions and no model process.
 
 use super::*;
-use crate::client::{CognitiveOptions, serialize_request_with_adapters};
+use crate::client::{CognitiveOptions, ReasoningEffort, serialize_request_with_adapters};
 use std::{collections::VecDeque, sync::mpsc};
 
 fn message(role: &'static str, content: &str) -> Message {
@@ -689,5 +689,679 @@ fn rsa_multi_draft_auto_continues_draft_a_and_synthesis() -> Result<()> {
     assert!(notifications.iter().any(|event| {
         matches!(event, Event::Draft(text) if text == "Draft A opening. Draft A ending.")
     }));
+    Ok(())
+}
+
+#[test]
+fn effort_auto_continue_false_and_rsa_draft_b_never_continue() -> Result<()> {
+    let pending = task();
+    // 1. PlanDraftReview with auto_continue = false stops Draft at 1 call on TokenLimit
+    let (_c1, inc1) = mpsc::channel();
+    let (ev1, out1) = crate::client::event_channel();
+    let mut s1 = 0_usize;
+    let (m1, comp1) = run_with_stream_hooks(
+        &pending,
+        &ResponseOptions {
+            max_completion_tokens: 1024,
+            enable_thinking: false,
+            ..ResponseOptions::default()
+        },
+        false,
+        65_536,
+        PromptReuse::Latest,
+        &inc1,
+        &ev1,
+        |_req, _stop, on_text, _| {
+            s1 += 1;
+            if s1 == 1 {
+                on_text(Cow::Borrowed("Plan."))?;
+                Ok((message("assistant", "Plan."), Completion::Finished, None))
+            } else {
+                on_text(Cow::Borrowed("Draft truncated."))?;
+                Ok((
+                    message("assistant", "Draft truncated."),
+                    Completion::TokenLimit,
+                    None,
+                ))
+            }
+        },
+        |_cmds, _ms| Ok(()),
+    )?;
+    assert_eq!(s1, 2);
+    assert_eq!(comp1, Completion::TokenLimit);
+    assert_eq!(m1.content.as_ref(), "Draft truncated.");
+    assert!(!out1.try_iter().any(|e| matches!(e, Event::Continuing(_))));
+
+    // 2. MultiDraftSynthesis with auto_continue = false stops Draft A at 1 call on TokenLimit
+    let rsa_opts = ResponseOptions {
+        max_completion_tokens: 1024,
+        enable_thinking: false,
+        cognitive_controls: true,
+        cognitive: CognitiveOptions {
+            extra_effort_strategy: ExtraEffortStrategy::MultiDraftSynthesis,
+            ..CognitiveOptions::default()
+        },
+        ..ResponseOptions::default()
+    };
+    let (_c2, inc2) = mpsc::channel();
+    let (ev2, out2) = crate::client::event_channel();
+    let mut s2 = 0_usize;
+    let (m2, comp2) = run_with_stream_hooks(
+        &pending,
+        &rsa_opts,
+        false,
+        65_536,
+        PromptReuse::Latest,
+        &inc2,
+        &ev2,
+        |_req, _stop, on_text, _| {
+            s2 += 1;
+            on_text(Cow::Borrowed("Draft A partial."))?;
+            Ok((
+                message("assistant", "Draft A partial."),
+                Completion::TokenLimit,
+                None,
+            ))
+        },
+        |_cmds, _ms| Ok(()),
+    )?;
+    assert_eq!(s2, 1);
+    assert_eq!(comp2, Completion::TokenLimit);
+    assert_eq!(m2.content.as_ref(), "Draft A partial.");
+    assert!(!out2.try_iter().any(|e| matches!(e, Event::Continuing(_))));
+
+    // 3. MultiDraftSynthesis with auto_continue = true STILL never auto-continues Draft B
+    let (_c3, inc3) = mpsc::channel();
+    let (ev3, out3) = crate::client::event_channel();
+    let mut s3 = 0_usize;
+    let (m3, comp3) = run_with_stream_hooks(
+        &pending,
+        &rsa_opts,
+        true,
+        65_536,
+        PromptReuse::Latest,
+        &inc3,
+        &ev3,
+        |_req, _stop, on_text, _| {
+            s3 += 1;
+            match s3 {
+                1 => {
+                    on_text(Cow::Borrowed("Draft A1."))?;
+                    Ok((
+                        message("assistant", "Draft A1."),
+                        Completion::TokenLimit,
+                        None,
+                    ))
+                }
+                2 => {
+                    on_text(Cow::Borrowed(" Draft A2."))?;
+                    Ok((
+                        message("assistant", " Draft A2."),
+                        Completion::Finished,
+                        None,
+                    ))
+                }
+                _ => {
+                    on_text(Cow::Borrowed("Draft B truncated"))?;
+                    Ok((
+                        message("assistant", "Draft B truncated"),
+                        Completion::TokenLimit,
+                        None,
+                    ))
+                }
+            }
+        },
+        |_cmds, _ms| Ok(()),
+    )?;
+    assert_eq!(s3, 3);
+    assert_eq!(comp3, Completion::Finished);
+    assert_eq!(m3.content.as_ref(), "Draft A1. Draft A2.");
+    let events3: Vec<_> = out3.try_iter().collect();
+    assert!(
+        events3
+            .iter()
+            .any(|e| matches!(e, Event::Stage("Second draft skipped; Draft A retained")))
+    );
+    assert!(
+        events3
+            .iter()
+            .any(|e| matches!(e, Event::RetainedAnswer(t) if t == "Draft A1. Draft A2."))
+    );
+    Ok(())
+}
+
+#[test]
+fn effort_stage_fallbacks_when_continuation_exhausts_at_token_limit() -> Result<()> {
+    let pending = task();
+    let opts = ResponseOptions {
+        max_completion_tokens: 1024,
+        enable_thinking: false,
+        ..ResponseOptions::default()
+    };
+
+    // 1. Plan-Draft-Review: Draft continuation stops at TokenLimit (via repetition) -> review skipped
+    let (_c1, inc1) = mpsc::channel();
+    let (ev1, out1) = crate::client::event_channel();
+    let mut s1 = 0_usize;
+    let repeated = "Repeated draft clause that triggers loop detection cleanly without finishing. ".repeat(2);
+    let (m1, comp1) = run_with_stream_hooks(
+        &pending,
+        &opts,
+        true,
+        65_536,
+        PromptReuse::Disabled,
+        &inc1,
+        &ev1,
+        |_req, _stop, on_text, _| {
+            s1 += 1;
+            if s1 == 1 {
+                on_text(Cow::Borrowed("Plan."))?;
+                Ok((message("assistant", "Plan."), Completion::Finished, None))
+            } else {
+                on_text(Cow::Borrowed(&repeated))?;
+                Ok((message("assistant", &repeated), Completion::TokenLimit, None))
+            }
+        },
+        |_cmds, _ms| Ok(()),
+    )?;
+    assert_eq!(comp1, Completion::TokenLimit);
+    assert_eq!(m1.content.as_ref(), repeated);
+    let e1: Vec<_> = out1.try_iter().collect();
+    assert!(
+        e1.iter()
+            .any(|e| matches!(e, Event::Stage("Draft incomplete; review skipped")))
+    );
+    assert!(
+        e1.iter()
+            .any(|e| matches!(e, Event::RetainedAnswer(t) if t == &repeated))
+    );
+
+    // 2. Plan-Draft-Review: Review continuation stops at TokenLimit -> stitched Draft retained
+    let (_c2, inc2) = mpsc::channel();
+    let (ev2, out2) = crate::client::event_channel();
+    let mut s2 = 0_usize;
+    let (m2, comp2) = run_with_stream_hooks(
+        &pending,
+        &opts,
+        true,
+        65_536,
+        PromptReuse::Disabled,
+        &inc2,
+        &ev2,
+        |_req, _stop, on_text, _| {
+            s2 += 1;
+            match s2 {
+                1 => {
+                    on_text(Cow::Borrowed("Plan."))?;
+                    Ok((message("assistant", "Plan."), Completion::Finished, None))
+                }
+                2 => {
+                    on_text(Cow::Borrowed("Draft A."))?;
+                    Ok((message("assistant", "Draft A."), Completion::TokenLimit, None))
+                }
+                3 => {
+                    on_text(Cow::Borrowed(" Draft B."))?;
+                    Ok((message("assistant", " Draft B."), Completion::Finished, None))
+                }
+                _ => {
+                    on_text(Cow::Borrowed(&repeated))?;
+                    Ok((message("assistant", &repeated), Completion::TokenLimit, None))
+                }
+            }
+        },
+        |_cmds, _ms| Ok(()),
+    )?;
+    assert_eq!(comp2, Completion::TokenLimit);
+    assert_eq!(m2.content.as_ref(), "Draft A. Draft B.");
+    let e2: Vec<_> = out2.try_iter().collect();
+    assert!(
+        e2.iter()
+            .any(|e| matches!(e, Event::Stage("Revision incomplete; complete draft retained")))
+    );
+    assert!(
+        e2.iter()
+            .any(|e| matches!(e, Event::RetainedAnswer(t) if t == "Draft A. Draft B."))
+    );
+
+    // 3. RSA Draft A continuation stops at TokenLimit -> Draft B & Synthesis skipped
+    let rsa_opts = ResponseOptions {
+        cognitive_controls: true,
+        cognitive: CognitiveOptions {
+            extra_effort_strategy: ExtraEffortStrategy::MultiDraftSynthesis,
+            ..CognitiveOptions::default()
+        },
+        ..opts.clone()
+    };
+    let (_c3, inc3) = mpsc::channel();
+    let (ev3, out3) = crate::client::event_channel();
+    let (m3, comp3) = run_with_stream_hooks(
+        &pending,
+        &rsa_opts,
+        true,
+        65_536,
+        PromptReuse::Disabled,
+        &inc3,
+        &ev3,
+        |_req, _stop, on_text, _| {
+            on_text(Cow::Borrowed(&repeated))?;
+            Ok((message("assistant", &repeated), Completion::TokenLimit, None))
+        },
+        |_cmds, _ms| Ok(()),
+    )?;
+    assert_eq!(comp3, Completion::TokenLimit);
+    assert_eq!(m3.content.as_ref(), repeated);
+    let e3: Vec<_> = out3.try_iter().collect();
+    assert!(e3.iter().any(|e| {
+        matches!(
+            e,
+            Event::Stage("First draft reached output limit; complete answer retained")
+        )
+    }));
+
+    // 4. RSA Synthesis continuation stops at TokenLimit -> best complete draft retained
+    let (_c4, inc4) = mpsc::channel();
+    let (ev4, out4) = crate::client::event_channel();
+    let mut s4 = 0_usize;
+    let (m4, comp4) = run_with_stream_hooks(
+        &pending,
+        &rsa_opts,
+        true,
+        65_536,
+        PromptReuse::Disabled,
+        &inc4,
+        &ev4,
+        |_req, _stop, on_text, _| {
+            s4 += 1;
+            match s4 {
+                1 => {
+                    on_text(Cow::Borrowed("Weaker A."))?;
+                    Ok((
+                        message("assistant", "Weaker A."),
+                        Completion::Finished,
+                        Some(ConfidenceSummary {
+                            tokens: 64,
+                            mean_logprob: -1.2,
+                            min_window_logprob: None,
+                            collapsed: false,
+                        }),
+                    ))
+                }
+                2 => {
+                    on_text(Cow::Borrowed("Stronger B."))?;
+                    Ok((
+                        message("assistant", "Stronger B."),
+                        Completion::Finished,
+                        Some(ConfidenceSummary {
+                            tokens: 64,
+                            mean_logprob: -0.1,
+                            min_window_logprob: None,
+                            collapsed: false,
+                        }),
+                    ))
+                }
+                _ => {
+                    on_text(Cow::Borrowed(&repeated))?;
+                    Ok((message("assistant", &repeated), Completion::TokenLimit, None))
+                }
+            }
+        },
+        |_cmds, _ms| Ok(()),
+    )?;
+    assert_eq!(comp4, Completion::TokenLimit);
+    assert_eq!(m4.content.as_ref(), "Stronger B.");
+    let e4: Vec<_> = out4.try_iter().collect();
+    assert!(
+        e4.iter()
+            .any(|e| matches!(e, Event::Stage("Synthesis incomplete; best complete draft retained")))
+    );
+    assert!(
+        e4.iter()
+            .any(|e| matches!(e, Event::RetainedAnswer(t) if t == "Stronger B."))
+    );
+    Ok(())
+}
+
+#[test]
+fn effort_continuation_wire_prefix_seam_thinking_stop_and_size_bounds() -> Result<()> {
+    let pending = task();
+    // 1. Wire-request parity under PromptReuse::Latest, seam overlap, Continuing ordering,
+    //    thinking handoff (reasoning_budget=1), stop_on_collapse=false on continuation,
+    //    and full stitched Draft/Draft A forwarded into Review/Synthesis.
+    let mut opts = ResponseOptions {
+        max_completion_tokens: 2048,
+        enable_thinking: true,
+        cognitive_controls: true,
+        cognitive: CognitiveOptions {
+            reasoning_effort: ReasoningEffort::Low,
+            extra_effort_strategy: ExtraEffortStrategy::PlanDraftReview,
+            ..CognitiveOptions::default()
+        },
+        ..ResponseOptions::default()
+    };
+    let (_c1, inc1) = mpsc::channel();
+    let (ev1, out1) = crate::client::event_channel();
+    let mut requests = Vec::new();
+    let mut stop_flags = Vec::new();
+    let mut step = 0_usize;
+    let (answer, comp) = run_with_stream_hooks(
+        &pending,
+        &opts,
+        true,
+        65_536,
+        PromptReuse::Latest,
+        &inc1,
+        &ev1,
+        |req, stop_on_collapse, on_text, on_reasoning| {
+            step += 1;
+            let json: serde_json::Value =
+                serde_json::from_slice(&req).map_err(|_| Failure::Message("invalid JSON"))?;
+            requests.push(json);
+            stop_flags.push(stop_on_collapse);
+            match step {
+                1 => {
+                    on_text(Cow::Borrowed("Plan: concise outline."))?;
+                    Ok((
+                        message("assistant", "Plan: concise outline."),
+                        Completion::Finished,
+                        None,
+                    ))
+                }
+                2 => {
+                    on_reasoning(Cow::Borrowed("Draft initial reasoning"))?;
+                    on_text(Cow::Borrowed("Draft ends at boundary."))?;
+                    Ok((
+                        Message {
+                            role: "assistant",
+                            content: "Draft ends at boundary.".into(),
+                            reasoning_content: Some("Draft initial reasoning".into()),
+                            images: std::sync::Arc::default(),
+                        },
+                        Completion::TokenLimit,
+                        None,
+                    ))
+                }
+                3 => {
+                    on_reasoning(Cow::Borrowed("Suppressed part2 thought"))?;
+                    on_text(Cow::Borrowed("at boundary. Draft finishes."))?;
+                    Ok((
+                        message("assistant", "at boundary. Draft finishes."),
+                        Completion::Finished,
+                        None,
+                    ))
+                }
+                _ => {
+                    on_text(Cow::Borrowed("Reviewed final."))?;
+                    Ok((
+                        message("assistant", "Reviewed final."),
+                        Completion::Finished,
+                        None,
+                    ))
+                }
+            }
+        },
+        |_cmds, _ms| Ok(()),
+    )?;
+    assert_eq!(comp, Completion::Finished);
+    assert_eq!(answer.content.as_ref(), "Reviewed final.");
+    assert!(stop_flags.iter().all(|&f| !f));
+    // Draft continuation (requests[2]) preserves requests[1] prefix and sets reasoning_budget=1
+    let d0 = requests[1]["messages"]
+        .as_array()
+        .ok_or_else(|| Failure::Message("missing draft req0"))?;
+    let d1 = requests[2]["messages"]
+        .as_array()
+        .ok_or_else(|| Failure::Message("missing draft req1"))?;
+    assert_eq!(d1.len(), d0.len() + 2);
+    assert_eq!(&d1[..d0.len()], &d0[..]);
+    assert_eq!(requests[2]["enable_thinking"], true);
+    assert_eq!(requests[2]["reasoning_budget"], 1);
+    // Review (requests[3]) receives the seam-cleaned stitched Draft
+    assert!(
+        requests[3]["messages"][3]["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("Draft ends at boundary. Draft finishes."))
+    );
+    // Verify Event::Continuing(2) occurs after Event::Stage(DRAFT) and before Draft part-2 Event::Text
+    let evs1: Vec<_> = out1.try_iter().collect();
+    let draft_stage_idx = evs1
+        .iter()
+        .position(|e| matches!(e, Event::Stage(DRAFT)))
+        .ok_or_else(|| Failure::Message("missing DRAFT stage"))?;
+    let cont_idx = evs1
+        .iter()
+        .position(|e| matches!(e, Event::Continuing(2)))
+        .ok_or_else(|| Failure::Message("missing Continuing(2)"))?;
+    let part2_idx = evs1
+        .iter()
+        .position(|e| matches!(e, Event::Text(t) if t.contains("Draft finishes.")))
+        .ok_or_else(|| Failure::Message("missing part2 text"))?;
+    assert!(draft_stage_idx < cont_idx && cont_idx < part2_idx);
+    assert!(
+        !evs1
+            .iter()
+            .any(|e| matches!(e, Event::Reasoning(r) if r.contains("Suppressed part2 thought")))
+    );
+
+    // 2. Publisher rollback / PromptReuse::Disabled disables thinking on stage continuation
+    opts.cognitive_controls = false;
+    let (_c_pub, inc_pub) = mpsc::channel();
+    let (ev_pub, _out_pub) = crate::client::event_channel();
+    let mut pub_reqs = Vec::new();
+    let mut pub_step = 0_usize;
+    let (_m_pub, comp_pub) = run_with_stream_hooks(
+        &pending,
+        &opts,
+        true,
+        65_536,
+        PromptReuse::Disabled,
+        &inc_pub,
+        &ev_pub,
+        |req, _stop, on_text, _| {
+            pub_step += 1;
+            pub_reqs.push(
+                serde_json::from_slice::<serde_json::Value>(&req)
+                    .map_err(|_| Failure::Message("invalid JSON"))?,
+            );
+            match pub_step {
+                1 => {
+                    on_text(Cow::Borrowed("Plan."))?;
+                    Ok((message("assistant", "Plan."), Completion::Finished, None))
+                }
+                2 => {
+                    on_text(Cow::Borrowed("Draft 1."))?;
+                    Ok((message("assistant", "Draft 1."), Completion::TokenLimit, None))
+                }
+                3 => {
+                    on_text(Cow::Borrowed(" Draft 2."))?;
+                    Ok((message("assistant", " Draft 2."), Completion::Finished, None))
+                }
+                _ => {
+                    on_text(Cow::Borrowed("Review."))?;
+                    Ok((message("assistant", "Review."), Completion::Finished, None))
+                }
+            }
+        },
+        |_cmds, _ms| Ok(()),
+    )?;
+    assert_eq!(comp_pub, Completion::Finished);
+    assert_eq!(pub_reqs[2]["enable_thinking"], false);
+    assert!(pub_reqs[2].get("reasoning_budget").is_none());
+
+    // 3. RSA Draft B stop_on_collapse=true vs continuation stop_on_collapse=false & Draft A payload
+    let rsa_opts = ResponseOptions {
+        cognitive_controls: true,
+        reset_on_cancel: true,
+        cognitive: CognitiveOptions {
+            extra_effort_strategy: ExtraEffortStrategy::MultiDraftSynthesis,
+            ..CognitiveOptions::default()
+        },
+        ..ResponseOptions {
+            max_completion_tokens: 2048,
+            enable_thinking: false,
+            ..ResponseOptions::default()
+        }
+    };
+    let (_c_rsa, inc_rsa) = mpsc::channel();
+    let (ev_rsa, _out_rsa) = crate::client::event_channel();
+    let mut rsa_reqs = Vec::new();
+    let mut rsa_stops = Vec::new();
+    let mut rsa_step = 0_usize;
+    let (_m_rsa, comp_rsa) = run_with_stream_hooks(
+        &pending,
+        &rsa_opts,
+        true,
+        65_536,
+        PromptReuse::Latest,
+        &inc_rsa,
+        &ev_rsa,
+        |req, stop_on_collapse, on_text, _| {
+            rsa_step += 1;
+            rsa_reqs.push(
+                serde_json::from_slice::<serde_json::Value>(&req)
+                    .map_err(|_| Failure::Message("invalid JSON"))?,
+            );
+            rsa_stops.push(stop_on_collapse);
+            match rsa_step {
+                1 => {
+                    on_text(Cow::Borrowed("A1."))?;
+                    Ok((message("assistant", "A1."), Completion::TokenLimit, None))
+                }
+                2 => {
+                    on_text(Cow::Borrowed(" A2."))?;
+                    Ok((message("assistant", " A2."), Completion::Finished, None))
+                }
+                3 => {
+                    on_text(Cow::Borrowed("B1."))?;
+                    Ok((message("assistant", "B1."), Completion::Finished, None))
+                }
+                _ => {
+                    on_text(Cow::Borrowed("Synth."))?;
+                    Ok((message("assistant", "Synth."), Completion::Finished, None))
+                }
+            }
+        },
+        |_cmds, _ms| Ok(()),
+    )?;
+    assert_eq!(comp_rsa, Completion::Finished);
+    assert_eq!(rsa_stops, vec![false, false, true, false]);
+    assert!(
+        rsa_reqs[3]["messages"][3]["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("A1. A2."))
+    );
+
+    // 4. Command::Stop mid-continuation inside Draft, Review, and RSA Synthesis aborts cleanly
+    for stop_at in [2_usize, 3_usize] {
+        let (tx, rx) = mpsc::channel();
+        let (ev, _out) = crate::client::event_channel();
+        let mut s = 0_usize;
+        let res = run_with_stream_hooks(
+            &pending,
+            &ResponseOptions {
+                max_completion_tokens: 1024,
+                enable_thinking: false,
+                ..ResponseOptions::default()
+            },
+            true,
+            65_536,
+            PromptReuse::Disabled,
+            &rx,
+            &ev,
+            |_req, _stop, on_text, _| {
+                s += 1;
+                if s == stop_at {
+                    let _ = tx.send(Command::Stop);
+                    on_text(Cow::Borrowed("Part."))?;
+                    Ok((message("assistant", "Part."), Completion::TokenLimit, None))
+                } else {
+                    on_text(Cow::Borrowed("Ok."))?;
+                    Ok((message("assistant", "Ok."), Completion::Finished, None))
+                }
+            },
+            |_cmds, _ms| Ok(()),
+        );
+        assert_eq!(res.err(), Some(Failure::Stopped));
+        assert_eq!(s, stop_at);
+    }
+
+    let (tx_s, rx_s) = mpsc::channel();
+    let (ev_s, _out_s) = crate::client::event_channel();
+    let mut ss = 0_usize;
+    let res_s = run_with_stream_hooks(
+        &pending,
+        &rsa_opts,
+        true,
+        65_536,
+        PromptReuse::Disabled,
+        &rx_s,
+        &ev_s,
+        |_req, _stop, on_text, _| {
+            ss += 1;
+            if ss == 3 {
+                let _ = tx_s.send(Command::Stop);
+                on_text(Cow::Borrowed("Synth part."))?;
+                Ok((
+                    message("assistant", "Synth part."),
+                    Completion::TokenLimit,
+                    None,
+                ))
+            } else {
+                on_text(Cow::Borrowed("Done."))?;
+                Ok((message("assistant", "Done."), Completion::Finished, None))
+            }
+        },
+        |_cmds, _ms| Ok(()),
+    );
+    assert_eq!(res_s.err(), Some(Failure::Stopped));
+    assert_eq!(ss, 3);
+
+    // 5. Stitched Draft exceeding MAX_REQUEST when escaped in Review's stage request
+    //    fails cleanly with request_byte_limit() after Event::Draft was emitted.
+    let (_c_lim, inc_lim) = mpsc::channel();
+    let (ev_lim, out_lim) = crate::client::event_channel();
+    let big_escaped_draft = "\\".repeat(300 * 1024);
+    let mut lim_step = 0_usize;
+    let res_lim = run_with_stream_hooks(
+        &pending,
+        &ResponseOptions {
+            max_completion_tokens: 1024,
+            enable_thinking: false,
+            ..ResponseOptions::default()
+        },
+        true,
+        2_097_152,
+        PromptReuse::Disabled,
+        &inc_lim,
+        &ev_lim,
+        |_req, _stop, on_text, _| {
+            lim_step += 1;
+            match lim_step {
+                1 => {
+                    on_text(Cow::Borrowed("Plan."))?;
+                    Ok((message("assistant", "Plan."), Completion::Finished, None))
+                }
+                2 => {
+                    on_text(Cow::Borrowed(&big_escaped_draft))?;
+                    Ok((
+                        message("assistant", &big_escaped_draft),
+                        Completion::TokenLimit,
+                        None,
+                    ))
+                }
+                _ => {
+                    on_text(Cow::Borrowed("Tail"))?;
+                    Ok((message("assistant", "Tail"), Completion::Finished, None))
+                }
+            }
+        },
+        |_cmds, _ms| Ok(()),
+    );
+    assert_eq!(res_lim.err(), Some(request_byte_limit()));
+    assert_eq!(lim_step, 3);
+    assert!(
+        out_lim
+            .try_iter()
+            .any(|e| matches!(e, Event::Draft(d) if d.len() == big_escaped_draft.len() + 4))
+    );
     Ok(())
 }
