@@ -320,9 +320,18 @@ impl PrefillCache {
     }
 
     fn capture(rows: &[Vec<f32>], layers: &[LayerKvCache], hidden: &[f32]) -> Option<Self> {
+        Self::capture_with_limit(rows, layers, hidden, MAX_PREFILL_CACHE_BYTES)
+    }
+
+    fn capture_with_limit(
+        rows: &[Vec<f32>],
+        layers: &[LayerKvCache],
+        hidden: &[f32],
+        max_bytes: usize,
+    ) -> Option<Self> {
         if rows.is_empty()
             || rows.len() > MAX_PREFILL_ROWS
-            || Self::bytes(rows, layers, hidden)? > MAX_PREFILL_CACHE_BYTES
+            || Self::bytes(rows, layers, hidden)? > max_bytes
         {
             return None;
         }
@@ -336,7 +345,7 @@ impl PrefillCache {
             layers: copy_layers(layers)?,
             hidden: copy_f32(hidden)?,
         };
-        (snapshot.allocated_bytes()? <= MAX_PREFILL_CACHE_BYTES).then_some(snapshot)
+        (snapshot.allocated_bytes()? <= max_bytes).then_some(snapshot)
     }
 
     fn allocated_bytes(&self) -> Option<usize> {
@@ -1561,8 +1570,9 @@ pub(crate) mod tests {
         );
         assert!(PrefillCache::capture(&vec![vec![0.0]; MAX_PREFILL_ROWS + 1], &[], &[]).is_none());
         assert!(PrefillCache::capture(&[], &[], &[]).is_none());
-        let oversized = vec![0.0; MAX_PREFILL_CACHE_BYTES / size_of::<f32>()];
-        assert!(PrefillCache::capture(&rows, &[], &oversized).is_none());
+        assert_eq!(MAX_PREFILL_CACHE_BYTES, 48 * 1024 * 1024);
+        let oversized = vec![0.0; 128 / size_of::<f32>()];
+        assert!(PrefillCache::capture_with_limit(&rows, &[], &oversized, 128).is_none());
     }
 
     #[test]

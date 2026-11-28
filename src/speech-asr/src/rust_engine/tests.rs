@@ -128,8 +128,15 @@ fn recognizer_ext(eos: u32, extra: &[&str]) -> io::Result<RustRecognizer> {
         vec![block(false)?, block(true)?],
         vec![1.0; 2],
     )?;
+    static CACHED_FRONTEND: std::sync::OnceLock<Frontend> = std::sync::OnceLock::new();
+    let frontend = if let Some(cached) = CACHED_FRONTEND.get() {
+        cached.clone()
+    } else {
+        let built = Frontend::from_checkpoint(None, None)?;
+        CACHED_FRONTEND.get_or_init(|| built).clone()
+    };
     Ok(RustRecognizer {
-        frontend: Frontend::from_checkpoint(None, None)?,
+        frontend,
         frontend_scratch: crate::frontend::FrontendScratch::default(),
         encoder,
         tokenizer,

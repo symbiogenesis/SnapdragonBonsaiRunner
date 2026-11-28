@@ -392,7 +392,7 @@ fn rust_asr_encoder_batched_parallel_matches_scalar_bits() -> io::Result<()> {
 
     let serial = build(1)?;
     let expected = serial.encode_mel(&mel, frames, &mut || false)?;
-    for workers in [2, 4] {
+    for workers in [4, 2] {
         let parallel = build(workers)?;
         let actual = parallel.encode_mel(&mel, frames, &mut || false)?;
         assert_eq!(actual.rows(), expected.rows());
@@ -434,7 +434,7 @@ fn rust_asr_encoder_parallel_conv_matches_sequential_bits() -> io::Result<()> {
         .map(|i| (f32::from(u16::try_from(i % 37).unwrap_or(0)) - 18.0) * 0.05)
         .collect();
     let expected = convolve(&layer, &input, width, height, channels, &mut || false)?;
-    for workers in [2_usize, 4, 8] {
+    for workers in [8_usize, 4, 2] {
         let actual = convolve_with_threads(
             &layer,
             &input,

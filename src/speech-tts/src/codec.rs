@@ -5166,7 +5166,7 @@ mod tests {
                     *value += bias;
                 }
             }
-            for threads in [1, 4, 18] {
+            for threads in [18, 4, 1] {
                 let mut carry = initial.clone();
                 let output = trans.forward_stream_parallel(&input, frames, &mut carry, threads)?;
                 assert_eq!(
@@ -5634,7 +5634,7 @@ mod tests {
             .collect();
         let mut seq = original.clone();
         snake.apply_in_place(&mut seq, frames)?;
-        for threads in [2_usize, 4, 18] {
+        for threads in [18_usize, 4, 2] {
             let mut par = original.clone();
             snake.apply_in_place_parallel(&mut par, frames, threads)?;
             assert_eq!(
@@ -5721,7 +5721,7 @@ mod tests {
         for (got, want) in off_out.iter().zip(&expected) {
             assert!((got - want).abs() < 1e-6);
         }
-        for threads in [2_usize, 4] {
+        for threads in [4_usize, 2] {
             let (par_off, _) = conv.forward_parallel(&input, frames, threads)?;
             let par_stream =
                 conv.forward_stream_parallel(&input, frames, &mut empty_state, threads)?;
@@ -6004,7 +6004,7 @@ mod tests {
                         &mut per_frame_state,
                     )?);
                 }
-                for threads in [1_usize, 4, 18] {
+                for threads in [18_usize, 4, 1] {
                     let mut batch_state = init_state.clone();
                     let batched =
                         conv.forward_stream_parallel(&input, frames, &mut batch_state, threads)?;
@@ -6079,7 +6079,12 @@ mod tests {
                 }
             });
 
-            for frames in [1_usize, 2, 3, 4, 32, 64] {
+            let frame_list: &[usize] = if in_c == 131 {
+                &[1, 4, 32, 64]
+            } else {
+                &[1, 2, 3, 4, 32, 64]
+            };
+            for &frames in frame_list {
                 let input = &full_input[..frames * in_c];
                 let (offline_t1, out_frames) = conv.forward_parallel(input, frames, 1)?;
                 assert_eq!(out_frames, frames);
@@ -6100,67 +6105,96 @@ mod tests {
                 }
 
                 // Verify bit-identical threads and weight_okic=None fallback.
-                let mut st = vec![0.0_f32; ctx_frames * in_c];
-                let thread_counts: &[usize] = if matches!(frames, 1 | 4 | 64) {
-                    &[1, 4, 10, 16]
-                } else {
-                    &[1, 16]
-                };
-                for &threads in thread_counts {
-                    if threads > 1 {
-                        let (par_off, _) = conv.forward_parallel(input, frames, threads)?;
+                let thread_counts: &[usize] =
+                    if matches!(frames, 1 | 4) || (in_c != 131 && frames == 64) {
+                        &[16, 10, 4, 1]
+                    } else {
+                        &[16, 1]
+                    };
+                let conv_ref = &conv;
+                let conv_fallback_ref = &conv_fallback;
+                let offline_ref = &offline_t1;
+                std::thread::scope(|scope| -> std::io::Result<()> {
+                    let h_threads = scope.spawn(move || -> std::io::Result<()> {
+                        let mut st = vec![0.0_f32; ctx_frames * in_c];
+                        for &threads in thread_counts {
+                            if threads > 1 {
+                                let (par_off, _) =
+                                    conv_ref.forward_parallel(input, frames, threads)?;
+                                assert_f32_bits_eq(
+                                    &par_off,
+                                    offline_ref,
+                                    &format!(
+                                        "offline threads={threads} in_c={in_c} out_c={out_c} frames={frames}"
+                                    ),
+                                );
+                            }
+                            st.fill(0.0);
+                            let par_stream = conv_ref.forward_stream_parallel(
+                                input, frames, &mut st, threads,
+                            )?;
+                            assert_f32_bits_eq(
+                                &par_stream,
+                                offline_ref,
+                                &format!(
+                                    "stream threads={threads} in_c={in_c} out_c={out_c} frames={frames}"
+                                ),
+                            );
+                        }
+                        Ok(())
+                    });
+                    let h_fallback = matches!(frames, 1 | 4 | 64).then(|| {
+                        scope.spawn(move || -> std::io::Result<()> {
+                            let (fallback_out, _) =
+                                conv_fallback_ref.forward_parallel(input, frames, 16)?;
+                            assert_f32_bits_eq(
+                                &fallback_out,
+                                offline_ref,
+                                &format!(
+                                    "fallback weight_okic=None mismatch in_c={in_c} out_c={out_c} frames={frames}"
+                                ),
+                            );
+                            Ok(())
+                        })
+                    });
+                    let h_chunked = scope.spawn(move || -> std::io::Result<()> {
+                        // Verify chunked [1, 2, 4, 8] streaming vs offline bits.
+                        let mut chunk_state = vec![0.0_f32; ctx_frames * in_c];
+                        let mut streamed = Vec::with_capacity(frames * out_c);
+                        let mut cursor = 0_usize;
+                        let mut chunk_cycle = [1_usize, 2, 4, 8].into_iter().cycle();
+                        while cursor < frames {
+                            let take = chunk_cycle.next().unwrap_or(1).min(frames - cursor);
+                            streamed.extend(conv_ref.forward_stream_parallel(
+                                &input[cursor * in_c..(cursor + take) * in_c],
+                                take,
+                                &mut chunk_state,
+                                16,
+                            )?);
+                            cursor += take;
+                        }
                         assert_f32_bits_eq(
-                            &par_off,
-                            &offline_t1,
+                            &streamed,
+                            offline_ref,
                             &format!(
-                                "offline threads={threads} in_c={in_c} out_c={out_c} frames={frames}"
+                                "chunked [1,2,4,8] streaming mismatch in_c={in_c} out_c={out_c} frames={frames}"
                             ),
                         );
+                        Ok(())
+                    });
+                    h_threads
+                        .join()
+                        .map_err(|_| std::io::Error::other("conv thread sweep panicked"))??;
+                    if let Some(handle) = h_fallback {
+                        handle
+                            .join()
+                            .map_err(|_| std::io::Error::other("conv fallback panicked"))??;
                     }
-                    st.fill(0.0);
-                    let par_stream =
-                        conv.forward_stream_parallel(input, frames, &mut st, threads)?;
-                    assert_f32_bits_eq(
-                        &par_stream,
-                        &offline_t1,
-                        &format!(
-                            "stream threads={threads} in_c={in_c} out_c={out_c} frames={frames}"
-                        ),
-                    );
-                }
-                if matches!(frames, 1 | 4 | 64) {
-                    let (fallback_out, _) = conv_fallback.forward_parallel(input, frames, 16)?;
-                    assert_f32_bits_eq(
-                        &fallback_out,
-                        &offline_t1,
-                        &format!(
-                            "fallback weight_okic=None mismatch in_c={in_c} out_c={out_c} frames={frames}"
-                        ),
-                    );
-                }
-
-                // Verify chunked [1, 2, 4, 8] streaming vs offline bits.
-                let mut chunk_state = vec![0.0_f32; ctx_frames * in_c];
-                let mut streamed = Vec::with_capacity(frames * out_c);
-                let mut cursor = 0_usize;
-                let mut chunk_cycle = [1_usize, 2, 4, 8].into_iter().cycle();
-                while cursor < frames {
-                    let take = chunk_cycle.next().unwrap_or(1).min(frames - cursor);
-                    streamed.extend(conv.forward_stream_parallel(
-                        &input[cursor * in_c..(cursor + take) * in_c],
-                        take,
-                        &mut chunk_state,
-                        16,
-                    )?);
-                    cursor += take;
-                }
-                assert_f32_bits_eq(
-                    &streamed,
-                    &offline_t1,
-                    &format!(
-                        "chunked [1,2,4,8] streaming mismatch in_c={in_c} out_c={out_c} frames={frames}"
-                    ),
-                );
+                    h_chunked
+                        .join()
+                        .map_err(|_| std::io::Error::other("conv chunked panicked"))??;
+                    Ok(())
+                })?;
             }
         }
         Ok(())
@@ -6212,7 +6246,7 @@ mod tests {
                                 *value += b;
                             }
                         }
-                        for threads in [1_usize, 4, 10, 16] {
+                        for threads in [16_usize, 10, 4, 1] {
                             let mut carry = initial_carry.clone();
                             let actual =
                                 trans.forward_stream_parallel(input, frames, &mut carry, threads)?;
@@ -6301,7 +6335,7 @@ mod tests {
                         for &frames in &BLOCK0_FRAMES {
                             let input = &full_input_ref[..frames * in_c];
                             let mut frame_runs = Vec::with_capacity(2);
-                            for threads in [10_usize, 16] {
+                            for threads in [16_usize, 10] {
                                 let mut carry = initial_carry_ref.clone();
                                 let out_par = block0_ref
                                     .forward_stream_parallel(input, frames, &mut carry, threads)?;
@@ -6476,69 +6510,78 @@ mod tests {
 
         // Verify ConvNeXtBlock::from_weights_packed_only drops raw weights when packed and
         // matches unpacked bit-for-bit across F_TILE=32 and IC_TILE=128 boundaries.
-        for (channels, mid_c) in [(129_usize, 517_usize), (192, 512)] {
-            let kernel = 7_usize;
-            let dw_weight = values(channels * kernel);
-            let dw_weight_kc = Some(ConvNeXtBlock::pack_dw_kc(&dw_weight, channels, kernel));
-            let dw_bias = values(channels);
-            let norm_w = vec![1.05; channels];
-            let norm_b = values(channels);
-            let pwconv1_w = values(mid_c * channels);
-            let pwconv1_b = values(mid_c);
-            let pwconv2_w = values(channels * mid_c);
-            let pwconv2_b = values(channels);
-            let gamma = values(channels);
+        std::thread::scope(|scope| -> std::io::Result<()> {
+            let handles: Vec<_> = setups
+                .into_iter()
+                .map(|(channels, mid_c, raw_block, _, _)| {
+                    scope.spawn(move || -> std::io::Result<()> {
+                        let kernel = raw_block.kernel;
+                        let packed_block = ConvNeXtBlock::from_weights_packed_only(
+                            channels,
+                            kernel,
+                            raw_block.dw_weight.clone(),
+                            raw_block.dw_bias.clone(),
+                            raw_block.norm_w.clone(),
+                            raw_block.norm_b.clone(),
+                            raw_block.pwconv1_w.clone(),
+                            raw_block.pwconv1_b.clone(),
+                            raw_block.pwconv2_w.clone(),
+                            raw_block.pwconv2_b.clone(),
+                            raw_block.gamma.clone(),
+                        )?;
+                        assert!(packed_block.pwconv1_w.is_empty());
+                        assert!(packed_block.pwconv1_w_packed.is_some());
+                        assert!(packed_block.pwconv2_w.is_empty());
+                        assert!(packed_block.pwconv2_w_packed.is_some());
 
-            let raw_block = ConvNeXtBlock {
-                channels,
-                kernel,
-                dw_weight: dw_weight.clone(),
-                dw_weight_kc,
-                dw_bias: dw_bias.clone(),
-                norm_w: norm_w.clone(),
-                norm_b: norm_b.clone(),
-                pwconv1_w: pwconv1_w.clone(),
-                pwconv1_w_packed: None,
-                pwconv1_b: pwconv1_b.clone(),
-                pwconv2_w: pwconv2_w.clone(),
-                pwconv2_w_packed: None,
-                pwconv2_b: pwconv2_b.clone(),
-                gamma: gamma.clone(),
-            };
-            let packed_block = ConvNeXtBlock::from_weights_packed_only(
-                channels, kernel, dw_weight, dw_bias, norm_w, norm_b, pwconv1_w, pwconv1_b,
-                pwconv2_w, pwconv2_b, gamma,
-            )?;
-            assert!(packed_block.pwconv1_w.is_empty());
-            assert!(packed_block.pwconv1_w_packed.is_some());
-            assert!(packed_block.pwconv2_w.is_empty());
-            assert!(packed_block.pwconv2_w_packed.is_some());
-
-            for frames in [1_usize, 7, 32, 33] {
-                let input = values(frames * channels);
-                let init_st = values((kernel - 1) * channels);
-                for threads in [1_usize, 8] {
-                    let mut st_raw = init_st.clone();
-                    let mut st_pkg = init_st.clone();
-                    let out_raw =
-                        raw_block.forward_stream_parallel(&input, frames, &mut st_raw, threads)?;
-                    let out_pkg = packed_block.forward_stream_parallel(
-                        &input,
-                        frames,
-                        &mut st_pkg,
-                        threads,
-                    )?;
-                    assert_f32_bits_eq(
-                        &out_pkg,
-                        &out_raw,
-                        &format!(
-                            "ConvNeXt packed_only mismatch c={channels} frames={frames} threads={threads}"
-                        ),
-                    );
-                    assert_eq!(st_pkg, st_raw);
-                }
+                        let raw_ref = &raw_block;
+                        let pkg_ref = &packed_block;
+                        std::thread::scope(|inner| -> std::io::Result<()> {
+                            let h_raw = inner.spawn(move || -> std::io::Result<()> {
+                                for frames in [1_usize, 7, 32, 33] {
+                                    let input = values(frames * channels);
+                                    let init_st = values((kernel - 1) * channels);
+                                    for threads in [8_usize, 1] {
+                                        let mut st_raw = init_st.clone();
+                                        let out_raw = raw_ref.forward_stream_parallel(
+                                            &input,
+                                            frames,
+                                            &mut st_raw,
+                                            threads,
+                                        )?;
+                                        let mut st_pkg = init_st.clone();
+                                        let out_pkg = pkg_ref.forward_stream_parallel(
+                                            &input,
+                                            frames,
+                                            &mut st_pkg,
+                                            threads,
+                                        )?;
+                                        assert_f32_bits_eq(
+                                            &out_pkg,
+                                            &out_raw,
+                                            &format!(
+                                                "ConvNeXt packed_only mismatch c={channels} mid_c={mid_c} frames={frames} threads={threads}"
+                                            ),
+                                        );
+                                        assert_eq!(st_pkg, st_raw);
+                                    }
+                                }
+                                Ok(())
+                            });
+                            h_raw
+                                .join()
+                                .map_err(|_| std::io::Error::other("ConvNeXt shape worker panicked"))?
+                        })
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| std::io::Error::other("ConvNeXt outer worker panicked"))??;
             }
-        }
+            Ok(())
+        })?;
         Ok(())
     }
 

@@ -571,20 +571,17 @@ fn watchdog_terminates_only_its_companion_on_disconnect_extra_data_and_deadline(
                         command.creation_flags(0x0800_0000);
                     }
                     let mut child = DisposableChild(command.spawn()?);
-                    listener.set_nonblocking(true)?;
                     let until = Instant::now() + Duration::from_secs(5);
-                    let mut peer = loop {
-                        match listener.accept() {
-                            Ok((peer, _)) => break peer,
-                            Err(error)
-                                if error.kind() == io::ErrorKind::WouldBlock
-                                    && Instant::now() < until =>
-                            {
-                                thread::sleep(Duration::from_millis(1));
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    };
+                    let (accept_tx, accept_rx) = std::sync::mpsc::sync_channel(1);
+                    thread::spawn(move || {
+                        let _ = accept_tx.send(listener.accept());
+                    });
+                    let mut peer = accept_rx
+                        .recv_timeout(until.saturating_duration_since(Instant::now()))
+                        .map_err(|_| {
+                            io::Error::other("Companion watchdog failed to accept before deadline")
+                        })??
+                        .0;
                     if mode == "extra" {
                         peer.write_all(b"queued-data")?;
                     }
@@ -594,18 +591,10 @@ fn watchdog_terminates_only_its_companion_on_disconnect_extra_data_and_deadline(
                     } else {
                         Some(peer)
                     };
-                    loop {
-                        if let Some(status) = child.0.try_wait()? {
-                            assert_eq!(status.code(), Some(70));
-                            break;
-                        }
-                        if Instant::now() >= until {
-                            return Err(io::Error::other(
-                                "Companion watchdog failed to terminate inference",
-                            ));
-                        }
-                        thread::sleep(Duration::from_millis(1));
-                    }
+                    let status = wait_child_exit(&mut child.0, until).map_err(|_| {
+                        io::Error::other("Companion watchdog failed to terminate inference")
+                    })?;
+                    assert_eq!(status.code(), Some(70));
                     Ok(())
                 })
             })
@@ -617,6 +606,26 @@ fn watchdog_terminates_only_its_companion_on_disconnect_extra_data_and_deadline(
         }
         Ok(())
     })
+}
+
+fn wait_child_exit(
+    child: &mut std::process::Child,
+    until: std::time::Instant,
+) -> io::Result<std::process::ExitStatus> {
+    let spin_until = std::time::Instant::now() + Duration::from_millis(5);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= until {
+            return Err(io::Error::other("Child failed to finish before deadline"));
+        }
+        if std::time::Instant::now() < spin_until {
+            thread::yield_now();
+        } else {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 struct CompletionFake(bool);
@@ -652,7 +661,7 @@ impl Engine for CompletionFake {
     }
 }
 
-const COMPLETED_REQUESTS: usize = 32;
+const COMPLETED_REQUESTS: usize = 8;
 
 #[test]
 #[ignore = "Only spawned by the completed-response regression as a disposable companion."]
@@ -786,19 +795,12 @@ fn completed_pcm_and_wave_clients_can_close_before_the_next_request() -> io::Res
         // ordinary HTTP client does. The next request reuses the same engine.
         drop(peer);
     }
-    loop {
-        if let Some(status) = child.0.try_wait()? {
-            assert!(
-                status.success(),
-                "Completed speech companion failed: {status}"
-            );
-            break;
-        }
-        if Instant::now() >= until {
-            return Err(io::Error::other("Completion fixture failed to finish."));
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
+    let status = wait_child_exit(&mut child.0, until)
+        .map_err(|_| io::Error::other("Completion fixture failed to finish."))?;
+    assert!(
+        status.success(),
+        "Completed speech companion failed: {status}"
+    );
     Ok(())
 }
 

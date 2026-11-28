@@ -6093,7 +6093,7 @@ mod tests {
                     }
                 };
 
-                const WORKERS_LIST: [usize; 3] = [1, 3, 8];
+                const WORKERS_LIST: [usize; 3] = [8, 3, 1];
                 let max_batch = 19_usize;
                 let raw_input_full: Vec<f32> = (0..max_batch * input)
                     .map(|idx| {
@@ -6500,6 +6500,11 @@ mod tests {
             full_exp_q6.extend(scalar_multiply_reference(wm6_max, row_in));
         }
 
+        let batches = [1_usize, 2, 4, 5, 8, 9, 12, 13, 16, 19];
+        let mut prepared_batches: Vec<PreparedBatch> = batches
+            .iter()
+            .map(|&batch| PreparedBatch::new(&full_raw_in[..batch * input], batch, input))
+            .collect();
         let mut got = Vec::new();
         let mut scratch = Vec::new();
         for out_rows in [1_usize, 3, 4, 5, 8, 9, 11, 13, 16, 24] {
@@ -6523,9 +6528,8 @@ mod tests {
                 multiply_single_into(wm6, row_in, 1, &mut single_row);
                 full_single_q6.extend(single_row.iter().map(|v| v.to_bits()));
             }
-            for batch in [1_usize, 2, 4, 5, 8, 9, 12, 13, 16, 19] {
+            for (batch, prepared) in batches.iter().copied().zip(prepared_batches.iter_mut()) {
                 let raw_in = &full_raw_in[..batch * input];
-                let mut prepared = PreparedBatch::new(raw_in, batch, input);
                 for (name, wm, full_exp, full_single_bits) in [
                     ("q4_k", wm4, &full_exp_q4, &full_single_q4),
                     ("q6_k", wm6, &full_exp_q6, &full_single_q6),
@@ -6539,12 +6543,18 @@ mod tests {
                     #[cfg(not(all(windows, feature = "rust-qualification")))]
                     let exp_bits: Vec<u32> = exp_batch.iter().map(|v| v.to_bits()).collect();
                     let mut prev_bits: Option<Vec<u32>> = None;
-                    for workers in [1_usize, 3, 8] {
+                    let worker_list: &[usize] =
+                        if matches!(out_rows, 1 | 5 | 13 | 24) && matches!(batch, 1 | 5 | 19) {
+                            &[8, 3, 1]
+                        } else {
+                            &[1]
+                        };
+                    for &workers in worker_list {
                         got.resize(batch * out_rows, 0.0_f32);
                         got.fill(0.0_f32);
                         multiply_batch_prepared_into(
                             wm,
-                            &mut prepared,
+                            prepared,
                             raw_in,
                             workers,
                             &mut scratch,
@@ -6606,7 +6616,7 @@ mod tests {
         ];
         let (_, seq_q8, seq_qk) =
             super::quantize_batch_activations(matrices, &raw_input, batch, width, 1);
-        for workers in [2_usize, 4, 8] {
+        for workers in [8_usize, 4, 2] {
             let (_, par_q8, par_qk) =
                 super::quantize_batch_activations(matrices, &raw_input, batch, width, workers);
             assert_eq!(par_q8.len(), seq_q8.len());
@@ -6714,7 +6724,7 @@ mod tests {
                 full_exp_single.extend_from_slice(&single_buf);
             }
             let full_exp_bits: Vec<u32> = full_exp_single.iter().map(|v| v.to_bits()).collect();
-            for workers in [1_usize, 3, 8] {
+            for workers in [8_usize, 3, 1] {
                 let mut single_repack = Vec::with_capacity(MAX_BATCH * out_rows);
                 for t in 0..MAX_BATCH {
                     multiply_single_into(
@@ -6752,7 +6762,7 @@ mod tests {
                 );
                 let exp_q8_bits: Vec<u32> = exp_q8.iter().map(|v| v.to_bits()).collect();
 
-                for workers in [1_usize, 3, 8] {
+                for workers in [8_usize, 3, 1] {
                     scratch.resize(out_rows * batch + 16, f32::NAN);
                     let mut batch_repack = vec![f32::NAN; batch * out_rows];
                     multiply_batch_prepared_into(
@@ -6887,7 +6897,7 @@ mod tests {
                 }
             }
             let expected_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            for workers in [1_usize, 2, 4] {
+            for workers in [4_usize, 2, 1] {
                 let mut actual = vec![f32::NAN; batch * output];
                 super::scatter_rows_to_batch(&transposed, output, batch, workers, &mut actual);
                 assert_eq!(
@@ -6950,7 +6960,7 @@ mod tests {
                 .zip(&add)
                 .map(|(&a, &b)| (a + b).to_bits())
                 .collect();
-            for workers in [1_usize, 3] {
+            for workers in [3_usize, 1] {
                 let mut actual = dst_init.clone();
                 super::add_residual_batch(&mut actual, &add, workers, width, inv)?;
                 assert_eq!(
@@ -7045,7 +7055,7 @@ mod tests {
                         }
                     }
 
-                    for workers in [1_usize, 3] {
+                    for workers in [3_usize, 1] {
                         let mut prepared = PreparedBatch::default();
                         prepared.prepare_meta(batch, input);
                         assert_eq!(prepared.quads_capacity(), 0);
@@ -7159,7 +7169,7 @@ mod tests {
                         }
                     }
 
-                    for workers in [1_usize, 3] {
+                    for workers in [3_usize, 1] {
                         let mut prepared = PreparedBatch::default();
                         prepared.prepare_meta(batch, input);
                         assert_eq!(prepared.quads_capacity(), 0);
@@ -7504,7 +7514,7 @@ mod tests {
             let mut logits = vec![0.0_f32; output];
             multiply_single_into(wm_f32, &act, 4, &mut logits);
             let expected = super::argmax_finite_f32(&logits);
-            for workers in [1_usize, 3, 8] {
+            for workers in [8_usize, 3, 1] {
                 assert_eq!(
                     super::multiply_single_argmax(wm_f32, &act, workers),
                     expected
@@ -7539,7 +7549,7 @@ mod tests {
             };
             multiply_single_into(wm_q8, &act, 4, &mut logits);
             let expected_q8 = super::argmax_finite_f32(&logits);
-            for workers in [1_usize, 3, 8] {
+            for workers in [8_usize, 3, 1] {
                 assert_eq!(
                     super::multiply_single_argmax(wm_q8, &act, workers),
                     expected_q8

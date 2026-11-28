@@ -901,11 +901,19 @@ mod tests {
         );
 
         // Worker returning Err(InvalidData) aborts peers and propagates error.
-        let abort_err = super::load_mapped_blocks(8, &mut || false, |layer| {
+        let abort_seen = std::sync::atomic::AtomicBool::new(false);
+        let abort_ref = &abort_seen;
+        let abort_err = super::load_mapped_blocks(8, &mut || false, move |layer| {
             if layer == 2 {
+                abort_ref.store(true, std::sync::atomic::Ordering::Release);
                 Err(io::Error::new(io::ErrorKind::InvalidData, "bad layer"))
             } else {
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+                while !abort_ref.load(std::sync::atomic::Ordering::Acquire)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
                 Ok(layer)
             }
         })
@@ -927,8 +935,14 @@ mod tests {
                 if layer < 2 {
                     worker_barrier.wait();
                     cancel_ref.store(true, std::sync::atomic::Ordering::Release);
+                } else {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+                    while !cancel_ref.load(std::sync::atomic::Ordering::Acquire)
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(3));
                 Ok(layer)
             },
         )

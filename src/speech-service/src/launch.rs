@@ -881,21 +881,28 @@ mod tests {
         Ok(())
     }
 
+    fn write_small_fixture_file(path: &Path, payload: &[u8]) -> io::Result<serde_json::Value> {
+        fs::write(path, payload)?;
+        let whole = hex_lower(&Sha256::digest_bytes(payload)?);
+        Ok(serde_json::json!({
+            "bytes": payload.len(),
+            "sha256": whole,
+        }))
+    }
+
     #[test]
     fn staged_tts_verification_never_loads_unverified_artifact() -> io::Result<()> {
         let (directory, mut values) = fixture()?;
         let codec = directory.join("codec.gguf");
         let voice = directory.join("voice.gguf");
         let chunk_bytes = usize::try_from(MIN_MAPPED_HASH_BYTES).map_err(io::Error::other)?;
-        let codec_entry =
-            write_chunked_fixture_file(&codec, &vec![0x11_u8; chunk_bytes + 5], chunk_bytes)?;
+        let codec_entry = write_small_fixture_file(&codec, b"cdc")?;
         let design_entry = write_chunked_fixture_file(
             &directory.join("model.gguf"),
             &vec![0x22_u8; chunk_bytes + 7],
             chunk_bytes,
         )?;
-        let voice_entry =
-            write_chunked_fixture_file(&voice, &vec![0x33_u8; chunk_bytes + 9], chunk_bytes)?;
+        let voice_entry = write_small_fixture_file(&voice, b"voc")?;
 
         values.extend([
             OsString::from("--codec"),
@@ -919,7 +926,6 @@ mod tests {
         // Case 1: invalid codec -> neither loader runs.
         let mut bad_codec = lock_value.clone();
         bad_codec["files"]["codec"]["sha256"] = serde_json::json!("0".repeat(64));
-        bad_codec["files"]["codec"]["chunkSha256s"][0] = serde_json::json!("0".repeat(64));
         let codec_called = AtomicBool::new(false);
         let design_called = AtomicBool::new(false);
         let res = verify_and_load_tts(

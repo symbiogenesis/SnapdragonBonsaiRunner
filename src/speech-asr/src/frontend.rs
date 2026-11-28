@@ -120,6 +120,7 @@ fn slaney_filterbank() -> io::Result<Vec<f32>> {
 }
 
 /// Immutable bounded frontend tables, reusable across requests without audio state.
+#[cfg_attr(test, derive(Clone))]
 pub struct Frontend {
     window: [f32; FFT_SIZE],
     filterbank: Vec<f32>,

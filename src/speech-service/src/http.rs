@@ -1059,7 +1059,7 @@ mod pcm_tests {
         .ok_or_else(|| io::Error::other("expected set_timeout read_failed"))?;
         assert_eq!((st_read_err.status, st_read_err.code), (400, "read_failed"));
 
-        let soon = Instant::now() + Duration::from_millis(15);
+        let soon = Instant::now() + Duration::from_millis(1);
         let mut loop_eintr = ScriptedIo {
             read_result: None,
             write_result: None,
@@ -1111,7 +1111,7 @@ mod pcm_tests {
             b"",
             Instant::now() - Duration::from_secs(1),
         )?;
-        let soon_w = Instant::now() + Duration::from_millis(15);
+        let soon_w = Instant::now() + Duration::from_millis(1);
         let mut loop_w_eintr = ScriptedIo {
             read_result: None,
             write_result: None,

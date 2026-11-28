@@ -3,7 +3,12 @@
 use super::*;
 
 fn frontend() -> io::Result<Frontend> {
-    Frontend::from_checkpoint(None, None)
+    static CACHED: std::sync::OnceLock<Frontend> = std::sync::OnceLock::new();
+    if let Some(frontend) = CACHED.get() {
+        return Ok(frontend.clone());
+    }
+    let frontend = Frontend::from_checkpoint(None, None)?;
+    Ok(CACHED.get_or_init(|| frontend).clone())
 }
 
 #[test]
@@ -235,7 +240,7 @@ fn rust_asr_frontend_four_frame_simd_and_parallel_match_scalar_bits() -> io::Res
         }
         normalize(&mut scalar_values, &mut || false)?;
 
-        for workers in [1, 2, 4, 8] {
+        for workers in [8, 4, 2, 1] {
             let actual = frontend.compute_with_threads(&pcm, workers, || false)?;
             assert_eq!(actual.frames(), frames);
             assert_eq!(actual.values().len(), scalar_values.len());

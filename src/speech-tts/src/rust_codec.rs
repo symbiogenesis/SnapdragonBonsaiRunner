@@ -2692,12 +2692,7 @@ fn load_dac_res_unit<S: CodecSource + ?Sized>(
     })
 }
 
-fn load_dac_decoder<S: CodecSource + ?Sized>(
-    weights: &S,
-    latent: usize,
-    output_rate: u32,
-    threads: usize,
-) -> io::Result<DacDecoder> {
+fn dac_layout(output_rate: u32) -> io::Result<(&'static [(usize, usize, usize)], usize)> {
     const STRIDES_24K: &[(usize, usize, usize)] =
         &[(0, 8, 1536), (1, 5, 768), (2, 4, 384), (3, 3, 192)];
     const STRIDES_48K: &[(usize, usize, usize)] = &[
@@ -2707,6 +2702,38 @@ fn load_dac_decoder<S: CodecSource + ?Sized>(
         (3, 3, 192),
         (4, 2, 96),
     ];
+    match output_rate {
+        SAMPLE_RATE => Ok((STRIDES_24K, 96)),
+        SAMPLE_RATE_48K => Ok((STRIDES_48K, 48)),
+        _ => Err(invalid()),
+    }
+}
+
+fn load_dac_decoder<S: CodecSource + ?Sized>(
+    weights: &S,
+    latent: usize,
+    output_rate: u32,
+    threads: usize,
+) -> io::Result<DacDecoder> {
+    let (strides, post_channels) = dac_layout(output_rate)?;
+    load_dac_decoder_with_layout(
+        weights,
+        latent,
+        output_rate,
+        threads,
+        strides,
+        post_channels,
+    )
+}
+
+fn load_dac_decoder_with_layout<S: CodecSource + ?Sized>(
+    weights: &S,
+    latent: usize,
+    output_rate: u32,
+    threads: usize,
+    strides: &[(usize, usize, usize)],
+    post_channels: usize,
+) -> io::Result<DacDecoder> {
     const DILATIONS: [usize; 3] = [1, 3, 9];
     enum DacLoadItem {
         ConvPre(CausalConv1d),
@@ -2715,11 +2742,7 @@ fn load_dac_decoder<S: CodecSource + ?Sized>(
         Post(SnakeBeta, CausalConv1d),
     }
 
-    let (strides, post_channels) = match output_rate {
-        SAMPLE_RATE => (STRIDES_24K, 96_usize),
-        SAMPLE_RATE_48K => (STRIDES_48K, 48_usize),
-        _ => return Err(invalid()),
-    };
+    let first_channels = strides.first().map(|&(_, _, ch)| ch).ok_or_else(invalid)?;
     let num_blocks = strides.len();
     let total_tasks = 1 + num_blocks * 4 + 1;
     let post_task = total_tasks - 1;
@@ -2733,7 +2756,7 @@ fn load_dac_decoder<S: CodecSource + ?Sized>(
                 weights,
                 "tok_dec.dec.0.conv",
                 latent,
-                1536,
+                first_channels,
                 7,
                 1,
                 1,
@@ -4660,22 +4683,39 @@ mod tests {
         let mut single = vec![1.0_f32, 0.0, 1.0, 0.0];
         super::apply_rope_batch(&mut single, 1, 1, 4, &[0.0, 0.0], &[1.0, 1.0], 1)?;
 
-        // load_dac_decoder rejects unsupported sample rates (e.g. 16_000) and builds 48 kHz 5-block decoder.
+        // dac_layout rejects unsupported sample rates and preserves production 24k/48k schedules;
+        // load_dac_decoder_with_layout builds a 48 kHz 5-block decoder without 430 MiB zero tensors.
+        let (strides_24k, post_24k) = super::dac_layout(super::SAMPLE_RATE)?;
+        assert_eq!(
+            strides_24k,
+            &[(0, 8, 1536), (1, 5, 768), (2, 4, 384), (3, 3, 192)]
+        );
+        assert_eq!(post_24k, 96);
+        let (strides_48k, post_48k) = super::dac_layout(super::SAMPLE_RATE_48K)?;
+        assert_eq!(
+            strides_48k,
+            &[
+                (0, 8, 1536),
+                (1, 5, 768),
+                (2, 4, 384),
+                (3, 3, 192),
+                (4, 2, 96)
+            ]
+        );
+        assert_eq!(post_48k, 48);
+        assert!(super::dac_layout(16_000).is_err());
+
+        const SCALED_48K: &[(usize, usize, usize)] =
+            &[(0, 8, 32), (1, 5, 16), (2, 4, 8), (3, 3, 4), (4, 2, 2)];
         struct ZeroCodecSource {
             shapes: std::collections::HashMap<String, Vec<usize>>,
         }
         impl ZeroCodecSource {
-            fn for_48k() -> Self {
+            fn for_scaled_48k() -> Self {
                 let mut shapes = std::collections::HashMap::new();
-                shapes.insert("tok_dec.dec.0.conv.weight".into(), vec![7, 1024, 1536]);
-                shapes.insert("tok_dec.dec.7.conv.weight".into(), vec![7, 48, 1]);
-                for (idx, stride, channels) in [
-                    (0_usize, 8_usize, 1536_usize),
-                    (1, 5, 768),
-                    (2, 4, 384),
-                    (3, 3, 192),
-                    (4, 2, 96),
-                ] {
+                shapes.insert("tok_dec.dec.0.conv.weight".into(), vec![7, 8, 32]);
+                shapes.insert("tok_dec.dec.7.conv.weight".into(), vec![7, 1, 1]);
+                for &(idx, stride, channels) in SCALED_48K {
                     let next = channels / 2;
                     shapes.insert(
                         format!("tok_dec.dec.{}.conv_t.weight", idx + 1),
@@ -4730,9 +4770,16 @@ mod tests {
                 Err(super::invalid())
             }
         }
-        let zero_src = ZeroCodecSource::for_48k();
-        assert!(super::load_dac_decoder(&zero_src, 1024, 16_000, 1).is_err());
-        let dac_48k = super::load_dac_decoder(&zero_src, 1024, super::SAMPLE_RATE_48K, 2)?;
+        let zero_src = ZeroCodecSource::for_scaled_48k();
+        assert!(super::load_dac_decoder(&zero_src, 8, 16_000, 1).is_err());
+        let dac_48k = super::load_dac_decoder_with_layout(
+            &zero_src,
+            8,
+            super::SAMPLE_RATE_48K,
+            2,
+            SCALED_48K,
+            1,
+        )?;
         assert_eq!(dac_48k.sample_rate(), super::SAMPLE_RATE_48K);
         assert_eq!(dac_48k.blocks.len(), 5);
         Ok(())

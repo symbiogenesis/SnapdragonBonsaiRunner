@@ -472,7 +472,7 @@ mod tests {
                                 .to_bits()
                         })
                         .collect();
-                    for workers in [1, 3, 18] {
+                    for workers in [18, 3, 1] {
                         let actual = projection.forward_vec_parallel(&input, None, workers)?;
                         assert_eq!(
                             actual
@@ -542,7 +542,7 @@ mod tests {
                 }
             }
             let mut baseline_bits = None;
-            for workers in [1, 3, 18] {
+            for workers in [18, 3, 1] {
                 let actual = projection.forward_vec_parallel(&input, None, workers)?;
                 let actual_bits: Vec<u32> = actual.iter().map(|value| value.to_bits()).collect();
                 if matches!(kind, 0 | 1) || cfg!(not(windows)) {

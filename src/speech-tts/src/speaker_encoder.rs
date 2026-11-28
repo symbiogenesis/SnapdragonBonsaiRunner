@@ -1555,7 +1555,7 @@ mod tests {
             },
         };
         let seq_xvec = encoder.extract_xvector(&audio)?;
-        for threads in [2_usize, 4, 8] {
+        for threads in [8_usize, 4, 2] {
             let (par_mel, par_frames) = encoder.mel.extract_parallel(&audio, threads)?;
             assert_eq!(par_frames, frames);
             assert_eq!(

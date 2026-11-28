@@ -1286,11 +1286,11 @@ mod tests {
         Ok(Fixture(path))
     }
 
-    fn single_tensor_gguf(
+    fn single_tensor_gguf_bytes(
         kv: &[(&[u8], u32, &[u8])],
         alignment: usize,
         tensor_offset: u64,
-    ) -> io::Result<Fixture> {
+    ) -> io::Result<Vec<u8>> {
         let mut bytes = b"GGUF".to_vec();
         bytes.extend(3_u32.to_le_bytes());
         bytes.extend(1_u64.to_le_bytes());
@@ -1314,95 +1314,87 @@ mod tests {
             padded + usize::try_from(tensor_offset).map_err(|_| invalid())? + 4,
             0,
         );
+        Ok(bytes)
+    }
+
+    fn single_tensor_gguf(
+        kv: &[(&[u8], u32, &[u8])],
+        alignment: usize,
+        tensor_offset: u64,
+    ) -> io::Result<Fixture> {
+        let bytes = single_tensor_gguf_bytes(kv, alignment, tensor_offset)?;
         write_raw_gguf(&bytes)
+    }
+
+    fn parse_gguf_bytes(bytes: &[u8]) -> io::Result<ParsedWeightsIndex> {
+        let length = u64::try_from(bytes.len()).map_err(|_| invalid())?;
+        let mut cursor = io::Cursor::new(bytes);
+        parse_index(&mut cursor, length, false, 64 * 1024 * 1024)
     }
 
     #[test]
     fn hardened_gguf_metadata_and_alignment_checks() -> io::Result<()> {
-        let checks: Vec<Box<dyn FnOnce() -> io::Result<()> + Send + Sync>> = vec![
-            Box::new(|| {
-                // Bool scalar: 0/1 valid, 2 invalid.
-                let ok_bool = single_tensor_gguf(&[(b"b", 7, &[1])], 32, 0)?;
-                assert!(Weights::open(&ok_bool.0).is_ok());
-                let bad_bool = single_tensor_gguf(&[(b"b", 7, &[2])], 32, 0)?;
-                assert!(Weights::open(&bad_bool.0).is_err());
-                Ok(())
-            }),
-            Box::new(|| {
-                // Bool array: 2 rejected.
-                let mut bad_bool_arr = Vec::new();
-                bad_bool_arr.extend(7_u32.to_le_bytes());
-                bad_bool_arr.extend(2_u64.to_le_bytes());
-                bad_bool_arr.extend([0_u8, 2]);
-                let bad_bool_arr_file = single_tensor_gguf(&[(b"arr", 9, &bad_bool_arr)], 32, 0)?;
-                assert!(Weights::open(&bad_bool_arr_file.0).is_err());
-                Ok(())
-            }),
-            Box::new(|| {
-                // Interior NUL in string metadata rejected.
-                let mut nul_str = Vec::new();
-                push_kv_str(&mut nul_str, b"hi\0there")?;
-                let nul_str_file = single_tensor_gguf(&[(b"s", 8, &nul_str)], 32, 0)?;
-                assert!(Weights::open(&nul_str_file.0).is_err());
-                Ok(())
-            }),
-            Box::new(|| {
-                // Positive power-of-two INT32 general.alignment accepted; non-positive, non-power-of-two,
-                // and > 1_048_576 rejected.
-                let positive_i32_align =
-                    single_tensor_gguf(&[(b"general.alignment", 5, &32_i32.to_le_bytes())], 32, 0)?;
-                assert!(Weights::open(&positive_i32_align.0).is_ok());
-                for bad_i32 in [0_i32, -32, 3, 2_097_152] {
-                    let file = single_tensor_gguf(
-                        &[(b"general.alignment", 5, &bad_i32.to_le_bytes())],
-                        32,
-                        0,
-                    )?;
-                    assert!(Weights::open(&file.0).is_err());
-                }
-                Ok(())
-            }),
-            Box::new(|| {
-                // Non-power-of-two and > 1_048_576 general.alignment rejected; 1_048_576 accepted.
-                for bad_align in [0_u32, 3, 2_097_152] {
-                    let file = single_tensor_gguf(
-                        &[(b"general.alignment", 4, &bad_align.to_le_bytes())],
-                        32,
-                        0,
-                    )?;
-                    assert!(Weights::open(&file.0).is_err());
-                }
-                let max_align = single_tensor_gguf(
-                    &[(b"general.alignment", 4, &1_048_576_u32.to_le_bytes())],
-                    1_048_576,
-                    0,
-                )?;
-                assert!(Weights::open(&max_align.0).is_ok());
-                Ok(())
-            }),
-            Box::new(|| {
-                // Duplicate metadata key rejected.
-                let dup_key = single_tensor_gguf(
-                    &[
-                        (b"dup", 4, &1_u32.to_le_bytes()),
-                        (b"dup", 4, &2_u32.to_le_bytes()),
-                    ],
-                    32,
-                    0,
-                )?;
-                assert!(Weights::open(&dup_key.0).is_err());
-                Ok(())
-            }),
-        ];
-        std::thread::scope(|scope| -> io::Result<()> {
-            let handles: Vec<_> = checks.into_iter().map(|work| scope.spawn(work)).collect();
-            for handle in handles {
-                handle
-                    .join()
-                    .map_err(|_| io::Error::other("gguf check worker panicked"))??;
-            }
-            Ok(())
-        })
+        // Disk smoke check on Weights::open for valid and invalid bool scalar.
+        let ok_bool = single_tensor_gguf(&[(b"b", 7, &[1])], 32, 0)?;
+        assert!(Weights::open(&ok_bool.0).is_ok());
+        let bad_bool = single_tensor_gguf(&[(b"b", 7, &[2])], 32, 0)?;
+        assert!(Weights::open(&bad_bool.0).is_err());
+
+        // Bool array: 2 rejected.
+        let mut bad_bool_arr = Vec::new();
+        bad_bool_arr.extend(7_u32.to_le_bytes());
+        bad_bool_arr.extend(2_u64.to_le_bytes());
+        bad_bool_arr.extend([0_u8, 2]);
+        let bad_bool_arr_bytes = single_tensor_gguf_bytes(&[(b"arr", 9, &bad_bool_arr)], 32, 0)?;
+        assert!(parse_gguf_bytes(&bad_bool_arr_bytes).is_err());
+
+        // Interior NUL in string metadata rejected.
+        let mut nul_str = Vec::new();
+        push_kv_str(&mut nul_str, b"hi\0there")?;
+        let nul_str_bytes = single_tensor_gguf_bytes(&[(b"s", 8, &nul_str)], 32, 0)?;
+        assert!(parse_gguf_bytes(&nul_str_bytes).is_err());
+
+        // Positive power-of-two INT32 general.alignment accepted; non-positive, non-power-of-two,
+        // and > 1_048_576 rejected.
+        let positive_i32_align =
+            single_tensor_gguf_bytes(&[(b"general.alignment", 5, &32_i32.to_le_bytes())], 32, 0)?;
+        assert!(parse_gguf_bytes(&positive_i32_align).is_ok());
+        for bad_i32 in [0_i32, -32, 3, 2_097_152] {
+            let bytes = single_tensor_gguf_bytes(
+                &[(b"general.alignment", 5, &bad_i32.to_le_bytes())],
+                32,
+                0,
+            )?;
+            assert!(parse_gguf_bytes(&bytes).is_err());
+        }
+
+        // Non-power-of-two and > 1_048_576 general.alignment rejected; 1_048_576 accepted.
+        for bad_align in [0_u32, 3, 2_097_152] {
+            let bytes = single_tensor_gguf_bytes(
+                &[(b"general.alignment", 4, &bad_align.to_le_bytes())],
+                32,
+                0,
+            )?;
+            assert!(parse_gguf_bytes(&bytes).is_err());
+        }
+        let max_align = single_tensor_gguf_bytes(
+            &[(b"general.alignment", 4, &1_048_576_u32.to_le_bytes())],
+            1_048_576,
+            0,
+        )?;
+        assert!(parse_gguf_bytes(&max_align).is_ok());
+
+        // Duplicate metadata key rejected.
+        let dup_key = single_tensor_gguf_bytes(
+            &[
+                (b"dup", 4, &1_u32.to_le_bytes()),
+                (b"dup", 4, &2_u32.to_le_bytes()),
+            ],
+            32,
+            0,
+        )?;
+        assert!(parse_gguf_bytes(&dup_key).is_err());
+        Ok(())
     }
 
     #[test]

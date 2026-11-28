@@ -159,13 +159,22 @@ pub fn serve(engine: impl Engine, port: u16, key_file: &Path) -> io::Result<()> 
 }
 
 fn accept_next<T>(mut accept: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    accept_next_with_backoff(&mut accept, || {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    })
+}
+
+fn accept_next_with_backoff<T>(
+    mut accept: impl FnMut() -> io::Result<T>,
+    mut on_backoff: impl FnMut(),
+) -> io::Result<T> {
     loop {
         match accept() {
             Ok(accepted) => return Ok(accepted),
             Err(error) => match error.kind() {
                 io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => {}
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    on_backoff();
                 }
                 _ => return Err(error),
             },
@@ -214,7 +223,7 @@ pub fn serve_with_ready(
 
 #[cfg(test)]
 mod accept_tests {
-    use super::accept_next;
+    use super::{accept_next, accept_next_with_backoff};
     use std::io;
 
     #[test]
@@ -227,12 +236,19 @@ mod accept_tests {
             Ok(42_u8),
         ]
         .into_iter();
-        let accepted = accept_next(|| {
-            sequence
-                .next()
-                .unwrap_or_else(|| Err(io::Error::other("exhausted")))
-        });
+        let mut backoffs = 0_usize;
+        let accepted = accept_next_with_backoff(
+            || {
+                sequence
+                    .next()
+                    .unwrap_or_else(|| Err(io::Error::other("exhausted")))
+            },
+            || {
+                backoffs += 1;
+            },
+        );
         assert_eq!(accepted.ok(), Some(42));
+        assert_eq!(backoffs, 2);
 
         let mut fatal_calls = 0_usize;
         let fatal = accept_next(|| -> io::Result<u8> {

@@ -7124,7 +7124,7 @@ mod tests {
                 )?;
                 expected.extend_from_slice(&row);
             }
-            for workers in [1_usize, 4, 8] {
+            for workers in [8_usize, 4, 1] {
                 let mut actual = Vec::new();
                 super::rms_norm_batch_into(&inputs, seq_len, &weight, 1e-6, workers, &mut actual)?;
                 assert_eq!(
@@ -7187,7 +7187,7 @@ mod tests {
                     1,
                 )?;
             }
-            for workers in [1_usize, 4, 8] {
+            for workers in [8_usize, 4, 1] {
                 let mut actual = vec![f32::NAN; seq_len * query_width];
                 super::attend_batch_f16(
                     level,
@@ -7622,7 +7622,7 @@ mod tests {
                 1,
             )?;
 
-            for workers in [4_usize, 8] {
+            for workers in [8_usize, 4] {
                 let mut q_par = q_init.clone();
                 let mut k_par = k_init.clone();
                 super::normalize_and_rope_qk_batch(
