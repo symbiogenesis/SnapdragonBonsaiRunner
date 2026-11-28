@@ -103,6 +103,7 @@ pub(super) mod cpu;
 pub(super) mod devices;
 mod environment;
 pub(super) mod host;
+pub(super) mod instance;
 pub(super) mod isa;
 #[cfg(feature = "test-probe")]
 mod job_probe;
@@ -385,7 +386,7 @@ pub(super) fn current_creation_time() -> io::Result<u64> {
     creation_file_time_raw(process)
 }
 
-fn creation_file_time(handle: &OwnedHandle) -> io::Result<u64> {
+pub(super) fn creation_file_time(handle: &OwnedHandle) -> io::Result<u64> {
     creation_file_time_raw(handle.as_raw_handle())
 }
 
@@ -1953,7 +1954,7 @@ fn standard_file(
     })
 }
 
-fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
+pub(super) fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
@@ -1962,7 +1963,7 @@ fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
-fn check(result: i32) -> io::Result<()> {
+pub(super) fn check(result: i32) -> io::Result<()> {
     if result == 0 {
         Err(io::Error::last_os_error())
     } else {

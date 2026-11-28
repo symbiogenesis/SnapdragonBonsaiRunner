@@ -838,7 +838,9 @@ cache cleanup. `chat` and JSON `chat-launch` own option validation, provisioning
 credentials, arguments and native app lifetime (including `--daisyrose-lora` /
 `--no-daisyrose-lora` opt-in/opt-out forwarding, gated off by default while
 unpinned). Rust holds the persistent per-user
-instance lock until the owned app tree exits.
+instance lock until the owned app tree exits; when a newer version starts while
+a strictly older instance holds the lock, it terminates the older process tree
+and takes over, while keeping same-version, newer, or unidentifiable holders.
 Build variants use independent, flushed-and-atomically-published receipts.
 Non-build documentation/helper changes preserve reuse; referenced embedded
 content and configuration changes invalidate it. Damaged outputs and incomplete

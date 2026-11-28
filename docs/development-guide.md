@@ -685,7 +685,10 @@ and `--broker-path` must select matching current builds. Unique system-temp lane
 
 One user-wide exclusive `%LOCALAPPDATA%/SwiftBonsai2/chat.lock` covers preparation
 through app exit, including launches from other checkouts/packages/data/ports.
-Repeated launches report already starting/running. The empty sentinel persists
+If another running instance is proven to be a strictly older version, the newer
+launcher terminates that older process tree, waits for exit, and takes over
+admission; same-version, newer, or unidentifiable holders keep the existing
+instance and report already starting/running. The empty sentinel persists
 after release; `--speech-models-only` is independent. Direct `bonsai-tools chat`
 and installed-package launches retain native admission. Installed launches use [package verification](chat-packages.md#launch-without-a-checkout).
 

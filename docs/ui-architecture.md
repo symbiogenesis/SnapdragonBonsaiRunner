@@ -44,7 +44,9 @@ identities for transient confirmation.
 ### Launch and ownership
 
 The native `bonsai-tools chat` command owns build reuse,
-immutable tool snapshots and the per-user launch guard through teardown.
+immutable tool snapshots and the per-user launch guard through teardown (replacing
+a strictly older running instance when a newer version starts, while keeping any
+same-version or newer instance).
 The [development guide](development-guide.md#source-launch-caches-and-runtime-selection)
 owns source-launch receipts/cache rules; the [package contract](chat-packages.md#launch-without-a-checkout)
 owns verified installed launches.

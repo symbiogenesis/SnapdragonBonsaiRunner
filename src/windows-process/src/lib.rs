@@ -351,6 +351,70 @@ pub fn monotonic_ticks() -> io::Result<(u64, u64)> {
     native::maintenance::monotonic_ticks()
 }
 
+/// Observed identity of a live Windows process, including its creation FILETIME and image path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessIdentity {
+    /// Windows numeric process identifier.
+    pub pid: u32,
+    /// Process UTC creation FILETIME in 100-nanosecond ticks since 1601.
+    pub creation_file_time: u64,
+    /// Full Win32 executable image path when available from the OS.
+    pub executable_path: Option<PathBuf>,
+}
+
+/// Lists live Windows processes currently holding an open handle to `path`.
+///
+/// Uses the Restart Manager session API (`rstrtmgr.dll`) loaded dynamically from
+/// `System32` and validates each live handle against its creation FILETIME.
+///
+/// # Errors
+/// Rejects invalid paths or Restart Manager session/query failures.
+pub fn file_lock_holders(path: &Path) -> io::Result<Vec<ProcessIdentity>> {
+    native::instance::file_lock_holders(path)
+}
+
+/// Lists live direct child processes of an explicitly identified parent process.
+///
+/// Filters children whose creation FILETIME precedes `parent_creation_file_time`
+/// to avoid reporting PID-reused unrelated processes.
+///
+/// # Errors
+/// Rejects zero parent identities or failed/oversized Windows process snapshots.
+pub fn process_direct_children(
+    parent_pid: u32,
+    parent_creation_file_time: u64,
+) -> io::Result<Vec<ProcessIdentity>> {
+    native::instance::process_direct_children(parent_pid, parent_creation_file_time)
+}
+
+/// Reads the neutral `VS_FIXEDFILEINFO` `(major, minor, patch, build)` tuple from a PE file.
+///
+/// Loads `version.dll` dynamically from `System32` and returns `Ok(None)` when
+/// the file has no version resource.
+///
+/// # Errors
+/// Rejects invalid paths, inaccessible files, or oversized/malformed version queries.
+pub fn file_fixed_version(path: &Path) -> io::Result<Option<(u16, u16, u16, u16)>> {
+    native::instance::file_fixed_version(path)
+}
+
+/// Terminates an explicitly identified process and waits for its live descendants to exit.
+///
+/// Verifies `expected_creation_file_time` before terminating so PID reuse cannot
+/// strike an unrelated process, gives owned Jobs a brief cascade window after root
+/// exit, and forcefully terminates any surviving verified descendants within `timeout`.
+///
+/// # Errors
+/// Rejects zero/self PIDs, invalid timeouts, failed termination calls, or timeouts
+/// waiting for the process or its descendants to exit.
+pub fn terminate_process_tree(
+    pid: u32,
+    expected_creation_file_time: u64,
+    timeout: Duration,
+) -> io::Result<()> {
+    native::instance::terminate_process_tree(pid, expected_creation_file_time, timeout)
+}
+
 /// Checks a bounded process snapshot for any explicitly selected executable name.
 ///
 /// # Errors
