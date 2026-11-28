@@ -1674,11 +1674,13 @@ mod tests {
     }
 
     fn run_preparation_batch() -> Result<BTreeMap<String, std::result::Result<(), String>>> {
-        const SHARDS: [&[&str]; 5] = [
-            &["cargo_path_fallback_discovers_cargo_and_restores_path"],
+        const SHARDS: [&[&str]; 7] = [
             &[
+                "cargo_path_fallback_discovers_cargo_and_restores_path",
                 "fresh_preparation_reaches_committed_bootstrap",
                 "failed_preparation_invalidates_existing_receipt",
+            ],
+            &[
                 "ordinary_push_archives_only_committed_policy",
                 "stale_checker_recovers_from_committed_source",
                 "malformed_checker_receipt_recovers_from_committed_source",
@@ -1687,19 +1689,23 @@ mod tests {
                 "corrupt_checker_recovers_from_committed_source",
                 "missing_checker_receipt_recovers_from_committed_source",
                 "collection_checker_source_recovers_from_committed_source",
-                "collection_checker_digest_recovers_from_committed_source",
-                "unverified_supervisor_triggers_preparation",
             ],
             &[
+                "collection_checker_digest_recovers_from_committed_source",
+                "unverified_supervisor_triggers_preparation",
                 "absent_target_directory_triggers_preparation",
+            ],
+            &[
                 "missing_recovery_receipt_triggers_preparation",
                 "missing_recovery_helper_triggers_preparation",
                 "stale_recovery_source_triggers_preparation",
-                "corrupt_recovery_helper_triggers_preparation",
             ],
             &[
+                "corrupt_recovery_helper_triggers_preparation",
                 "automatic_preparation_invokes_committed_helper_once",
                 "automatic_preparation_rejects_invalid_prepared_outputs",
+            ],
+            &[
                 "failed_automatic_recovery_invalidates_existing_receipt",
                 "collection_recovery_source_triggers_preparation",
                 "collection_recovery_digest_triggers_preparation",

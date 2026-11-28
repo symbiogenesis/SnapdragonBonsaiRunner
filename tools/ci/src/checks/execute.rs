@@ -510,7 +510,7 @@ fn is_transient_fs_error(error: &std::io::Error) -> bool {
 
 fn rename_with_retry(source: &Path, destination: &Path) -> std::io::Result<()> {
     const MAX_ATTEMPTS: usize = 6;
-    let mut delay = Duration::from_millis(10);
+    let mut delay = Duration::from_millis(if cfg!(test) { 1 } else { 10 });
     for attempt in 1..=MAX_ATTEMPTS {
         match fs::rename(source, destination) {
             Ok(()) => return Ok(()),
@@ -571,7 +571,7 @@ impl Drop for TempWorkDir {
                 .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
         {
             const MAX_ATTEMPTS: usize = 5;
-            let mut delay = Duration::from_millis(10);
+            let mut delay = Duration::from_millis(if cfg!(test) { 1 } else { 10 });
             for attempt in 1..=MAX_ATTEMPTS {
                 match fs::remove_dir_all(&self.0) {
                     Ok(()) => return,

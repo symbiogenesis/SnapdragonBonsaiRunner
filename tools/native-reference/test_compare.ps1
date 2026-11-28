@@ -53,7 +53,19 @@ $tests=[ordered]@{
             [IO.File]::WriteAllBytes($reference,$raw);Write-FloatFixture $actual $values;$stride=if($format -ceq 'f16'){'2'}else{'4'}
             $result=Invoke-ReferenceNumeric $tool @('compare',$reference,$actual,$format,'0','4097',$stride,'0.001','0.001','plain');Assert-Reference ($result.byteExact -and $result.failedElements -eq 0) 'exact chunks differ'
             $bytes=[IO.File]::ReadAllBytes($actual);$bytes[7]=$bytes[7] -bxor 0x80;[IO.File]::WriteAllBytes($actual,$bytes);$result=Invoke-ReferenceNumeric $tool @('compare',$reference,$actual,$format,'0','4097',$stride,'0.001','0.001','plain');Assert-Reference (-not $result.byteExact -and $result.failedElements -eq 0) 'signed-zero exactness lost'
-            foreach($index in 0,4095,4096){foreach($special in [single]::NaN,[single]::PositiveInfinity,[single]::NegativeInfinity){$changed=$values.Clone();$changed[$index]=$special;Write-FloatFixture $actual $changed;Assert-Rejected {Invoke-ReferenceNumeric $tool @('compare',$reference,$actual,$format,'0','4097',$stride,'0.001','0.001','plain')}}}
+            $nonFiniteCases = @(foreach($index in 0,4095,4096){foreach($special in [single]::NaN,[single]::PositiveInfinity,[single]::NegativeInfinity){@{Index=$index;Special=$special}}})
+            $nonFiniteCases | ForEach-Object -ThrottleLimit 4 -Parallel {
+                Set-StrictMode -Version Latest
+                $ErrorActionPreference = 'Stop'
+                . (Join-Path $using:PSScriptRoot 'public_pack_formats.ps1')
+                $vals=$using:values;$changed=$vals.Clone();$changed[$_.Index]=$_.Special
+                $laneActual=Join-Path $using:scratch ('actual-'+[guid]::NewGuid().ToString('N'))
+                try{
+                    $bytes=[byte[]]::new($changed.Length*4);[Buffer]::BlockCopy($changed,0,$bytes,0,$bytes.Length);[IO.File]::WriteAllBytes($laneActual,$bytes)
+                    $rejected=$false;try{Invoke-ReferenceNumeric $using:tool @('compare',$using:reference,$laneActual,$using:format,'0','4097',$using:stride,'0.001','0.001','plain') 2>$null|Out-Null}catch{$global:LASTEXITCODE=0;$rejected=$true}
+                    Assert-Reference $rejected 'fixture expected rejection'
+                }finally{[IO.File]::Delete($laneActual)}
+            }
         }
     }
     test_selected_adapter_condition_binds_loading_scale_and_rust_identity={

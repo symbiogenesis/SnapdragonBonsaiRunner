@@ -42,77 +42,115 @@ function Copy-PublicReplayFixture($Template,[string]$Destination){
     Copy-DirectoryTree $Template.Root $Destination
     return @{source=(Join-Path $Destination 'source');evidence=(Join-Path $Destination 'evidence');adapter=(Join-Path $Destination 'adapter');direction=(Join-Path $Destination 'direction');report=$Template.Report}
 }
-function Invoke-SyntheticReplay([scriptblock]$Mutate={},[string]$RunId='123'){
-    $report=ConvertFrom-ReferenceJson ([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $fixture.report -Depth 64)));& $Mutate $report
-    Write-ReferenceJson (Join-Path $fixture.evidence 'report.json') $report;Write-ReferenceJson (Join-Path $fixture.evidence 'attempt.json') $report
-    Invoke-PublicReferenceReplay $fixture.evidence $fixture.adapter $fixture.direction ('a'*40) $RunId '1' $fixture.source
+$runSingleCase = {
+    param([string]$CaseName, [string]$ScriptDir, $Fixture)
+    $ErrorActionPreference = 'Stop'
+    . (Join-Path $ScriptDir 'audit_public_reference.ps1')
+    . (Join-Path $ScriptDir 'public_pack_reference.ps1')
+    $fixture = $Fixture
+    function Assert-Rejected([scriptblock]$Action){$rejected=$false;try{& $Action 2>$null|Out-Null}catch{$rejected=$true};Assert-Reference $rejected 'fixture expected rejection'}
+    function Invoke-SyntheticReplay([scriptblock]$Mutate={},[string]$RunId='123'){
+        $report=ConvertFrom-ReferenceJson ([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $fixture.report -Depth 64)));& $Mutate $report
+        Write-ReferenceJson (Join-Path $fixture.evidence 'report.json') $report;Write-ReferenceJson (Join-Path $fixture.evidence 'attempt.json') $report
+        Invoke-PublicReferenceReplay $fixture.evidence $fixture.adapter $fixture.direction ('a'*40) $RunId '1' $fixture.source
+    }
+    function Add-SealedSource {Save-PublicReplaySource $fixture.source $fixture.evidence ('a'*40)}
+    $tests=[ordered]@{
+        test_complete_scalar_replay_retains_qualification_boundaries={
+            $result=Invoke-SyntheticReplay;Assert-Reference ($result.sites.Count -eq 48 -and $result.all48PublicAComparisonPassed -and -not $result.retainedReplaySourceVerified -and -not $result.producerAuthenticated -and -not $result.defaultMayChange) 'independent replay scope differs'
+        }
+        test_valid_losing_result_is_verified_without_relabelling_as_a_match={
+            $path=Join-Path $fixture.evidence 'ssm-00.f32le';$original=[IO.File]::ReadAllBytes($path);$losing=$original.Clone();[Array]::Copy([BitConverter]::GetBytes([single]1),$losing,4);[IO.File]::WriteAllBytes($path,$losing)
+            try{$result=Invoke-SyntheticReplay {$args[0].status='rejected-public-A-comparison';$args[0].all48PublicAComparisonPassed=$false;$args[0].sites[0].authoringASha256=Get-ReferenceDigest $losing;$args[0].sites[0].mismatchedElements=1;$args[0].sites[0].maximumAbsoluteDifference=1.0};Assert-Reference (-not $result.all48PublicAComparisonPassed -and $result.status -ceq 'retained-result-verified') 'losing result relabelled';Assert-Rejected {Invoke-SyntheticReplay}}finally{[IO.File]::WriteAllBytes($path,$original)}
+        }
+        test_fabricated_metrics_missing_duplicate_reordered_and_path_sites_reject={
+            foreach($mode in 'metric','missing','duplicate','reordered','path','descriptor','promotion'){Assert-Rejected {Invoke-SyntheticReplay {$r=$args[0];switch($mode){metric{$r.sites[0].mismatchedElements=1}missing{$r.sites=$r.sites[0..46]}duplicate{$r.sites[1]=$r.sites[0]}reordered{[Array]::Reverse($r.sites)}path{$r.sites[0].authoringAFile='../ssm-00.f32le'}descriptor{$r.sites[0].inputTensorDescriptors.weight.absoluteByteBegin=0}promotion{$r.defaultMayChange=$true}}}}}
+        }
+        test_independent_producer_selection_and_source_bytes_reject_substitution={
+            Assert-Rejected {Invoke-SyntheticReplay -RunId '124'};$path=Join-Path $fixture.source 'tools/native-reference/public_pack_formats.ps1';$raw=[IO.File]::ReadAllBytes($path);try{[IO.File]::WriteAllText($path,'substituted');Assert-Rejected {Invoke-SyntheticReplay}}finally{[IO.File]::WriteAllBytes($path,$raw)}
+        }
+        test_sealed_source_replays_with_different_checkout_bytes_without_executing_producer={
+            $binding=Add-SealedSource;$path=Join-Path $fixture.source 'tools/native-reference/public_pack_formats.ps1';$raw=[IO.File]::ReadAllBytes($path)
+            try{[IO.File]::WriteAllText($path,'changed reviewer checkout');$result=Invoke-SyntheticReplay {foreach($key in $binding.Keys){$args[0][$key]=$binding[$key]}};Assert-Reference ($result.retainedReplaySourceVerified -and -not $result.producerAuthenticated) 'sealed replay scope differs'}finally{[IO.File]::WriteAllBytes($path,$raw)}
+        }
+        test_sealed_source_rejects_missing_extra_changed_and_wrong_type_entries={
+            $binding=Add-SealedSource;$bundle=Join-Path $fixture.evidence 'replay-source';$path=Join-Path $bundle 'tools/native-reference/public_pack_reference.ps1';$original=[IO.File]::ReadAllBytes($path)
+            foreach($mode in 'missing','extra-root','extra-nested','changed','wrong-type','unbound'){
+                $extra=$null
+                try{
+                    switch($mode){missing{[IO.File]::Delete($path)}extra-root{$extra=Join-Path $bundle 'unexpected.txt';[IO.File]::WriteAllText($extra,'extra')}extra-nested{$extra=Join-Path $bundle 'tools/native-reference/unexpected.ps1';[IO.File]::WriteAllText($extra,'extra')}changed{[IO.File]::WriteAllText($path,'changed producer')}wrong-type{[IO.File]::Delete($path);[void][IO.Directory]::CreateDirectory($path)}}
+                    if($mode -ceq 'unbound'){Assert-Rejected {Invoke-SyntheticReplay}}else{Assert-Rejected {Invoke-SyntheticReplay {foreach($key in $binding.Keys){$args[0][$key]=$binding[$key]}}}}
+                }finally{if($extra){[IO.File]::Delete($extra)};if([IO.Directory]::Exists($path)){[IO.Directory]::Delete($path)};[IO.File]::WriteAllBytes($path,$original)}
+            }
+        }
+        test_sealed_source_rejects_manifest_tampering_paths_and_approved_lock_substitution={
+            $binding=Add-SealedSource;$bundle=Join-Path $fixture.evidence 'replay-source';$path=Join-Path $bundle 'source-manifest.json';$original=[IO.File]::ReadAllBytes($path)
+            foreach($mode in 'digest','revision','duplicate','path','outside','approved-lock'){
+                $manifest=ConvertFrom-ReferenceJson $original;$restores=@{}
+                try{
+                    switch($mode){revision{$manifest.sourceRevision='b'*40}duplicate{$manifest.files[1]=$manifest.files[0]}path{$manifest.files[0].path='../swift-lora.lock.json'}approved-lock{
+                        $pinPath='tools/native-reference/public-authoring-pins.json';$pins=Read-ReferenceJson (Join-Path $bundle $pinPath);$pins.adapter.url='https://example.invalid/substitution'
+                        foreach($relative in $pinPath,'config/swift-lora.lock.json'){$target=Join-Path $bundle $relative;$restores[$target]=[IO.File]::ReadAllBytes($target);Write-ReferenceJson $target $(if($relative -ceq $pinPath){$pins}else{@{adapter=$pins.adapter}});foreach($item in $manifest.files){if($item.path -ceq $relative){$item.bytes=(Get-Item -LiteralPath $target).Length;$item.sha256=Get-ReferenceFileDigest $target}}}
+                    }}
+                    Write-ReferenceJson $path $manifest
+                    Assert-Rejected {Invoke-SyntheticReplay {$args[0].replaySourceManifestFile=$(if($mode -ceq 'outside'){'../source-manifest.json'}else{$binding.replaySourceManifestFile});$args[0].replaySourceManifestSha256=$(if($mode -ceq 'digest'){'0'*64}else{Get-ReferenceFileDigest $path})}}
+                }finally{[IO.File]::WriteAllBytes($path,$original);foreach($target in $restores.Keys){[IO.File]::WriteAllBytes($target,$restores[$target])}}
+            }
+        }
+        test_sealed_source_preserves_a_verified_losing_result={
+            $binding=Add-SealedSource;$path=Join-Path $fixture.evidence 'ssm-00.f32le';$losing=[byte[]]::new(24576);[Array]::Copy([BitConverter]::GetBytes([single]1),$losing,4);[IO.File]::WriteAllBytes($path,$losing)
+            $result=Invoke-SyntheticReplay {foreach($key in $binding.Keys){$args[0][$key]=$binding[$key]};$args[0].status='rejected-public-A-comparison';$args[0].all48PublicAComparisonPassed=$false;$args[0].sites[0].authoringASha256=Get-ReferenceDigest $losing;$args[0].sites[0].mismatchedElements=1;$args[0].sites[0].maximumAbsoluteDifference=1.0};Assert-Reference ($result.retainedReplaySourceVerified -and -not $result.all48PublicAComparisonPassed) 'sealed losing replay differs'
+        }
+        test_sealed_source_rejects_recipe_substitution_despite_consistent_report_and_manifest={
+            $binding=Add-SealedSource;$bundle=Join-Path $fixture.evidence 'replay-source';$relative='tools/native-reference/public-authoring-pins.json';$pin=Join-Path $bundle $relative;$manifestPath=Join-Path $bundle 'source-manifest.json';$pinOriginal=[IO.File]::ReadAllBytes($pin);$manifestOriginal=[IO.File]::ReadAllBytes($manifestPath);$configPath=Join-Path $fixture.evidence 'config.json';$configOriginal=[IO.File]::ReadAllBytes($configPath)
+            foreach($mode in 'model','config'){
+                try{
+                    $pins=ConvertFrom-ReferenceJson $pinOriginal;$manifest=ConvertFrom-ReferenceJson $manifestOriginal
+                    if($mode -ceq 'model'){$pins.model.sha256='0'*64}else{$raw=[Text.Encoding]::UTF8.GetBytes('{"substituted":true}');$pins.config.bytes=$raw.Length;$pins.config.sha256=Get-ReferenceDigest $raw;[IO.File]::WriteAllBytes($configPath,$raw)}
+                    Write-ReferenceJson $pin $pins;foreach($item in $manifest.files){if($item.path -ceq $relative){$item.bytes=(Get-Item -LiteralPath $pin).Length;$item.sha256=Get-ReferenceFileDigest $pin}};Write-ReferenceJson $manifestPath $manifest
+                    Assert-Rejected {Invoke-SyntheticReplay {$args[0].replaySourceManifestFile=$binding.replaySourceManifestFile;$args[0].replaySourceManifestSha256=Get-ReferenceFileDigest $manifestPath;$args[0].inputPins=$pins;$args[0].referencePinsSha256=Get-ReferenceFileDigest $pin}}
+                }finally{[IO.File]::WriteAllBytes($pin,$pinOriginal);[IO.File]::WriteAllBytes($manifestPath,$manifestOriginal);[IO.File]::WriteAllBytes($configPath,$configOriginal)}
+            }
+        }
+        test_missing_or_extra_vector_files_reject={
+            $path=Join-Path $fixture.evidence 'ssm-00.f32le';$raw=[IO.File]::ReadAllBytes($path);[IO.File]::Delete($path);Assert-Rejected {Invoke-SyntheticReplay};[IO.File]::WriteAllBytes($path,$raw)
+            [IO.File]::WriteAllBytes((Join-Path $fixture.evidence 'ssm-03.f32le'),[byte[]]::new(24576));Assert-Rejected {Invoke-SyntheticReplay}
+        }
+        test_duplicate_nonfinite_json_truncation_and_misaligned_adapter_reject={
+            foreach($raw in '{"x":1,"x":2}','{"x":NaN}','{"x":1e999}'){Assert-Rejected {ConvertFrom-ReferenceJson ([Text.Encoding]::UTF8.GetBytes($raw))}}
+            foreach($raw in @([byte[]]@(),([Text.Encoding]::ASCII.GetBytes('GGUF')+[BitConverter]::GetBytes([uint32]3)+[BitConverter]::GetBytes([uint64]258)+[BitConverter]::GetBytes([uint64]0)))){Assert-Rejected {Read-AuditAdapter $raw}}
+        }
+    }
+    Assert-Reference ($tests.Contains($CaseName)) 'unknown focused regression'
+    & $tests[$CaseName]
+    "PASS $CaseName"
 }
-function Add-SealedSource {Save-PublicReplaySource $fixture.source $fixture.evidence ('a'*40)}
 $scratch=Join-Path ([IO.Path]::GetTempPath()) ('Bonsai-PublicReplay-Tests-'+[guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($scratch)
-$tests=[ordered]@{
-    test_complete_scalar_replay_retains_qualification_boundaries={
-        $result=Invoke-SyntheticReplay;Assert-Reference ($result.sites.Count -eq 48 -and $result.all48PublicAComparisonPassed -and -not $result.retainedReplaySourceVerified -and -not $result.producerAuthenticated -and -not $result.defaultMayChange) 'independent replay scope differs'
-    }
-    test_valid_losing_result_is_verified_without_relabelling_as_a_match={
-        $path=Join-Path $fixture.evidence 'ssm-00.f32le';$original=[IO.File]::ReadAllBytes($path);$losing=$original.Clone();[Array]::Copy([BitConverter]::GetBytes([single]1),$losing,4);[IO.File]::WriteAllBytes($path,$losing)
-        try{$result=Invoke-SyntheticReplay {$args[0].status='rejected-public-A-comparison';$args[0].all48PublicAComparisonPassed=$false;$args[0].sites[0].authoringASha256=Get-ReferenceDigest $losing;$args[0].sites[0].mismatchedElements=1;$args[0].sites[0].maximumAbsoluteDifference=1.0};Assert-Reference (-not $result.all48PublicAComparisonPassed -and $result.status -ceq 'retained-result-verified') 'losing result relabelled';Assert-Rejected {Invoke-SyntheticReplay}}finally{[IO.File]::WriteAllBytes($path,$original)}
-    }
-    test_fabricated_metrics_missing_duplicate_reordered_and_path_sites_reject={
-        foreach($mode in 'metric','missing','duplicate','reordered','path','descriptor','promotion'){Assert-Rejected {Invoke-SyntheticReplay {$r=$args[0];switch($mode){metric{$r.sites[0].mismatchedElements=1}missing{$r.sites=$r.sites[0..46]}duplicate{$r.sites[1]=$r.sites[0]}reordered{[Array]::Reverse($r.sites)}path{$r.sites[0].authoringAFile='../ssm-00.f32le'}descriptor{$r.sites[0].inputTensorDescriptors.weight.absoluteByteBegin=0}promotion{$r.defaultMayChange=$true}}}}}
-    }
-    test_independent_producer_selection_and_source_bytes_reject_substitution={
-        Assert-Rejected {Invoke-SyntheticReplay -RunId '124'};$path=Join-Path $fixture.source 'tools/native-reference/public_pack_formats.ps1';$raw=[IO.File]::ReadAllBytes($path);try{[IO.File]::WriteAllText($path,'substituted');Assert-Rejected {Invoke-SyntheticReplay}}finally{[IO.File]::WriteAllBytes($path,$raw)}
-    }
-    test_sealed_source_replays_with_different_checkout_bytes_without_executing_producer={
-        $binding=Add-SealedSource;$path=Join-Path $fixture.source 'tools/native-reference/public_pack_formats.ps1';$raw=[IO.File]::ReadAllBytes($path)
-        try{[IO.File]::WriteAllText($path,'changed reviewer checkout');$result=Invoke-SyntheticReplay {foreach($key in $binding.Keys){$args[0][$key]=$binding[$key]}};Assert-Reference ($result.retainedReplaySourceVerified -and -not $result.producerAuthenticated) 'sealed replay scope differs'}finally{[IO.File]::WriteAllBytes($path,$raw)}
-    }
-    test_sealed_source_rejects_missing_extra_changed_and_wrong_type_entries={
-        $binding=Add-SealedSource;$bundle=Join-Path $fixture.evidence 'replay-source';$path=Join-Path $bundle 'tools/native-reference/public_pack_reference.ps1';$original=[IO.File]::ReadAllBytes($path)
-        foreach($mode in 'missing','extra-root','extra-nested','changed','wrong-type','unbound'){
-            $extra=$null
-            try{
-                switch($mode){missing{[IO.File]::Delete($path)}extra-root{$extra=Join-Path $bundle 'unexpected.txt';[IO.File]::WriteAllText($extra,'extra')}extra-nested{$extra=Join-Path $bundle 'tools/native-reference/unexpected.ps1';[IO.File]::WriteAllText($extra,'extra')}changed{[IO.File]::WriteAllText($path,'changed producer')}wrong-type{[IO.File]::Delete($path);[void][IO.Directory]::CreateDirectory($path)}}
-                if($mode -ceq 'unbound'){Assert-Rejected {Invoke-SyntheticReplay}}else{Assert-Rejected {Invoke-SyntheticReplay {foreach($key in $binding.Keys){$args[0][$key]=$binding[$key]}}}}
-            }finally{if($extra){[IO.File]::Delete($extra)};if([IO.Directory]::Exists($path)){[IO.Directory]::Delete($path)};[IO.File]::WriteAllBytes($path,$original)}
+try{
+    $selected=@(if($Name.Count){@($Name|ForEach-Object{($_ -split '\.')[-1]})}elseif($env:GITHUB_ACTIONS -ceq 'true'){@(
+        'test_complete_scalar_replay_retains_qualification_boundaries',
+        'test_valid_losing_result_is_verified_without_relabelling_as_a_match',
+        'test_fabricated_metrics_missing_duplicate_reordered_and_path_sites_reject',
+        'test_independent_producer_selection_and_source_bytes_reject_substitution',
+        'test_sealed_source_replays_with_different_checkout_bytes_without_executing_producer',
+        'test_sealed_source_rejects_missing_extra_changed_and_wrong_type_entries',
+        'test_sealed_source_rejects_manifest_tampering_paths_and_approved_lock_substitution',
+        'test_sealed_source_preserves_a_verified_losing_result',
+        'test_sealed_source_rejects_recipe_substitution_despite_consistent_report_and_manifest',
+        'test_missing_or_extra_vector_files_reject',
+        'test_duplicate_nonfinite_json_truncation_and_misaligned_adapter_reject'
+    )}else{throw 'Select a named focused regression locally; complete tests are CI-only.'})
+    $templateDir=Join-Path $scratch 'template';[void][IO.Directory]::CreateDirectory($templateDir);$template=New-PublicReplayFixture $templateDir;$templateReport=$template.report
+    if($selected.Count -le 1){
+        foreach($case in $selected){Write-Output (& $runSingleCase $case $PSScriptRoot $template)}
+    }else{
+        $runSingleCaseText=$runSingleCase.ToString();$copyTreeText=${function:Copy-DirectoryTree}.ToString()
+        $outputs=$selected | ForEach-Object -ThrottleLimit 4 -Parallel {
+            $lane=Join-Path $using:scratch ([guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($lane)
+            $copyTree=[scriptblock]::Create($using:copyTreeText);& $copyTree $using:templateDir $lane
+            $laneFixture=@{source=(Join-Path $lane 'source');evidence=(Join-Path $lane 'evidence');adapter=(Join-Path $lane 'adapter');direction=(Join-Path $lane 'direction');report=$using:templateReport}
+            & ([scriptblock]::Create($using:runSingleCaseText)) $_ $using:PSScriptRoot $laneFixture
         }
+        foreach($line in $outputs){Write-Output $line}
     }
-    test_sealed_source_rejects_manifest_tampering_paths_and_approved_lock_substitution={
-        $binding=Add-SealedSource;$bundle=Join-Path $fixture.evidence 'replay-source';$path=Join-Path $bundle 'source-manifest.json';$original=[IO.File]::ReadAllBytes($path)
-        foreach($mode in 'digest','revision','duplicate','path','outside','approved-lock'){
-            $manifest=ConvertFrom-ReferenceJson $original;$restores=@{}
-            try{
-                switch($mode){revision{$manifest.sourceRevision='b'*40}duplicate{$manifest.files[1]=$manifest.files[0]}path{$manifest.files[0].path='../swift-lora.lock.json'}approved-lock{
-                    $pinPath='tools/native-reference/public-authoring-pins.json';$pins=Read-ReferenceJson (Join-Path $bundle $pinPath);$pins.adapter.url='https://example.invalid/substitution'
-                    foreach($relative in $pinPath,'config/swift-lora.lock.json'){$target=Join-Path $bundle $relative;$restores[$target]=[IO.File]::ReadAllBytes($target);Write-ReferenceJson $target $(if($relative -ceq $pinPath){$pins}else{@{adapter=$pins.adapter}});foreach($item in $manifest.files){if($item.path -ceq $relative){$item.bytes=(Get-Item -LiteralPath $target).Length;$item.sha256=Get-ReferenceFileDigest $target}}}
-                }}
-                Write-ReferenceJson $path $manifest
-                Assert-Rejected {Invoke-SyntheticReplay {$args[0].replaySourceManifestFile=$(if($mode -ceq 'outside'){'../source-manifest.json'}else{$binding.replaySourceManifestFile});$args[0].replaySourceManifestSha256=$(if($mode -ceq 'digest'){'0'*64}else{Get-ReferenceFileDigest $path})}}
-            }finally{[IO.File]::WriteAllBytes($path,$original);foreach($target in $restores.Keys){[IO.File]::WriteAllBytes($target,$restores[$target])}}
-        }
-    }
-    test_sealed_source_preserves_a_verified_losing_result={
-        $binding=Add-SealedSource;$path=Join-Path $fixture.evidence 'ssm-00.f32le';$losing=[byte[]]::new(24576);[Array]::Copy([BitConverter]::GetBytes([single]1),$losing,4);[IO.File]::WriteAllBytes($path,$losing)
-        $result=Invoke-SyntheticReplay {foreach($key in $binding.Keys){$args[0][$key]=$binding[$key]};$args[0].status='rejected-public-A-comparison';$args[0].all48PublicAComparisonPassed=$false;$args[0].sites[0].authoringASha256=Get-ReferenceDigest $losing;$args[0].sites[0].mismatchedElements=1;$args[0].sites[0].maximumAbsoluteDifference=1.0};Assert-Reference ($result.retainedReplaySourceVerified -and -not $result.all48PublicAComparisonPassed) 'sealed losing replay differs'
-    }
-    test_sealed_source_rejects_recipe_substitution_despite_consistent_report_and_manifest={
-        $binding=Add-SealedSource;$bundle=Join-Path $fixture.evidence 'replay-source';$relative='tools/native-reference/public-authoring-pins.json';$pin=Join-Path $bundle $relative;$manifestPath=Join-Path $bundle 'source-manifest.json';$pinOriginal=[IO.File]::ReadAllBytes($pin);$manifestOriginal=[IO.File]::ReadAllBytes($manifestPath);$configPath=Join-Path $fixture.evidence 'config.json';$configOriginal=[IO.File]::ReadAllBytes($configPath)
-        foreach($mode in 'model','config'){
-            try{
-                $pins=ConvertFrom-ReferenceJson $pinOriginal;$manifest=ConvertFrom-ReferenceJson $manifestOriginal
-                if($mode -ceq 'model'){$pins.model.sha256='0'*64}else{$raw=[Text.Encoding]::UTF8.GetBytes('{"substituted":true}');$pins.config.bytes=$raw.Length;$pins.config.sha256=Get-ReferenceDigest $raw;[IO.File]::WriteAllBytes($configPath,$raw)}
-                Write-ReferenceJson $pin $pins;foreach($item in $manifest.files){if($item.path -ceq $relative){$item.bytes=(Get-Item -LiteralPath $pin).Length;$item.sha256=Get-ReferenceFileDigest $pin}};Write-ReferenceJson $manifestPath $manifest
-                Assert-Rejected {Invoke-SyntheticReplay {$args[0].replaySourceManifestFile=$binding.replaySourceManifestFile;$args[0].replaySourceManifestSha256=Get-ReferenceFileDigest $manifestPath;$args[0].inputPins=$pins;$args[0].referencePinsSha256=Get-ReferenceFileDigest $pin}}
-            }finally{[IO.File]::WriteAllBytes($pin,$pinOriginal);[IO.File]::WriteAllBytes($manifestPath,$manifestOriginal);[IO.File]::WriteAllBytes($configPath,$configOriginal)}
-        }
-    }
-    test_missing_or_extra_vector_files_reject={
-        $path=Join-Path $fixture.evidence 'ssm-00.f32le';$raw=[IO.File]::ReadAllBytes($path);[IO.File]::Delete($path);Assert-Rejected {Invoke-SyntheticReplay};[IO.File]::WriteAllBytes($path,$raw)
-        [IO.File]::WriteAllBytes((Join-Path $fixture.evidence 'ssm-03.f32le'),[byte[]]::new(24576));Assert-Rejected {Invoke-SyntheticReplay}
-    }
-    test_duplicate_nonfinite_json_truncation_and_misaligned_adapter_reject={
-        foreach($raw in '{"x":1,"x":2}','{"x":NaN}','{"x":1e999}'){Assert-Rejected {ConvertFrom-ReferenceJson ([Text.Encoding]::UTF8.GetBytes($raw))}}
-        foreach($raw in @([byte[]]@(),([Text.Encoding]::ASCII.GetBytes('GGUF')+[BitConverter]::GetBytes([uint32]3)+[BitConverter]::GetBytes([uint64]258)+[BitConverter]::GetBytes([uint64]0)))){Assert-Rejected {Read-AuditAdapter $raw}}
-    }
-}
-try{$selected=@(if($Name.Count){@($Name|ForEach-Object{($_ -split '\.')[-1]})}elseif($env:GITHUB_ACTIONS -ceq 'true'){@($tests.Keys)}else{throw 'Select a named focused regression locally; complete tests are CI-only.'});$templateDir=Join-Path $scratch 'template';[void][IO.Directory]::CreateDirectory($templateDir);$template=New-PublicReplayFixture $templateDir;$templateInfo=@{Root=$templateDir;Report=$template.report};foreach($case in $selected){$fixture=if($selected.Count -eq 1){$template}else{$lane=Join-Path $scratch ([guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($lane);Copy-PublicReplayFixture $templateInfo $lane};Assert-Reference ($tests.Contains($case)) 'unknown focused regression';& $tests[$case];Write-Output "PASS $case"}}finally{[IO.Directory]::Delete($scratch,$true)}
+}finally{[IO.Directory]::Delete($scratch,$true)}
