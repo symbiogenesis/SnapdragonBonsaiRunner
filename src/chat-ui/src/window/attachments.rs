@@ -24,9 +24,6 @@ impl State {
             ));
             return;
         }
-        if self.active_conversation_busy() {
-            return;
-        }
         let remaining_slots =
             MAX_ATTACHMENTS_PER_MESSAGE.saturating_sub(self.draft_attachments.len());
         if remaining_slots == 0 {
@@ -108,6 +105,14 @@ impl State {
             .iter()
             .map(|message| message.images.len())
             .fold(0, usize::saturating_add)
+            .saturating_add(
+                self.queued_messages
+                    .iter()
+                    .filter(|item| item.conversation_id == self.active_conversation)
+                    .flat_map(|item| item.attachments.iter())
+                    .map(Attachment::image_count)
+                    .fold(0, usize::saturating_add),
+            )
             .saturating_add(
                 self.draft_attachments
                     .iter()
@@ -240,9 +245,8 @@ impl State {
                     && !self.speaking
                     && !self.dictation_requested
                     && self.audio_import.is_none();
-                let can_draft_attach = !self.active_conversation_busy()
-                    && self.attachment_import.is_none()
-                    && self.audio_import.is_none();
+                let can_draft_attach =
+                    self.attachment_import.is_none() && self.audio_import.is_none();
 
                 ui.horizontal(|ui| {
                     if attachment_option_button(

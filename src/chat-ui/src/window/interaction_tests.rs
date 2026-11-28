@@ -2295,6 +2295,30 @@ fn queued_messages_strip_edit_remove_clear_sidebar_badge_and_send_next() {
         assert!(bounds.contains_rect(queue_rect));
         assert!(bounds.contains_rect(stop_rect));
 
+        // Attachment menu keeps Text files and Images and Videos enabled while generating.
+        chat.get_by_role_and_label(egui::Role::Button, "Add attachment")
+            .click();
+        chat.run_steps(4);
+        assert!(
+            chat.get_by_role_and_label(egui::Role::Button, "Audio files")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(
+            !chat
+                .get_by_role_and_label(egui::Role::Button, "Text files")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(
+            !chat
+                .get_by_role_and_label(egui::Role::Button, "Images and Videos")
+                .accesskit_node()
+                .is_disabled()
+        );
+        chat.key_press(egui::Key::Escape);
+        chat.run_steps(4);
+
         let composer = chat.get_by_role_and_label(egui::Role::MultilineTextInput, "Message");
         composer.focus();
         composer.type_text("Queued via Enter");
