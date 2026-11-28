@@ -227,7 +227,9 @@ fn context_capacity_recovery_and_branch_rebuild_without_saving_estimates() -> st
 #[test]
 fn context_capacity_warning_keeps_send_available_without_changing_reply_limits() {
     for size in [[1180.0, 860.0], [620.0, 640.0]] {
-        let mut chat = harness(size, &"a".repeat(20_000));
+        let mut chat = harness(size, &"a".repeat(3_500));
+        chat.state_mut().app.context_tokens = Some(1_024);
+        chat.run();
         assert_eq!(
             chat.state_mut().app.context_estimate().pressure(),
             Pressure::Over
@@ -386,7 +388,9 @@ fn context_capacity_details_leave_both_toolbar_actions_uncovered() -> Result<(),
 
 #[test]
 fn context_capacity_start_fresh_preserves_original_draft_and_full_history() {
-    let mut chat = harness([620.0, 640.0], &"a".repeat(40_000));
+    let mut chat = harness([620.0, 640.0], &"a".repeat(3_500));
+    chat.state_mut().app.context_tokens = Some(1_024);
+    chat.run();
     let original = chat.state().app.active_conversation;
     chat.get_by_role_and_label(egui::Role::Button, "Start fresh")
         .click();

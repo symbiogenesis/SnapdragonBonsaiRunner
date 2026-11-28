@@ -2541,39 +2541,7 @@ fn test_font_provider() -> std::sync::Arc<CachedTestFontProvider> {
 
 #[cfg(test)]
 fn test_font_definitions() -> egui::FontDefinitions {
-    use egui::epaint::text::{FallbackRequest, FontPriority, FontProvider as _};
-    use std::sync::{Arc, LazyLock};
-
-    static TEST_FONTS: LazyLock<egui::FontDefinitions> = LazyLock::new(|| {
-        let mut fonts = appearance::base_fonts();
-        let provider = test_font_provider();
-        for ch in ['🌱', '界'] {
-            let mut buf = [0_u8; 4];
-            let cluster = ch.encode_utf8(&mut buf);
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                if let Some(insert) = provider.font_for(&FallbackRequest {
-                    cluster,
-                    family: &family,
-                }) {
-                    fonts
-                        .font_data
-                        .entry(insert.name.clone())
-                        .or_insert_with(|| Arc::new(insert.data));
-                    for target in insert.families {
-                        let list = fonts.families.entry(target.family).or_default();
-                        if !list.iter().any(|name| name == &insert.name) {
-                            match target.priority {
-                                FontPriority::Highest => list.insert(0, insert.name.clone()),
-                                FontPriority::Lowest => list.push(insert.name.clone()),
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        fonts
-    });
-    TEST_FONTS.clone()
+    appearance::base_fonts()
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ const SEAM_TAIL_BYTES: usize = 256;
 const SEAM_HOLD_MAX_BYTES: usize = 256;
 const SEAM_EARLY_FLUSH_BYTES: usize = 24;
 const ANCHOR_QUOTE_BYTES: usize = 120;
-const RATE_LIMIT_WAIT_MS: u64 = 1_050;
+pub(super) const RATE_LIMIT_WAIT_MS: u64 = 1_050;
 const RATE_LIMIT_SLICE_MS: u64 = 25;
 const REPETITION_WINDOW_BYTES: usize = 16 * 1024;
 const REPETITION_NEEDLE_BYTES: usize = 120;
@@ -757,6 +757,36 @@ pub(super) fn run(
     events: &EventSender,
     broker: Option<&OwnedProcess>,
 ) -> Result<(Message, Completion)> {
+    run_with_wait(
+        port,
+        key,
+        pending,
+        options,
+        context_tokens,
+        prompt_reuse,
+        commands,
+        events,
+        broker,
+        sleep_interruptible,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Continuation worker runs against explicit broker connection and prompt-reuse policy."
+)]
+pub(super) fn run_with_wait(
+    port: u16,
+    key: &str,
+    pending: &[Message],
+    options: &ResponseOptions,
+    context_tokens: usize,
+    prompt_reuse: PromptReuse,
+    commands: &Receiver<Command>,
+    events: &EventSender,
+    broker: Option<&OwnedProcess>,
+    wait_rate_limit: impl FnMut(&Receiver<Command>, u64) -> Result<()>,
+) -> Result<(Message, Completion)> {
     run_with(
         pending,
         options,
@@ -777,7 +807,7 @@ pub(super) fn run(
             )?;
             Ok((msg, completion))
         },
-        sleep_interruptible,
+        wait_rate_limit,
     )
 }
 

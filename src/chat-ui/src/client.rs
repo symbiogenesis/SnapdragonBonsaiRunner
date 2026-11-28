@@ -4783,7 +4783,8 @@ mod tests {
             max_completion_tokens: 4096,
             ..super::ResponseOptions::default()
         };
-        let (msg, completion) = super::continuation::run(
+        let mut waited_ms = Vec::new();
+        let (msg, completion) = super::continuation::run_with_wait(
             port,
             "test-key",
             &pending,
@@ -4793,12 +4794,17 @@ mod tests {
             &rx,
             &events,
             None,
+            |_, ms| {
+                waited_ms.push(ms);
+                Ok(())
+            },
         )
         .map_err(|e| io::Error::other(format!("continuation::run failed: {e:?}")))?;
         let max_tokens = server
             .join()
             .map_err(|_| io::Error::other("server panicked"))??;
 
+        assert_eq!(waited_ms, vec![super::continuation::RATE_LIMIT_WAIT_MS]);
         assert_eq!(completion, Completion::Finished);
         assert_eq!(msg.content.as_ref(), "Alpha end. Beta done.");
         assert_eq!(max_tokens, vec![4096, 4096, 2048, 2048]);

@@ -56,12 +56,15 @@ fn is_transient_windows_file_error(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
-fn retry_transient_io(mut op: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+fn retry_transient_io_with(
+    mut op: impl FnMut() -> io::Result<()>,
+    mut sleep: impl FnMut(Duration),
+) -> io::Result<()> {
     for delay_ms in TRANSIENT_BACKOFF_MS {
         match op() {
             Ok(()) => return Ok(()),
             Err(error) if is_transient_windows_file_error(&error) => {
-                thread::sleep(Duration::from_millis(delay_ms));
+                sleep(Duration::from_millis(delay_ms));
             }
             Err(error) => return Err(error),
         }
@@ -237,6 +240,24 @@ fn replace_with(
     validate_temp: fn(&Path) -> io::Result<()>,
     revalidate_target: fn(&Path) -> io::Result<()>,
 ) -> Result<(), StagedError> {
+    replace_with_sleep(
+        path,
+        bytes,
+        validate_target,
+        validate_temp,
+        revalidate_target,
+        thread::sleep,
+    )
+}
+
+fn replace_with_sleep(
+    path: &Path,
+    bytes: &[u8],
+    validate_target: fn(&Path) -> io::Result<()>,
+    validate_temp: fn(&Path) -> io::Result<()>,
+    revalidate_target: fn(&Path) -> io::Result<()>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), StagedError> {
     validate_stage(Stage::ValidatePath, validate_target, path)?;
     let (temporary, mut file) = open_exclusive_temp(path, validate_temp, pending_path)?;
     let result = (|| {
@@ -254,13 +275,26 @@ fn replace_with(
             })?;
         drop(file);
         validate_stage(Stage::RevalidatePath, revalidate_target, path)?;
-        retry_transient_io(|| fs::rename(&temporary, path)).map_err(|error| StagedError {
+        retry_transient_io_with(
+            || {
+                let err = match fs::rename(&temporary, path) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => error,
+                };
+                if is_transient_windows_file_error(&err) && path.is_dir() {
+                    return Err(io::Error::new(io::ErrorKind::IsADirectory, err));
+                }
+                Err(err)
+            },
+            &mut sleep,
+        )
+        .map_err(|error| StagedError {
             stage: Stage::Replace,
             error,
         })
     })();
     if result.is_err() {
-        let _removed = retry_transient_io(|| fs::remove_file(&temporary));
+        let _removed = retry_transient_io_with(|| fs::remove_file(&temporary), &mut sleep);
     }
     result
 }
@@ -274,6 +308,22 @@ pub(crate) fn replace_staged(path: &Path, bytes: &[u8]) -> Result<(), StagedErro
         bonsai_windows_credentials::validate_external_path,
         bonsai_windows_credentials::validate_external_path,
         bonsai_windows_credentials::validate_external_path,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn replace_staged_with_sleep(
+    path: &Path,
+    bytes: &[u8],
+    sleep: impl FnMut(Duration),
+) -> Result<(), StagedError> {
+    replace_with_sleep(
+        path,
+        bytes,
+        bonsai_windows_credentials::validate_external_path,
+        bonsai_windows_credentials::validate_external_path,
+        bonsai_windows_credentials::validate_external_path,
+        sleep,
     )
 }
 
@@ -379,7 +429,19 @@ mod tests {
         assert_eq!(fs::read(&path)?, b"complete replacement");
         // Deny delete sharing so publication fails after the sibling is written.
         let retained = OpenOptions::new().read(true).share_mode(1).open(&path)?;
-        assert!(replace(&path, b"must not replace the retained file").is_err());
+        let mut sleeps = Vec::new();
+        let blocked =
+            replace_staged_with_sleep(&path, b"must not replace the retained file", |delay| {
+                sleeps.push(delay)
+            });
+        assert!(blocked.is_err());
+        assert_eq!(
+            sleeps,
+            TRANSIENT_BACKOFF_MS
+                .iter()
+                .map(|&ms| Duration::from_millis(ms))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(fs::read(&path)?, b"complete replacement");
         assert_eq!(fs::read_dir(&directory)?.count(), 1);
         drop(retained);
@@ -423,22 +485,33 @@ mod tests {
         assert_eq!(fs::read(&existing)?, b"occupied");
 
         let mut os_attempts = 0_usize;
-        retry_transient_io(|| {
-            os_attempts += 1;
-            if os_attempts < 3 {
-                Err(io::Error::from_raw_os_error(32))
-            } else {
-                Ok(())
-            }
-        })?;
+        let mut os_sleeps = Vec::new();
+        retry_transient_io_with(
+            || {
+                os_attempts += 1;
+                if os_attempts < 3 {
+                    Err(io::Error::from_raw_os_error(32))
+                } else {
+                    Ok(())
+                }
+            },
+            |delay| os_sleeps.push(delay),
+        )?;
         assert_eq!(os_attempts, 3);
+        assert_eq!(
+            os_sleeps,
+            vec![Duration::from_millis(10), Duration::from_millis(25)]
+        );
 
         let mut fatal_attempts = 0_usize;
         assert!(
-            retry_transient_io(|| {
-                fatal_attempts += 1;
-                Err(io::Error::new(io::ErrorKind::NotFound, "missing"))
-            })
+            retry_transient_io_with(
+                || {
+                    fatal_attempts += 1;
+                    Err(io::Error::new(io::ErrorKind::NotFound, "missing"))
+                },
+                |_| {},
+            )
             .is_err()
         );
         assert_eq!(fatal_attempts, 1);
@@ -455,15 +528,26 @@ mod tests {
 
         // retry_transient_io exhausts after 4 attempts (3 backoffs + 1 final attempt).
         let mut exhausted_attempts = 0_usize;
-        let exhausted = retry_transient_io(|| {
-            exhausted_attempts += 1;
-            Err(io::Error::from_raw_os_error(5))
-        });
+        let mut exhausted_sleeps = Vec::new();
+        let exhausted = retry_transient_io_with(
+            || {
+                exhausted_attempts += 1;
+                Err(io::Error::from_raw_os_error(5))
+            },
+            |delay| exhausted_sleeps.push(delay),
+        );
         assert_eq!(
             exhausted.as_ref().err().and_then(io::Error::raw_os_error),
             Some(5)
         );
         assert_eq!(exhausted_attempts, TRANSIENT_BACKOFF_MS.len() + 1);
+        assert_eq!(
+            exhausted_sleeps,
+            TRANSIENT_BACKOFF_MS
+                .iter()
+                .map(|&ms| Duration::from_millis(ms))
+                .collect::<Vec<_>>()
+        );
 
         // open_exclusive_temp stages: make_path error, validate_temp error, non-AlreadyExists error,
         // and 4-collision AlreadyExists exhaustion.

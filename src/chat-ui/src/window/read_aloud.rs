@@ -208,7 +208,10 @@ mod tests {
         assert!(matches!(next(&commands)?, speech::Command::StopListening));
         assert!(matches!(next(&commands)?, speech::Command::StopSpeaking));
         assert!(!state.speaking);
-        assert!(commands.recv_timeout(Duration::from_millis(20)).is_err());
+        if let Some(speech) = state.speech.as_mut() {
+            speech.stop_for_test();
+        }
+        assert!(commands.try_recv().is_err());
         Ok(())
     }
 
@@ -242,7 +245,10 @@ mod tests {
         assert!(matches!(next(&commands)?, speech::Command::StopSpeaking));
         state.model_event(client::Event::Text("late text".to_owned()));
         assert!(!state.streaming_active);
-        assert!(commands.recv_timeout(Duration::from_millis(20)).is_err());
+        if let Some(speech) = state.speech.as_mut() {
+            speech.stop_for_test();
+        }
+        assert!(commands.try_recv().is_err());
         Ok(())
     }
 
@@ -264,7 +270,10 @@ mod tests {
         state.toggle_streaming_read_aloud();
         assert!(!state.streaming_read_aloud);
         state.model_event(client::Event::Text(" continues silently".to_owned()));
-        assert!(commands.recv_timeout(Duration::from_millis(20)).is_err());
+        if let Some(speech) = state.speech.as_mut() {
+            speech.stop_for_test();
+        }
+        assert!(commands.try_recv().is_err());
         Ok(())
     }
 
@@ -282,9 +291,11 @@ mod tests {
         }
         state.model_event(client::Event::Complete(client::Completion::Finished));
         let mut spoken = String::new();
-        while let Ok(command) = commands.recv_timeout(Duration::from_millis(50)) {
-            if let speech::Command::AppendStream { text } = command {
-                spoken.push_str(&text);
+        loop {
+            match next(&commands)? {
+                speech::Command::AppendStream { text } => spoken.push_str(&text),
+                speech::Command::FinishStream => break,
+                _ => {}
             }
         }
         assert_eq!(spoken, "Here is an emblem:\n\n\nAll set.");
@@ -345,11 +356,7 @@ mod tests {
         state.model_event(client::Event::Continuing(2));
         assert!(state.model.busy() && state.streaming_active);
         // Part 1 is not cut off with StopSpeaking or closed early with FinishStream.
-        assert!(
-            speech_commands
-                .recv_timeout(Duration::from_millis(20))
-                .is_err()
-        );
+        assert!(speech_commands.try_recv().is_err());
 
         state.model_event(client::Event::Text("Second part.".to_owned()));
         assert!(
@@ -533,11 +540,7 @@ mod tests {
             speech::Command::FinishStream
         ));
         state.model_event(client::Event::Text("suppressed tail".to_owned()));
-        assert!(
-            speech_commands
-                .recv_timeout(Duration::from_millis(20))
-                .is_err()
-        );
+        assert!(speech_commands.try_recv().is_err());
         state.model_event(client::Event::Complete(client::Completion::Finished));
 
         // 4. Toggling Always Read Aloud ON mid-continuation speaks accumulated answer and streams seg 2+

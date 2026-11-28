@@ -105,16 +105,18 @@ fn retry_transient_connect(error: &io::Error) -> bool {
     )
 }
 
-fn wait_interruptible<E>(
+fn wait_interruptible_with<E>(
     delay: Duration,
     deadline: Instant,
     poll_step: &mut impl FnMut() -> Duration,
     check: &mut impl FnMut() -> Result<(), E>,
+    now_fn: &mut impl FnMut() -> Instant,
+    sleep: &mut impl FnMut(Duration),
 ) -> Result<bool, Error<E>> {
-    let wait_until = (Instant::now() + delay).min(deadline);
+    let wait_until = (now_fn() + delay).min(deadline);
     loop {
         check().map_err(Error::Interrupted)?;
-        let now = Instant::now();
+        let now = now_fn();
         if now >= deadline {
             return Ok(false);
         }
@@ -125,7 +127,7 @@ fn wait_interruptible<E>(
         if step.is_zero() {
             return Ok(false);
         }
-        std::thread::sleep(step);
+        sleep(step);
     }
 }
 
@@ -148,12 +150,32 @@ pub(crate) fn connect_socket<E>(
     mut poll_step: impl FnMut() -> Duration,
     mut check: impl FnMut() -> Result<(), E>,
 ) -> Result<TcpStream, Error<E>> {
+    connect_socket_with(
+        address,
+        connect_timeout,
+        &mut poll_step,
+        &mut check,
+        &mut |addr, slice| TcpStream::connect_timeout(addr, slice),
+        &mut Instant::now,
+        &mut std::thread::sleep,
+    )
+}
+
+fn connect_socket_with<E>(
+    address: SocketAddr,
+    connect_timeout: Duration,
+    poll_step: &mut impl FnMut() -> Duration,
+    check: &mut impl FnMut() -> Result<(), E>,
+    connect: &mut impl FnMut(&SocketAddr, Duration) -> io::Result<TcpStream>,
+    now_fn: &mut impl FnMut() -> Instant,
+    sleep: &mut impl FnMut(Duration),
+) -> Result<TcpStream, Error<E>> {
     check().map_err(Error::Interrupted)?;
-    let deadline = Instant::now() + connect_timeout;
+    let deadline = now_fn() + connect_timeout;
     let mut transient_retry = 0_usize;
     loop {
         check().map_err(Error::Interrupted)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(now_fn());
         if remaining.is_zero() {
             return Err(Error::Transport(TransportError::Connect));
         }
@@ -161,14 +183,14 @@ pub(crate) fn connect_socket<E>(
         if slice.is_zero() {
             return Err(Error::Transport(TransportError::Connect));
         }
-        match TcpStream::connect_timeout(&address, slice) {
+        match connect(&address, slice) {
             Ok(stream) => {
                 check().map_err(Error::Interrupted)?;
                 return Ok(stream);
             }
             Err(error) if retry_poll(&error) => {
                 check().map_err(Error::Interrupted)?;
-                if Instant::now() >= deadline {
+                if now_fn() >= deadline {
                     return Err(Error::Transport(TransportError::Connect));
                 }
             }
@@ -178,7 +200,7 @@ pub(crate) fn connect_socket<E>(
             {
                 let delay = Duration::from_millis(CONNECT_TRANSIENT_BACKOFF_MS[transient_retry]);
                 transient_retry += 1;
-                if !wait_interruptible(delay, deadline, &mut poll_step, &mut check)? {
+                if !wait_interruptible_with(delay, deadline, poll_step, check, now_fn, sleep)? {
                     return Err(Error::Transport(TransportError::Connect));
                 }
             }
@@ -966,44 +988,75 @@ mod tests {
             Some(super::Error::Transport(super::TransportError::Connect))
         );
 
+        let addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::LOCALHOST,
+            port,
+        ));
         drop(listener);
         let mut checks = 0_usize;
-        let cancelled = super::connect_loopback(
-            port,
+        let cancel_clock = std::cell::Cell::new(std::time::Instant::now());
+        let mut cancel_sleeps = Vec::new();
+        let cancelled = super::connect_socket_with(
+            addr,
             std::time::Duration::from_millis(200),
-            || std::time::Duration::from_millis(25),
-            || {
+            &mut || std::time::Duration::from_millis(25),
+            &mut || {
                 checks += 1;
-                if checks >= 3 { Err("stopped") } else { Ok(()) }
+                if checks >= 4 { Err("stopped") } else { Ok(()) }
+            },
+            &mut |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "refused",
+                ))
+            },
+            &mut || cancel_clock.get(),
+            &mut |delay| {
+                cancel_sleeps.push(delay);
+                cancel_clock.set(cancel_clock.get() + delay);
             },
         );
         assert_eq!(cancelled.err(), Some(super::Error::Interrupted("stopped")));
+        assert_eq!(cancel_sleeps, vec![std::time::Duration::from_millis(25)]);
 
         // Transient ConnectionRefused retries within connect_timeout until peer binds.
-        let probe = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-        let retry_port = probe.local_addr()?.port();
-        drop(probe);
-        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ready_flag = std::sync::Arc::clone(&ready);
-        let delayed_server = std::thread::spawn(move || -> std::io::Result<()> {
-            std::thread::sleep(std::time::Duration::from_millis(35));
-            let listener =
-                std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, retry_port))?;
-            ready_flag.store(true, std::sync::atomic::Ordering::Release);
-            let _accepted = listener.accept()?;
-            Ok(())
-        });
-        let retried = super::connect_loopback(
-            retry_port,
+        let delayed_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let retry_addr = delayed_listener.local_addr()?;
+        let mut attempts = 0_usize;
+        let retry_clock = std::cell::Cell::new(std::time::Instant::now());
+        let mut retry_sleeps = Vec::new();
+        let retried = super::connect_socket_with(
+            retry_addr,
             std::time::Duration::from_secs(2),
-            || std::time::Duration::from_millis(20),
-            || Ok::<(), &'static str>(()),
+            &mut || std::time::Duration::from_millis(20),
+            &mut || Ok::<(), &'static str>(()),
+            &mut |addr, slice| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "not yet bound",
+                    ))
+                } else {
+                    std::net::TcpStream::connect_timeout(addr, slice)
+                }
+            },
+            &mut || retry_clock.get(),
+            &mut |delay| {
+                retry_sleeps.push(delay);
+                retry_clock.set(retry_clock.get() + delay);
+            },
         );
-        delayed_server
-            .join()
-            .map_err(|_| std::io::Error::other("delayed server panicked"))??;
-        assert!(ready.load(std::sync::atomic::Ordering::Acquire));
         assert!(retried.is_ok());
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            retry_sleeps,
+            vec![
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(10),
+            ]
+        );
 
         // Direct checks for retry_transient_connect classification and wait_interruptible.
         for kind in [
@@ -1026,55 +1079,69 @@ mod tests {
             )));
         }
 
-        let future = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let wait_base = std::time::Instant::now();
+        let wait_clock = std::cell::Cell::new(wait_base);
+        let future = wait_base + std::time::Duration::from_secs(1);
         assert!(matches!(
-            super::wait_interruptible(
+            super::wait_interruptible_with(
                 std::time::Duration::from_millis(10),
                 future,
                 &mut || std::time::Duration::from_millis(5),
                 &mut || Ok::<(), &'static str>(()),
+                &mut || wait_clock.get(),
+                &mut |delay| wait_clock.set(wait_clock.get() + delay),
             ),
             Ok(true)
         ));
 
-        let expired = std::time::Instant::now()
+        let expired = wait_base
             .checked_sub(std::time::Duration::from_millis(1))
-            .unwrap_or_else(std::time::Instant::now);
+            .unwrap_or(wait_base);
         assert!(matches!(
-            super::wait_interruptible(
+            super::wait_interruptible_with(
                 std::time::Duration::from_millis(50),
                 expired,
                 &mut || std::time::Duration::from_millis(5),
                 &mut || Ok::<(), &'static str>(()),
+                &mut || wait_base,
+                &mut |_| {},
             ),
             Ok(false)
         ));
         assert!(matches!(
-            super::wait_interruptible(
+            super::wait_interruptible_with(
                 std::time::Duration::from_millis(50),
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                wait_base + std::time::Duration::from_secs(1),
                 &mut || std::time::Duration::ZERO,
                 &mut || Ok::<(), &'static str>(()),
+                &mut || wait_base,
+                &mut |_| {},
             ),
             Ok(false)
         ));
 
         let mut polls = 0_usize;
-        let started = std::time::Instant::now();
-        let interrupted = super::wait_interruptible(
+        let mut int_sleeps = Vec::new();
+        let int_clock = std::cell::Cell::new(wait_base);
+        let interrupted = super::wait_interruptible_with(
             std::time::Duration::from_secs(5),
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            wait_base + std::time::Duration::from_secs(5),
             &mut || std::time::Duration::from_millis(5),
             &mut || {
                 polls += 1;
                 if polls >= 2 { Err("cancelled") } else { Ok(()) }
+            },
+            &mut || int_clock.get(),
+            &mut |delay| {
+                int_sleeps.push(delay);
+                int_clock.set(int_clock.get() + delay);
             },
         );
         assert_eq!(
             interrupted.err(),
             Some(super::Error::Interrupted("cancelled"))
         );
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(int_sleeps, vec![std::time::Duration::from_millis(5)]);
         Ok(())
     }
 }

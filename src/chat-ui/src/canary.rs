@@ -30,7 +30,10 @@ const MAX_WAVE_RESPONSE: usize = 5_760_044;
 #[cfg(test)]
 const MAX_HEAD: usize = crate::http::MAX_HEAD;
 const MAX_TEXT: usize = 32768;
+#[cfg(not(test))]
 const IO_POLL: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const IO_POLL: Duration = Duration::from_millis(25);
 const CONNECT_POLL: Duration = Duration::from_millis(50);
 const READY_LIMIT: Duration = Duration::from_secs(5);
 const TRANSCRIBE_LIMIT: Duration = Duration::from_mins(2);

@@ -254,12 +254,33 @@ struct DraftHistory {
     undo_stack: VecDeque<UndoGroup>,
     redo_stack: Vec<UndoGroup>,
     retained_bytes: usize,
+    #[cfg(test)]
+    max_retained_bytes: Option<usize>,
     ime_active: bool,
     ime_pending: Option<UndoGroup>,
     fingerprint: Option<TextFingerprint>,
 }
 
 impl DraftHistory {
+    #[cfg(test)]
+    fn with_budget(max_retained_bytes: usize) -> Self {
+        Self {
+            max_retained_bytes: Some(max_retained_bytes),
+            ..Self::default()
+        }
+    }
+
+    fn max_retained_bytes(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.max_retained_bytes.unwrap_or(MAX_RETAINED_UNDO_BYTES)
+        }
+        #[cfg(not(test))]
+        {
+            MAX_RETAINED_UNDO_BYTES
+        }
+    }
+
     const fn is_empty(&self) -> bool {
         self.undo_stack.is_empty()
             && self.redo_stack.is_empty()
@@ -276,10 +297,11 @@ impl DraftHistory {
     }
 
     fn push_undo_group(&mut self, group: UndoGroup) {
+        let budget = self.max_retained_bytes();
         for dropped in self.redo_stack.drain(..) {
             self.retained_bytes = self.retained_bytes.saturating_sub(dropped.byte_cost);
         }
-        if group.byte_cost > MAX_RETAINED_UNDO_BYTES {
+        if group.byte_cost > budget {
             self.clear_history();
             return;
         }
@@ -298,10 +320,9 @@ impl DraftHistory {
     }
 
     fn enforce_budget(&mut self) {
-        while self.undo_stack.len() > MAX_UNDO_GROUPS
-            || self.retained_bytes > MAX_RETAINED_UNDO_BYTES
-        {
-            if !self.redo_stack.is_empty() && self.retained_bytes > MAX_RETAINED_UNDO_BYTES {
+        let budget = self.max_retained_bytes();
+        while self.undo_stack.len() > MAX_UNDO_GROUPS || self.retained_bytes > budget {
+            if !self.redo_stack.is_empty() && self.retained_bytes > budget {
                 let dropped = self.redo_stack.remove(0);
                 self.retained_bytes = self.retained_bytes.saturating_sub(dropped.byte_cost);
                 continue;
@@ -551,6 +572,7 @@ impl<'a> Buffer<'a> {
         before_cursor: Option<CCursorRange>,
         after_cursor: Option<CCursorRange>,
     ) {
+        let max_retained_bytes = guard.max_retained_bytes();
         let mut ops = Vec::with_capacity(self.tx_ops.len());
         let mut byte_cost = 0_usize;
         for tx in std::mem::take(&mut self.tx_ops) {
@@ -559,7 +581,7 @@ impl<'a> Buffer<'a> {
                 return;
             };
             byte_cost = byte_cost.saturating_add(edit.byte_cost());
-            if byte_cost > MAX_RETAINED_UNDO_BYTES {
+            if byte_cost > max_retained_bytes {
                 guard.clear_history();
                 return;
             }
@@ -584,7 +606,7 @@ impl<'a> Buffer<'a> {
                 guard.ime_active = true;
                 if let Some(pending) = &mut guard.ime_pending {
                     let next_cost = pending.byte_cost.saturating_add(group.byte_cost);
-                    if next_cost > MAX_RETAINED_UNDO_BYTES {
+                    if next_cost > max_retained_bytes {
                         guard.clear_history();
                     } else {
                         pending.ops.extend(group.ops);
@@ -603,7 +625,7 @@ impl<'a> Buffer<'a> {
                 guard.ime_active = false;
                 if let Some(mut pending) = guard.ime_pending.take() {
                     let next_cost = pending.byte_cost.saturating_add(group.byte_cost);
-                    if next_cost > MAX_RETAINED_UNDO_BYTES {
+                    if next_cost > max_retained_bytes {
                         guard.clear_history();
                     } else {
                         pending.ops.extend(group.ops);
@@ -1346,13 +1368,39 @@ mod tests {
 
     #[test]
     fn inverse_op_history_evicts_oldest_at_one_mib_and_handles_ime_and_external_switch() {
+        assert_eq!(MAX_RETAINED_UNDO_BYTES, 1_048_576);
+        let mut direct_history = DraftHistory::default();
+        for step in 0..4 {
+            direct_history.push_undo_group(UndoGroup {
+                ops: vec![EditOp::Insert {
+                    byte_idx: step * 300 * 1024,
+                    text: "a".repeat(300 * 1024),
+                }],
+                before_cursor: None,
+                after_cursor: None,
+                timestamp: f64::from(u32::try_from(step).unwrap_or(0)),
+                byte_cost: 300 * 1024,
+                coalesceable: false,
+            });
+        }
+        assert!(direct_history.retained_bytes <= MAX_RETAINED_UNDO_BYTES);
+        assert_eq!(direct_history.undo_stack.len(), 3);
+
         let ctx = egui::Context::default();
         let id = egui::Id::unique("budget-ime-switch");
+        let test_budget = 4 * 1024;
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                id.with("draft_history"),
+                Arc::new(Mutex::new(DraftHistory::with_budget(test_budget))),
+            );
+        });
         let mut text = String::new();
         ctx.memory_mut(|mem| mem.request_focus(id));
 
-        // 4 x 300 KiB pastes = 1.2 MiB > 1 MiB budget -> oldest group evicted.
-        let chunk_300k = "a".repeat(300 * 1024);
+        // 4 x 1.2 KiB pastes = 4.8 KiB > 4 KiB test budget -> oldest group evicted
+        // without paying multi-megabyte egui TextEdit layout cost.
+        let chunk_1200 = "a".repeat(1200);
         for step in 0..4 {
             let _ = drive_text_edit_events(
                 &ctx,
@@ -1360,7 +1408,7 @@ mod tests {
                 &mut text,
                 super::super::INPUT_LIMIT,
                 f64::from(step * 2),
-                vec![egui::Event::Paste(chunk_300k.clone())],
+                vec![egui::Event::Paste(chunk_1200.clone())],
             );
         }
         let history_arc =
@@ -1368,7 +1416,7 @@ mod tests {
         if let Some(arc) = history_arc
             && let Ok(guard) = arc.lock()
         {
-            assert!(guard.retained_bytes <= MAX_RETAINED_UNDO_BYTES);
+            assert!(guard.retained_bytes <= test_budget);
             assert!(guard.undo_stack.len() <= 3);
         }
 

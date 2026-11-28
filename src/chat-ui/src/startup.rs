@@ -276,7 +276,19 @@ fn capture(
                 "Native startup output exceeded its bound.",
             ));
         }
-        if let Some(status) = child.try_wait()? {
+        let wait = if deadline.is_zero() {
+            Duration::from_millis(20)
+        } else {
+            let remaining = deadline.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Native startup timed out.",
+                ));
+            }
+            remaining.min(Duration::from_millis(20))
+        };
+        if let Some(status) = child.wait_for_exit(wait)? {
             break Ok(status);
         }
         if observed.elapsed() >= Duration::from_millis(250) {
@@ -291,7 +303,6 @@ fn capture(
                 "Native startup timed out.",
             ));
         }
-        thread::sleep(Duration::from_millis(20));
     })();
     let status = finish_capture(outcome, || child.stop(Duration::from_secs(10)))?;
     if status != 0 {

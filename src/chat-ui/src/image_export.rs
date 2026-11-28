@@ -63,6 +63,8 @@ pub(crate) struct Export {
     outcome: Receiver<Outcome>,
     raster_tx: Option<SyncSender<Result<Arc<[u8]>, &'static str>>>,
     raster: Option<PendingRaster>,
+    #[cfg(test)]
+    raster_dim: u32,
     worker: Option<JoinHandle<()>>,
     finished: bool,
 }
@@ -75,9 +77,15 @@ impl Export {
         svg: Arc<str>,
         suggested_stem: String,
     ) -> io::Result<Self> {
-        Self::start_with(ctx, svg, "bonsai-image-save", move |shared| {
-            picker::pick_save_target(owner, &shared.picker, &shared.cancelled, &suggested_stem)
-        })
+        Self::start_with(
+            ctx,
+            svg,
+            EXPORT_RASTER_DIM,
+            "bonsai-image-save",
+            move |shared| {
+                picker::pick_save_target(owner, &shared.picker, &shared.cancelled, &suggested_stem)
+            },
+        )
     }
 
     #[cfg(test)]
@@ -85,20 +93,26 @@ impl Export {
         ctx: &egui::Context,
         selection: Selection,
         svg: Arc<str>,
+        raster_dim: u32,
     ) -> io::Result<Self> {
-        Self::start_with(ctx, svg, "bonsai-image-save-test-worker", move |_| {
-            Ok(Some(selection))
-        })
+        Self::start_with(
+            ctx,
+            svg,
+            raster_dim,
+            "bonsai-image-save-test-worker",
+            move |_| Ok(Some(selection)),
+        )
     }
 
     fn start_with(
         ctx: &egui::Context,
         svg: Arc<str>,
+        raster_dim: u32,
         thread_name: &'static str,
         select: impl FnOnce(&Shared) -> Result<Option<Selection>, &'static str> + Send + 'static,
     ) -> io::Result<Self> {
         let (raster_tx, raster_rx) = mpsc::sync_channel::<Result<Arc<[u8]>, &'static str>>(1);
-        let raster = prepare_raster(ctx, &svg, &raster_tx);
+        let raster = prepare_raster(ctx, &svg, &raster_tx, raster_dim);
         let shared = Arc::new(Shared::default());
         let worker_shared = Arc::clone(&shared);
         let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
@@ -114,6 +128,8 @@ impl Export {
             outcome: outcome_rx,
             raster_tx: Some(raster_tx),
             raster,
+            #[cfg(test)]
+            raster_dim,
             worker: Some(worker),
             finished: false,
         })
@@ -144,6 +160,8 @@ impl Export {
             outcome: outcome_rx,
             raster_tx: Some(raster_tx),
             raster: None,
+            #[cfg(test)]
+            raster_dim: EXPORT_RASTER_DIM,
             worker: Some(worker),
             finished: false,
         })
@@ -176,10 +194,19 @@ impl Export {
         let Some(tx) = &self.raster_tx else {
             return;
         };
+        let raster_dim = {
+            #[cfg(test)]
+            {
+                self.raster_dim
+            }
+            #[cfg(not(test))]
+            {
+                EXPORT_RASTER_DIM
+            }
+        };
         match raster {
             PendingRaster::Retry { service, svg } => {
-                match service.request_raster(Arc::clone(&svg), EXPORT_RASTER_DIM, EXPORT_RASTER_DIM)
-                {
+                match service.request_raster(Arc::clone(&svg), raster_dim, raster_dim) {
                     Admission::Admitted(ticket) => {
                         self.raster = Some(PendingRaster::Ticket(service, ticket));
                     }
@@ -250,9 +277,10 @@ fn prepare_raster(
     ctx: &egui::Context,
     svg: &Arc<str>,
     raster_tx: &SyncSender<Result<Arc<[u8]>, &'static str>>,
+    raster_dim: u32,
 ) -> Option<PendingRaster> {
     if let Some(service) = Service::get(ctx) {
-        match service.request_raster(Arc::clone(svg), EXPORT_RASTER_DIM, EXPORT_RASTER_DIM) {
+        match service.request_raster(Arc::clone(svg), raster_dim, raster_dim) {
             Admission::Admitted(ticket) => Some(PendingRaster::Ticket(service, ticket)),
             Admission::InvalidInput => {
                 let _sent = raster_tx.try_send(Err(UNRENDERABLE_IMAGE));
@@ -270,16 +298,13 @@ fn prepare_raster(
     } else {
         #[cfg(test)]
         {
-            let packet = Arc::from(bonsai_markdown::rasterize(
-                svg,
-                EXPORT_RASTER_DIM,
-                EXPORT_RASTER_DIM,
-            ));
+            let packet = Arc::from(bonsai_markdown::rasterize(svg, raster_dim, raster_dim));
             let _sent = raster_tx.try_send(Ok(packet));
             None
         }
         #[cfg(not(test))]
         {
+            let _ = raster_dim;
             let _sent = raster_tx.try_send(Err(RASTER_UNAVAILABLE));
             None
         }
@@ -442,6 +467,7 @@ mod tests {
                 format: Format::Svg,
             },
             Arc::clone(&svg),
+            64,
         )?;
         match wait_outcome(&mut export) {
             Outcome::Saved(saved) => assert_eq!(saved, target),
@@ -467,6 +493,7 @@ mod tests {
                 format: Format::Png,
             },
             Arc::clone(&svg),
+            64,
         )?;
         match wait_outcome(&mut export) {
             Outcome::Saved(saved) => assert_eq!(saved, target),
@@ -518,6 +545,7 @@ mod tests {
                 format: Format::Png,
             },
             Arc::clone(&broken),
+            64,
         )?;
         match wait_outcome(&mut png_export) {
             Outcome::Failed(message) => assert_eq!(message, UNRENDERABLE_IMAGE),
@@ -532,6 +560,7 @@ mod tests {
                 format: Format::Svg,
             },
             Arc::clone(&scripted),
+            64,
         )?;
         match wait_outcome(&mut svg_export) {
             Outcome::Failed(message) => assert_eq!(message, UNRENDERABLE_IMAGE),
@@ -554,8 +583,10 @@ mod tests {
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="teal"/></svg>"#,
         );
         let ctx = egui::Context::default();
+        assert_eq!(EXPORT_RASTER_DIM, 2_048);
         // Forged non-premultiplied RGBA8 (`r = 250 > a = 10`) from a compromised worker.
-        let (service, mut step) = Service::custom_responder(&ctx, |_, _| {
+        let (service, mut step) = Service::custom_responder(&ctx, |_, dims| {
+            assert_eq!(dims, Some((EXPORT_RASTER_DIM, EXPORT_RASTER_DIM)));
             let mut bad = b"BMG1".to_vec();
             bad.push(1);
             bad.extend_from_slice(&1_u32.to_le_bytes());
@@ -571,6 +602,7 @@ mod tests {
                 format: Format::Svg,
             },
             Arc::clone(&svg),
+            EXPORT_RASTER_DIM,
         )?;
         assert_eq!(&*step()?, &*svg);
         match wait_outcome(&mut export) {
@@ -601,6 +633,7 @@ mod tests {
                 format: Format::Svg,
             },
             Arc::clone(&svg),
+            64,
         )?;
         match wait_outcome(&mut export) {
             Outcome::Saved(saved) => assert_eq!(saved, target),
@@ -621,7 +654,7 @@ mod tests {
         let svg: Arc<str> = Arc::from(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32"/></svg>"#,
         );
-        let mut export = Export::start_with(&ctx, svg, "bonsai-image-cancel-test", |shared| {
+        let mut export = Export::start_with(&ctx, svg, 64, "bonsai-image-cancel-test", |shared| {
             while !shared.cancelled.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -650,6 +683,7 @@ mod tests {
                 format: Format::Png,
             },
             Arc::from(""),
+            64,
         )?;
         match wait_outcome(&mut invalid_export) {
             Outcome::Failed(message) => assert_eq!(message, UNRENDERABLE_IMAGE),
@@ -673,6 +707,7 @@ mod tests {
                 format: Format::Png,
             },
             Arc::clone(&svg),
+            64,
         )?;
         assert!(matches!(busy_export.poll(), Outcome::Pending));
         if let Some(first) = filler.pop() {
@@ -699,6 +734,7 @@ mod tests {
                 format: Format::Png,
             },
             Arc::clone(&svg),
+            64,
         )?;
         match wait_outcome(&mut unavail_export) {
             Outcome::Failed(message) => assert_eq!(message, RASTER_FAILED),

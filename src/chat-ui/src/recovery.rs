@@ -121,6 +121,15 @@ impl Recovery {
     /// Opens one recovery store before starting the native event loop. A file
     /// lock prevents concurrent windows from overwriting each other's recovery.
     pub(crate) fn open(data: &Path) -> io::Result<Opened> {
+        Self::open_with_sleep(data, std::thread::sleep)
+    }
+
+    #[cfg(test)]
+    fn open_without_retry_sleep(data: &Path) -> io::Result<Opened> {
+        Self::open_with_sleep(data, |_| {})
+    }
+
+    fn open_with_sleep(data: &Path, retry_sleep: fn(std::time::Duration)) -> io::Result<Opened> {
         let path = data.join("chat-recovery.dpapi");
         let backup_path = data.join("chat-recovery.backup.dpapi");
         let preserved_path = data.join("chat-recovery.preserved.dpapi");
@@ -152,12 +161,13 @@ impl Recovery {
                 while let Ok(command) = incoming.recv() {
                     let event = match command {
                         Command::Save(operation, bytes, slot, quarantine_existing) => {
-                            let saved = save_with_rotation(
+                            let saved = save_with_rotation_with_sleep(
                                 &path,
                                 &worker_backup,
                                 &preserved_path,
                                 quarantine_existing,
                                 &bytes,
+                                retry_sleep,
                             )
                             .and_then(|()| {
                                 if saving_enabled_persisted {
@@ -436,12 +446,13 @@ fn read(path: &Path) -> io::Result<Option<crate::scrub::ScrubbingBytes>> {
         .map(Some)
 }
 
-fn save_with_rotation(
+fn save_with_rotation_with_sleep(
     path: &Path,
     backup_path: &Path,
     preserved_path: &Path,
     quarantine_existing: bool,
     bytes: &[u8],
+    retry_sleep: fn(std::time::Duration),
 ) -> Result<(), Failure> {
     if bytes.is_empty() || bytes.len() > MAX_BYTES {
         return Err(Failure::at(
@@ -465,7 +476,15 @@ fn save_with_rotation(
     }
     // A unique create-new sibling receives ciphertext only; atomic replacement
     // preserves the prior snapshot on any write/sync/revalidation failure.
-    crate::window::atomic_file::replace_staged(path, &sealed).map_err(|failure| {
+    #[cfg(test)]
+    let replaced =
+        crate::window::atomic_file::replace_staged_with_sleep(path, &sealed, retry_sleep);
+    #[cfg(not(test))]
+    let replaced = {
+        let _ = retry_sleep;
+        crate::window::atomic_file::replace_staged(path, &sealed)
+    };
+    replaced.map_err(|failure| {
         use crate::window::atomic_file::Stage;
         let stage = match failure.stage {
             Stage::ValidatePath | Stage::RevalidatePath => "checking the storage path",
@@ -501,7 +520,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("Bonsai-recovery-failure-{stamp}"));
         fs::create_dir(&directory)?;
         let path = directory.join("chat-recovery.dpapi");
-        let store = Recovery::open(&directory)?.store;
+        let store = Recovery::open_without_retry_sleep(&directory)?.store;
         store.finish_with(|| Some(b"Last saved private draft".to_vec()));
         assert!(matches!(
             store.events.recv_timeout(std::time::Duration::from_secs(5)),

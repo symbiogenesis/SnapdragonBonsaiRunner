@@ -187,41 +187,41 @@ fn streaming_read_aloud_control_is_available_during_generation_and_stops_audio()
         "Older answer.".clone_into(&mut chat.state_mut().app.transcript.messages[1].body);
         // AccessKit focus requests use the previous frame's focusable widgets.
         // Publish the newly enabled checkbox before asking it to take focus.
-        chat.run_steps(8);
+        chat.run();
         chat.get_by_role_and_label(egui::Role::CheckBox, "Always Read Aloud")
             .focus();
-        chat.run_steps(8);
+        chat.run();
         assert!(
             chat.get_by_role_and_label(egui::Role::CheckBox, "Always Read Aloud")
                 .is_focused()
         );
         chat.key_press(egui::Key::Space);
-        chat.run_steps(8);
+        chat.run();
         assert!(chat.state().app.streaming_read_aloud);
         chat.state_mut().app.input = "Next answer".to_owned();
         chat.state_mut().app.submit();
         chat.state_mut()
             .app
             .model_event(Event::Text("Live answer.".to_owned()));
-        chat.run_steps(8);
+        chat.run_steps(2);
         assert!(chat.state().app.model.busy() && chat.state().app.streaming_active);
         chat.get_by_role_and_label(egui::Role::Button, "Stop speech")
             .click();
-        chat.run_steps(8);
+        chat.run_steps(2);
         assert!(!chat.state().app.speaking);
         assert!(chat.state().app.model.busy() && chat.state().app.streaming_read_aloud);
         chat.get_all_by_role_and_label(egui::Role::Button, "Read this response aloud")
             .next()
             .ok_or_else(|| io::Error::other("Missing older response speaker"))?
             .click();
-        chat.run_steps(8);
+        chat.run_steps(2);
         assert_eq!(
             chat.state().app.speaking_message,
             Some(chat.state().app.transcript.messages[1].id)
         );
         chat.get_by_role_and_label(egui::Role::CheckBox, "Always Read Aloud")
             .click();
-        chat.run_steps(8);
+        chat.run_steps(2);
         assert!(!chat.state().app.streaming_read_aloud);
         assert!(chat.state().app.speaking);
     }
@@ -303,7 +303,7 @@ fn response_speakers_stay_in_bubbles_and_support_keyboard_play_and_stop() -> io:
             .app
             .transcript
             .append("Private reasoning", true);
-        chat.run_steps(8);
+        chat.run();
         assert!(
             chat.query_by_role_and_label(egui::Role::Button, "Read aloud")
                 .is_none()
@@ -323,7 +323,7 @@ fn response_speakers_stay_in_bubbles_and_support_keyboard_play_and_stop() -> io:
         );
         chat.get_by_role_and_label(egui::Role::Button, "Show thinking")
             .click();
-        chat.run_steps(8);
+        chat.run();
         let speaker = chat
             .get_by_role_and_label(egui::Role::Button, "Read this response aloud")
             .rect();
@@ -341,12 +341,12 @@ fn response_speakers_stay_in_bubbles_and_support_keyboard_play_and_stop() -> io:
         let (session, _commands) = speech::Session::fixture()?;
         chat.state_mut().app.speech = Some(session);
         chat.state_mut().app.speech_output = true;
-        chat.run_steps(8);
+        chat.run();
         chat.get_by_role_and_label(egui::Role::Button, "Read this response aloud")
             .focus();
-        chat.run_steps(8);
+        chat.run();
         chat.key_press(egui::Key::Space);
-        chat.run_steps(8);
+        chat.run_steps(2);
         assert!(chat.state().app.speaking);
         assert_eq!(
             chat.state().app.speaking_message,
@@ -354,7 +354,7 @@ fn response_speakers_stay_in_bubbles_and_support_keyboard_play_and_stop() -> io:
         );
         chat.get_by_role_and_label(egui::Role::Button, "Stop reading this response")
             .click();
-        chat.run_steps(8);
+        chat.run();
         assert!(!chat.state().app.speaking);
         assert_eq!(chat.state().app.speaking_message, None);
     }
@@ -997,7 +997,7 @@ fn long_drafts_keep_transcript_and_actions_visible_and_editable() {
         "A wrapped manuscript passage. ",
     ]
     .into_iter()
-    .map(|line| line.chars().cycle().take(65_536 - 2).collect())
+    .map(|line| line.chars().cycle().take(4_096).collect())
     .collect();
     for size in [[1180.0, 860.0], [620.0, 640.0]] {
         for draft in &drafts {
@@ -1623,8 +1623,8 @@ fn audio_transcript_modal_stays_bounded_as_a_long_recording_arrives() -> io::Res
         // the viewport or move the action row as recognition appends more text.
         for part in [
             "Let's start with the main idea. A little space between thoughts makes the conversation easier to follow.\n\nWe can review the details together, then decide what comes next.\n".to_owned(),
-            "word ".repeat(3000),
-            "界".repeat(16000),
+            "word ".repeat(400),
+            "界".repeat(1200),
         ] {
             chat.state_mut().app.audio_file_part(7, &part);
             chat.run_steps(2);

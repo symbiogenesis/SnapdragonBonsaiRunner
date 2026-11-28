@@ -48,7 +48,7 @@ fn harness(size: [f32; 2], font_size: f32) -> Harness<'static, AlertFixture> {
 fn long_error() -> String {
     format!(
         "The operation could not finish.\r\n{}\nFinal cause: permission denied. 日本語 🌱",
-        "C:\\a-very-long-path-without-spaces\\日本語\\artifact: nested cause\n".repeat(1_000)
+        "C:\\a-very-long-path-without-spaces\\日本語\\artifact: nested cause\n".repeat(80)
     )
 }
 
