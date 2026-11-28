@@ -4,6 +4,12 @@ use super::{
     Transcript, VOICE_LIMIT, client, egui, io, workspace::ConversationSnapshot,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SalvageReport {
+    pub(super) recovered_conversations: usize,
+    pub(super) dropped_conversations: usize,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SavedWorkspace {
@@ -137,25 +143,11 @@ impl State {
                             .clone_into(&mut self.recovery_notice);
                     } else {
                         self.recovery_quarantine_primary = true;
-                        if self.restore_from_backup() {
-                            self.save_conversations = true;
-                            self.recovery_dirty = true;
-                            self.recovery_flush_now = true;
-                            "Restored conversations from your previous encrypted backup because the latest file could not be read.".clone_into(&mut self.recovery_notice);
-                        } else {
-                            "Could not restore saved conversations. The existing file is preserved. Enable saving to replace it with this workspace.".clone_into(&mut self.recovery_notice);
-                        }
+                        self.recover_corrupt_primary(Some(&bytes), false);
                     }
                 } else if opened.load_failed {
                     self.recovery_quarantine_primary = true;
-                    if self.restore_from_backup() {
-                        self.save_conversations = true;
-                        self.recovery_dirty = true;
-                        self.recovery_flush_now = true;
-                        "Restored conversations from your previous encrypted backup because the latest file could not be read.".clone_into(&mut self.recovery_notice);
-                    } else {
-                        "Could not unlock saved conversations. The existing file is preserved. Enable saving to replace it with this workspace.".clone_into(&mut self.recovery_notice);
-                    }
+                    self.recover_corrupt_primary(None, true);
                 } else if opened.saving_disabled {
                     self.recovery_erase_pending = true;
                     "Saving is off. Enable it to keep conversations after closing this window."
@@ -173,15 +165,67 @@ impl State {
         }
     }
 
-    fn restore_from_backup(&mut self) -> bool {
-        let Some(backup_bytes) = self
+    fn recover_corrupt_primary(&mut self, primary: Option<&[u8]>, load_failed: bool) {
+        let primary_salvage = primary.and_then(|bytes| self.salvage_workspace_data(bytes).ok());
+        if let Some((saved, report)) = primary_salvage
+            && report.dropped_conversations == 0
+        {
+            self.apply_saved_workspace(saved);
+            self.save_conversations = true;
+            self.recovery_dirty = true;
+            self.recovery_flush_now = true;
+            "Recovered conversations from a modified or newer save format."
+                .clone_into(&mut self.recovery_notice);
+            return;
+        }
+        let backup_bytes = self
             .recovery
             .as_ref()
-            .and_then(|recovery| recovery.read_backup().ok().flatten())
-        else {
-            return false;
-        };
-        self.restore_workspace(&backup_bytes).is_ok()
+            .and_then(|recovery| recovery.read_backup().ok().flatten());
+        if let Some(backup) = backup_bytes.as_deref()
+            && self.restore_workspace(backup).is_ok()
+        {
+            self.save_conversations = true;
+            self.recovery_dirty = true;
+            self.recovery_flush_now = true;
+            "Restored conversations from your previous encrypted backup because the latest file could not be read.".clone_into(&mut self.recovery_notice);
+            return;
+        }
+        if let Some((saved, report)) =
+            primary.and_then(|bytes| self.salvage_workspace_data(bytes).ok())
+        {
+            self.apply_saved_workspace(saved);
+            self.save_conversations = true;
+            self.recovery_dirty = true;
+            self.recovery_flush_now = true;
+            self.recovery_notice = format!(
+                "Recovered {} conversation(s); {} damaged conversation(s) could not be restored.",
+                report.recovered_conversations, report.dropped_conversations
+            );
+            return;
+        }
+        if let Some(backup) = backup_bytes.as_deref()
+            && let Ok((saved, report)) = self.salvage_workspace_data(backup)
+        {
+            self.apply_saved_workspace(saved);
+            self.save_conversations = true;
+            self.recovery_dirty = true;
+            self.recovery_flush_now = true;
+            self.recovery_notice = if report.dropped_conversations == 0 {
+                "Restored conversations from your previous encrypted backup.".to_owned()
+            } else {
+                format!(
+                    "Restored {} conversation(s) from your previous backup; {} damaged conversation(s) could not be restored.",
+                    report.recovered_conversations, report.dropped_conversations
+                )
+            };
+            return;
+        }
+        if load_failed {
+            "Could not unlock saved conversations. The existing file is preserved. Enable saving to replace it with this workspace.".clone_into(&mut self.recovery_notice);
+        } else {
+            "Could not restore saved conversations. The existing file is preserved. Enable saving to replace it with this workspace.".clone_into(&mut self.recovery_notice);
+        }
     }
 
     pub(super) fn workspace_bytes(&self) -> io::Result<Vec<u8>> {
@@ -299,10 +343,22 @@ impl State {
         if bytes.len() > 8 * 1024 * 1024 {
             return Err(io::Error::other("Saved workspace is too large."));
         }
-        let mut saved: SavedWorkspace = serde_json::from_slice(bytes).map_err(io::Error::other)?;
+        let saved: SavedWorkspace = serde_json::from_slice(bytes).map_err(io::Error::other)?;
         if !saved.valid() {
             return Err(io::Error::other("Invalid saved workspace."));
         }
+        self.apply_saved_workspace(saved);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn salvage_workspace(&mut self, bytes: &[u8]) -> io::Result<SalvageReport> {
+        let (saved, report) = self.salvage_workspace_data(bytes)?;
+        self.apply_saved_workspace(saved);
+        Ok(report)
+    }
+
+    fn apply_saved_workspace(&mut self, mut saved: SavedWorkspace) {
         // A locally identified in-flight turn can supply context after a crash.
         // Recovery never starts or replays its request.
         let mut adopted = saved.active.transcript.recover_interrupted(
@@ -336,7 +392,151 @@ impl State {
         self.load_conversation(saved.active);
         self.restore_history = true;
         self.recovery_dirty |= adopted;
-        Ok(())
+    }
+
+    fn salvage_workspace_data(&self, bytes: &[u8]) -> io::Result<(SavedWorkspace, SalvageReport)> {
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err(io::Error::other("Saved workspace is too large."));
+        }
+        let root: serde_json::Value = serde_json::from_slice(bytes).map_err(io::Error::other)?;
+        if root.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+            return Err(io::Error::other("Unsupported workspace version."));
+        }
+        let raw_conversations = root
+            .get("conversations")
+            .and_then(serde_json::Value::as_array)
+            .filter(|items| !items.is_empty())
+            .ok_or_else(|| io::Error::other("Missing saved conversations."))?;
+
+        let requested_active = root
+            .get("active_conversation")
+            .and_then(serde_json::Value::as_u64);
+        let default_scale = self.daisyrose_default_scale();
+        let mut conversations = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut dropped_conversations = 0_usize;
+        let mut active_entry: Option<(usize, ConversationSnapshot)> = None;
+
+        for item in raw_conversations {
+            let Some(id) = item
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|id| *id < u64::MAX && seen_ids.insert(*id))
+            else {
+                dropped_conversations += 1;
+                continue;
+            };
+            let title = item
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(
+                    || "Recovered conversation".to_owned(),
+                    |text| truncate_chars(text, 64),
+                );
+            let renamed = item
+                .get("renamed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let is_active = Some(id) == requested_active
+                && item.get("saved").is_none_or(serde_json::Value::is_null);
+            let snapshot_value = if is_active {
+                root.get("active")
+            } else {
+                item.get("saved").filter(|value| !value.is_null())
+            };
+            let Some(snapshot) =
+                snapshot_value.and_then(|value| salvage_snapshot(value, default_scale))
+            else {
+                dropped_conversations += 1;
+                continue;
+            };
+
+            let mut conversation = Conversation::new(id);
+            conversation.title = title;
+            conversation.renamed = renamed;
+            if is_active {
+                active_entry = Some((conversations.len(), snapshot));
+            } else {
+                conversation.saved = Some(snapshot);
+            }
+            conversations.push(conversation);
+        }
+
+        if conversations.is_empty() {
+            return Err(io::Error::other("No recoverable conversations found."));
+        }
+
+        let (active_index, active_snapshot) = if let Some((index, snapshot)) = active_entry {
+            (index, snapshot)
+        } else {
+            let mut found = None;
+            for (index, conversation) in conversations.iter_mut().enumerate() {
+                if let Some(snapshot) = conversation.saved.take() {
+                    found = Some((index, snapshot));
+                    break;
+                }
+            }
+            found.ok_or_else(|| io::Error::other("Missing active snapshot."))?
+        };
+        let active_conversation = conversations[active_index].id;
+        let max_id = conversations
+            .iter()
+            .map(|conversation| conversation.id)
+            .max()
+            .unwrap_or(active_conversation);
+        let next_conversation = root
+            .get("next_conversation")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|next| *next > max_id && *next < u64::MAX)
+            .unwrap_or_else(|| max_id.saturating_add(1).min(u64::MAX - 1));
+        if max_id >= next_conversation {
+            return Err(io::Error::other(
+                "Conversation identifiers exceed capacity.",
+            ));
+        }
+
+        let voice_profile = root
+            .get("voice_profile")
+            .and_then(serde_json::Value::as_str)
+            .filter(|voice| voice.chars().count() <= VOICE_LIMIT)
+            .unwrap_or_default()
+            .to_owned();
+        let memory = root.get("memory").map(salvage_memory).unwrap_or_default();
+
+        let has_user_content = !memory.is_default_empty()
+            || snapshot_has_user_content(&active_snapshot)
+            || conversations.iter().any(|conversation| {
+                conversation
+                    .saved
+                    .as_ref()
+                    .is_some_and(snapshot_has_user_content)
+            });
+        if !has_user_content {
+            return Err(io::Error::other(
+                "No saved conversation content to salvage.",
+            ));
+        }
+
+        let recovered_conversations = conversations.len();
+        let saved = SavedWorkspace {
+            version: 1,
+            conversations,
+            active_conversation,
+            next_conversation,
+            active: active_snapshot,
+            voice_profile,
+            memory,
+        };
+        if !saved.valid() {
+            return Err(io::Error::other("Salvaged workspace failed validation."));
+        }
+        Ok((
+            saved,
+            SalvageReport {
+                recovered_conversations,
+                dropped_conversations,
+            },
+        ))
     }
 
     pub(super) fn recovery_controls(&mut self, ui: &mut egui::Ui) {
@@ -542,6 +742,358 @@ fn valid_parts(
                     .as_ref()
                     .is_none_or(|text| text.len() <= 1024 * 1024)
         })
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn snapshot_has_user_content(snapshot: &ConversationSnapshot) -> bool {
+    !snapshot.transcript.messages.is_empty()
+        || !snapshot.committed.is_empty()
+        || !snapshot.input.is_empty()
+        || !snapshot.draft_attachments.is_empty()
+        || !snapshot.last_answer.is_empty()
+        || !snapshot.retained_draft.is_empty()
+}
+
+fn salvage_attachments(value: &serde_json::Value) -> Vec<crate::attachment_import::Attachment> {
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    let candidate: Vec<crate::attachment_import::Attachment> = items
+        .iter()
+        .filter_map(|item| serde_json::from_value(item.clone()).ok())
+        .take(crate::attachment_import::MAX_ATTACHMENTS_PER_MESSAGE)
+        .collect();
+    if super::transcript::valid_attachments(&candidate) {
+        candidate
+    } else {
+        Vec::new()
+    }
+}
+
+fn salvage_committed(value: &serde_json::Value) -> Vec<client::Message> {
+    #[derive(serde::Deserialize)]
+    struct LooseWireMessage {
+        role: String,
+        content: String,
+        #[serde(default)]
+        reasoning_content: Option<String>,
+        #[serde(default)]
+        images: Vec<String>,
+    }
+
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut committed = Vec::new();
+    let mut total_images = 0_usize;
+    for item in items.iter().take(128) {
+        let expected_role = if committed.len().is_multiple_of(2) {
+            "user"
+        } else {
+            "assistant"
+        };
+        let message = if let Ok(strict) = serde_json::from_value::<client::Message>(item.clone()) {
+            strict
+        } else if let Ok(loose) = serde_json::from_value::<LooseWireMessage>(item.clone()) {
+            let role = match loose.role.as_str() {
+                "user" => "user",
+                "assistant" => "assistant",
+                _ => break,
+            };
+            let images: Vec<std::sync::Arc<str>> = if role == "user" {
+                loose
+                    .images
+                    .into_iter()
+                    .take(client::MAX_REQUEST_IMAGES)
+                    .map(std::sync::Arc::from)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            client::Message {
+                role,
+                content: loose.content.into(),
+                reasoning_content: loose.reasoning_content.map(Into::into),
+                images: images.into(),
+            }
+        } else {
+            break;
+        };
+        if message.role != expected_role
+            || (message.role != "user" && !message.images.is_empty())
+            || message.content.len() > 1024 * 1024
+            || message
+                .reasoning_content
+                .as_ref()
+                .is_some_and(|text| text.len() > 1024 * 1024)
+            || total_images.saturating_add(message.images.len()) > client::MAX_REQUEST_IMAGES
+        {
+            break;
+        }
+        total_images = total_images.saturating_add(message.images.len());
+        committed.push(message);
+    }
+    if !committed.len().is_multiple_of(2) {
+        committed.pop();
+    }
+    committed
+}
+
+fn salvage_cognitive(value: &serde_json::Value) -> client::CognitiveOptions {
+    if let Ok(strict) = serde_json::from_value::<client::CognitiveOptions>(value.clone()) {
+        return strict;
+    }
+    client::CognitiveOptions {
+        reasoning_effort: value
+            .get("reasoning_effort")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default(),
+        thinking_budget: value
+            .get("thinking_budget")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default(),
+        sampling_preset: value
+            .get("sampling_preset")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default(),
+        extra_effort_strategy: value
+            .get("extra_effort_strategy")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default(),
+    }
+}
+
+fn salvage_memory(value: &serde_json::Value) -> crate::context_cards::MemoryStore {
+    #[derive(serde::Deserialize)]
+    struct LooseCard {
+        id: u64,
+        title: String,
+        #[serde(default)]
+        triggers: Vec<String>,
+        content: String,
+        #[serde(default)]
+        pinned: bool,
+        #[serde(default = "default_true_flag")]
+        enabled: bool,
+    }
+    const fn default_true_flag() -> bool {
+        true
+    }
+    #[derive(serde::Deserialize)]
+    struct LooseMemory {
+        #[serde(default)]
+        persistent_instructions: String,
+        #[serde(default)]
+        cards: Vec<serde_json::Value>,
+        #[serde(default)]
+        token_budget: Option<usize>,
+        #[serde(default)]
+        next_card_id: u64,
+    }
+
+    if let Ok(strict) = serde_json::from_value::<crate::context_cards::MemoryStore>(value.clone())
+        && strict.valid()
+    {
+        return strict;
+    }
+    let Ok(loose) = serde_json::from_value::<LooseMemory>(value.clone()) else {
+        return crate::context_cards::MemoryStore::default();
+    };
+    let persistent_instructions = truncate_chars(
+        &loose.persistent_instructions,
+        crate::context_cards::MAX_INSTRUCTIONS_CHARS,
+    );
+    let token_budget = loose
+        .token_budget
+        .filter(|budget| {
+            (crate::context_cards::MIN_TOKEN_BUDGET..=crate::context_cards::MAX_TOKEN_BUDGET)
+                .contains(budget)
+        })
+        .unwrap_or(crate::context_cards::DEFAULT_TOKEN_BUDGET);
+    let mut cards = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut max_id = 0_u64;
+    for raw in loose
+        .cards
+        .into_iter()
+        .take(crate::context_cards::MAX_CARDS)
+    {
+        let Ok(card) = serde_json::from_value::<LooseCard>(raw) else {
+            continue;
+        };
+        if card.id == u64::MAX || !seen_ids.insert(card.id) {
+            continue;
+        }
+        let title = truncate_chars(&card.title, crate::context_cards::MAX_CARD_TITLE_CHARS);
+        let content = truncate_chars(&card.content, crate::context_cards::MAX_CARD_CONTENT_CHARS);
+        let triggers = card
+            .triggers
+            .into_iter()
+            .take(crate::context_cards::MAX_CARD_TRIGGERS)
+            .map(|trigger| truncate_chars(&trigger, crate::context_cards::MAX_CARD_TRIGGER_CHARS))
+            .collect();
+        max_id = max_id.max(card.id);
+        cards.push(crate::context_cards::ContextCard {
+            id: card.id,
+            title,
+            triggers,
+            content,
+            pinned: card.pinned,
+            enabled: card.enabled,
+        });
+    }
+    let next_card_id = if cards.is_empty() {
+        loose.next_card_id
+    } else {
+        loose.next_card_id.max(max_id.saturating_add(1))
+    };
+    let store = crate::context_cards::MemoryStore {
+        persistent_instructions,
+        cards,
+        token_budget,
+        next_card_id,
+    };
+    if store.valid() {
+        store
+    } else {
+        crate::context_cards::MemoryStore::default()
+    }
+}
+
+fn salvage_snapshot(
+    value: &serde_json::Value,
+    default_daisyrose_scale: f32,
+) -> Option<ConversationSnapshot> {
+    let object = value.as_object()?;
+    if ![
+        "transcript",
+        "committed",
+        "input",
+        "last_answer",
+        "retained_draft",
+        "draft_attachments",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+    {
+        return None;
+    }
+    let transcript = object
+        .get("transcript")
+        .map(Transcript::salvage_from_json)
+        .unwrap_or_default();
+    let committed = object
+        .get("committed")
+        .map(salvage_committed)
+        .unwrap_or_default();
+    let input = object
+        .get("input")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| super::draft_buffer::fits(text))
+        .unwrap_or_default()
+        .to_owned();
+    let draft_attachments = object
+        .get("draft_attachments")
+        .map(salvage_attachments)
+        .unwrap_or_default();
+    let last_answer = object
+        .get("last_answer")
+        .and_then(serde_json::Value::as_str)
+        .map(|text| truncate_utf8(text, 4 * 1024 * 1024).to_owned())
+        .unwrap_or_default();
+    let retained_draft = object
+        .get("retained_draft")
+        .and_then(serde_json::Value::as_str)
+        .map(|text| truncate_utf8(text, 4 * 1024 * 1024).to_owned())
+        .unwrap_or_default();
+    let answer_complete = object
+        .get("answer_complete")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let extra_effort = object
+        .get("extra_effort")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let auto_continue = object
+        .get("auto_continue")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let enable_thinking = object
+        .get("enable_thinking")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let streaming_read_aloud = object
+        .get("streaming_read_aloud")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let output_budget = object
+        .get("output_budget")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|budget| usize::try_from(budget).ok())
+        .filter(|budget| *budget < OUTPUT_TOKENS.len())
+        .unwrap_or(3);
+    let daisyrose_enabled = object
+        .get("daisyrose_enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let daisyrose_scale = object
+        .get("daisyrose_scale")
+        .and_then(|scale| serde_json::from_value::<f32>(scale.clone()).ok())
+        .filter(|scale| client::valid_daisyrose_scale(*scale))
+        .unwrap_or(default_daisyrose_scale);
+    let cognitive = object
+        .get("cognitive")
+        .map(salvage_cognitive)
+        .unwrap_or_default();
+    let status = object
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(
+            || "Ready when you are.".to_owned(),
+            |text| truncate_chars(text, MAX_DIAGNOSTIC_CHARS),
+        );
+    let warning = object
+        .get("warning")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let snapshot = ConversationSnapshot {
+        transcript,
+        committed,
+        context_history: None,
+        input,
+        draft_attachments,
+        last_answer,
+        retained_draft,
+        answer_complete,
+        extra_effort,
+        auto_continue,
+        enable_thinking,
+        streaming_read_aloud,
+        output_budget,
+        _legacy_abliteration_scale: None,
+        daisyrose_enabled,
+        daisyrose_scale,
+        cognitive,
+        status,
+        status_detail: String::new(),
+        warning,
+        stage: None,
+    };
+    valid_snapshot(&snapshot).then_some(snapshot)
 }
 
 #[cfg(test)]
@@ -1779,5 +2331,100 @@ mod tests {
         drop(reopened);
 
         remove_recovery_directory(&directory)
+    }
+
+    #[test]
+    fn salvage_recovers_newer_schema_fields_and_quarantines_original_file() -> io::Result<()> {
+        let mut original = state();
+        original.input = "Draft from future schema".to_owned();
+        original.transcript.push(Role::User, "Hello".to_owned());
+        original
+            .transcript
+            .push(Role::Assistant, "Hi there".to_owned());
+        original.committed = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]))
+        .map_err(io::Error::other)?;
+        let bytes = original.workspace_bytes()?;
+        let mut future: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        future["future_root_field"] = serde_json::json!("new");
+        future["active"]["future_snapshot_field"] = serde_json::json!(42);
+        future["active"]["cognitive"]["future_cog_field"] = serde_json::json!(true);
+        future["active"]["transcript"]["messages"][0]["future_msg_field"] =
+            serde_json::json!("meta");
+        future["active"]["committed"][0]["future_wire_field"] = serde_json::json!(123);
+        let future_bytes = serde_json::to_vec(&future).map_err(io::Error::other)?;
+
+        // Strict restore still rejects unknown fields.
+        let mut strict = state();
+        assert!(strict.restore_workspace(&future_bytes).is_err());
+
+        // Opening via attach_recovery salvages 100% of conversations and quarantines original bytes.
+        let directory = recovery_directory("salvage-future")?;
+        let primary = directory.join("chat-recovery.dpapi");
+        let preserved = directory.join("chat-recovery.preserved.dpapi");
+        let sealed = bonsai_windows_credentials::protect_private_data(&future_bytes)?;
+        std::fs::write(&primary, &sealed)?;
+
+        let mut recovered = state();
+        recovered.attach_recovery(crate::recovery::Recovery::open(&directory));
+        assert!(recovered.save_conversations);
+        assert!(recovered.recovery_quarantine_primary);
+        assert_eq!(recovered.input, "Draft from future schema");
+        assert_eq!(recovered.committed.len(), 2);
+        assert!(recovered.transcript.plain_text().contains("Hi there"));
+        drop(recovered);
+
+        assert_eq!(std::fs::read(&preserved)?, sealed);
+        remove_recovery_directory(&directory)
+    }
+
+    #[test]
+    fn salvage_recovers_healthy_conversations_around_partial_corruption_and_rejects_empty()
+    -> io::Result<()> {
+        let mut original = state();
+        original
+            .transcript
+            .push(Role::User, "First chat".to_owned());
+        original.new_chat();
+        original
+            .transcript
+            .push(Role::User, "Second chat".to_owned());
+        let bytes = original.workspace_bytes()?;
+        let mut damaged: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+
+        // Corrupt conversation[0] (active) and give conversation[1] an odd committed tail and bad budget.
+        damaged["active"] = serde_json::json!({"corrupted": true});
+        damaged["conversations"][1]["saved"]["output_budget"] = serde_json::json!(999);
+        damaged["conversations"][1]["saved"]["committed"] = serde_json::json!([
+            {"role": "user", "content": "First chat"},
+            {"role": "assistant", "content": "Reply"},
+            {"role": "user", "content": "Unpaired trailing turn"}
+        ]);
+
+        let mut salvaged = state();
+        let report =
+            salvaged.salvage_workspace(&serde_json::to_vec(&damaged).map_err(io::Error::other)?)?;
+        assert_eq!(report.recovered_conversations, 1);
+        assert_eq!(report.dropped_conversations, 1);
+        assert!(salvaged.transcript.plain_text().contains("First chat"));
+        assert_eq!(salvaged.committed.len(), 2);
+        assert_eq!(salvaged.output_budget, 3);
+
+        // Empty objects and unsupported versions must still be rejected.
+        let mut rejected = state();
+        assert!(rejected.salvage_workspace(b"{}").is_err());
+        let mut wrong_version: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        wrong_version["version"] = serde_json::json!(2);
+        assert!(
+            rejected
+                .salvage_workspace(&serde_json::to_vec(&wrong_version).map_err(io::Error::other)?)
+                .is_err()
+        );
+        Ok(())
     }
 }

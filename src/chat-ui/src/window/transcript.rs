@@ -383,6 +383,103 @@ impl<'de> serde::Deserialize<'de> for Transcript {
 }
 
 impl Transcript {
+    pub(super) fn salvage_from_json(value: &serde_json::Value) -> Self {
+        #[derive(serde::Deserialize)]
+        struct SalvageMessage {
+            role: Role,
+            body: String,
+            #[serde(default)]
+            attachments: Vec<serde_json::Value>,
+            #[serde(default)]
+            history_index: Option<usize>,
+            #[serde(default)]
+            turn_prefix: Option<usize>,
+            #[serde(default)]
+            retry_prefix: Option<usize>,
+            #[serde(default)]
+            interrupted: bool,
+            #[serde(default)]
+            token_limit: bool,
+            #[serde(default)]
+            reasoning: String,
+        }
+
+        let Some(items) = value.get("messages").and_then(serde_json::Value::as_array) else {
+            return Self::default();
+        };
+        let mut transcript = Self::default();
+        for item in items.iter().take(MAX_MESSAGES) {
+            let mut message = if let Ok(strict) = serde_json::from_value::<Message>(item.clone()) {
+                strict
+            } else if let Ok(loose) = serde_json::from_value::<SalvageMessage>(item.clone()) {
+                let attachments = if loose.role == Role::User {
+                    let candidate: Vec<crate::attachment_import::Attachment> = loose
+                        .attachments
+                        .into_iter()
+                        .filter_map(|raw| serde_json::from_value(raw).ok())
+                        .take(crate::attachment_import::MAX_ATTACHMENTS_PER_MESSAGE)
+                        .collect();
+                    if valid_attachments(&candidate) {
+                        candidate
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                Message {
+                    id: 0,
+                    role: loose.role,
+                    body: loose.body,
+                    attachments,
+                    history_index: loose.history_index,
+                    turn_prefix: loose.turn_prefix,
+                    retry_prefix: loose.retry_prefix,
+                    interrupted: loose.interrupted,
+                    token_limit: loose.token_limit,
+                    body_revision: 0,
+                    reasoning: loose.reasoning,
+                    pending: false,
+                    show_reasoning: false,
+                    cache: None,
+                    markdown: formatting::Pending::default(),
+                    measured_height: None,
+                    can_speak_cache: std::cell::Cell::new(None),
+                    #[cfg(test)]
+                    body_layouts: 0,
+                    #[cfg(test)]
+                    shaped_galleys: 0,
+                    #[cfg(test)]
+                    reasoning_galleys_shaped: 0,
+                    #[cfg(test)]
+                    cache_updates: 0,
+                    #[cfg(test)]
+                    underline_layouts: 0,
+                    #[cfg(test)]
+                    highlight_range_visits: std::cell::Cell::new(0),
+                    #[cfg(test)]
+                    history_checks: std::cell::Cell::new(0),
+                }
+            } else {
+                continue;
+            };
+            if (message.role != Role::User && !message.attachments.is_empty())
+                || !valid_attachments(&message.attachments)
+            {
+                message.attachments.clear();
+            }
+            let addition = message.text_bytes();
+            if transcript.text_bytes.saturating_add(addition) > MAX_BYTES {
+                break;
+            }
+            transcript.next_id = transcript.next_id.wrapping_add(1);
+            message.id = transcript.next_id;
+            transcript.text_bytes = transcript.text_bytes.saturating_add(addition);
+            transcript.messages.push(message);
+        }
+        transcript
+    }
+
     pub(super) fn invalidate_presentation(&mut self) {
         self.presentation = None;
     }
