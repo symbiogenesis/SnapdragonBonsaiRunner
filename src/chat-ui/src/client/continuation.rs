@@ -382,6 +382,23 @@ fn strip_leading_ellipsis<'a>(prev_tail: &str, rest: &'a str) -> &'a str {
     }
 }
 
+fn strip_trimmed_prev_overlap<'a>(
+    prev_tail: &str,
+    prev_trimmed: &str,
+    candidate: &'a str,
+) -> Option<&'a str> {
+    let overlap = find_overlap(prev_trimmed, candidate);
+    if overlap == 0 {
+        return None;
+    }
+    let after = &candidate[overlap..];
+    Some(if prev_tail.ends_with([' ', '\t']) {
+        after.strip_prefix(' ').unwrap_or(after)
+    } else {
+        after
+    })
+}
+
 fn strip_tail_overlap<'a>(prev_tail: &str, rest: &'a str) -> (&'a str, bool) {
     if prev_tail.is_empty() || rest.is_empty() {
         return (rest, false);
@@ -392,7 +409,8 @@ fn strip_tail_overlap<'a>(prev_tail: &str, rest: &'a str) -> (&'a str, bool) {
     }
     let trimmed = rest.trim_start();
     let leading_ws = rest.len().saturating_sub(trimmed.len());
-    if leading_ws > 0 && leading_ws <= 8 {
+    let has_short_ws = leading_ws > 0 && leading_ws <= 8;
+    if has_short_ws {
         let trimmed_overlap = find_overlap(prev_tail, trimmed);
         if trimmed_overlap > 0 {
             return (&trimmed[trimmed_overlap..], true);
@@ -405,27 +423,13 @@ fn strip_tail_overlap<'a>(prev_tail: &str, rest: &'a str) -> (&'a str, bool) {
     {
         let prev_trimmed = prev_tail.trim_end();
         if !prev_trimmed.is_empty() {
-            let overlap = find_overlap(prev_trimmed, rest);
-            if overlap > 0 {
-                let after = &rest[overlap..];
-                let after = if prev_tail.ends_with([' ', '\t']) {
-                    after.strip_prefix(' ').unwrap_or(after)
-                } else {
-                    after
-                };
+            if let Some(after) = strip_trimmed_prev_overlap(prev_tail, prev_trimmed, rest) {
                 return (after, true);
             }
-            if leading_ws > 0 && leading_ws <= 8 {
-                let trimmed_overlap = find_overlap(prev_trimmed, trimmed);
-                if trimmed_overlap > 0 {
-                    let after = &trimmed[trimmed_overlap..];
-                    let after = if prev_tail.ends_with([' ', '\t']) {
-                        after.strip_prefix(' ').unwrap_or(after)
-                    } else {
-                        after
-                    };
-                    return (after, true);
-                }
+            if has_short_ws
+                && let Some(after) = strip_trimmed_prev_overlap(prev_tail, prev_trimmed, trimmed)
+            {
+                return (after, true);
             }
         }
     }
@@ -542,6 +546,10 @@ struct SeamFilter {
     resolved: bool,
 }
 
+fn starts_with_fence_char(text: &str) -> bool {
+    text.starts_with('`') || text.starts_with('~')
+}
+
 impl SeamFilter {
     const fn new(prev_tail: String, open_fence: Option<OpenFence>) -> Self {
         Self {
@@ -552,13 +560,15 @@ impl SeamFilter {
         }
     }
 
+    fn contained_in_tail(&self, text: &str) -> bool {
+        self.prev_tail.contains(text) || self.prev_tail.trim_end().contains(text)
+    }
+
     fn potential_preamble_or_fence(&self) -> bool {
-        let trimmed = self.buffer.trim_start();
         if let Some(nl) = self.buffer.find('\n') {
             if let Some((after_preamble, _)) = strip_preamble_line(&self.buffer) {
                 if self.open_fence.is_some()
-                    && (after_preamble.trim_start().starts_with('`')
-                        || after_preamble.trim_start().starts_with('~'))
+                    && starts_with_fence_char(after_preamble.trim_start())
                     && !after_preamble.contains('\n')
                 {
                     return true;
@@ -577,17 +587,14 @@ impl SeamFilter {
                 }
             }
             let first_line = self.buffer[..nl].trim_end_matches('\r');
-            if self.open_fence.is_some()
+            let rest = &self.buffer[nl + 1..];
+            return self.open_fence.is_some()
                 && first_line.is_empty()
-                && !self.buffer[nl + 1..].contains('\n')
-                && (self.buffer[nl + 1..].trim_start().starts_with('`')
-                    || self.buffer[nl + 1..].trim_start().starts_with('~'))
-            {
-                return true;
-            }
-            return false;
+                && !rest.contains('\n')
+                && starts_with_fence_char(rest.trim_start());
         }
-        if self.open_fence.is_some() && (trimmed.starts_with('`') || trimmed.starts_with('~')) {
+        let trimmed = self.buffer.trim_start();
+        if self.open_fence.is_some() && starts_with_fence_char(trimmed) {
             return true;
         }
         if self.open_fence.is_none() && (trimmed.starts_with("...") || trimmed.starts_with('…')) {
@@ -597,17 +604,12 @@ impl SeamFilter {
     }
 
     fn can_flush_early(&self) -> bool {
-        if self.buffer.len() < SEAM_EARLY_FLUSH_BYTES {
-            return false;
-        }
-        if self.potential_preamble_or_fence() {
+        if self.buffer.len() < SEAM_EARLY_FLUSH_BYTES || self.potential_preamble_or_fence() {
             return false;
         }
         let trimmed = self.buffer.trim_start();
         if !trimmed.is_empty()
-            && (self.prev_tail.contains(trimmed)
-                || self.prev_tail.contains(&self.buffer)
-                || self.prev_tail.trim_end().contains(trimmed))
+            && (self.prev_tail.contains(&self.buffer) || self.contained_in_tail(trimmed))
         {
             return false;
         }
@@ -890,6 +892,193 @@ where
     )
 }
 
+struct ContinuationState<'a> {
+    base_wire_history: Vec<Message>,
+    wire_history: Vec<Message>,
+    stitched_text: String,
+    stitched_reasoning: String,
+    prev_emitted_chunk: String,
+    observed_budget_ceiling: Option<u32>,
+    options: &'a ResponseOptions,
+    context_tokens: usize,
+    prompt_reuse: PromptReuse,
+}
+
+impl<'a> ContinuationState<'a> {
+    fn clamped_budget(&self) -> Option<u32> {
+        let initial = next_chunk_budget(
+            &self.wire_history,
+            self.options.system_appendix.as_deref(),
+            self.context_tokens,
+            self.options.max_completion_tokens,
+        )?;
+        let budget = self
+            .observed_budget_ceiling
+            .map_or(initial, |ceil| initial.min(ceil));
+        (budget >= MIN_CONTINUATION_TOKENS).then_some(budget)
+    }
+
+    fn prepare_segment_budget(&mut self, cont_prompt: &str) -> Option<u32> {
+        if self.prompt_reuse.enabled() {
+            if self.wire_history.len().saturating_add(1) > MAX_WIRE_HISTORY_MESSAGES {
+                if self.wire_history.len() <= self.base_wire_history.len().saturating_add(1) {
+                    return None;
+                }
+                self.wire_history = compacted_wire_history(
+                    &self.base_wire_history,
+                    &self.stitched_text,
+                    &self.stitched_reasoning,
+                    cont_prompt,
+                )?;
+            } else {
+                self.wire_history.push(Message {
+                    role: "user",
+                    content: cont_prompt.into(),
+                    reasoning_content: None,
+                    images: Arc::default(),
+                });
+            }
+        } else {
+            self.wire_history = compacted_wire_history(
+                &self.base_wire_history,
+                &self.stitched_text,
+                &self.stitched_reasoning,
+                cont_prompt,
+            )?;
+        }
+        self.clamped_budget()
+    }
+
+    fn compact_for_serialize_retry(&mut self, cont_prompt: &str) -> Option<u32> {
+        self.wire_history = compacted_wire_history(
+            &self.base_wire_history,
+            &self.stitched_text,
+            &self.stitched_reasoning,
+            cont_prompt,
+        )?;
+        self.clamped_budget()
+    }
+
+    fn stream_attempt<G>(
+        &mut self,
+        request: Vec<u8>,
+        open_fence: Option<&OpenFence>,
+        commands: &Receiver<Command>,
+        events: &EventSender,
+        generate: &mut G,
+    ) -> Result<(Message, Completion, String)>
+    where
+        G: FnMut(
+            Vec<u8>,
+            &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+            &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+        ) -> Result<(Message, Completion)>,
+    {
+        let prev_tail = tail_slice(&self.stitched_text, SEAM_TAIL_BYTES).to_owned();
+        let mut filter = SeamFilter::new(prev_tail, open_fence.cloned());
+        let mut emitted_chunk = String::new();
+        let mut stream_err: Option<Failure> = None;
+
+        let outcome = {
+            let stitched_text = &mut self.stitched_text;
+            let mut on_text = |delta: Cow<'_, str>| -> Result<()> {
+                let result = filter.push(&delta, &mut |clean| {
+                    emitted_chunk.push_str(clean);
+                    stitched_text.push_str(clean);
+                    events.stream_text(Cow::Borrowed(clean), false, commands)
+                });
+                if let Err(err) = result {
+                    stream_err = Some(err);
+                    return Err(err);
+                }
+                Ok(())
+            };
+            let mut on_reasoning = |_delta: Cow<'_, str>| -> Result<()> { Ok(()) };
+            generate(request, &mut on_text, &mut on_reasoning)
+        };
+
+        if let Some(err) = stream_err {
+            return Err(err);
+        }
+
+        let (raw_msg, completion) = outcome?;
+        filter.finish(&mut |clean| {
+            emitted_chunk.push_str(clean);
+            self.stitched_text.push_str(clean);
+            events.stream_text(Cow::Borrowed(clean), false, commands)
+        })?;
+        Ok((raw_msg, completion, emitted_chunk))
+    }
+
+    fn run_segment<G, S>(
+        &mut self,
+        cont_prompt: &str,
+        open_fence: Option<&OpenFence>,
+        initial_budget: u32,
+        commands: &Receiver<Command>,
+        events: &EventSender,
+        generate: &mut G,
+        wait_rate_limit: &mut S,
+    ) -> Result<Option<(Message, Completion, String)>>
+    where
+        G: FnMut(
+            Vec<u8>,
+            &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+            &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
+        ) -> Result<(Message, Completion)>,
+        S: FnMut(&Receiver<Command>, u64) -> Result<()>,
+    {
+        let mut chunk_budget = initial_budget;
+        let mut stepdowns = 0_usize;
+        let mut rate_retries = 0_usize;
+        let mut compacted_on_serialize = !self.prompt_reuse.enabled();
+
+        loop {
+            let cont_options =
+                prepare_continuation_options(self.options, chunk_budget, self.prompt_reuse);
+            let request = match serialize_request_with_options(&self.wire_history, &cont_options) {
+                Ok(bytes) => bytes,
+                Err(_)
+                    if !compacted_on_serialize
+                        && self.wire_history.len()
+                            > self.base_wire_history.len().saturating_add(2) =>
+                {
+                    compacted_on_serialize = true;
+                    let Some(recomputed) = self.compact_for_serialize_retry(cont_prompt) else {
+                        return Ok(None);
+                    };
+                    chunk_budget = recomputed;
+                    continue;
+                }
+                Err(_) => return Ok(None),
+            };
+
+            match self.stream_attempt(request, open_fence, commands, events, generate) {
+                Ok(chunk) => return Ok(Some(chunk)),
+                Err(Failure::Rejected(CONTEXT_LIMIT_MESSAGE))
+                    if stepdowns < MAX_CONTEXT_STEPDOWNS
+                        && chunk_budget / 2 >= MIN_CONTINUATION_TOKENS =>
+                {
+                    stepdowns += 1;
+                    chunk_budget /= 2;
+                    self.observed_budget_ceiling = Some(
+                        self.observed_budget_ceiling
+                            .map_or(chunk_budget, |prev| prev.min(chunk_budget)),
+                    );
+                }
+                Err(Failure::Rejected(RATE_LIMIT_MESSAGE))
+                    if rate_retries < MAX_RATE_LIMIT_RETRIES =>
+                {
+                    rate_retries += 1;
+                    wait_rate_limit(commands, RATE_LIMIT_WAIT_MS)?;
+                }
+                Err(Failure::Rejected(_)) => return Ok(None),
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Shared continuation loop preserves exact wire prefix, context budget, and stream hooks."
@@ -913,21 +1102,16 @@ where
     ) -> Result<(Message, Completion)>,
     S: FnMut(&Receiver<Command>, u64) -> Result<()>,
 {
-    let mut stitched_text = first_raw.content.to_string();
+    let stitched_text = first_raw.content.to_string();
     let stitched_reasoning = first_raw
         .reasoning_content
         .as_deref()
         .unwrap_or_default()
         .to_owned();
 
-    if stitched_text.trim().is_empty() && stitched_reasoning.trim().is_empty() {
-        return Ok((
-            build_stitched_message(stitched_text, stitched_reasoning),
-            Completion::TokenLimit,
-        ));
-    }
-
-    if message_has_control_marker(&first_raw) {
+    if (stitched_text.trim().is_empty() && stitched_reasoning.trim().is_empty())
+        || message_has_control_marker(&first_raw)
+    {
         return Ok((
             build_stitched_message(stitched_text, stitched_reasoning),
             Completion::TokenLimit,
@@ -937,7 +1121,7 @@ where
     let mut base_wire_history = pending.to_vec();
     fold_turn_appendix_for_wire(&mut base_wire_history, options.turn_appendix.as_deref());
 
-    let mut wire_history = if prompt_reuse.enabled() {
+    let wire_history = if prompt_reuse.enabled() {
         let mut history = base_wire_history.clone();
         history.push(first_raw);
         history
@@ -945,183 +1129,64 @@ where
         Vec::new()
     };
 
-    let mut prev_emitted_chunk = stitched_text.clone();
-    let mut observed_budget_ceiling: Option<u32> = None;
+    let mut state = ContinuationState {
+        base_wire_history,
+        wire_history,
+        prev_emitted_chunk: stitched_text.clone(),
+        stitched_text,
+        stitched_reasoning,
+        observed_budget_ceiling: None,
+        options,
+        context_tokens,
+        prompt_reuse,
+    };
     let mut final_completion = Completion::TokenLimit;
 
     for segment in 2..=MAX_TOTAL_SEGMENTS {
         check_commands(commands)?;
-        if stitched_text.len().saturating_add(stitched_reasoning.len()) >= MAX_STITCHED_BYTES {
+        if state
+            .stitched_text
+            .len()
+            .saturating_add(state.stitched_reasoning.len())
+            >= MAX_STITCHED_BYTES
+        {
             break;
         }
 
-        let open_fence = open_fence_state(&stitched_text);
-        let cont_prompt = build_continuation_prompt(&stitched_text, open_fence.as_ref());
-
-        if prompt_reuse.enabled() {
-            if wire_history.len().saturating_add(1) > MAX_WIRE_HISTORY_MESSAGES {
-                if wire_history.len() > base_wire_history.len().saturating_add(1)
-                    && let Some(compacted) = compacted_wire_history(
-                        &base_wire_history,
-                        &stitched_text,
-                        &stitched_reasoning,
-                        &cont_prompt,
-                    )
-                {
-                    wire_history = compacted;
-                } else {
-                    break;
-                }
-            } else {
-                wire_history.push(Message {
-                    role: "user",
-                    content: cont_prompt.clone().into(),
-                    reasoning_content: None,
-                    images: Arc::default(),
-                });
-            }
-        } else {
-            let Some(compacted) = compacted_wire_history(
-                &base_wire_history,
-                &stitched_text,
-                &stitched_reasoning,
-                &cont_prompt,
-            ) else {
-                break;
-            };
-            wire_history = compacted;
-        }
-
-        let Some(initial_budget) = next_chunk_budget(
-            &wire_history,
-            options.system_appendix.as_deref(),
-            context_tokens,
-            options.max_completion_tokens,
-        ) else {
+        let open_fence = open_fence_state(&state.stitched_text);
+        let cont_prompt = build_continuation_prompt(&state.stitched_text, open_fence.as_ref());
+        let Some(chunk_budget) = state.prepare_segment_budget(&cont_prompt) else {
             break;
         };
-        let mut chunk_budget =
-            observed_budget_ceiling.map_or(initial_budget, |ceil| initial_budget.min(ceil));
-        if chunk_budget < MIN_CONTINUATION_TOKENS {
-            break;
-        }
 
         notify(events, Event::Continuing(segment))?;
 
-        let mut stepdowns = 0_usize;
-        let mut rate_retries = 0_usize;
-        let mut compacted_on_serialize = !prompt_reuse.enabled();
-        let mut chunk_result: Option<(Message, Completion, String)> = None;
-
-        loop {
-            let cont_options = prepare_continuation_options(options, chunk_budget, prompt_reuse);
-            let request = match serialize_request_with_options(&wire_history, &cont_options) {
-                Ok(bytes) => bytes,
-                Err(_)
-                    if !compacted_on_serialize
-                        && wire_history.len() > base_wire_history.len().saturating_add(2) =>
-                {
-                    compacted_on_serialize = true;
-                    let Some(compacted) = compacted_wire_history(
-                        &base_wire_history,
-                        &stitched_text,
-                        &stitched_reasoning,
-                        &cont_prompt,
-                    ) else {
-                        break;
-                    };
-                    wire_history = compacted;
-                    let Some(recomputed) = next_chunk_budget(
-                        &wire_history,
-                        options.system_appendix.as_deref(),
-                        context_tokens,
-                        options.max_completion_tokens,
-                    ) else {
-                        break;
-                    };
-                    chunk_budget =
-                        observed_budget_ceiling.map_or(recomputed, |ceil| recomputed.min(ceil));
-                    if chunk_budget < MIN_CONTINUATION_TOKENS {
-                        break;
-                    }
-                    continue;
-                }
-                Err(_) => break,
-            };
-
-            let prev_tail = tail_slice(&stitched_text, SEAM_TAIL_BYTES).to_owned();
-            let mut filter = SeamFilter::new(prev_tail, open_fence.clone());
-            let mut emitted_chunk = String::new();
-            let mut stream_err: Option<Failure> = None;
-
-            let outcome = {
-                let mut on_text = |delta: Cow<'_, str>| -> Result<()> {
-                    let result = filter.push(&delta, &mut |clean| {
-                        emitted_chunk.push_str(clean);
-                        stitched_text.push_str(clean);
-                        events.stream_text(Cow::Borrowed(clean), false, commands)
-                    });
-                    if let Err(err) = result {
-                        stream_err = Some(err);
-                        return Err(err);
-                    }
-                    Ok(())
-                };
-                let mut on_reasoning = |_delta: Cow<'_, str>| -> Result<()> { Ok(()) };
-                generate(request, &mut on_text, &mut on_reasoning)
-            };
-
-            if let Some(err) = stream_err {
-                return Err(err);
-            }
-
-            match outcome {
-                Ok((raw_msg, completion)) => {
-                    filter.finish(&mut |clean| {
-                        emitted_chunk.push_str(clean);
-                        stitched_text.push_str(clean);
-                        events.stream_text(Cow::Borrowed(clean), false, commands)
-                    })?;
-                    chunk_result = Some((raw_msg, completion, emitted_chunk));
-                    break;
-                }
-                Err(Failure::Rejected(CONTEXT_LIMIT_MESSAGE))
-                    if stepdowns < MAX_CONTEXT_STEPDOWNS
-                        && chunk_budget / 2 >= MIN_CONTINUATION_TOKENS =>
-                {
-                    stepdowns += 1;
-                    chunk_budget /= 2;
-                    observed_budget_ceiling = Some(
-                        observed_budget_ceiling.map_or(chunk_budget, |prev| prev.min(chunk_budget)),
-                    );
-                }
-                Err(Failure::Rejected(RATE_LIMIT_MESSAGE))
-                    if rate_retries < MAX_RATE_LIMIT_RETRIES =>
-                {
-                    rate_retries += 1;
-                    wait_rate_limit(commands, RATE_LIMIT_WAIT_MS)?;
-                }
-                Err(Failure::Rejected(_)) => {
-                    break;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        let Some((raw_msg, completion, emitted_chunk)) = chunk_result else {
+        let Some((raw_msg, completion, emitted_chunk)) = state.run_segment(
+            &cont_prompt,
+            open_fence.as_ref(),
+            chunk_budget,
+            commands,
+            events,
+            &mut generate,
+            &mut wait_rate_limit,
+        )?
+        else {
             break;
         };
 
         if emitted_chunk.trim().is_empty() {
-            if completion == Completion::Finished && !stitched_text.trim().is_empty() {
+            if completion == Completion::Finished && !state.stitched_text.trim().is_empty() {
                 final_completion = Completion::Finished;
             }
             break;
         }
-        let prior_len = stitched_text.len().saturating_sub(emitted_chunk.len());
+        let prior_len = state
+            .stitched_text
+            .len()
+            .saturating_sub(emitted_chunk.len());
         if is_repetition_loop(
-            &stitched_text[..prior_len],
-            &prev_emitted_chunk,
+            &state.stitched_text[..prior_len],
+            &state.prev_emitted_chunk,
             &emitted_chunk,
         ) {
             break;
@@ -1135,13 +1200,13 @@ where
         }
 
         if prompt_reuse.enabled() {
-            wire_history.push(raw_msg);
+            state.wire_history.push(raw_msg);
         }
-        prev_emitted_chunk = emitted_chunk;
+        state.prev_emitted_chunk = emitted_chunk;
     }
 
     Ok((
-        build_stitched_message(stitched_text, stitched_reasoning),
+        build_stitched_message(state.stitched_text, state.stitched_reasoning),
         final_completion,
     ))
 }
