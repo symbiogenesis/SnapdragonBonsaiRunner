@@ -530,15 +530,41 @@ fn settings_reply_limit_is_advanced_and_keeps_each_conversations_choice() {
         chat.run();
         assert_eq!(chat.state().app.output_budget, 1);
         assert!(chat.state().app.auto_continue);
+        chat.state_mut().app.recovery_dirty = false;
         chat.get_by_role_and_label(egui::Role::CheckBox, "Auto-continue long responses")
             .click();
         chat.run();
         assert!(!chat.state().app.auto_continue);
         assert!(chat.state().app.recovery_dirty);
+        chat.state_mut().app.recovery_dirty = false;
+        chat.get_by_role_and_label(egui::Role::CheckBox, "Auto-continue long responses")
+            .click();
+        chat.run();
+        assert!(chat.state().app.auto_continue);
+        assert!(chat.state().app.recovery_dirty);
+        chat.get_by_role_and_label(egui::Role::CheckBox, "Auto-continue long responses")
+            .click();
+        chat.run();
+        assert!(!chat.state().app.auto_continue);
         assert!(chat.state().commands.try_recv().is_err());
         chat.get_by_role_and_label(egui::Role::Button, "Done")
             .click();
         chat.run();
+        if size[0] > 1000.0 {
+            chat.state_mut().app.submit();
+            assert!(matches!(
+                chat.state().commands.try_recv(),
+                Ok(Command::Send {
+                    auto_continue: false,
+                    ..
+                })
+            ));
+            chat.state_mut()
+                .app
+                .model_event(Event::Stopping("Keep my next draft 🌱".into()));
+            chat.state_mut().app.model_event(Event::Stopped);
+            chat.state_mut().app.input = "Keep my next draft 🌱".into();
+        }
         chat.state_mut().app.new_chat();
         assert_eq!(chat.state().app.output_budget, 3);
         assert!(chat.state().app.auto_continue);

@@ -1543,4 +1543,89 @@ mod tests {
             vec![crate::window::error_ui::AlertKind::Recovery]
         );
     }
+
+    #[test]
+    fn auto_continue_workspace_round_trip_legacy_default_and_mid_continuation_crash()
+    -> io::Result<()> {
+        let mut s = state();
+        s.auto_continue = false;
+        s.new_chat();
+        s.auto_continue = true;
+        s.new_chat();
+        s.auto_continue = false;
+
+        let bytes = s.workspace_bytes()?;
+        let mut restored = state();
+        restored.restore_workspace(&bytes)?;
+        assert!(!restored.auto_continue);
+        assert_eq!(restored.conversations.len(), 3);
+        let middle_id = restored.conversations[1].id;
+        restored.switch_conversation(middle_id);
+        assert!(restored.auto_continue);
+
+        // Legacy workspace omitting "auto_continue" in active and saved defaults to true
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        if let Some(active) = json["active"].as_object_mut() {
+            active.remove("auto_continue");
+        }
+        if let Some(convs) = json["conversations"].as_array_mut() {
+            for conv in convs {
+                if let Some(saved) = conv["saved"].as_object_mut() {
+                    saved.remove("auto_continue");
+                }
+            }
+        }
+        let mut legacy = state();
+        legacy.auto_continue = false;
+        legacy.restore_workspace(&serde_json::to_vec(&json).map_err(io::Error::other)?)?;
+        assert!(legacy.auto_continue);
+        for conv in &legacy.conversations {
+            if let Some(saved) = &conv.saved {
+                assert!(saved.auto_continue);
+            }
+        }
+
+        // Invalid types for auto_continue fail cleanly without clobbering live state
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+        ] {
+            let mut malformed = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map_err(io::Error::other)?;
+            malformed["active"]["auto_continue"] = bad;
+            let live_before = restored.active_conversation;
+            let err = restored
+                .restore_workspace(&serde_json::to_vec(&malformed).map_err(io::Error::other)?);
+            assert!(err.is_err());
+            assert_eq!(restored.active_conversation, live_before);
+        }
+
+        // Crash recovery mid-continuation adopts a single stitched partial answer
+        let (mid_commands, _mid_cmd_rx) = mpsc::channel();
+        let (_mid_events, mid_incoming) = client::event_channel();
+        let mut mid = State::create(mid_commands, mid_incoming, None, None);
+        mid.preview = false;
+        mid.model = ModelLifecycle::Ready;
+        mid.context_tokens = Some(65_536);
+        mid.input = "Mid-continuation prompt".to_owned();
+        mid.submit();
+        mid.model_event(client::Event::Text("Segment one.".to_owned()));
+        mid.model_event(client::Event::Continuing(2));
+        mid.model_event(client::Event::Text(" Segment two.".to_owned()));
+        let mid_bytes = mid.workspace_bytes()?;
+
+        let mut recovered = state();
+        recovered.restore_workspace(&mid_bytes)?;
+        let last = recovered
+            .transcript
+            .messages
+            .last()
+            .ok_or_else(|| io::Error::other("missing stitched partial answer"))?;
+        assert_eq!(last.body, "Segment one. Segment two.");
+        assert!(last.interrupted);
+        assert!(last.can_continue(&recovered.committed));
+        Ok(())
+    }
 }

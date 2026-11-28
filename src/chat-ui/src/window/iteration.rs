@@ -1522,4 +1522,250 @@ mod tests {
             "Background part one. Background part two."
         );
     }
+
+    #[test]
+    fn continuation_actions_stages_failures_retained_draft_and_reasoning_bind()
+    -> std::io::Result<()> {
+        let entry = |role, content: &str, reasoning: Option<&str>| client::Message {
+            role,
+            content: content.into(),
+            images: std::sync::Arc::default(),
+            reasoning_content: reasoning.map(Into::into),
+        };
+
+        // 1. submit(), Continue, Retry, Regenerate, Edit, and Branch forward/preserve auto_continue = false
+        let (mut state, commands) = fixture();
+        state.context_tokens = Some(65_536);
+        state.extra_effort = false;
+        state.auto_continue = false;
+        state.input = "First turn".into();
+        state.submit();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Send {
+                auto_continue: false,
+                ..
+            })
+        ));
+        state.model_event(client::Event::Reasoning("Thought".into()));
+        state.model_event(client::Event::Text("Alpha".into()));
+        state.model_event(client::Event::Continuing(2));
+        assert_eq!(state.status, "Continuing response (part 2)…");
+        assert!(!state.awaiting_first_token);
+        state.model_event(client::Event::Text(" Beta".into()));
+        assert_eq!(state.status, "Writing…");
+        let mut hist = state.committed.clone();
+        hist.push(entry("user", "First turn", None));
+        hist.push(entry("assistant", "Alpha Beta", Some("Thought")));
+        state.model_event(client::Event::Committed(hist));
+        state.model_event(client::Event::Complete(client::Completion::TokenLimit));
+
+        let last_assistant = state
+            .transcript
+            .messages
+            .last()
+            .ok_or_else(|| std::io::Error::other("missing last assistant"))?
+            .id;
+        let last_prompt = state
+            .transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::window::Role::User)
+            .ok_or_else(|| std::io::Error::other("missing last prompt"))?
+            .id;
+        assert!(
+            state
+                .transcript
+                .committed_index(last_assistant, &state.committed)
+                .is_some()
+        );
+
+        state.message_action(MessageAction::Continue(last_assistant));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Send {
+                auto_continue: false,
+                ..
+            })
+        ));
+        state.model_event(client::Event::Stopping("Continue".into()));
+        state.model_event(client::Event::Stopped);
+
+        state.message_action(MessageAction::Regenerate(last_assistant));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::RestoreChat(_))
+        ));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Send {
+                auto_continue: false,
+                ..
+            })
+        ));
+        assert!(!state.auto_continue);
+        state.model_event(client::Event::Stopping("First turn".into()));
+        state.model_event(client::Event::Stopped);
+
+        let cur_prompt = state
+            .transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::window::Role::User)
+            .ok_or_else(|| std::io::Error::other("missing prompt"))?
+            .id;
+        state.message_action(MessageAction::Edit(cur_prompt));
+        if let Some(mut edit) = state.edit_message.take() {
+            edit.text = "Edited turn".into();
+            state.resend_edited_message(edit);
+        }
+        assert!(matches!(commands.try_recv(), Ok(Command::RestoreChat(_))));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Send {
+                auto_continue: false,
+                ..
+            })
+        ));
+        let edited_prompt = state
+            .transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::window::Role::User)
+            .ok_or_else(|| std::io::Error::other("missing edited prompt"))?
+            .id;
+
+        // Retry with Retryable state
+        state.model_event(client::Event::Rejected {
+            message: "Needs retry".into(),
+            text: "Edited turn".into(),
+            retry_required: true,
+        });
+        state.model_event(client::Event::Retryable("Select Retry model.".into()));
+        state.message_action(MessageAction::Retry(edited_prompt));
+        assert!(matches!(commands.try_recv(), Ok(Command::Retry)));
+        state.model_event(client::Event::Starting);
+        state.model_event(client::Event::Ready);
+        state.message_action(MessageAction::Retry(edited_prompt));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Send {
+                auto_continue: false,
+                ..
+            })
+        ));
+        state.model_event(client::Event::Stopping("Edited turn".into()));
+        state.model_event(client::Event::Stopped);
+        let _ = last_prompt;
+
+        // 2. Stage + Continuing + Text status transitions & stale Continuing ignored when Ready/Stopping
+        let (mut st, cmds2) = fixture();
+        st.context_tokens = Some(65_536);
+        st.extra_effort = true;
+        st.input = "Extra effort task".into();
+        st.submit();
+        assert!(matches!(cmds2.try_recv(), Ok(Command::Send { .. })));
+        st.model_event(client::Event::Stage("Extra effort: Drafting (2/3)"));
+        st.model_event(client::Event::Text("D1".into()));
+        st.model_event(client::Event::Continuing(2));
+        assert_eq!(
+            st.status,
+            "Extra effort: Drafting (2/3) — continuing (part 2)…"
+        );
+        st.model_event(client::Event::Text(" D2".into()));
+        assert_eq!(st.status, "Extra effort: Drafting (2/3)");
+        st.model_event(client::Event::Draft("D1 D2".into()));
+        st.model_event(client::Event::Stage("Extra effort: Reviewing (3/3)"));
+        st.model_event(client::Event::Text("Partial".into()));
+        st.model_event(client::Event::Continuing(2));
+        assert_eq!(
+            st.status,
+            "Extra effort: Reviewing (3/3) — continuing (part 2)…"
+        );
+        st.model_event(client::Event::RetainedAnswer("D1 D2".into()));
+        // Reset transcript to the retained draft as the worker commits it
+        let mut ee_hist = st.committed.clone();
+        ee_hist.push(entry("user", "Extra effort task", None));
+        ee_hist.push(entry("assistant", "D1 D2", None));
+        st.last_answer = "D1 D2".into();
+        st.model_event(client::Event::Committed(ee_hist));
+        st.model_event(client::Event::Complete(client::Completion::TokenLimit));
+        assert_eq!(
+            st.status,
+            "Review did not finish. Your complete draft is retained."
+        );
+        let retained_msg = st
+            .transcript
+            .messages
+            .last()
+            .ok_or_else(|| std::io::Error::other("missing retained draft"))?;
+        assert!(!retained_msg.token_limit);
+        // Stale Continuing(9) in Ready is ignored
+        st.model_event(client::Event::Continuing(9));
+        assert_eq!(
+            st.status,
+            "Review did not finish. Your complete draft is retained."
+        );
+
+        // 3. Rejected, Failed, and thinking-only Stopping mid-continuation; background swap preserves auto_continue
+        let (mut st_err, _c3) = fixture();
+        st_err.context_tokens = Some(65_536);
+        st_err.auto_continue = false;
+        let owner_id = st_err.active_conversation;
+        st_err.input = "Mid-cont failure".into();
+        st_err.submit();
+        st_err.model_event(client::Event::Text("Seg1".into()));
+        st_err.model_event(client::Event::Continuing(2));
+        st_err.model_event(client::Event::Text(" Seg2".into()));
+        st_err.new_chat();
+        assert!(st_err.auto_continue);
+        st_err.model_event(client::Event::Continuing(3));
+        // Active conversation status stays clean while background owner receives Continuing(3)
+        assert_ne!(st_err.status, "Continuing response (part 3)…");
+        st_err.model_event(client::Event::Rejected {
+            message: "Rejected mid-cont".into(),
+            text: "Mid-cont failure".into(),
+            retry_required: true,
+        });
+        assert_eq!(st_err.model, ModelLifecycle::AwaitingTeardown);
+        st_err.model_event(client::Event::Retryable("Select Retry model.".into()));
+        assert_eq!(st_err.model, ModelLifecycle::Retryable);
+        st_err.switch_conversation(owner_id);
+        assert!(!st_err.auto_continue);
+        assert_eq!(st_err.last_answer, "Seg1 Seg2");
+
+        // Thinking-only Stopping mid-continuation restores prompt and leaves no empty response
+        let (mut st_think, _c4) = fixture();
+        st_think.context_tokens = Some(65_536);
+        st_think.input = "Think only".into();
+        st_think.submit();
+        st_think.model_event(client::Event::Reasoning("Thinking...".into()));
+        st_think.model_event(client::Event::Continuing(2));
+        st_think.model_event(client::Event::Stopping("Think only".into()));
+        st_think.model_event(client::Event::Stopped);
+        assert_eq!(st_think.input, "Think only");
+
+        // Failed mid-continuation adopts stitched partial and sets Unavailable
+        let (mut st_fail, _c5) = fixture();
+        st_fail.context_tokens = Some(65_536);
+        st_fail.input = "Fail mid-cont".into();
+        st_fail.submit();
+        st_fail.model_event(client::Event::Text("Part A".into()));
+        st_fail.model_event(client::Event::Continuing(2));
+        st_fail.model_event(client::Event::Text(" Part B".into()));
+        st_fail.model_event(client::Event::Failed("Connection lost".into()));
+        assert_eq!(st_fail.model, ModelLifecycle::Unavailable);
+        assert_eq!(
+            st_fail
+                .transcript
+                .messages
+                .last()
+                .map(|m| m.body.as_str()),
+            Some("Part A Part B")
+        );
+        Ok(())
+    }
 }

@@ -109,3 +109,31 @@ impl ModelLifecycle {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn continuing_event_is_accepted_only_while_generating() {
+        let all = [
+            ModelLifecycle::Unavailable,
+            ModelLifecycle::Preparing,
+            ModelLifecycle::Restarting,
+            ModelLifecycle::Ready,
+            ModelLifecycle::AwaitingTeardown,
+            ModelLifecycle::Generating,
+            ModelLifecycle::Stopping,
+            ModelLifecycle::StoppingModel,
+            ModelLifecycle::Stopped,
+            ModelLifecycle::Retryable,
+        ];
+        for state in all {
+            assert_eq!(
+                state.accepts(&Event::Continuing(2)),
+                matches!(state, ModelLifecycle::Generating),
+                "unexpected accepts(Continuing) for {state:?}"
+            );
+        }
+    }
+}

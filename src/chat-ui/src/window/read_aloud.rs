@@ -377,4 +377,255 @@ mod tests {
         ));
         Ok(())
     }
+
+    #[test]
+    fn streaming_read_aloud_handles_token_limit_svg_split_stages_max_text_and_errors()
+    -> io::Result<()> {
+        let user_entry = |content: &str| client::Message {
+            role: "user",
+            content: content.into(),
+            images: std::sync::Arc::default(),
+            reasoning_content: None,
+        };
+        let assistant_entry = |content: &str| client::Message {
+            role: "assistant",
+            content: content.into(),
+            images: std::sync::Arc::default(),
+            reasoning_content: None,
+        };
+
+        // 1. SVG fence split across Event::Continuing(2) + Complete(TokenLimit) finishes once without speaking SVG
+        let (mut state, speech_commands) = fixture()?;
+        let (model_commands, incoming_model) = mpsc::channel();
+        state.commands = model_commands;
+        state.context_tokens = Some(65_536);
+        state.model = ModelLifecycle::Ready;
+        state.transcript.clear();
+        state.toggle_streaming_read_aloud();
+
+        state.input = "SVG across continuation".to_owned();
+        state.submit();
+        assert!(matches!(
+            incoming_model.try_recv(),
+            Ok(client::Command::Send { .. })
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopSpeaking
+        ));
+
+        state.model_event(client::Event::Text("Intro.\n```svg\n<svg><circle".to_owned()));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopListening
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::BeginStream { .. }
+        ));
+        assert!(
+            matches!(next(&speech_commands)?, speech::Command::AppendStream { text } if text == "Intro.\n")
+        );
+
+        state.model_event(client::Event::Continuing(2));
+        state.model_event(client::Event::Text("/>\n</svg>\n```\nOutro.".to_owned()));
+        assert!(
+            matches!(next(&speech_commands)?, speech::Command::AppendStream { text } if text == "Outro.")
+        );
+        state.model_event(client::Event::Committed(vec![
+            user_entry("SVG across continuation"),
+            assistant_entry("Intro.\n```svg\n<svg><circle/>\n</svg>\n```\nOutro."),
+        ]));
+        state.model_event(client::Event::Complete(client::Completion::TokenLimit));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::FinishStream
+        ));
+
+        // 2. Extra effort Stage transition resets Draft speech cleanly, then Review continues seamlessly
+        state.input = "Extra effort read aloud".to_owned();
+        state.submit();
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopSpeaking
+        ));
+        state.model_event(client::Event::Stage("Extra effort: Drafting (2/3)"));
+        state.model_event(client::Event::Text("Draft1 ".to_owned()));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopListening
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::BeginStream { .. }
+        ));
+        assert!(
+            matches!(next(&speech_commands)?, speech::Command::AppendStream { text } if text == "Draft1 ")
+        );
+        state.model_event(client::Event::Continuing(2));
+        state.model_event(client::Event::Text("Draft2".to_owned()));
+        assert!(
+            matches!(next(&speech_commands)?, speech::Command::AppendStream { text } if text == "Draft2")
+        );
+        state.model_event(client::Event::Stage("Extra effort: Reviewing (3/3)"));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopListening
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopSpeaking
+        ));
+        state.model_event(client::Event::Text("Rev1 ".to_owned()));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopListening
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::BeginStream { .. }
+        ));
+        assert!(
+            matches!(next(&speech_commands)?, speech::Command::AppendStream { text } if text == "Rev1 ")
+        );
+        state.model_event(client::Event::Continuing(2));
+        state.model_event(client::Event::Text("Rev2".to_owned()));
+        assert!(
+            matches!(next(&speech_commands)?, speech::Command::AppendStream { text } if text == "Rev2")
+        );
+        state.model_event(client::Event::Committed(vec![
+            user_entry("Extra effort read aloud"),
+            assistant_entry("Rev1 Rev2"),
+        ]));
+        state.model_event(client::Event::Complete(client::Completion::Finished));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::FinishStream
+        ));
+
+        // 3. Crossing speech::MAX_TEXT mid-continuation emits FinishStream once and suppresses further segments
+        state.input = "Huge text".to_owned();
+        state.submit();
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopSpeaking
+        ));
+        let large = "a".repeat(speech::MAX_TEXT - 4);
+        state.model_event(client::Event::Text(large));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopListening
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::BeginStream { .. }
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::AppendStream { .. }
+        ));
+        state.model_event(client::Event::Continuing(2));
+        state.model_event(client::Event::Text("overflow beyond limit".to_owned()));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::FinishStream
+        ));
+        state.model_event(client::Event::Text("suppressed tail".to_owned()));
+        assert!(
+            speech_commands
+                .recv_timeout(Duration::from_millis(20))
+                .is_err()
+        );
+        state.model_event(client::Event::Complete(client::Completion::Finished));
+
+        // 4. Toggling Always Read Aloud ON mid-continuation speaks accumulated answer and streams seg 2+
+        // First toggle OFF (since test 1-3 left it ON) while idle.
+        state.toggle_streaming_read_aloud();
+        state.input = "Late toggle".to_owned();
+        state.submit();
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopSpeaking
+        ));
+        state.model_event(client::Event::Text("Already streamed.".to_owned()));
+        state.model_event(client::Event::Continuing(2));
+        // Now toggle ON mid-continuation: stops current speech, speaks accumulated last_answer, and continues seg 2+.
+        state.toggle_streaming_read_aloud();
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopListening
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopSpeaking
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopListening
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::BeginStream { .. }
+        ));
+        assert!(
+            matches!(next(&speech_commands)?, speech::Command::AppendStream { text } if text == "Already streamed.")
+        );
+        state.model_event(client::Event::Text(" More.".to_owned()));
+        assert!(
+            matches!(next(&speech_commands)?, speech::Command::AppendStream { text } if text == " More.")
+        );
+
+        // 5. Stopping / Rejected / Failed mid-continuation stops speaking immediately
+        state.model_event(client::Event::Stopping("Late toggle".to_owned()));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopListening
+        ));
+        assert!(matches!(
+            next(&speech_commands)?,
+            speech::Command::StopSpeaking
+        ));
+        state.model_event(client::Event::Stopped);
+
+        for terminal in [
+            client::Event::Rejected {
+                message: "Rejected".to_owned(),
+                text: "p".to_owned(),
+                retry_required: false,
+            },
+            client::Event::Failed("Failed".to_owned()),
+        ] {
+            state.model = ModelLifecycle::Ready;
+            state.input = "Err test".to_owned();
+            state.submit();
+            assert!(matches!(
+                next(&speech_commands)?,
+                speech::Command::StopSpeaking
+            ));
+            state.model_event(client::Event::Text("Part1".to_owned()));
+            assert!(matches!(
+                next(&speech_commands)?,
+                speech::Command::StopListening
+            ));
+            assert!(matches!(
+                next(&speech_commands)?,
+                speech::Command::BeginStream { .. }
+            ));
+            assert!(matches!(
+                next(&speech_commands)?,
+                speech::Command::AppendStream { .. }
+            ));
+            state.model_event(client::Event::Continuing(2));
+            state.model_event(terminal);
+            assert!(matches!(
+                next(&speech_commands)?,
+                speech::Command::StopListening
+            ));
+            assert!(matches!(
+                next(&speech_commands)?,
+                speech::Command::StopSpeaking
+            ));
+        }
+        Ok(())
+    }
 }
