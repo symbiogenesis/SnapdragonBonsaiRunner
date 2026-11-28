@@ -167,22 +167,18 @@ fn run_with_detailed(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Stage execution shares stream hooks, continuation policy, and cancellation."
-)]
-fn run_stage_with_continuation<G, S>(
-    stage_messages: &[Message],
-    stage_options: &ResponseOptions,
-    stop_on_collapse: bool,
+struct EffortRunner<'a, G, S> {
+    options: &'a ResponseOptions,
     auto_continue: bool,
     context_tokens: usize,
     prompt_reuse: PromptReuse,
-    commands: &Receiver<Command>,
-    events: &EventSender,
-    generate: &mut G,
-    wait_rate_limit: &mut S,
-) -> Result<(Message, Completion, Option<ConfidenceSummary>)>
+    commands: &'a Receiver<Command>,
+    events: &'a EventSender,
+    generate: G,
+    wait_rate_limit: S,
+}
+
+impl<'a, G, S> EffortRunner<'a, G, S>
 where
     G: FnMut(
         Vec<u8>,
@@ -192,32 +188,257 @@ where
     ) -> Result<(Message, Completion, Option<ConfidenceSummary>)>,
     S: FnMut(&Receiver<Command>, u64) -> Result<()>,
 {
-    let request = serialize_request_with_options(stage_messages, stage_options)?;
-    let (msg, completion, conf) = {
-        let mut on_text =
-            |delta: Cow<'_, str>| -> Result<()> { events.stream_text(delta, false, commands) };
-        let mut on_reasoning =
-            |delta: Cow<'_, str>| -> Result<()> { events.stream_text(delta, true, commands) };
-        generate(request, stop_on_collapse, &mut on_text, &mut on_reasoning)?
-    };
-    if !auto_continue || completion != Completion::TokenLimit {
-        return Ok((msg, completion, conf));
+    fn run(&mut self, pending: &[Message]) -> Result<(Message, Completion)> {
+        match self.options.cognitive.extra_effort_strategy {
+            ExtraEffortStrategy::PlanDraftReview => self.plan_draft_review(pending),
+            ExtraEffortStrategy::MultiDraftSynthesis => self.multi_draft_synthesis(pending),
+        }
     }
-    let (stitched, cont_completion) = super::continuation::continue_after_token_limit(
-        stage_messages,
-        msg,
-        stage_options,
-        context_tokens,
-        prompt_reuse,
-        commands,
-        events,
-        |cont_req, on_text, on_reasoning| {
-            let (cont_msg, cont_comp, _) = generate(cont_req, false, on_text, on_reasoning)?;
-            Ok((cont_msg, cont_comp))
-        },
-        |cmds, ms| wait_rate_limit(cmds, ms),
-    )?;
-    Ok((stitched, cont_completion, conf))
+
+    fn retain_answer(
+        &self,
+        stage_label: &'static str,
+        answer: Message,
+        completion: Completion,
+    ) -> Result<(Message, Completion)> {
+        notify(self.events, Event::Stage(stage_label))?;
+        notify(
+            self.events,
+            Event::RetainedAnswer(answer.content.to_string()),
+        )?;
+        Ok((answer, completion))
+    }
+
+    fn run_stage(
+        &mut self,
+        stage_messages: &[Message],
+        stage_options: &ResponseOptions,
+        stop_on_collapse: bool,
+        allow_continue: bool,
+    ) -> Result<(Message, Completion, Option<ConfidenceSummary>)> {
+        let request = serialize_request_with_options(stage_messages, stage_options)?;
+        let (msg, completion, conf) = {
+            let commands = self.commands;
+            let events = self.events;
+            let mut on_text =
+                |delta: Cow<'_, str>| -> Result<()> { events.stream_text(delta, false, commands) };
+            let mut on_reasoning =
+                |delta: Cow<'_, str>| -> Result<()> { events.stream_text(delta, true, commands) };
+            (self.generate)(request, stop_on_collapse, &mut on_text, &mut on_reasoning)?
+        };
+        if !allow_continue || completion != Completion::TokenLimit {
+            return Ok((msg, completion, conf));
+        }
+        let generate = &mut self.generate;
+        let wait_rate_limit = &mut self.wait_rate_limit;
+        let (stitched, cont_completion) = super::continuation::continue_after_token_limit(
+            stage_messages,
+            msg,
+            stage_options,
+            self.context_tokens,
+            self.prompt_reuse,
+            self.commands,
+            self.events,
+            |cont_req, on_text, on_reasoning| {
+                let (cont_msg, cont_comp, _) = generate(cont_req, false, on_text, on_reasoning)?;
+                Ok((cont_msg, cont_comp))
+            },
+            |cmds, ms| wait_rate_limit(cmds, ms),
+        )?;
+        Ok((stitched, cont_completion, conf))
+    }
+
+    fn plan_draft_review(&mut self, pending: &[Message]) -> Result<(Message, Completion)> {
+        check_commands(self.commands)?;
+        notify(self.events, Event::Stage(PLAN))?;
+        let plan_messages = bounded_stage_messages(
+            pending,
+            "Make a compact plan for the original task: identify its constraints and consider distinct \
+             approaches. Use at most 300 words of visible notes. Do not write the final answer yet.",
+            &Working {
+                plan: None,
+                draft: None,
+            },
+        )?;
+        let (plan, completion, _) = self.run_stage(&plan_messages, self.options, false, false)?;
+        check_commands(self.commands)?;
+        if completion == Completion::TokenLimit {
+            notify(
+                self.events,
+                Event::Stage("Planning incomplete; later passes skipped"),
+            )?;
+            return Err(Failure::Rejected(
+                "Extra effort planning reached its output limit. Increase the output allowance or use Standard.",
+            ));
+        }
+        if plan.content.trim().is_empty() {
+            return Err(Failure::Rejected(
+                "Extra effort planning produced no visible notes. Increase the output allowance or use Standard.",
+            ));
+        }
+
+        check_commands(self.commands)?;
+        notify(self.events, Event::Stage(DRAFT))?;
+        let draft_messages = bounded_stage_messages(
+            pending,
+            "Write a complete draft answering the original task. Consult the generated plan as \
+             working notes, checking it against the original constraints and source material.",
+            &Working {
+                plan: Some(&plan.content),
+                draft: None,
+            },
+        )?;
+        let (draft, completion, _) =
+            self.run_stage(&draft_messages, self.options, false, self.auto_continue)?;
+        check_commands(self.commands)?;
+        if completion == Completion::TokenLimit {
+            return self.retain_answer(
+                "Draft incomplete; review skipped",
+                draft,
+                Completion::TokenLimit,
+            );
+        }
+        if draft.content.trim().is_empty() {
+            return Err(Failure::Rejected(
+                "Extra effort drafting produced no visible answer. Increase the output allowance or use Standard.",
+            ));
+        }
+        notify(self.events, Event::Draft(draft.content.to_string()))?;
+
+        check_commands(self.commands)?;
+        notify(self.events, Event::Stage(REVIEW))?;
+        let review_messages = bounded_stage_messages(
+            pending,
+            "Review the generated draft against the original task, user constraints and source material. \
+             Produce a targeted revision. Preserve good passages; return the complete revised answer \
+             without a critique preamble. If no change is warranted, return the draft unchanged.",
+            &Working {
+                plan: Some(&plan.content),
+                draft: Some(&draft.content),
+            },
+        )?;
+        let (revision, completion, _) =
+            self.run_stage(&review_messages, self.options, false, self.auto_continue)?;
+        check_commands(self.commands)?;
+        if completion == Completion::TokenLimit {
+            return self.retain_answer(
+                "Revision incomplete; complete draft retained",
+                draft,
+                Completion::TokenLimit,
+            );
+        }
+        if revision.content.trim().is_empty() {
+            return Err(Failure::Rejected(
+                "Extra effort review produced no visible revision. The complete draft remains in the conversation.",
+            ));
+        }
+        Ok((revision, completion))
+    }
+
+    fn multi_draft_synthesis(&mut self, pending: &[Message]) -> Result<(Message, Completion)> {
+        if pending.last().is_none_or(|message| message.role != "user") {
+            return Err(Failure::Rejected(
+                "Extra effort requires a user task. Start a new conversation.",
+            ));
+        }
+        check_commands(self.commands)?;
+        notify(self.events, Event::Stage(RSA_DRAFT_A))?;
+        let opt_a = ResponseOptions {
+            request_logprobs: self.options.cognitive_controls,
+            temperature_nudge: 0.0,
+            ..self.options.clone()
+        };
+        let (draft_a, comp_a, conf_a) =
+            self.run_stage(pending, &opt_a, false, self.auto_continue)?;
+        check_commands(self.commands)?;
+        if draft_a.content.trim().is_empty() {
+            return Err(Failure::Rejected(
+                "Extra effort drafting produced no visible answer. Increase the output allowance or use Standard.",
+            ));
+        }
+        if comp_a == Completion::TokenLimit {
+            return self.retain_answer(
+                "First draft reached output limit; complete answer retained",
+                draft_a,
+                Completion::TokenLimit,
+            );
+        }
+
+        check_commands(self.commands)?;
+        notify(self.events, Event::Stage(RSA_DRAFT_B))?;
+        let opt_b = ResponseOptions {
+            request_logprobs: self.options.cognitive_controls,
+            temperature_nudge: if self.options.cognitive_controls {
+                0.1
+            } else {
+                0.0
+            },
+            ..self.options.clone()
+        };
+        let stop_b = self.options.cognitive_controls && self.options.reset_on_cancel;
+        let draft_b_outcome = match self.run_stage(pending, &opt_b, stop_b, false) {
+            Ok((draft_b, comp_b, conf_b)) => {
+                check_commands(self.commands)?;
+                if comp_b == Completion::Finished
+                    && !draft_b.content.trim().is_empty()
+                    && !conf_b.is_some_and(|summary| summary.collapsed)
+                {
+                    Some((draft_b, conf_b))
+                } else {
+                    None
+                }
+            }
+            Err(Failure::CollapsedDraft) => {
+                check_commands(self.commands)?;
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let Some((draft_b, conf_b)) = draft_b_outcome else {
+            return self.retain_answer(
+                "Second draft skipped; Draft A retained",
+                draft_a,
+                Completion::Finished,
+            );
+        };
+
+        let best = match (conf_a, conf_b) {
+            (Some(a), Some(b)) if b.mean_logprob > a.mean_logprob => &draft_b,
+            _ => &draft_a,
+        };
+        notify(self.events, Event::Draft(best.content.to_string()))?;
+
+        check_commands(self.commands)?;
+        notify(self.events, Event::Stage(RSA_SYNTHESIZE))?;
+        let opt_synth = ResponseOptions {
+            request_logprobs: false,
+            temperature_nudge: 0.0,
+            ..self.options.clone()
+        };
+        let synth_messages = bounded_stage_messages(
+            pending,
+            "Synthesize ONE superior, self-consistent final answer from Draft A and Draft B below. \
+             Verify claims against the authoritative task, resolve any contradictions, combine stronger \
+             steps, and return only the final answer without a critique preamble.",
+            &RsaCandidates {
+                draft_a: &draft_a.content,
+                draft_b: &draft_b.content,
+                draft_a_mean_logprob: format_confidence(conf_a),
+                draft_b_mean_logprob: format_confidence(conf_b),
+            },
+        )?;
+        let (synthesis, comp_s, _) =
+            self.run_stage(&synth_messages, &opt_synth, false, self.auto_continue)?;
+        check_commands(self.commands)?;
+        if comp_s == Completion::TokenLimit || synthesis.content.trim().is_empty() {
+            return self.retain_answer(
+                "Synthesis incomplete; best complete draft retained",
+                best.clone(),
+                Completion::TokenLimit,
+            );
+        }
+        Ok((synthesis, comp_s))
+    }
 }
 
 #[expect(
@@ -244,332 +465,21 @@ where
     ) -> Result<(Message, Completion, Option<ConfidenceSummary>)>,
     S: FnMut(&Receiver<Command>, u64) -> Result<()>,
 {
-    match options.cognitive.extra_effort_strategy {
-        ExtraEffortStrategy::PlanDraftReview => run_plan_draft_review(
-            pending,
-            options,
-            auto_continue,
-            context_tokens,
-            prompt_reuse,
-            commands,
-            events,
-            generate,
-            wait_rate_limit,
-        ),
-        ExtraEffortStrategy::MultiDraftSynthesis => run_multi_draft_synthesis(
-            pending,
-            options,
-            auto_continue,
-            context_tokens,
-            prompt_reuse,
-            commands,
-            events,
-            generate,
-            wait_rate_limit,
-        ),
-    }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Plan -> Draft -> Review shares continuation policy across Draft and Review stages."
-)]
-fn run_plan_draft_review<G, S>(
-    pending: &[Message],
-    options: &ResponseOptions,
-    auto_continue: bool,
-    context_tokens: usize,
-    prompt_reuse: PromptReuse,
-    commands: &Receiver<Command>,
-    events: &EventSender,
-    mut generate: G,
-    mut wait_rate_limit: S,
-) -> Result<(Message, Completion)>
-where
-    G: FnMut(
-        Vec<u8>,
-        bool,
-        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
-        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
-    ) -> Result<(Message, Completion, Option<ConfidenceSummary>)>,
-    S: FnMut(&Receiver<Command>, u64) -> Result<()>,
-{
-    check_commands(commands)?;
-    notify(events, Event::Stage(PLAN))?;
-    let plan_messages = bounded_stage_messages(
-        pending,
-        "Make a compact plan for the original task: identify its constraints and consider distinct \
-         approaches. Use at most 300 words of visible notes. Do not write the final answer yet.",
-        &Working {
-            plan: None,
-            draft: None,
-        },
-    )?;
-    let (plan, completion, _) = run_stage_with_continuation(
-        &plan_messages,
+    EffortRunner {
         options,
-        false,
-        false,
-        context_tokens,
-        prompt_reuse,
-        commands,
-        events,
-        &mut generate,
-        &mut wait_rate_limit,
-    )?;
-    check_commands(commands)?;
-    if completion == Completion::TokenLimit {
-        notify(
-            events,
-            Event::Stage("Planning incomplete; later passes skipped"),
-        )?;
-        return Err(Failure::Rejected(
-            "Extra effort planning reached its output limit. Increase the output allowance or use Standard.",
-        ));
-    }
-    if plan.content.trim().is_empty() {
-        return Err(Failure::Rejected(
-            "Extra effort planning produced no visible notes. Increase the output allowance or use Standard.",
-        ));
-    }
-
-    check_commands(commands)?;
-    notify(events, Event::Stage(DRAFT))?;
-    let draft_messages = bounded_stage_messages(
-        pending,
-        "Write a complete draft answering the original task. Consult the generated plan as \
-         working notes, checking it against the original constraints and source material.",
-        &Working {
-            plan: Some(&plan.content),
-            draft: None,
-        },
-    )?;
-    let (draft, completion, _) = run_stage_with_continuation(
-        &draft_messages,
-        options,
-        false,
         auto_continue,
         context_tokens,
         prompt_reuse,
         commands,
         events,
-        &mut generate,
-        &mut wait_rate_limit,
-    )?;
-    check_commands(commands)?;
-    if completion == Completion::TokenLimit {
-        notify(events, Event::Stage("Draft incomplete; review skipped"))?;
-        notify(events, Event::RetainedAnswer(draft.content.to_string()))?;
-        return Ok((draft, Completion::TokenLimit));
+        generate,
+        wait_rate_limit,
     }
-    if draft.content.trim().is_empty() {
-        return Err(Failure::Rejected(
-            "Extra effort drafting produced no visible answer. Increase the output allowance or use Standard.",
-        ));
-    }
-    notify(events, Event::Draft(draft.content.to_string()))?;
-
-    check_commands(commands)?;
-    notify(events, Event::Stage(REVIEW))?;
-    let review_messages = bounded_stage_messages(
-        pending,
-        "Review the generated draft against the original task, user constraints and source material. \
-         Produce a targeted revision. Preserve good passages; return the complete revised answer \
-         without a critique preamble. If no change is warranted, return the draft unchanged.",
-        &Working {
-            plan: Some(&plan.content),
-            draft: Some(&draft.content),
-        },
-    )?;
-    let (revision, completion, _) = run_stage_with_continuation(
-        &review_messages,
-        options,
-        false,
-        auto_continue,
-        context_tokens,
-        prompt_reuse,
-        commands,
-        events,
-        &mut generate,
-        &mut wait_rate_limit,
-    )?;
-    check_commands(commands)?;
-    if completion == Completion::TokenLimit {
-        notify(
-            events,
-            Event::Stage("Revision incomplete; complete draft retained"),
-        )?;
-        notify(events, Event::RetainedAnswer(draft.content.to_string()))?;
-        return Ok((draft, Completion::TokenLimit));
-    }
-    if revision.content.trim().is_empty() {
-        return Err(Failure::Rejected(
-            "Extra effort review produced no visible revision. The complete draft remains in the conversation.",
-        ));
-    }
-    Ok((revision, completion))
+    .run(pending)
 }
 
 fn format_confidence(summary: Option<ConfidenceSummary>) -> Option<String> {
     summary.map(|item| format!("{:.3}", item.mean_logprob))
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "RSA synthesis shares continuation policy across Draft A and Synthesis stages."
-)]
-fn run_multi_draft_synthesis<G, S>(
-    pending: &[Message],
-    options: &ResponseOptions,
-    auto_continue: bool,
-    context_tokens: usize,
-    prompt_reuse: PromptReuse,
-    commands: &Receiver<Command>,
-    events: &EventSender,
-    mut generate: G,
-    mut wait_rate_limit: S,
-) -> Result<(Message, Completion)>
-where
-    G: FnMut(
-        Vec<u8>,
-        bool,
-        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
-        &mut dyn FnMut(Cow<'_, str>) -> Result<()>,
-    ) -> Result<(Message, Completion, Option<ConfidenceSummary>)>,
-    S: FnMut(&Receiver<Command>, u64) -> Result<()>,
-{
-    if pending.last().is_none_or(|message| message.role != "user") {
-        return Err(Failure::Rejected(
-            "Extra effort requires a user task. Start a new conversation.",
-        ));
-    }
-    check_commands(commands)?;
-    notify(events, Event::Stage(RSA_DRAFT_A))?;
-    let opt_a = ResponseOptions {
-        request_logprobs: options.cognitive_controls,
-        temperature_nudge: 0.0,
-        ..options.clone()
-    };
-    let (draft_a, comp_a, conf_a) = run_stage_with_continuation(
-        pending,
-        &opt_a,
-        false,
-        auto_continue,
-        context_tokens,
-        prompt_reuse,
-        commands,
-        events,
-        &mut generate,
-        &mut wait_rate_limit,
-    )?;
-    check_commands(commands)?;
-    if draft_a.content.trim().is_empty() {
-        return Err(Failure::Rejected(
-            "Extra effort drafting produced no visible answer. Increase the output allowance or use Standard.",
-        ));
-    }
-    if comp_a == Completion::TokenLimit {
-        notify(
-            events,
-            Event::Stage("First draft reached output limit; complete answer retained"),
-        )?;
-        notify(events, Event::RetainedAnswer(draft_a.content.to_string()))?;
-        return Ok((draft_a, Completion::TokenLimit));
-    }
-
-    check_commands(commands)?;
-    notify(events, Event::Stage(RSA_DRAFT_B))?;
-    let opt_b = ResponseOptions {
-        request_logprobs: options.cognitive_controls,
-        temperature_nudge: if options.cognitive_controls { 0.1 } else { 0.0 },
-        ..options.clone()
-    };
-    let stop_b = options.cognitive_controls && options.reset_on_cancel;
-    let draft_b_outcome = match run_stage_with_continuation(
-        pending,
-        &opt_b,
-        stop_b,
-        false,
-        context_tokens,
-        prompt_reuse,
-        commands,
-        events,
-        &mut generate,
-        &mut wait_rate_limit,
-    ) {
-        Ok((draft_b, comp_b, conf_b)) => {
-            check_commands(commands)?;
-            if comp_b == Completion::Finished
-                && !draft_b.content.trim().is_empty()
-                && !conf_b.is_some_and(|summary| summary.collapsed)
-            {
-                Some((draft_b, conf_b))
-            } else {
-                None
-            }
-        }
-        Err(Failure::CollapsedDraft) => {
-            check_commands(commands)?;
-            None
-        }
-        Err(error) => return Err(error),
-    };
-    let Some((draft_b, conf_b)) = draft_b_outcome else {
-        notify(
-            events,
-            Event::Stage("Second draft skipped; Draft A retained"),
-        )?;
-        notify(events, Event::RetainedAnswer(draft_a.content.to_string()))?;
-        return Ok((draft_a, Completion::Finished));
-    };
-
-    let best = match (conf_a, conf_b) {
-        (Some(a), Some(b)) if b.mean_logprob > a.mean_logprob => &draft_b,
-        _ => &draft_a,
-    };
-    notify(events, Event::Draft(best.content.to_string()))?;
-
-    check_commands(commands)?;
-    notify(events, Event::Stage(RSA_SYNTHESIZE))?;
-    let opt_synth = ResponseOptions {
-        request_logprobs: false,
-        temperature_nudge: 0.0,
-        ..options.clone()
-    };
-    let synth_messages = bounded_stage_messages(
-        pending,
-        "Synthesize ONE superior, self-consistent final answer from Draft A and Draft B below. \
-         Verify claims against the authoritative task, resolve any contradictions, combine stronger \
-         steps, and return only the final answer without a critique preamble.",
-        &RsaCandidates {
-            draft_a: &draft_a.content,
-            draft_b: &draft_b.content,
-            draft_a_mean_logprob: format_confidence(conf_a),
-            draft_b_mean_logprob: format_confidence(conf_b),
-        },
-    )?;
-    let (synthesis, comp_s, _) = run_stage_with_continuation(
-        &synth_messages,
-        &opt_synth,
-        false,
-        auto_continue,
-        context_tokens,
-        prompt_reuse,
-        commands,
-        events,
-        &mut generate,
-        &mut wait_rate_limit,
-    )?;
-    check_commands(commands)?;
-    if comp_s == Completion::TokenLimit || synthesis.content.trim().is_empty() {
-        notify(
-            events,
-            Event::Stage("Synthesis incomplete; best complete draft retained"),
-        )?;
-        notify(events, Event::RetainedAnswer(best.content.to_string()))?;
-        return Ok((best.clone(), Completion::TokenLimit));
-    }
-    Ok((synthesis, comp_s))
 }
 
 #[cfg(test)]
