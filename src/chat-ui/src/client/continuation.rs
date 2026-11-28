@@ -2307,7 +2307,12 @@ mod tests {
             run_chunks(
                 "Sentence one.",
                 None,
-                &["Sure, ", "here's ", "the continuation:\r\n\r\n", "Next para."]
+                &[
+                    "Sure, ",
+                    "here's ",
+                    "the continuation:\r\n\r\n",
+                    "Next para."
+                ]
             )?,
             "\n\nNext para."
         );
@@ -2340,19 +2345,35 @@ mod tests {
             "    x();"
         );
         assert_eq!(
-            run_chunks("let v = 1;", Some("```\nlet v = 1;"), &["```\nlet v = 1;\nlet w = 2;"])?,
+            run_chunks(
+                "let v = 1;",
+                Some("```\nlet v = 1;"),
+                &["```\nlet v = 1;\nlet w = 2;"]
+            )?,
             "\nlet w = 2;"
         );
         assert_eq!(
-            run_chunks("fn a() {", Some("```rust\nfn a() {"), &["```python\nprint(1)"])?,
+            run_chunks(
+                "fn a() {",
+                Some("```rust\nfn a() {"),
+                &["```python\nprint(1)"]
+            )?,
             "```python\nprint(1)"
         );
         assert_eq!(
-            run_chunks("fn a() {", Some("```rust\nfn a() {"), &["~~~rust\nfn b() {}"])?,
+            run_chunks(
+                "fn a() {",
+                Some("```rust\nfn a() {"),
+                &["~~~rust\nfn b() {}"]
+            )?,
             "~~~rust\nfn b() {}"
         );
         assert_eq!(
-            run_chunks("fn a() {", Some("```rust\nfn a() {"), &["```rust\n    y();"])?,
+            run_chunks(
+                "fn a() {",
+                Some("```rust\nfn a() {"),
+                &["```rust\n    y();"]
+            )?,
             "\n    y();"
         );
         assert_eq!(
@@ -2406,7 +2427,10 @@ mod tests {
         assert_eq!(run_chunks("Intro.", None, &["* Bullet"])?, "\n* Bullet");
         assert_eq!(run_chunks("Intro.", None, &["+ Plus"])?, "\n+ Plus");
         assert_eq!(run_chunks("Intro.", None, &["1. First"])?, "\n1. First");
-        assert_eq!(run_chunks("Intro.", None, &["12) Twelfth"])?, "\n12) Twelfth");
+        assert_eq!(
+            run_chunks("Intro.", None, &["12) Twelfth"])?,
+            "\n12) Twelfth"
+        );
         assert_eq!(
             run_chunks("Intro.", None, &["####### TooDeep"])?,
             "####### TooDeep"
@@ -2550,8 +2574,14 @@ mod tests {
             &" ".repeat(600)
         ));
         // Legitimate repeat outside the 16 KiB window is NOT flagged
-        let needle = "A distinct factual summary sentence that appeared much earlier in the document. ".repeat(2);
-        let old_prior = format!("{needle}{}{needle}{}", "x".repeat(REPETITION_WINDOW_BYTES + 512), "y".repeat(256));
+        let needle =
+            "A distinct factual summary sentence that appeared much earlier in the document. "
+                .repeat(2);
+        let old_prior = format!(
+            "{needle}{}{needle}{}",
+            "x".repeat(REPETITION_WINDOW_BYTES + 512),
+            "y".repeat(256)
+        );
         assert!(!is_repetition_loop(&old_prior, "prev", &needle));
 
         // >256-byte repeated chunk bypasses 256-byte SeamFilter and hits prev_trimmed == new_trimmed

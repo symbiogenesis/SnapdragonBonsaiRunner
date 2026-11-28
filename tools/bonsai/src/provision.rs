@@ -2529,8 +2529,14 @@ mod tests {
 
             let locked_commit = "3429a33772089dfd3a50a96c698b9dbe0b36836c";
             let unlocked_commit = "4429a33772089dfd3a50a96c698b9dbe0b36836d";
-            let locked_exe = inference.join(locked_commit).join(target).join("prism-inference.exe");
-            let unlocked_exe = inference.join(unlocked_commit).join(target).join("prism-inference.exe");
+            let locked_exe = inference
+                .join(locked_commit)
+                .join(target)
+                .join("prism-inference.exe");
+            let unlocked_exe = inference
+                .join(unlocked_commit)
+                .join(target)
+                .join("prism-inference.exe");
             fs::create_dir_all(locked_exe.parent().ok_or("missing parent")?)
                 .map_err(|e| e.to_string())?;
             fs::create_dir_all(unlocked_exe.parent().ok_or("missing parent")?)

@@ -241,7 +241,10 @@ fn supervise(
     finalize_supervise_outcome(result, cleanup_error)
 }
 
-fn finalize_supervise_outcome<T>(result: crate::Result<T>, cleanup_error: Option<String>) -> crate::Result<T> {
+fn finalize_supervise_outcome<T>(
+    result: crate::Result<T>,
+    cleanup_error: Option<String>,
+) -> crate::Result<T> {
     let output = result?;
     if let Some(error) = cleanup_error {
         return Err(error);

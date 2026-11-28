@@ -553,8 +553,8 @@ mod tests {
             },
             (initial, "retryable markdown".to_owned(), None, false),
         );
-        let respond = Service::get(&harness.ctx)
-            .ok_or_else(|| std::io::Error::other("missing service"))?;
+        let respond =
+            Service::get(&harness.ctx).ok_or_else(|| std::io::Error::other("missing service"))?;
 
         // Saturate MAX_REQUESTS before enabling refresh so Admission::Busy is hit deterministically.
         let mut fillers = Vec::new();

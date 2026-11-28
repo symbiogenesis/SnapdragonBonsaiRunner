@@ -1592,8 +1592,8 @@ mod tests {
             serde_json::json!("true"),
             serde_json::json!(1),
         ] {
-            let mut malformed = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .map_err(io::Error::other)?;
+            let mut malformed =
+                serde_json::from_slice::<serde_json::Value>(&bytes).map_err(io::Error::other)?;
             malformed["active"]["auto_continue"] = bad;
             let live_before = restored.active_conversation;
             let err = restored
@@ -1655,10 +1655,7 @@ mod tests {
         // Disconnected on erase() also calls disconnect_recovery.
         let mut s_erase = state();
         let (erase_store, erase_ctrl) = crate::recovery::Recovery::controlled();
-        assert_eq!(
-            erase_store.erase(),
-            crate::recovery::DispatchStatus::Queued
-        );
+        assert_eq!(erase_store.erase(), crate::recovery::DispatchStatus::Queued);
         s_erase.recovery = Some(erase_store);
         s_erase.recovery_erase_pending = true;
         let _ = erase_ctrl.next_completion()?;

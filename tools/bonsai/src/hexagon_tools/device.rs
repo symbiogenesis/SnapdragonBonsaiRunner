@@ -1251,10 +1251,8 @@ mod tests {
         assert!(zero_err.is_err());
 
         // ScratchDir::drop refuses to delete a directory junction
-        let j_root = std::env::temp_dir().join(format!(
-            "bonsai-hex-junction-{}",
-            startup_process::unique()
-        ));
+        let j_root =
+            std::env::temp_dir().join(format!("bonsai-hex-junction-{}", startup_process::unique()));
         let j_target = j_root.join("target");
         let j_link = j_root.join("link");
         let sentinel = j_target.join("keep.txt");

@@ -286,7 +286,10 @@ mod tests {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt as _;
-            let locked = OpenOptions::new().read(true).share_mode(0).open(&locked_path)?;
+            let locked = OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&locked_path)?;
             let releaser = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(15));
                 drop(locked);

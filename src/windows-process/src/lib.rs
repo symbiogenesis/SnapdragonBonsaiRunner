@@ -2820,7 +2820,10 @@ mod maintenance_tests {
         let mut kind_only_attempts = 0_usize;
         let kind_only = retry_transient_win32::<()>(true, || {
             kind_only_attempts += 1;
-            Err(io::Error::new(io::ErrorKind::PermissionDenied, "no os code"))
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "no os code",
+            ))
         });
         assert!(kind_only.is_err());
         assert_eq!(kind_only_attempts, 1);

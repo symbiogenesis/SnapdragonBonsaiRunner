@@ -414,7 +414,9 @@ mod tests {
             speech::Command::StopSpeaking
         ));
 
-        state.model_event(client::Event::Text("Intro.\n```svg\n<svg><circle".to_owned()));
+        state.model_event(client::Event::Text(
+            "Intro.\n```svg\n<svg><circle".to_owned(),
+        ));
         assert!(matches!(
             next(&speech_commands)?,
             speech::Command::StopListening

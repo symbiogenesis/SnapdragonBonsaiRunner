@@ -1593,10 +1593,7 @@ mod tests {
         state.model_event(client::Event::Stopped);
 
         state.message_action(MessageAction::Regenerate(last_assistant));
-        assert!(matches!(
-            commands.try_recv(),
-            Ok(Command::RestoreChat(_))
-        ));
+        assert!(matches!(commands.try_recv(), Ok(Command::RestoreChat(_))));
         assert!(matches!(
             commands.try_recv(),
             Ok(Command::Send {
@@ -1759,11 +1756,7 @@ mod tests {
         st_fail.model_event(client::Event::Failed("Connection lost".into()));
         assert_eq!(st_fail.model, ModelLifecycle::Unavailable);
         assert_eq!(
-            st_fail
-                .transcript
-                .messages
-                .last()
-                .map(|m| m.body.as_str()),
+            st_fail.transcript.messages.last().map(|m| m.body.as_str()),
             Some("Part A Part B")
         );
         Ok(())

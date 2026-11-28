@@ -1070,7 +1070,10 @@ mod tests {
                 if polls >= 2 { Err("cancelled") } else { Ok(()) }
             },
         );
-        assert_eq!(interrupted.err(), Some(super::Error::Interrupted("cancelled")));
+        assert_eq!(
+            interrupted.err(),
+            Some(super::Error::Interrupted("cancelled"))
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         Ok(())
     }

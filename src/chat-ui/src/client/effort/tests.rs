@@ -843,7 +843,8 @@ fn effort_stage_fallbacks_when_continuation_exhausts_at_token_limit() -> Result<
     let (_c1, inc1) = mpsc::channel();
     let (ev1, out1) = crate::client::event_channel();
     let mut s1 = 0_usize;
-    let repeated = "Repeated draft clause that triggers loop detection cleanly without finishing. ".repeat(2);
+    let repeated =
+        "Repeated draft clause that triggers loop detection cleanly without finishing. ".repeat(2);
     let (m1, comp1) = run_with_stream_hooks(
         &pending,
         &opts,
@@ -859,7 +860,11 @@ fn effort_stage_fallbacks_when_continuation_exhausts_at_token_limit() -> Result<
                 Ok((message("assistant", "Plan."), Completion::Finished, None))
             } else {
                 on_text(Cow::Borrowed(&repeated))?;
-                Ok((message("assistant", &repeated), Completion::TokenLimit, None))
+                Ok((
+                    message("assistant", &repeated),
+                    Completion::TokenLimit,
+                    None,
+                ))
             }
         },
         |_cmds, _ms| Ok(()),
@@ -897,15 +902,27 @@ fn effort_stage_fallbacks_when_continuation_exhausts_at_token_limit() -> Result<
                 }
                 2 => {
                     on_text(Cow::Borrowed("Draft A."))?;
-                    Ok((message("assistant", "Draft A."), Completion::TokenLimit, None))
+                    Ok((
+                        message("assistant", "Draft A."),
+                        Completion::TokenLimit,
+                        None,
+                    ))
                 }
                 3 => {
                     on_text(Cow::Borrowed(" Draft B."))?;
-                    Ok((message("assistant", " Draft B."), Completion::Finished, None))
+                    Ok((
+                        message("assistant", " Draft B."),
+                        Completion::Finished,
+                        None,
+                    ))
                 }
                 _ => {
                     on_text(Cow::Borrowed(&repeated))?;
-                    Ok((message("assistant", &repeated), Completion::TokenLimit, None))
+                    Ok((
+                        message("assistant", &repeated),
+                        Completion::TokenLimit,
+                        None,
+                    ))
                 }
             }
         },
@@ -914,10 +931,10 @@ fn effort_stage_fallbacks_when_continuation_exhausts_at_token_limit() -> Result<
     assert_eq!(comp2, Completion::TokenLimit);
     assert_eq!(m2.content.as_ref(), "Draft A. Draft B.");
     let e2: Vec<_> = out2.try_iter().collect();
-    assert!(
-        e2.iter()
-            .any(|e| matches!(e, Event::Stage("Revision incomplete; complete draft retained")))
-    );
+    assert!(e2.iter().any(|e| matches!(
+        e,
+        Event::Stage("Revision incomplete; complete draft retained")
+    )));
     assert!(
         e2.iter()
             .any(|e| matches!(e, Event::RetainedAnswer(t) if t == "Draft A. Draft B."))
@@ -944,7 +961,11 @@ fn effort_stage_fallbacks_when_continuation_exhausts_at_token_limit() -> Result<
         &ev3,
         |_req, _stop, on_text, _| {
             on_text(Cow::Borrowed(&repeated))?;
-            Ok((message("assistant", &repeated), Completion::TokenLimit, None))
+            Ok((
+                message("assistant", &repeated),
+                Completion::TokenLimit,
+                None,
+            ))
         },
         |_cmds, _ms| Ok(()),
     )?;
@@ -1001,7 +1022,11 @@ fn effort_stage_fallbacks_when_continuation_exhausts_at_token_limit() -> Result<
                 }
                 _ => {
                     on_text(Cow::Borrowed(&repeated))?;
-                    Ok((message("assistant", &repeated), Completion::TokenLimit, None))
+                    Ok((
+                        message("assistant", &repeated),
+                        Completion::TokenLimit,
+                        None,
+                    ))
                 }
             }
         },
@@ -1010,10 +1035,10 @@ fn effort_stage_fallbacks_when_continuation_exhausts_at_token_limit() -> Result<
     assert_eq!(comp4, Completion::TokenLimit);
     assert_eq!(m4.content.as_ref(), "Stronger B.");
     let e4: Vec<_> = out4.try_iter().collect();
-    assert!(
-        e4.iter()
-            .any(|e| matches!(e, Event::Stage("Synthesis incomplete; best complete draft retained")))
-    );
+    assert!(e4.iter().any(|e| matches!(
+        e,
+        Event::Stage("Synthesis incomplete; best complete draft retained")
+    )));
     assert!(
         e4.iter()
             .any(|e| matches!(e, Event::RetainedAnswer(t) if t == "Stronger B."))
@@ -1169,11 +1194,19 @@ fn effort_continuation_wire_prefix_seam_thinking_stop_and_size_bounds() -> Resul
                 }
                 2 => {
                     on_text(Cow::Borrowed("Draft 1."))?;
-                    Ok((message("assistant", "Draft 1."), Completion::TokenLimit, None))
+                    Ok((
+                        message("assistant", "Draft 1."),
+                        Completion::TokenLimit,
+                        None,
+                    ))
                 }
                 3 => {
                     on_text(Cow::Borrowed(" Draft 2."))?;
-                    Ok((message("assistant", " Draft 2."), Completion::Finished, None))
+                    Ok((
+                        message("assistant", " Draft 2."),
+                        Completion::Finished,
+                        None,
+                    ))
                 }
                 _ => {
                     on_text(Cow::Borrowed("Review."))?;

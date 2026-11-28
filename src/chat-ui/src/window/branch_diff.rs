@@ -994,8 +994,7 @@ mod tests {
         assert!(!DiffError::WorkerFailed.to_string().is_empty());
 
         // Disconnected channel when already cancelled resolves to Err(DiffError::Cancelled), not WorkerFailed.
-        let (cancel_tx, cancel_rx) =
-            std::sync::mpsc::sync_channel::<super::BranchDiffOutcome>(1);
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel::<super::BranchDiffOutcome>(1);
         drop(cancel_tx);
         let mut cancelled_disconnect_job = BranchDiffJob {
             generation: 10,

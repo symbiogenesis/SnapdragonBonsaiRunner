@@ -4693,8 +4693,8 @@ mod tests {
     }
 
     #[test]
-    fn continuation_run_end_to_end_over_loopback_http_handles_413_429_and_length()
-    -> io::Result<()> {
+    fn continuation_run_end_to_end_over_loopback_http_handles_413_429_and_length() -> io::Result<()>
+    {
         use std::{
             io::Write,
             net::{Ipv4Addr, TcpListener},

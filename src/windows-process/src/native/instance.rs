@@ -84,8 +84,7 @@ type RmGetListFn =
     unsafe extern "system" fn(u32, *mut u32, *mut u32, *mut RmProcessInfo, *mut u32) -> u32;
 type RmEndSessionFn = unsafe extern "system" fn(u32) -> u32;
 
-type GetFileVersionInfoSizeExWFn =
-    unsafe extern "system" fn(u32, *const u16, *mut u32) -> u32;
+type GetFileVersionInfoSizeExWFn = unsafe extern "system" fn(u32, *const u16, *mut u32) -> u32;
 type GetFileVersionInfoExWFn =
     unsafe extern "system" fn(u32, *const u16, u32, u32, *mut c_void) -> i32;
 type VerQueryValueWFn =
@@ -189,10 +188,7 @@ fn open_query_sync(pid: u32) -> io::Result<Option<OwnedHandle>> {
     };
     if raw.is_null() {
         let error = io::Error::last_os_error();
-        if error.raw_os_error()
-            == i32::try_from(ERROR_INVALID_PARAMETER)
-                .ok()
-        {
+        if error.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() {
             return Ok(None);
         }
         return Err(error);
@@ -236,7 +232,10 @@ pub(crate) fn file_lock_holders(path: &Path) -> io::Result<Vec<ProcessIdentity>>
         )
     };
     if status != 0 {
-        return Err(win32_error(status, "Restart Manager resource registration failed."));
+        return Err(win32_error(
+            status,
+            "Restart Manager resource registration failed.",
+        ));
     }
 
     let mut needed = 0_u32;
@@ -388,7 +387,13 @@ pub(crate) fn file_fixed_version(path: &Path) -> io::Result<Option<(u16, u16, u1
 
     let mut zero_handle = 0_u32;
     // SAFETY: `path_wide` is NUL-terminated and `zero_handle` is a writable u32 output.
-    let size = unsafe { get_size(FILE_VER_GET_NEUTRAL, path_wide.as_ptr(), &raw mut zero_handle) };
+    let size = unsafe {
+        get_size(
+            FILE_VER_GET_NEUTRAL,
+            path_wide.as_ptr(),
+            &raw mut zero_handle,
+        )
+    };
     if size == 0 {
         let error = io::Error::last_os_error();
         if matches!(
@@ -583,7 +588,8 @@ pub(crate) fn terminate_process_tree(
         ));
     }
 
-    let grace_limit = Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now()));
+    let grace_limit =
+        Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now()));
     let grace_deadline = Instant::now() + grace_limit;
     let mut survivors = Vec::new();
     for descendant in descendants {
@@ -702,7 +708,10 @@ mod tests {
     #[test]
     fn terminate_process_tree_guards_identity_and_kills_descendants() -> io::Result<()> {
         let self_creation = super::super::current_creation_time()?;
-        assert!(terminate_process_tree(std::process::id(), self_creation, Duration::from_secs(1)).is_err());
+        assert!(
+            terminate_process_tree(std::process::id(), self_creation, Duration::from_secs(1))
+                .is_err()
+        );
         assert!(terminate_process_tree(0, 1, Duration::from_secs(1)).is_err());
 
         let dir = temp_dir("terminate-tree")?;

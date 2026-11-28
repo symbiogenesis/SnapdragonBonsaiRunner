@@ -450,10 +450,7 @@ mod tests {
         perms.set_readonly(true);
         fs::set_permissions(&to_file, perms).map_err(|e| e.to_string())?;
         rename_with_retry(&from_file, &to_file).map_err(|e| e.to_string())?;
-        assert_eq!(
-            fs::read(&to_file).map_err(|e| e.to_string())?,
-            b"updated"
-        );
+        assert_eq!(fs::read(&to_file).map_err(|e| e.to_string())?, b"updated");
 
         // 5. write_atomic_bytes & write_new_atomic_bytes error paths leave 0 .partial files
         assert_eq!(
@@ -474,10 +471,7 @@ mod tests {
         assert!(write_atomic_bytes(&occupied_dir, b"fail").is_err());
 
         assert!(write_new_atomic_bytes(&to_file, b"collide").is_err());
-        assert_eq!(
-            fs::read(&to_file).map_err(|e| e.to_string())?,
-            b"updated"
-        );
+        assert_eq!(fs::read(&to_file).map_err(|e| e.to_string())?, b"updated");
 
         let partials = fs::read_dir(&root)
             .map_err(|e| e.to_string())?

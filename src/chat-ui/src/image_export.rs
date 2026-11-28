@@ -659,8 +659,8 @@ mod tests {
         // Admission::Busy -> PendingRaster::Retry, then Ticket once queue clears -> Saved.
         let ctx_busy = egui::Context::default();
         let respond_busy = Service::fixture(&ctx_busy);
-        let service = Service::get(&ctx_busy)
-            .ok_or_else(|| io::Error::other("missing fixture service"))?;
+        let service =
+            Service::get(&ctx_busy).ok_or_else(|| io::Error::other("missing fixture service"))?;
         let mut filler = Vec::new();
         while let Admission::Admitted(ticket) = service.request(Arc::from("filler")) {
             filler.push(ticket);

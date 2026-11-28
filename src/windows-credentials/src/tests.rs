@@ -590,8 +590,8 @@ fn parallel_mapped_chunk_verification_honors_immediate_cancellation() -> io::Res
 }
 
 #[test]
-fn validate_external_path_creatable_enforces_existing_ancestors_and_component_rules() -> io::Result<()>
-{
+fn validate_external_path_creatable_enforces_existing_ancestors_and_component_rules()
+-> io::Result<()> {
     let lane = test_lane("creatable-path")?;
 
     // 1. Existing non-directory ancestor followed by missing segments MUST fail
@@ -627,7 +627,14 @@ fn validate_external_path_creatable_enforces_existing_ancestors_and_component_ru
     assert!(validate_external_path_creatable(&link.join("missing").join("leaf")).is_err());
 
     // 4. Multiple deep nonexistent segments succeed
-    validate_external_path_creatable(&lane.join("a").join("b").join("c").join("d").join("leaf.bin"))?;
+    validate_external_path_creatable(
+        &lane
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("d")
+            .join("leaf.bin"),
+    )?;
 
     // 5. Invalid component rules in missing segments still fail
     for bad in [

@@ -1,13 +1,13 @@
 //! Per-user launcher admission retained until the owned app tree has exited.
 
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 use std::{
     fmt,
     fs::{self, File, OpenOptions},
     io::Read as _,
     path::{Path, PathBuf},
 };
-#[cfg(windows)]
-use std::time::{Duration, Instant};
 
 use bonsai_artifacts::is_redirect;
 #[cfg(windows)]
@@ -30,9 +30,8 @@ pub(super) struct Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         if super::external(&self.metadata_path).is_ok()
-            && fs::symlink_metadata(&self.metadata_path).is_ok_and(|metadata| {
-                metadata.is_file() && !is_redirect(&metadata)
-            })
+            && fs::symlink_metadata(&self.metadata_path)
+                .is_ok_and(|metadata| metadata.is_file() && !is_redirect(&metadata))
         {
             let _ = fs::remove_file(&self.metadata_path);
         }
@@ -472,9 +471,7 @@ fn acquire_contended(
         let older_holders: Vec<&ProcessIdentity> = resolved
             .iter()
             .filter_map(|(holder, version)| {
-                version
-                    .is_some_and(|ver| ver < current)
-                    .then_some(*holder)
+                version.is_some_and(|ver| ver < current).then_some(*holder)
             })
             .collect();
         if older_holders.is_empty() {
@@ -615,7 +612,10 @@ mod tests {
                 ))
                 .map_err(|error| error.to_string())?;
             writer
-                .start_file("package.json", SimpleFileOptions::default().compression_method(CompressionMethod::Deflated))
+                .start_file(
+                    "package.json",
+                    SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+                )
                 .map_err(|error| error.to_string())?;
             writer
                 .write_all(br#"{"kind":"bonsai-chat-package","version":"0.3.4"}"#)
@@ -764,11 +764,21 @@ mod tests {
         let result = (|| -> crate::Result<()> {
             write_test_record(&dir, "0.3.9", child_pid, child_creation)?;
             assert!(acquire_for_version(&dir, InstanceVersion(0, 3, 9))?.is_none());
-            assert!(child.try_wait().map_err(|error| error.to_string())?.is_none());
+            assert!(
+                child
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+            );
 
             write_test_record(&dir, "0.4.0", child_pid, child_creation)?;
             assert!(acquire_for_version(&dir, InstanceVersion(0, 3, 9))?.is_none());
-            assert!(child.try_wait().map_err(|error| error.to_string())?.is_none());
+            assert!(
+                child
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+            );
             Ok(())
         })();
 
@@ -780,7 +790,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn unknown_holder_or_tampered_metadata_never_terminates_existing_process() -> crate::Result<()> {
+    fn unknown_holder_or_tampered_metadata_never_terminates_existing_process() -> crate::Result<()>
+    {
         use std::os::windows::process::CommandExt as _;
         use std::process::{Command, Stdio};
 
@@ -800,15 +811,30 @@ mod tests {
         let result = (|| -> crate::Result<()> {
             // No metadata and non-Bonsai executable (`cmd.exe`) must keep holder alive.
             assert!(acquire_for_version(&dir, InstanceVersion(0, 3, 9))?.is_none());
-            assert!(holder.try_wait().map_err(|error| error.to_string())?.is_none());
+            assert!(
+                holder
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+            );
 
             // Tampered metadata pointing to a separate decoy PID must kill neither decoy nor holder.
             let decoy_creation = bonsai_windows_process::process_creation_file_time(decoy.id())
                 .map_err(|error| error.to_string())?;
             write_test_record(&dir, "0.1.0", decoy.id(), decoy_creation)?;
             assert!(acquire_for_version(&dir, InstanceVersion(0, 3, 9))?.is_none());
-            assert!(holder.try_wait().map_err(|error| error.to_string())?.is_none());
-            assert!(decoy.try_wait().map_err(|error| error.to_string())?.is_none());
+            assert!(
+                holder
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+            );
+            assert!(
+                decoy
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+            );
             Ok(())
         })();
 

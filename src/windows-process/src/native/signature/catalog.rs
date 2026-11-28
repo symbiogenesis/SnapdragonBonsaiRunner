@@ -122,7 +122,9 @@ pub(super) fn verify(file: &File, filename: &[u16]) -> io::Result<crate::Authent
                 Some(context)
             }
         },
-        |context| verify_catalog_member(&admin, context, file, filename, &member, &hash, hash_bytes),
+        |context| {
+            verify_catalog_member(&admin, context, file, filename, &member, &hash, hash_bytes)
+        },
     )
 }
 

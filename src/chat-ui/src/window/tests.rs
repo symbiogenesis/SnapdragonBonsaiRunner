@@ -1905,7 +1905,9 @@ fn speech_disconnect_stops_per_frame_alerts_and_oversized_read_aloud_preserves_s
     for (invalid_body, expect_notice) in [("   \n\t", false), ("hello\0world", true)] {
         state.speech_notice = false;
         state.model = ModelLifecycle::Generating;
-        state.transcript.push(Role::Assistant, invalid_body.to_owned());
+        state
+            .transcript
+            .push(Role::Assistant, invalid_body.to_owned());
         state.model_event(Event::Complete(Completion::Finished));
         let invalid_id = state.transcript.messages.last().map_or(0, |m| m.id);
         state.toggle_read_aloud(invalid_id);

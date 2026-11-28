@@ -867,7 +867,12 @@ mod tests {
         // result=Ok + write_result=Err still cleans scratch and returns write_result
         let w_scratch_path = root.join("w-scratch");
         let w_scratch = ScratchDir::create(w_scratch_path.clone())?;
-        let w_err = finalize_audit(&non_dir_output, json!({"status": "ok"}), Ok(()), Some(w_scratch));
+        let w_err = finalize_audit(
+            &non_dir_output,
+            json!({"status": "ok"}),
+            Ok(()),
+            Some(w_scratch),
+        );
         assert!(w_err.is_err());
         assert!(!w_scratch_path.exists());
 
@@ -877,9 +882,9 @@ mod tests {
                 code
             )));
         }
-        assert!(!is_retryable_cleanup_error(
-            &io::Error::from_raw_os_error(2)
-        ));
+        assert!(!is_retryable_cleanup_error(&io::Error::from_raw_os_error(
+            2
+        )));
 
         remove_dir_all_with_retry(&root)?;
         Ok(())
@@ -1042,7 +1047,9 @@ mod tests {
             for reply in err_replies {
                 let (mut stream, _) = err_listener.accept().map_err(|e| e.to_string())?;
                 let _ = read_http_request(&mut stream)?;
-                stream.write_all(reply.as_bytes()).map_err(|e| e.to_string())?;
+                stream
+                    .write_all(reply.as_bytes())
+                    .map_err(|e| e.to_string())?;
                 count += 1;
             }
             Ok(count)
