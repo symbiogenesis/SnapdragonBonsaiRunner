@@ -409,6 +409,9 @@ fn acquire_contended(
     current: InstanceVersion,
 ) -> crate::Result<Option<Guard>> {
     const MAX_ROUNDS: usize = 4;
+    const POLL_INTERVAL: Duration = Duration::from_millis(if cfg!(test) { 2 } else { 25 });
+    const PEER_PUBLISH_WAIT: Duration = Duration::from_millis(if cfg!(test) { 5 } else { 50 });
+    const POLL_WINDOW: Duration = Duration::from_millis(if cfg!(test) { 100 } else { 500 });
 
     let start = Instant::now();
     for _round in 0..MAX_ROUNDS {
@@ -423,7 +426,7 @@ fn acquire_contended(
                 if start.elapsed() >= REPLACE_ALLOWANCE {
                     return Ok(None);
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(POLL_INTERVAL);
             }
             return Ok(None);
         }
@@ -444,7 +447,7 @@ fn acquire_contended(
             .is_none_or(|rec| !record_matches_any(rec, &holders))
         {
             // Give a simultaneous peer launcher a brief moment to finish publishing `chat.instance.json`.
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(PEER_PUBLISH_WAIT);
             if let Some(lock) = try_open_lock(lock_path)? {
                 return write_metadata_and_guard(lock, meta_path, current).map(Some);
             }
@@ -512,12 +515,12 @@ fn acquire_contended(
             })?;
         }
 
-        let poll_deadline = Instant::now() + Duration::from_millis(500);
+        let poll_deadline = Instant::now() + POLL_WINDOW;
         while Instant::now() < poll_deadline && start.elapsed() < REPLACE_ALLOWANCE {
             if let Some(lock) = try_open_lock(lock_path)? {
                 return write_metadata_and_guard(lock, meta_path, current).map(Some);
             }
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(POLL_INTERVAL);
         }
     }
 
@@ -710,21 +713,27 @@ mod tests {
     fn newer_version_terminates_older_process_tree_and_takes_over() -> crate::Result<()> {
         let dir = directory("replace-older")?;
         let lock_path = dir.join("chat.lock");
-        let mut child = spawn_lock_holder(&lock_path, "ping -n 30 127.0.0.1 >nul")?;
+        let mut child = spawn_lock_holder(&lock_path, "ping -n 10 127.0.0.1 >nul")?;
         let child_pid = child.id();
         let child_creation = bonsai_windows_process::process_creation_file_time(child_pid)
             .map_err(|error| error.to_string())?;
 
         let result = (|| -> crate::Result<()> {
             let mut grandchildren = Vec::new();
-            for _ in 0..40 {
+            let spin_until = Instant::now() + Duration::from_millis(5);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
                 grandchildren =
                     bonsai_windows_process::process_direct_children(child_pid, child_creation)
                         .map_err(|error| error.to_string())?;
                 if !grandchildren.is_empty() {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                if Instant::now() < spin_until {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
             assert!(!grandchildren.is_empty());
 

@@ -3134,7 +3134,7 @@ mod tests {
                         );
                     }
                     Err(err) if err.kind() == io_error_would_block() => {
-                        thread::sleep(Duration::from_millis(10));
+                        thread::sleep(Duration::from_millis(1));
                     }
                     Err(_) => break,
                 }

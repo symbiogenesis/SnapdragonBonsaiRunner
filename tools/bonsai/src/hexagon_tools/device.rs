@@ -396,7 +396,7 @@ fn capture(
             if clock.elapsed() >= deadline {
                 return Err("Hexagon capture exhausted its worker deadline.".into());
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(if cfg!(test) { 1 } else { 10 }));
         }
     })();
     // Keep verified input handles alive until teardown is confirmed. A refused
@@ -1138,7 +1138,7 @@ mod tests {
         let mut stderr = std::io::stderr();
         stderr.write_all(b"hexagon-fixture:stage=private-path\nhexagon-fixture:stage=con")?;
         stderr.flush()?;
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(2));
         stderr.write_all(b"text\n")
     }
     #[test]
@@ -1189,7 +1189,7 @@ mod tests {
             3,
             Duration::from_millis(1),
             Duration::from_secs(5),
-            Duration::from_millis(1),
+            Duration::ZERO,
         );
         assert_eq!(attempts, 3);
         assert!(
@@ -1210,7 +1210,7 @@ mod tests {
             5,
             Duration::from_millis(1),
             Duration::from_secs(5),
-            Duration::from_millis(1),
+            Duration::ZERO,
         )?;
         assert_eq!(succeed_attempts, 2);
 

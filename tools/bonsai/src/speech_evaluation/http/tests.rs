@@ -177,7 +177,7 @@ fn stalled_body_cannot_extend_the_original_request_deadline() -> crate::Result<(
         body: None,
         media: "audio/wav",
         maximum: 4,
-        deadline: Instant::now() + Duration::from_millis(250),
+        deadline: Instant::now() + Duration::from_millis(50),
     };
     let started = Instant::now();
     let result = exchange(&call, || Ok(()));

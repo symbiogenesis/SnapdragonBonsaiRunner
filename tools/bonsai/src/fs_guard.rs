@@ -70,13 +70,14 @@ fn retry_windows_sharing<T>(
     mut prepare_retry: impl FnMut(),
 ) -> io::Result<T> {
     const RETRIES: usize = 7;
+    let base_ms: u64 = if cfg!(test) { 1 } else { 20 };
     for attempt in 0..RETRIES {
         match op() {
             Ok(value) => return Ok(value),
             Err(error) if is_windows_sharing_or_access(&error) => {
                 prepare_retry();
                 let shift = u32::try_from(attempt.min(3)).unwrap_or(3);
-                std::thread::sleep(Duration::from_millis(20 << shift));
+                std::thread::sleep(Duration::from_millis(base_ms << shift));
             }
             Err(error) => return Err(error),
         }

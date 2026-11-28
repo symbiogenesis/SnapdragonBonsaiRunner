@@ -311,33 +311,49 @@ fn output_and_root_junctions_are_rejected_without_touching_their_target() -> cra
     let target = Fixture::new()?;
     let sentinel = target.0.join("private.key");
     fs::write(&sentinel, "b".repeat(64)).map_err(|error| error.to_string())?;
-    for name in PUBLIC_FILES {
-        let fixture = Fixture::new()?;
-        fixture.session('1')?;
-        let link = fixture.0.join(name);
-        // mklink /J creates directory junctions without symlink privilege. Each
-        // argument is a generated fixture path, never user-controlled content.
-        let output = std::process::Command::new("cmd.exe")
-            .creation_flags(0x0800_0000)
-            .args(["/D", "/C", "mklink", "/J"])
-            .arg(&link)
-            .arg(&target.0)
-            .output()
-            .map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            return Err("Unable to prepare the junction regression fixture.".into());
+    std::thread::scope(|scope| -> crate::Result<()> {
+        let handles: Vec<_> = PUBLIC_FILES
+            .into_iter()
+            .map(|name| {
+                let target_dir = &target.0;
+                let sentinel = &sentinel;
+                scope.spawn(move || -> crate::Result<()> {
+                    let fixture = Fixture::new()?;
+                    fixture.session('1')?;
+                    let link = fixture.0.join(name);
+                    // mklink /J creates directory junctions without symlink privilege. Each
+                    // argument is a generated fixture path, never user-controlled content.
+                    let output = std::process::Command::new("cmd.exe")
+                        .creation_flags(0x0800_0000)
+                        .args(["/D", "/C", "mklink", "/J"])
+                        .arg(&link)
+                        .arg(target_dir)
+                        .output()
+                        .map_err(|error| error.to_string())?;
+                    if !output.status.success() {
+                        return Err("Unable to prepare the junction regression fixture.".into());
+                    }
+                    assert_eq!(fixture.collect()?["Classification"], "unsafe-output");
+                    assert_eq!(run(json!({"evidenceDirectory": link}))?["Ready"], false);
+                    assert_eq!(
+                        fs::read_to_string(sentinel).map_err(|error| error.to_string())?,
+                        "b".repeat(64)
+                    );
+                    assert!(is_redirect(
+                        &fs::symlink_metadata(&link).map_err(|error| error.to_string())?
+                    ));
+                    fs::remove_dir(link).map_err(|error| error.to_string())?;
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| String::from("Junction diagnostic thread panicked."))??;
         }
-        assert_eq!(fixture.collect()?["Classification"], "unsafe-output");
-        assert_eq!(run(json!({"evidenceDirectory": link}))?["Ready"], false);
-        assert_eq!(
-            fs::read_to_string(&sentinel).map_err(|error| error.to_string())?,
-            "b".repeat(64)
-        );
-        assert!(is_redirect(
-            &fs::symlink_metadata(&link).map_err(|error| error.to_string())?
-        ));
-        fs::remove_dir(link).map_err(|error| error.to_string())?;
-    }
+        Ok(())
+    })?;
     Ok(())
 }
 

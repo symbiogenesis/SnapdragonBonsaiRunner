@@ -420,6 +420,13 @@ fn capture_write_failure_cannot_publish_a_completed_sample() -> Result<()> {
 #[test]
 fn packaged_supervisor_retains_parent_death_timeout_and_exit_code() -> Result<()> {
     use std::time::{Duration, Instant};
+    let poll_pause = |spin_until: Instant| {
+        if Instant::now() < spin_until {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
     std::thread::scope(|scope| {
         let handles: Vec<_> = ["ParentDeath", "Timeout", "ExitCode"]
             .into_iter()
@@ -448,6 +455,7 @@ fn packaged_supervisor_retains_parent_death_timeout_and_exit_code() -> Result<()
                                 .spawn()
                                 .map_err(|e| e.to_string())?;
                         let observed = (|| -> std::result::Result<(), String> {
+                            let spin_until = Instant::now() + Duration::from_millis(5);
                             let deadline = Instant::now() + Duration::from_secs(15);
                             let id = loop {
                                 if let Ok(bytes) = fs::read(&marker)
@@ -461,7 +469,7 @@ fn packaged_supervisor_retains_parent_death_timeout_and_exit_code() -> Result<()
                                 if Instant::now() >= deadline {
                                     return Err("Synthetic completion child did not start.".into());
                                 }
-                                std::thread::sleep(Duration::from_millis(2));
+                                poll_pause(spin_until);
                             };
                             let child = bonsai_windows_process::ParentProcess::open(
                                 id,
@@ -471,6 +479,7 @@ fn packaged_supervisor_retains_parent_death_timeout_and_exit_code() -> Result<()
                             .map_err(|e| e.to_string())?;
                             caller.kill().map_err(|e| e.to_string())?;
                             caller.wait().map_err(|e| e.to_string())?;
+                            let spin_until = Instant::now() + Duration::from_millis(5);
                             let deadline = Instant::now() + Duration::from_secs(10);
                             while child.ensure_alive().is_ok() {
                                 if Instant::now() >= deadline {
@@ -478,7 +487,7 @@ fn packaged_supervisor_retains_parent_death_timeout_and_exit_code() -> Result<()
                                         "Caller death left a completion child running.".into()
                                     );
                                 }
-                                std::thread::sleep(Duration::from_millis(2));
+                                poll_pause(spin_until);
                             }
                             Ok(())
                         })();
@@ -497,6 +506,7 @@ fn packaged_supervisor_retains_parent_death_timeout_and_exit_code() -> Result<()
                             .map_err(|e| e.to_string())?;
                         assert!(!result.status.success());
                     }
+                    let spin_until = Instant::now() + Duration::from_millis(5);
                     let deadline = Instant::now() + Duration::from_secs(10);
                     let receipt: Value = loop {
                         if let Ok(bytes) = fs::read(lane.join("supervision.json"))
@@ -507,7 +517,7 @@ fn packaged_supervisor_retains_parent_death_timeout_and_exit_code() -> Result<()
                         if Instant::now() >= deadline {
                             return Err("Missing completion failure receipt.".into());
                         }
-                        std::thread::sleep(Duration::from_millis(2));
+                        poll_pause(spin_until);
                     };
                     assert_eq!(receipt["Status"], "failed");
                     assert_eq!(receipt["ModelProcessStarted"], true);

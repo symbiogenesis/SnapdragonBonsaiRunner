@@ -504,7 +504,11 @@ pub(crate) fn run_with_retry_budget<T, C: FnMut() -> crate::Result<()> + ?Sized>
                     if wait.is_zero() {
                         break;
                     }
-                    thread::sleep(wait.min(rem).min(Duration::from_millis(50)));
+                    thread::sleep(wait.min(rem).min(Duration::from_millis(if cfg!(test) {
+                        5
+                    } else {
+                        50
+                    })));
                 }
             }
         }
@@ -1219,7 +1223,7 @@ mod tests {
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             remaining(until)?;
-                            thread::sleep(Duration::from_millis(5));
+                            thread::sleep(Duration::from_millis(1));
                         }
                         Err(e) => return Err(e.to_string()),
                     }
@@ -1496,7 +1500,7 @@ mod tests {
                 Ok((stream, _)) => break stream,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     remaining(until)?;
-                    thread::sleep(Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) => return Err(e.to_string()),
             }
@@ -1572,7 +1576,7 @@ mod tests {
                         Ok((stream, _)) => break stream,
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             remaining(until)?;
-                            thread::sleep(Duration::from_millis(5));
+                            thread::sleep(Duration::from_millis(1));
                         }
                         Err(e) => return Err(e.to_string()),
                     }
@@ -1830,7 +1834,7 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(10);
         let (bytes, total) = run_with_retry_budget(
             4,
-            Duration::from_millis(10),
+            Duration::from_millis(1),
             until,
             &mut || Ok(()),
             |checkpoint| match owned_with_abort(
@@ -1859,7 +1863,7 @@ mod tests {
         ])?;
         let not_found = run_with_retry_budget(
             4,
-            Duration::from_millis(10),
+            Duration::from_millis(1),
             until,
             &mut || Ok(()),
             |checkpoint| match owned_with_abort(
@@ -1893,7 +1897,7 @@ mod tests {
         ])?;
         let meta_res = run_with_retry_budget(
             4,
-            Duration::from_millis(10),
+            Duration::from_millis(1),
             until,
             &mut || Ok(()),
             |checkpoint| match owned_with_abort(
@@ -1923,7 +1927,7 @@ mod tests {
         ])?;
         let over_res = run_with_retry_budget(
             3,
-            Duration::from_millis(10),
+            Duration::from_millis(1),
             until,
             &mut || Ok(()),
             |checkpoint| match owned_with_abort(
@@ -1981,7 +1985,7 @@ mod tests {
         let started_cancel = Instant::now();
         let cancelled_res = run_with_retry_budget(
             3,
-            Duration::from_millis(500),
+            Duration::from_millis(50),
             Instant::now() + Duration::from_secs(10),
             &mut || {
                 sleep_checks += 1;
@@ -1994,7 +1998,7 @@ mod tests {
             |_| -> RetryOutcome<()> {
                 RetryOutcome::Retry {
                     error: "transient".into(),
-                    retry_after: Some(Duration::from_secs(2)),
+                    retry_after: Some(Duration::from_millis(200)),
                 }
             },
         );
