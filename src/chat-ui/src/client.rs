@@ -76,10 +76,6 @@ const RATE_LIMIT_MESSAGE: &str =
 const TEARDOWN_FAILURE_MESSAGE: &str = "The local model's owned processes could not be confirmed stopped. Copy any conversation or drafts you want to keep, then close this app before launching again.";
 const NATIVE_IDENTITY_GUIDANCE: &[(&str, &str)] = &[
     (
-        "Native identity verification failed: reason=release-pin.",
-        "Swift's compiled Rust runtime version check failed readiness verification. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
-    ),
-    (
         "Native identity verification failed: reason=framing.",
         "The local Rust runtime returned an unexpected readiness response format. Close and reopen Swift (or rebuild matching local binaries) instead of retrying. Completed conversation turns remain in memory.",
     ),
@@ -4440,7 +4436,6 @@ mod tests {
     fn native_identity_guidance_maps_all_closed_reasons_and_rejects_partial_or_publisher_lines()
     -> Result<(), Failure> {
         let reasons = [
-            ("release-pin", "version check failed"),
             ("framing", "response format"),
             ("schema", "unsupported readiness schema"),
             ("model", "model identity"),

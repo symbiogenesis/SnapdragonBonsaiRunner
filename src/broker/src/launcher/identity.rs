@@ -6,7 +6,6 @@ use std::{borrow::Cow, ops::Deref};
 /// Value-free reason why a native child's `/v1/models` readiness failed verification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NativeIdentityError {
-    ReleasePin,
     Framing,
     Schema,
     Model,
@@ -25,7 +24,6 @@ pub(super) enum NativeIdentityError {
 impl NativeIdentityError {
     pub(super) const fn reason(self) -> &'static str {
         match self {
-            Self::ReleasePin => "release-pin",
             Self::Framing => "framing",
             Self::Schema => "schema",
             Self::Model => "model",
@@ -43,25 +41,12 @@ impl NativeIdentityError {
     }
 }
 
-fn prism_zero_one_patch(version: &str) -> Option<u32> {
-    let patch = version.strip_prefix("0.1.")?;
-    if patch.is_empty()
-        || !patch.bytes().all(|byte| byte.is_ascii_digit())
-        || (patch.len() > 1 && patch.starts_with('0'))
-    {
-        return None;
-    }
-    patch.parse::<u32>().ok()
-}
-
 /// The selected private projection-worker budget, separate from execution evidence.
 #[derive(Clone, Copy)]
 pub(super) struct WorkerReadiness<'a> {
     pub(super) expected: u8,
-    pub(super) prefill_row_workers: Option<u8>,
+    pub(super) prefill_row_workers: u8,
     pub(super) context_tokens: usize,
-    pub(super) legacy_missing_allowed: bool,
-    pub(super) projection_startup_required: bool,
     pub(super) prompt_reuse: crate::inference::PromptReuseMode,
     pub(super) prompt_reuse_checkpoints: u8,
     pub(super) vision: bool,
@@ -74,21 +59,11 @@ pub(super) struct WorkerReadiness<'a> {
 }
 
 impl<'a> WorkerReadiness<'a> {
-    pub(super) fn for_version(version: &str, expected: u8) -> Self {
-        let patch = prism_zero_one_patch(version);
+    pub(super) fn new(expected: u8) -> Self {
         Self {
             expected,
-            // Reviewed 0.1.38+ releases always publish their effective prefill worker
-            // budget (`prefill_row_workers`), defaulting to `row_workers` when split
-            // prefill workers are not explicitly overridden.
-            prefill_row_workers: patch.is_some_and(|number| number >= 38).then_some(expected),
+            prefill_row_workers: expected,
             context_tokens: crate::CONTEXT_TOKENS,
-            // Only these reviewed historical releases omit this identity. A
-            // later pin must report its graph's effective worker budget.
-            legacy_missing_allowed: matches!(version, "0.1.8" | "0.1.9" | "0.1.10"),
-            // Reviewed 0.1.28+ releases wait for model-thread initialization and
-            // always publish their completed placement/residency observation.
-            projection_startup_required: patch.is_some_and(|number| number >= 28),
             prompt_reuse: crate::inference::PromptReuseMode::Disabled,
             prompt_reuse_checkpoints: 1,
             vision: false,
@@ -101,33 +76,13 @@ impl<'a> WorkerReadiness<'a> {
         }
     }
 
-    #[cfg(test)]
-    pub(super) const fn allows_missing_row_workers(self) -> bool {
-        self.legacy_missing_allowed
-    }
-
-    #[cfg(test)]
-    pub(super) const fn expected_prefill_row_workers(self) -> Option<u8> {
-        self.prefill_row_workers
-    }
-
-    #[cfg(test)]
-    pub(super) const fn requires_projection_startup(self) -> bool {
-        self.projection_startup_required
-    }
-
     fn accepts(self, observed: Option<u8>) -> bool {
-        matches!(self.expected, 1 | 4 | 8 | 12)
-            && observed.map_or(self.legacy_missing_allowed, |workers| {
-                workers == self.expected
-            })
+        matches!(self.expected, 1 | 4 | 8 | 12) && observed == Some(self.expected)
     }
 
     fn accepts_prefill_row_workers(self, observed: Option<u8>) -> bool {
-        match self.prefill_row_workers {
-            Some(expected) => matches!(expected, 1 | 4 | 8 | 12 | 16) && observed == Some(expected),
-            None => observed.is_none(),
-        }
+        matches!(self.prefill_row_workers, 1 | 4 | 8 | 12 | 16)
+            && observed == Some(self.prefill_row_workers)
     }
 }
 
@@ -257,9 +212,7 @@ fn startup_projection_matches(
     is_nariq: bool,
 ) -> bool {
     let Some(startup) = &model.startup_projection else {
-        // Historical releases, including 0.1.27, predate this observation.
-        // The reviewed 0.1.28, 0.1.30 and 0.1.31 tuples must identify completed initialization.
-        return !is_nariq && !workers.projection_startup_required;
+        return false;
     };
     let requested = match workers.placement {
         crate::inference::Placement::Auto => "auto",
@@ -582,10 +535,6 @@ mod tests {
     }
 
     fn kv_cache_model(ptq1: bool) -> (serde_json::Value, String) {
-        kv_cache_model_for_version("0.1.35", ptq1)
-    }
-
-    fn kv_cache_model_for_version(_version: &str, ptq1: bool) -> (serde_json::Value, String) {
         use serde_json::json;
         let variant = if ptq1 {
             Bonsai25Variant::Ptq1
@@ -602,7 +551,9 @@ mod tests {
             "template_sha256": crate::inference::TEMPLATE_SHA256,
             "runtime": "prism-inference", "context_tokens": 8192, "seed": 42,
             "weight_representation": variant.representation_name(),
-            "row_workers": 4, "kv_cache": "rsq4", "startup_graph_identity": graph,
+            "row_workers": 4, "prefill_row_workers": 4,
+            "kv_cache": "rsq4", "startup_graph_identity": graph,
+            "startup_projection": projection_startup("cpu"),
         });
         (model, graph)
     }
@@ -625,25 +576,15 @@ mod tests {
     fn projection_startup_binds_completed_residency_and_requested_policy()
     -> Result<(), serde_json::Error> {
         use crate::inference::{KvCache, Placement};
-        let (legacy_model, _) = kv_cache_model_for_version("0.1.27", false);
-        let legacy = WorkerReadiness {
-            kv_cache: Some(KvCache::Rsq4),
-            ..WorkerReadiness::for_version("0.1.27", 4)
-        };
-        assert!(validate_native_identity(&model_response(&legacy_model)?, false, legacy).is_ok());
-
-        let (mut model, _) = kv_cache_model_for_version("0.1.31", false);
+        let (mut model, _) = kv_cache_model(false);
         let auto = WorkerReadiness {
             kv_cache: Some(KvCache::Rsq4),
-            ..WorkerReadiness::for_version("0.1.31", 4)
+            ..WorkerReadiness::new(4)
         };
+        if let Some(object) = model.as_object_mut() {
+            object.remove("startup_projection");
+        }
         assert!(validate_native_identity(&model_response(&model)?, false, auto).is_err());
-        let mut legacy_with_startup = legacy_model;
-        legacy_with_startup["startup_projection"] = projection_startup("cpu");
-        assert_eq!(
-            validate_native_identity_detailed(&model_response(&legacy_with_startup)?, false, auto),
-            Ok(())
-        );
         for effective in ["cpu", "hexagon-native-q2"] {
             model["startup_projection"] = projection_startup(effective);
             assert!(validate_native_identity(&model_response(&model)?, false, auto).is_ok());
@@ -658,7 +599,7 @@ mod tests {
         model["startup_projection"] = projection_startup("cpu");
         model["startup_projection"]["requested"] = serde_json::json!("cpu");
         assert!(validate_native_identity(&model_response(&model)?, false, cpu).is_ok());
-        let (mut ptq1, _) = kv_cache_model_for_version("0.1.31", true);
+        let (mut ptq1, _) = kv_cache_model(true);
         ptq1["startup_projection"] = projection_startup("hexagon-native-q2");
         assert!(validate_native_identity(&model_response(&ptq1)?, true, auto).is_err());
         ptq1["startup_projection"] = projection_startup("cpu");
@@ -672,10 +613,10 @@ mod tests {
         use crate::inference::{KvCache, Placement};
         use serde_json::json;
 
-        let (mut model, _) = kv_cache_model_for_version("0.1.31", false);
+        let (mut model, _) = kv_cache_model(false);
         let auto = WorkerReadiness {
             kv_cache: Some(KvCache::Rsq4),
-            ..WorkerReadiness::for_version("0.1.31", 4)
+            ..WorkerReadiness::new(4)
         };
         for identity in [
             "hexagon-v73-hvx-native-q2-partial-v1-experimental",
@@ -706,7 +647,7 @@ mod tests {
         cpu_model["startup_projection"]["requested"] = json!("cpu");
         assert!(validate_native_identity(&model_response(&cpu_model)?, false, cpu).is_err());
 
-        let (mut ptq1, _) = kv_cache_model_for_version("0.1.31", true);
+        let (mut ptq1, _) = kv_cache_model(true);
         ptq1["startup_projection"] = model["startup_projection"].clone();
         assert!(validate_native_identity(&model_response(&ptq1)?, true, auto).is_err());
 
@@ -745,7 +686,7 @@ mod tests {
         let (model, _) = kv_cache_model(false);
         let auto = WorkerReadiness {
             kv_cache: Some(KvCache::Rsq4),
-            ..WorkerReadiness::for_version("0.1.31", 4)
+            ..WorkerReadiness::new(4)
         };
         for (field, value) in [
             ("schema_version", json!(2)),
@@ -826,7 +767,7 @@ mod tests {
         let (mut model, _) = kv_cache_model(false);
         let auto = WorkerReadiness {
             kv_cache: Some(KvCache::Rsq4),
-            ..WorkerReadiness::for_version("0.1.31", 4)
+            ..WorkerReadiness::new(4)
         };
         model["startup_projection"] = projection_startup("external");
         for identity in ["", " ", "bad\nidentity", &"x".repeat(257)] {
@@ -850,7 +791,7 @@ mod tests {
             let (mut model, _) = kv_cache_model(ptq1);
             let auto = WorkerReadiness {
                 kv_cache: Some(KvCache::Rsq4),
-                ..WorkerReadiness::for_version("0.1.27", 4)
+                ..WorkerReadiness::new(4)
             };
             let cpu = WorkerReadiness {
                 placement: Placement::Cpu,
@@ -860,6 +801,7 @@ mod tests {
             assert!(validate_native_identity(&model_response(&model)?, ptq1, cpu).is_err());
             model["placement"] = json!("cpu");
             model["projection_backend"] = json!("cpu");
+            model["startup_projection"]["requested"] = json!("cpu");
             let bytes = model_response(&model)?;
             assert!(validate_native_identity(&bytes, ptq1, cpu).is_ok());
             assert!(validate_native_identity(&bytes, ptq1, auto).is_err());
@@ -891,7 +833,7 @@ mod tests {
         }
         let cpu = WorkerReadiness {
             placement: Placement::Cpu,
-            ..WorkerReadiness::for_version("0.1.27", 4)
+            ..WorkerReadiness::new(4)
         };
         for extra in [
             "\"placement\":\"cpu\",\"projection_backend\":\"cpu\",\"placement\":\"cpu\"",
@@ -915,7 +857,7 @@ mod tests {
                 let graph = graph.replace("kv-rsq4-", &format!("kv-{}-", policy.name()));
                 model["kv_cache"] = json!(policy.name());
                 model["startup_graph_identity"] = json!(graph);
-                let f16 = WorkerReadiness::for_version("0.1.27", 4);
+                let f16 = WorkerReadiness::new(4);
                 let selected = WorkerReadiness {
                     kv_cache: Some(policy),
                     ..f16
@@ -980,7 +922,7 @@ mod tests {
 
         let scratch = 11_501_568_usize;
         for kv in [KvCache::F16, KvCache::Rsq4] {
-            let (mut prefill_model, _) = kv_cache_model_for_version("0.1.31", false);
+            let (mut prefill_model, _) = kv_cache_model(false);
             prefill_model["startup_projection"] = projection_startup("cpu");
             prefill_model["cpu_prefill_tokens"] = json!(8);
             prefill_model["cpu_prefill_scratch_bytes"] = json!(scratch);
@@ -1000,7 +942,7 @@ mod tests {
             let policy = WorkerReadiness {
                 kv_cache: Some(kv),
                 cpu_prefill: Some((8, scratch)),
-                ..WorkerReadiness::for_version("0.1.31", 4)
+                ..WorkerReadiness::new(4)
             };
             assert_eq!(
                 validate_native_identity_detailed(&model_response(&prefill_model)?, false, policy),
@@ -1014,7 +956,7 @@ mod tests {
                 Err(NativeIdentityError::CpuPrefill)
             );
 
-            // 0.1.32+ preserves mixed-phase Hexagon decode alongside CPU tiled prefill
+            // Mixed-phase Hexagon decode remains supported alongside CPU tiled prefill
             // whenever CPU speculation is disabled, while "external" stays excluded.
             let mut hex_active = prefill_model.clone();
             hex_active["startup_projection"] = projection_startup("hexagon-native-q2");
@@ -1038,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_reuse_gdn_wy_f32_and_speculation_readiness_bind_all_0_1_32_fields()
+    fn branch_reuse_gdn_wy_f32_and_speculation_readiness_bind_all_fields()
     -> Result<(), serde_json::Error> {
         use crate::inference::{KvCache, PromptReuseMode};
         use serde_json::json;
@@ -1048,7 +990,7 @@ mod tests {
         let checkpoint_bytes = 1_073_741_824_usize;
 
         // Prompt-end-and-latest reuse with multi-branch checkpoints and chunkwise wy-f32 GDN prefill.
-        let (mut gdn_model, _) = kv_cache_model_for_version("0.1.35", false);
+        let (mut gdn_model, _) = kv_cache_model(false);
         gdn_model.as_object_mut().map(|o| o.remove("kv_cache"));
         let base_f16 = gdn_model["startup_graph_identity"]
             .as_str()
@@ -1069,10 +1011,11 @@ mod tests {
             prompt_reuse_checkpoints: 4,
             cpu_prefill: Some((16, prefill_scratch)),
             cpu_prefill_gdn_wy_f32: true,
-            ..WorkerReadiness::for_version("0.1.35", 8)
+            ..WorkerReadiness::new(8)
         };
         let mut gdn_eight = gdn_model.clone();
         gdn_eight["row_workers"] = json!(8);
+        gdn_eight["prefill_row_workers"] = json!(8);
         assert_eq!(
             validate_native_identity_detailed(&model_response(&gdn_eight)?, false, gdn_policy),
             Ok(())
@@ -1095,8 +1038,9 @@ mod tests {
         );
 
         // Speculative decoding with K4/V4 cache requires CPU projection and :cpu-tiled-verify-v1.
-        let (mut spec_model, base_rsq4) = kv_cache_model_for_version("0.1.35", false);
+        let (mut spec_model, base_rsq4) = kv_cache_model(false);
         spec_model["row_workers"] = json!(8);
+        spec_model["prefill_row_workers"] = json!(8);
         spec_model["startup_projection"] = projection_startup("cpu");
         spec_model["cpu_prefill_tokens"] = json!(16);
         spec_model["cpu_prefill_scratch_bytes"] = json!(prefill_scratch);
@@ -1111,7 +1055,7 @@ mod tests {
             kv_cache: Some(KvCache::Rsq4),
             cpu_prefill: Some((16, prefill_scratch)),
             cpu_speculation: Some((4, verify_scratch, checkpoint_bytes)),
-            ..WorkerReadiness::for_version("0.1.35", 8)
+            ..WorkerReadiness::new(8)
         };
         assert_eq!(
             validate_native_identity_detailed(&model_response(&spec_model)?, false, spec_policy),
@@ -1139,8 +1083,12 @@ mod tests {
         let variant = Bonsai25Variant::Pq2;
         let extension =
             workers.map_or_else(String::new, |workers| format!(",\"row_workers\":{workers}"));
+        let prefill_row_workers = workers
+            .and_then(|value| value.split(',').next())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("4");
         let body = format!(
-            "{{\"data\":[{{\"id\":\"{}\",\"object\":\"model\",\"model_sha256\":\"{}\",\"template_sha256\":\"{}\",\"runtime\":\"prism-inference\",\"weight_representation\":\"{}\",\"context_tokens\":8192,\"seed\":42{extension}}}]}}",
+            "{{\"data\":[{{\"id\":\"{}\",\"object\":\"model\",\"model_sha256\":\"{}\",\"template_sha256\":\"{}\",\"runtime\":\"prism-inference\",\"weight_representation\":\"{}\",\"context_tokens\":8192,\"seed\":42,\"prefill_row_workers\":{prefill_row_workers},\"startup_projection\":{{\"schema_version\":1,\"requested\":\"auto\",\"effective\":\"cpu\",\"identity\":null,\"resident_tensors\":0,\"resident_weight_bytes\":0,\"host_metadata_bytes\":0}}{extension}}}]}}",
             variant.model_id(),
             variant.sha256(),
             crate::inference::TEMPLATE_SHA256,
@@ -1154,45 +1102,22 @@ mod tests {
     }
 
     #[test]
-    fn worker_readiness_missing_field_is_limited_to_exact_legacy_pins() {
-        for (version, legacy) in [
-            ("0.1.8", true),
-            ("0.1.9", true),
-            ("0.1.10", true),
-            ("0.1.7", false),
-            ("0.1.11", false),
-            ("0.1.27", false),
-            ("0.1.10-dev", false),
-            ("v0.1.10", false),
-            ("0.1.10.0", false),
-            ("0.1.010", false),
-            ("1.0.0", false),
-            ("", false),
-        ] {
-            for expected in [1, 4] {
-                let policy = WorkerReadiness::for_version(version, expected);
-                assert_eq!(
-                    validate_native_identity(&response(None), false, policy).is_ok(),
-                    legacy,
-                    "{version}/{expected}"
-                );
-                assert!(
-                    validate_native_identity(
-                        &response(Some(&expected.to_string())),
-                        false,
-                        policy,
-                    )
+    fn worker_readiness_always_requires_matching_row_workers() {
+        for expected in [1, 4, 8, 12] {
+            let policy = WorkerReadiness::new(expected);
+            assert!(validate_native_identity(&response(None), false, policy).is_err());
+            assert!(
+                validate_native_identity(&response(Some(&expected.to_string())), false, policy,)
                     .is_ok()
-                );
-                let other = if expected == 1 { "4" } else { "1" };
-                assert!(validate_native_identity(&response(Some(other)), false, policy).is_err());
-            }
+            );
+            let other = if expected == 1 { "4" } else { "1" };
+            assert!(validate_native_identity(&response(Some(other)), false, policy).is_err());
         }
     }
 
     #[test]
     fn prompt_reuse_readiness_must_match_the_explicit_request_exactly() {
-        let reset = WorkerReadiness::for_version("0.1.27", 4);
+        let reset = WorkerReadiness::new(4);
         let latest = WorkerReadiness {
             prompt_reuse: crate::inference::PromptReuseMode::Latest,
             ..reset
@@ -1225,43 +1150,43 @@ mod tests {
     -> Result<(), serde_json::Error> {
         use serde_json::json;
 
-        for version in ["0.1.11", "0.1.27"] {
-            for ptq1 in [false, true] {
-                let variant = if ptq1 {
-                    Bonsai25Variant::Ptq1
-                } else {
-                    Bonsai25Variant::Pq2
-                };
-                for expected in [1, 4] {
-                    let model = json!({
-                        "id": variant.model_id(),
-                        "object": "model",
-                        "model_sha256": variant.sha256(),
-                        "template_sha256": crate::inference::TEMPLATE_SHA256,
-                        "runtime": "prism-inference", "context_tokens": 8192, "seed": 42,
-                        "weight_representation": variant.representation_name(),
-                    });
-                    for observed in [None, Some(1), Some(4)] {
-                        let mut candidate = model.clone();
-                        if let Some(workers) = observed {
-                            candidate["row_workers"] = json!(workers);
-                        }
-                        let body = serde_json::to_string(&json!({"data": [candidate]}))?;
-                        let framed = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                            body.len()
-                        );
-                        assert_eq!(
-                            validate_native_identity(
-                                framed.as_bytes(),
-                                ptq1,
-                                WorkerReadiness::for_version(version, expected)
-                            )
-                            .is_ok(),
-                            observed == Some(expected),
-                            "version={version}, ptq1={ptq1}, expected={expected}, observed={observed:?}"
-                        );
+        for ptq1 in [false, true] {
+            let variant = if ptq1 {
+                Bonsai25Variant::Ptq1
+            } else {
+                Bonsai25Variant::Pq2
+            };
+            for expected in [1, 4] {
+                let model = json!({
+                    "id": variant.model_id(),
+                    "object": "model",
+                    "model_sha256": variant.sha256(),
+                    "template_sha256": crate::inference::TEMPLATE_SHA256,
+                    "runtime": "prism-inference", "context_tokens": 8192, "seed": 42,
+                    "prefill_row_workers": expected,
+                    "startup_projection": projection_startup("cpu"),
+                    "weight_representation": variant.representation_name(),
+                });
+                for observed in [None, Some(1), Some(4)] {
+                    let mut candidate = model.clone();
+                    if let Some(workers) = observed {
+                        candidate["row_workers"] = json!(workers);
                     }
+                    let body = serde_json::to_string(&json!({"data": [candidate]}))?;
+                    let framed = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    assert_eq!(
+                        validate_native_identity(
+                            framed.as_bytes(),
+                            ptq1,
+                            WorkerReadiness::new(expected)
+                        )
+                        .is_ok(),
+                        observed == Some(expected),
+                        "ptq1={ptq1}, expected={expected}, observed={observed:?}"
+                    );
                 }
             }
         }
@@ -1270,33 +1195,31 @@ mod tests {
 
     #[test]
     fn worker_readiness_rejects_coercion_unbounded_counts_and_duplicate_fields() {
-        for version in ["0.1.10", "0.1.11", "0.1.27"] {
-            let policy = WorkerReadiness::for_version(version, 4);
-            for invalid in [
-                "null",
-                "\"4\"",
-                "0",
-                "2",
-                "16",
-                "17",
-                "-1",
-                "256",
-                "18446744073709551616",
-                "4.0",
-                "true",
-                "[]",
-                "{}",
-                "4,\"row_workers\":4",
-                "4,\"row_workers\":null",
-            ] {
-                assert!(
-                    validate_native_identity(&response(Some(invalid)), false, policy).is_err(),
-                    "{version}/{invalid}"
-                );
-            }
+        let policy = WorkerReadiness::new(4);
+        for invalid in [
+            "null",
+            "\"4\"",
+            "0",
+            "2",
+            "16",
+            "17",
+            "-1",
+            "256",
+            "18446744073709551616",
+            "4.0",
+            "true",
+            "[]",
+            "{}",
+            "4,\"row_workers\":4",
+            "4,\"row_workers\":null",
+        ] {
+            assert!(
+                validate_native_identity(&response(Some(invalid)), false, policy).is_err(),
+                "{invalid}"
+            );
         }
         for expected in [0, 2, 16, 255] {
-            let policy = WorkerReadiness::for_version("0.1.10", expected);
+            let policy = WorkerReadiness::new(expected);
             assert!(validate_native_identity(&response(None), false, policy).is_err());
             assert!(
                 validate_native_identity(&response(Some(&expected.to_string())), false, policy)
@@ -1304,11 +1227,11 @@ mod tests {
             );
         }
         for expected in [8, 12] {
-            let policy = WorkerReadiness::for_version("0.1.31", expected);
+            let policy = WorkerReadiness::new(expected);
             assert!(validate_native_identity(&response(None), false, policy).is_err());
             assert!(
                 validate_native_identity(&response(Some(&expected.to_string())), false, policy)
-                    .is_err()
+                    .is_ok()
             );
         }
     }
@@ -1321,10 +1244,11 @@ mod tests {
         for expected in [4_u8, 8, 12] {
             let (mut model, _) = kv_cache_model(false);
             model["row_workers"] = json!(expected);
+            model["prefill_row_workers"] = json!(expected);
             model["startup_projection"] = projection_startup("cpu");
             let policy = WorkerReadiness {
                 kv_cache: Some(KvCache::Rsq4),
-                ..WorkerReadiness::for_version("0.1.31", expected)
+                ..WorkerReadiness::new(expected)
             };
             assert!(validate_native_identity(&model_response(&model)?, false, policy).is_ok());
             for other in [1_u8, 4, 8, 12] {
@@ -1345,8 +1269,9 @@ mod tests {
         use crate::inference::{KvCache, Placement};
         use serde_json::json;
 
-        let (mut base, _) = kv_cache_model_for_version("0.1.35", false);
+        let (mut base, _) = kv_cache_model(false);
         base["row_workers"] = json!(8);
+        base["prefill_row_workers"] = json!(8);
 
         let mut vulkan_model = base.clone();
         vulkan_model["placement"] = json!("vulkan");
@@ -1363,7 +1288,7 @@ mod tests {
         let vulkan_policy = WorkerReadiness {
             kv_cache: Some(KvCache::Rsq4),
             placement: Placement::Vulkan,
-            ..WorkerReadiness::for_version("0.1.35", 8)
+            ..WorkerReadiness::new(8)
         };
         let vulkan_wire = model_response(&vulkan_model).map_err(|e| e.to_string())?;
         assert_eq!(
@@ -1406,7 +1331,7 @@ mod tests {
         let composite_policy = WorkerReadiness {
             kv_cache: Some(KvCache::Rsq4),
             placement: Placement::Composite,
-            ..WorkerReadiness::for_version("0.1.35", 8)
+            ..WorkerReadiness::new(8)
         };
         let composite_wire = model_response(&composite_model).map_err(|e| e.to_string())?;
         assert_eq!(
@@ -1468,7 +1393,12 @@ mod context_tests {
             "model_sha256":variant.sha256(),
             "template_sha256":crate::inference::TEMPLATE_SHA256,
             "runtime":"prism-inference", "weight_representation":variant.representation_name(),
-            "context_tokens":16384, "seed":42, "row_workers":1
+            "context_tokens":16384, "seed":42, "row_workers":1, "prefill_row_workers":1,
+            "startup_projection": {
+                "schema_version": 1, "requested": "auto", "effective": "cpu",
+                "identity": null, "resident_tensors": 0,
+                "resident_weight_bytes": 0, "host_metadata_bytes": 0,
+            }
         }]})
         .to_string();
         let wire = format!(
@@ -1477,11 +1407,11 @@ mod context_tests {
         );
         let selected = WorkerReadiness {
             context_tokens: 16384,
-            ..WorkerReadiness::for_version("0.1.27", 1)
+            ..WorkerReadiness::new(1)
         };
         assert!(validate_native_identity(wire.as_bytes(), false, selected).is_ok());
-        let legacy = WorkerReadiness::for_version("0.1.27", 1);
-        assert!(validate_native_identity(wire.as_bytes(), false, legacy).is_err());
+        let default_ctx = WorkerReadiness::new(1);
+        assert!(validate_native_identity(wire.as_bytes(), false, default_ctx).is_err());
     }
 
     #[test]
@@ -1500,7 +1430,12 @@ mod context_tests {
             "template_sha256": crate::inference::TEMPLATE_SHA256,
             "runtime": "prism-inference",
             "weight_representation": variant.representation_name(),
-            "context_tokens": 8192, "seed": 42, "row_workers": 1,
+            "context_tokens": 8192, "seed": 42, "row_workers": 1, "prefill_row_workers": 1,
+            "startup_projection": {
+                "schema_version": 1, "requested": "auto", "effective": "cpu",
+                "identity": null, "resident_tensors": 0,
+                "resident_weight_bytes": 0, "host_metadata_bytes": 0,
+            }
         });
         let mut with_vision = base_model.clone();
         with_vision["vision"] = serde_json::json!(true);
@@ -1510,9 +1445,9 @@ mod context_tests {
             .map_err(|err| format!("{err:?}"))?;
         let expect_vision = WorkerReadiness {
             vision: true,
-            ..WorkerReadiness::for_version("0.1.27", 1)
+            ..WorkerReadiness::new(1)
         };
-        let expect_text = WorkerReadiness::for_version("0.1.27", 1);
+        let expect_text = WorkerReadiness::new(1);
         assert!(validate_native_identity(&vision_wire, false, expect_vision).is_ok());
         assert!(validate_native_identity(&vision_wire, false, expect_text).is_err());
 
@@ -1531,45 +1466,14 @@ mod context_tests {
     }
 
     #[test]
-    fn pinned_release_version_enforces_all_current_readiness_and_start_chat_combinations()
+    fn bundled_readiness_enforces_all_current_readiness_and_start_chat_combinations()
     -> Result<(), String> {
         use super::NativeIdentityError;
         use crate::inference::{KvCache, Placement};
         use serde_json::json;
 
-        for (version, legacy_workers, proj_required, prefill_required) in [
-            ("0.1.8", true, false, false),
-            ("0.1.10", true, false, false),
-            ("0.1.11", false, false, false),
-            ("0.1.27", false, false, false),
-            ("0.1.28", false, true, false),
-            ("0.1.29", false, true, false),
-            ("0.1.30", false, true, false),
-            ("0.1.31", false, true, false),
-            ("0.1.32", false, true, false),
-            ("0.1.34", false, true, false),
-            ("0.1.35", false, true, false),
-            ("0.1.38", false, true, true),
-            ("0.1.39", false, true, true),
-            ("1.0.0", false, false, false),
-            ("0.1.031", false, false, false),
-            ("0.1.31-dev", false, false, false),
-        ] {
-            let w = WorkerReadiness::for_version(version, 4);
-            assert_eq!(w.allows_missing_row_workers(), legacy_workers, "{version}");
-            assert_eq!(w.requires_projection_startup(), proj_required, "{version}");
-            assert_eq!(
-                w.expected_prefill_row_workers(),
-                prefill_required.then_some(4),
-                "{version}"
-            );
-        }
-
-        let pinned = crate::inference::pinned_version().map_err(|err| format!("{err:?}"))?;
-        let base_policy = WorkerReadiness::for_version(&pinned, 4);
-        assert!(!base_policy.allows_missing_row_workers());
-        assert!(base_policy.requires_projection_startup());
-        assert_eq!(base_policy.expected_prefill_row_workers(), Some(4));
+        let base_policy = WorkerReadiness::new(4);
+        assert_eq!(base_policy.prefill_row_workers, 4);
 
         let build_payload = |variant: Bonsai25Variant,
                              vision: bool,
@@ -1697,7 +1601,7 @@ mod context_tests {
                                                 crate::inference::PromptReuseMode::Disabled
                                             },
                                             context_tokens,
-                                            ..WorkerReadiness::for_version(&pinned, row_workers)
+                                            ..WorkerReadiness::new(row_workers)
                                         };
                                         let bytes = wire(&model)?;
                                         assert_eq!(
@@ -1722,7 +1626,7 @@ mod context_tests {
             vision: true,
             kv_cache: Some(KvCache::Rsq4),
             context_tokens: 32_768,
-            ..WorkerReadiness::for_version(&pinned, 4)
+            ..WorkerReadiness::new(4)
         };
         let default_model = build_payload(
             default_variant,
@@ -1918,11 +1822,11 @@ mod context_tests {
             split_model["prefill_row_workers"] = json!(prefill_workers);
             let split_wire = wire(&split_model)?;
             let split_policy = WorkerReadiness {
-                prefill_row_workers: Some(prefill_workers),
+                prefill_row_workers: prefill_workers,
                 vision: true,
                 kv_cache: Some(KvCache::Rsq4),
                 context_tokens: 32_768,
-                ..WorkerReadiness::for_version(&pinned, 8)
+                ..WorkerReadiness::new(8)
             };
             assert!(super::native_supports_cognitive_controls(&split_wire));
             assert_eq!(
@@ -1939,7 +1843,7 @@ mod context_tests {
         assert_mutated_err(
             &wrong_prefill_workers,
             WorkerReadiness {
-                prefill_row_workers: Some(16),
+                prefill_row_workers: 16,
                 ..default_policy
             },
             NativeIdentityError::RowWorkers,
@@ -1951,16 +1855,6 @@ mod context_tests {
         assert_mutated_err(
             &missing_prefill_workers,
             default_policy,
-            NativeIdentityError::RowWorkers,
-        )?;
-        assert_mutated_err(
-            &cognitive_on,
-            WorkerReadiness {
-                vision: true,
-                kv_cache: Some(KvCache::Rsq4),
-                context_tokens: 32_768,
-                ..WorkerReadiness::for_version("0.1.35", 4)
-            },
             NativeIdentityError::RowWorkers,
         )?;
         let mut null_prefill_workers = cognitive_on;
@@ -1979,7 +1873,6 @@ mod context_tests {
         use super::NativeIdentityError;
         use serde_json::json;
         let variant = bonsai_cpu_policy::NariqVariant::Bpw2_5;
-        let pinned = crate::inference::pinned_version().map_err(|e| format!("{e:?}"))?;
         let daisy_sha = "cd".repeat(32);
         let daisy_exec_sha = "ab".repeat(32);
         let graph = format!(
@@ -2019,7 +1912,7 @@ mod context_tests {
             kv_cache: Some(crate::inference::KvCache::Rsq4),
             context_tokens: 32_768,
             daisyrose: Some((daisy_sha.as_str(), 16)),
-            ..WorkerReadiness::for_version(&pinned, 4)
+            ..WorkerReadiness::new(4)
         };
         let repr = super::super::WeightRepresentation::NariQ(variant);
         assert_eq!(
@@ -2064,7 +1957,6 @@ mod context_tests {
     -> Result<(), String> {
         use super::NativeIdentityError;
         use serde_json::json;
-        let pinned = crate::inference::pinned_version().map_err(|e| format!("{e:?}"))?;
         let daisy_sha = "cd".repeat(32);
         let daisy_exec_sha = "ab".repeat(32);
 
@@ -2111,7 +2003,7 @@ mod context_tests {
                 context_tokens: 32_768,
                 vision: true,
                 daisyrose: Some((daisy_sha.as_str(), 16)),
-                ..WorkerReadiness::for_version(&pinned, 4)
+                ..WorkerReadiness::new(4)
             };
             assert_eq!(
                 super::validate_native_identity_for_representation(&wire, repr, policy),
@@ -2138,7 +2030,6 @@ mod context_tests {
         use serde_json::json;
 
         let variant = Bonsai25Variant::Pq2;
-        let pinned = crate::inference::pinned_version().map_err(|e| format!("{e:?}"))?;
         let daisy_sha = "ef".repeat(32);
         let daisy_exec_sha = "12".repeat(32);
         let graph = format!(
@@ -2205,7 +2096,7 @@ mod context_tests {
                 cpu_speculation: Some((6, 1, 1)),
                 placement,
                 daisyrose: Some((daisy_sha.as_str(), 16)),
-                ..WorkerReadiness::for_version(&pinned, 4)
+                ..WorkerReadiness::new(4)
             };
             assert_eq!(
                 super::validate_native_identity_for_representation(

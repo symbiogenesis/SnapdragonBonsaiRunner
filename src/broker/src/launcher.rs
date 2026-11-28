@@ -54,23 +54,23 @@ pub const LAUNCH_USAGE: &str = concat!(
     "  [--profile <reference-cpu|swift-pq2-assessment>]\n",
     "  [--native-engine|--publisher-engine] (Swift defaults to the pinned Rust runtime; publisher is explicit rollback)\n",
     "  [--native-row-workers 1|4|8|12] (Rust defaults to 8 on Snapdragon X1/X2 or 4 otherwise; publisher supports only 1)\n",
-    "  [--prompt-reuse disabled|latest|prompt-end-and-latest] (reviewed native runtime only)\n",
-    "  [--prompt-reuse-checkpoints 1..=8] [--prompt-reuse-checkpoint-bytes <bytes>] (reviewed native runtime only; requires --prompt-reuse)\n",
-    "  [--kv-cache f16|rsq4|rsq4kvf|rsq4k3v] (reviewed native runtime only; rsq4 default when supported, f16 explicit recovery)\n",
-    "  [--cpu-prefill-tokens 8|16|32|64] (reviewed native runtime only; enables layer-major CPU FFN tile prefill)\n",
-    "  [--cpu-prefill-gdn sequential|wy-f32] (reviewed native runtime only; requires --cpu-prefill-tokens; wy-f32 excludes suffix speculation)\n",
-    "  [--spec-type none|suffix] [--draft-max 1..=8] (reviewed native runtime only; suffix requires --cpu-prefill-tokens and suppresses mmproj)\n",
-    "  [--cpu-family x1|x2] (reviewed native runtime only; overrides detected Snapdragon X1/X2 family)\n",
-    "  [--placement auto|cpu|vulkan|composite] (native Swift only; cpu/vulkan/composite require a reviewed compatible release)\n",
-    "  [--hexagon-arena-cache <abs-dir>] (reviewed native runtime only; requires --allow-unisolated-backend and excludes --placement cpu)\n",
-    "  [--reset-on-cancel] (reviewed native runtime only; reset live state in place on client cancel)\n",
+    "  [--prompt-reuse disabled|latest|prompt-end-and-latest] (native Swift only)\n",
+    "  [--prompt-reuse-checkpoints 1..=8] [--prompt-reuse-checkpoint-bytes <bytes>] (native Swift only; requires --prompt-reuse)\n",
+    "  [--kv-cache f16|rsq4|rsq4kvf|rsq4k3v] (native Swift only; rsq4 default, f16 explicit recovery)\n",
+    "  [--cpu-prefill-tokens 8|16|32|64] (native Swift only; enables layer-major CPU FFN tile prefill)\n",
+    "  [--cpu-prefill-gdn sequential|wy-f32] (native Swift only; requires --cpu-prefill-tokens; wy-f32 excludes suffix speculation)\n",
+    "  [--spec-type none|suffix] [--draft-max 1..=8] (native Swift only; suffix requires --cpu-prefill-tokens and suppresses mmproj)\n",
+    "  [--cpu-family x1|x2] (native Swift only; overrides detected Snapdragon X1/X2 family)\n",
+    "  [--placement auto|cpu|vulkan|composite] (native Swift only)\n",
+    "  [--hexagon-arena-cache <abs-dir>] (native Swift only; requires --allow-unisolated-backend and excludes --placement cpu)\n",
+    "  [--reset-on-cancel] (native Swift only; reset live state in place on client cancel)\n",
     "  [--no-mmproj] (disable multimodal vision projector; Swift only)\n",
     "  [--daisyrose-lora <absolute-gguf>] (stackable multi-rank NpuFriendly LoRA; native Swift only; request scale 0..2, default 0.0 unless promoted lock)\n",
     "  [--no-daisyrose-lora] (disable any default-enabled DaisyRose adapter; native Swift only)\n",
     "  [--nariq 2.5bpw|3.0bpw|2.0bpw|--bonsai-2-5 pq2|ptq1] (mutually exclusive weight selections; native Swift only)\n",
     "  [--max-waiting <0..8>] [--check-only]\n",
     "Default: reference-cpu. Only compiled model/runtime pins and fixed CPU policies are accepted.\n",
-    "Swift defaults to Rust with eight workers on Snapdragon X1/X2 (four otherwise), Bonsai 2.5 PQ2 weights (with local-verified DaisyRose attached when present), and --bonsai-2-5 ptq1 or --nariq as explicit native selections; --publisher-engine rollback defaults to original PQ2. --require-broker-pipe omits --backend-port and requires a reviewed offline native release. Full daily-use qualification remains pending.\n",
+    "Swift defaults to Rust with eight workers on Snapdragon X1/X2 (four otherwise), Bonsai 2.5 PQ2 weights (with local-verified DaisyRose attached when present), and --bonsai-2-5 ptq1 or --nariq as explicit native selections; --publisher-engine rollback defaults to original PQ2. --require-broker-pipe omits --backend-port. Full daily-use qualification remains pending.\n",
     "Creates fresh protected credentials; prints paths, never key values.\n",
 );
 
@@ -447,7 +447,7 @@ impl LaunchConfig {
             1
         });
         let prompt_reuse = prompt_reuse.unwrap_or_default();
-        let kv_cache = crate::inference::pinned_kv_cache(native_engine, kv_cache)?;
+        let kv_cache = crate::inference::select_kv_cache(native_engine, kv_cache)?;
         if (cpu_prefill_tokens.is_some()
             || prefill_row_workers.is_some()
             || cpu_prefill_gdn.is_some()
@@ -461,14 +461,14 @@ impl LaunchConfig {
             return Err(LaunchError::Arguments);
         }
         let cpu_prefill_tokens =
-            crate::inference::pinned_cpu_prefill_tokens(native_engine, cpu_prefill_tokens)?;
-        let prefill_row_workers = crate::inference::pinned_prefill_row_workers(
+            crate::inference::select_cpu_prefill_tokens(native_engine, cpu_prefill_tokens)?;
+        let prefill_row_workers = crate::inference::select_prefill_row_workers(
             native_engine,
             prefill_row_workers,
             family,
             cpu_family,
         )?;
-        let placement = crate::inference::pinned_placement(native_engine, placement)?;
+        let placement = crate::inference::select_placement(native_engine, placement)?;
         let mut configuration = Self {
             data: data.ok_or(LaunchError::Arguments)?,
             evidence_parent: evidence_parent.ok_or(LaunchError::Arguments)?,
@@ -513,65 +513,12 @@ impl LaunchConfig {
             && configuration.profile == LaunchProfile::SwiftPq2Assessment
             && configuration.native_engine
         {
-            let resolved = configuration.resolve_default_bonsai25_variant(memory)?;
+            let resolved = configuration.resolve_default_bonsai25_variant(memory);
             configuration.weight_representation = WeightRepresentation::Bonsai25(resolved);
         }
         if let Some(cache_dir) = &configuration.hexagon_arena_cache {
             validate_hexagon_arena_cache_dir(cache_dir)?;
         }
-        let gates: [(bool, fn() -> Result<bool, LaunchError>); 10] = [
-            (
-                configuration.reset_on_cancel,
-                crate::inference::reset_on_cancel_supported,
-            ),
-            (
-                configuration.require_broker_pipe,
-                crate::inference::broker_pipe_supported,
-            ),
-            (
-                configuration.prompt_reuse == crate::inference::PromptReuseMode::PromptEndAndLatest
-                    || configuration.prompt_reuse_checkpoints.is_some()
-                    || configuration.prompt_reuse_checkpoint_bytes.is_some(),
-                crate::inference::branch_prompt_reuse_supported,
-            ),
-            (
-                configuration.cpu_prefill_gdn.is_some(),
-                crate::inference::cpu_prefill_gdn_supported,
-            ),
-            (
-                configuration.spec_type.is_some(),
-                crate::inference::cpu_speculation_supported,
-            ),
-            (
-                configuration.cpu_family.is_some(),
-                crate::inference::broker_pipe_supported,
-            ),
-            (
-                configuration.daisyrose_lora.is_some(),
-                crate::inference::multi_rank_lora_supported,
-            ),
-            (
-                configuration.hexagon_arena_cache.is_some(),
-                crate::inference::hexagon_arena_cache_supported,
-            ),
-            (
-                configuration.nariq_variant().is_some(),
-                crate::inference::nariq_trellis_supported,
-            ),
-            (
-                configuration.bonsai25_variant().is_some(),
-                crate::inference::bonsai_2_5_supported,
-            ),
-        ];
-        for (enabled, supported) in gates {
-            if enabled && !supported()? {
-                return Err(LaunchError::NativeRuntime);
-            }
-        }
-        crate::inference::pinned_wy_f32_kv_cache(
-            configuration.cpu_prefill_gdn,
-            configuration.kv_cache,
-        )?;
         Ok(configuration)
     }
 
@@ -697,63 +644,35 @@ impl LaunchConfig {
 
     /// Whether the selected configuration uses offline broker-pipe containment.
     #[must_use]
-    pub fn uses_broker_pipe_transport(&self) -> bool {
-        self.uses_broker_pipe().unwrap_or(false)
+    pub const fn uses_broker_pipe_transport(&self) -> bool {
+        self.requires_native_sandbox() && self.native_engine
     }
 
-    fn uses_broker_pipe(&self) -> Result<bool, LaunchError> {
-        if !self.requires_native_sandbox() || !self.native_engine {
-            return if self.require_broker_pipe {
-                Err(LaunchError::Arguments)
-            } else {
-                Ok(false)
-            };
-        }
-        let supported = crate::inference::broker_pipe_supported()?;
-        if self.require_broker_pipe && !supported {
-            return Err(LaunchError::NativeRuntime);
-        }
-        Ok(supported)
+    /// Whether the selected runtime has the memory-context protocol.
+    #[must_use]
+    pub const fn memory_context_supported(&self) -> bool {
+        matches!(self.profile, LaunchProfile::SwiftPq2Assessment)
     }
 
-    /// Whether the selected runtime has the reviewed memory-context protocol.
-    /// Publisher Swift supports an explicit context; native releases require
-    /// exact source and release-byte review before enabling the paired flags.
-    ///
-    /// # Errors
-    /// Returns a failure if the compiled native release identity cannot be verified.
-    pub fn memory_context_supported(&self) -> Result<bool, LaunchError> {
-        Ok(self.profile == LaunchProfile::SwiftPq2Assessment
-            && (!self.native_engine || crate::inference::memory_context_supported()?))
-    }
-
-    fn runtime_supports_vision(&self) -> Result<bool, LaunchError> {
-        Ok(self.memory_context_supported()?
+    const fn runtime_supports_vision(&self) -> bool {
+        self.memory_context_supported()
             && !self.no_mmproj
             && self.nariq_variant().is_none()
             && self.effective_speculation_tokens().is_none()
-            && (!self.native_engine || crate::inference::vision_supported()?))
     }
 
-    fn swift_context_profile(
-        &self,
-    ) -> Result<bonsai_cpu_policy::context::SwiftContextProfile, LaunchError> {
+    const fn swift_context_profile(&self) -> bonsai_cpu_policy::context::SwiftContextProfile {
         use bonsai_cpu_policy::context::SwiftContextProfile;
         if self.native_engine {
             match self.kv_cache {
-                Some(crate::inference::KvCache::Rsq4 | crate::inference::KvCache::Rsq4Kvf)
-                    if crate::inference::full_context_supported()? =>
-                {
-                    Ok(SwiftContextProfile::NativeRsq4Full)
-                }
                 Some(crate::inference::KvCache::Rsq4 | crate::inference::KvCache::Rsq4Kvf) => {
-                    Ok(SwiftContextProfile::NativeRsq4)
+                    SwiftContextProfile::NativeRsq4Full
                 }
-                Some(crate::inference::KvCache::Rsq4K3v) => Ok(SwiftContextProfile::NativeRsq4K3v),
-                Some(crate::inference::KvCache::F16) | None => Ok(SwiftContextProfile::NativeF16),
+                Some(crate::inference::KvCache::Rsq4K3v) => SwiftContextProfile::NativeRsq4K3v,
+                Some(crate::inference::KvCache::F16) | None => SwiftContextProfile::NativeF16,
             }
         } else {
-            Ok(SwiftContextProfile::PublisherF16)
+            SwiftContextProfile::PublisherF16
         }
     }
 
@@ -803,21 +722,14 @@ impl LaunchConfig {
     fn resolve_default_bonsai25_variant(
         &self,
         memory: Option<bonsai_cpu_policy::Bonsai25MemorySnapshot>,
-    ) -> Result<bonsai_cpu_policy::Bonsai25Variant, LaunchError> {
+    ) -> bonsai_cpu_policy::Bonsai25Variant {
         let cached = cached_bonsai25_variants(&self.data);
-        let profile = self.swift_context_profile()?;
+        let profile = self.swift_context_profile();
         let options = self.swift_calibrated_options(
             bonsai_cpu_policy::context::SwiftWeightPacking::Bonsai25Pq2,
             !self.no_mmproj,
         );
-        let allow_tile_64 = crate::inference::prefill_tile_64_supported()?;
-        Ok(bonsai_cpu_policy::select_default_bonsai25_variant(
-            memory,
-            cached,
-            profile,
-            options,
-            allow_tile_64,
-        ))
+        bonsai_cpu_policy::select_default_bonsai25_variant(memory, cached, profile, options)
     }
 
     fn calibrated_context_plan_with_daisyrose(
@@ -832,12 +744,11 @@ impl LaunchConfig {
             WeightRepresentation::NariQ(variant) => SwiftWeightPacking::from_nariq(variant),
             WeightRepresentation::Bonsai25(variant) => SwiftWeightPacking::from_bonsai25(variant),
         };
-        SwiftContextPlan::for_calibrated_execution_with_adapter_reserve_and_tile_64(
+        SwiftContextPlan::for_calibrated_execution_with_adapter_reserve(
             available_bytes,
-            self.swift_context_profile()?,
+            self.swift_context_profile(),
             self.swift_calibrated_options(weight_packing, request_vision),
             daisyrose_reserve_bytes,
-            crate::inference::prefill_tile_64_supported()?,
         )
         .map_err(|_| LaunchError::Memory)
     }
@@ -887,7 +798,7 @@ impl LaunchConfig {
         let (mut plan, vision_admitted, prefill_scratch) =
             bonsai_cpu_policy::context::SwiftContextPlan::for_profile_with_options(
                 budget,
-                self.swift_context_profile()?,
+                self.swift_context_profile(),
                 request_vision,
                 self.cpu_prefill_tokens.map(usize::from),
             )
@@ -946,9 +857,7 @@ impl LaunchConfig {
         available_bytes: u64,
         daisyrose_reserve_bytes: u64,
     ) -> Result<bonsai_cpu_policy::context::SwiftContextPlan, LaunchError> {
-        if self.native_engine
-            && crate::inference::calibrated_cow_admission_supported().unwrap_or(false)
-        {
+        if self.native_engine {
             return Ok(self
                 .calibrated_context_plan_with_daisyrose(
                     available_bytes,
@@ -957,23 +866,13 @@ impl LaunchConfig {
                 )?
                 .context_plan);
         }
-        if self.nariq_variant().is_some()
-            || self.bonsai25_variant().is_some()
-            || self.effective_speculation_tokens().is_some()
-            || self.cpu_prefill_gdn.is_some()
-            || self.prompt_reuse == crate::inference::PromptReuseMode::PromptEndAndLatest
-            || self.prompt_reuse_checkpoints.is_some()
-            || self.prompt_reuse_checkpoint_bytes.is_some()
-        {
-            return Err(LaunchError::NativeRuntime);
-        }
         Ok(self
             .profile_context_plan_with_reserve(available_bytes, false, daisyrose_reserve_bytes)?
             .0)
     }
 
     fn initial_memory_admission(&self, plan: &LaunchPlan) -> Result<(), LaunchError> {
-        if self.memory_context_supported()? {
+        if self.memory_context_supported() {
             self.swift_context_plan_with_daisyrose(
                 available_memory_bytes().map_err(|_| LaunchError::Memory)?,
                 0,
@@ -1005,7 +904,7 @@ impl LaunchConfig {
             .map_or(0, VerifiedDaisyRose::reserve_bytes);
         let daisyrose_sheddable = guards.daisyrose.as_ref().is_some_and(|d| d.sheddable);
         let available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
-        let memory_admitted = if self.memory_context_supported()? {
+        let memory_admitted = if self.memory_context_supported() {
             Self::with_sheddable_reserve(daisyrose_reserve, daisyrose_sheddable, |reserve| {
                 self.swift_context_plan_with_daisyrose(available, reserve)
             })
@@ -1023,7 +922,7 @@ impl LaunchConfig {
     }
 
     fn check_sandbox_support(&self) -> Result<(), LaunchError> {
-        if self.uses_broker_pipe()? {
+        if self.uses_broker_pipe_transport() {
             native_sandbox_offline_available()
                 .map_err(|error| Self::sandbox_support_error(error.kind()))?;
         } else if self.requires_native_sandbox() {
@@ -1034,7 +933,7 @@ impl LaunchConfig {
     }
 
     fn check_launch_environment(&self) -> Result<(), LaunchError> {
-        if self.requires_native_sandbox() && !self.uses_broker_pipe()? {
+        if self.requires_native_sandbox() && !self.uses_broker_pipe_transport() {
             // Real launch admits the complete V1 loopback policy without a throwaway PSEC.
             validate_sandbox_environment()
                 .map_err(|error| Self::sandbox_support_error(error.kind()))?;
@@ -1084,49 +983,39 @@ impl LaunchConfig {
             base_sha256,
         )
         .map_err(|_| LaunchError::Policy)?;
-        let multi_rank_supported = crate::inference::multi_rank_lora_supported()?;
-        self.resolve_daisyrose_selection_with(pinned, multi_rank_supported)
+        Ok(self.resolve_daisyrose_selection_with(pinned))
     }
 
     fn resolve_daisyrose_selection_with(
         &self,
         pinned: Option<bonsai_cpu_policy::DaisyRoseLoraArtifact>,
-        multi_rank_supported: bool,
-    ) -> Result<Option<DaisyRoseSelection>, LaunchError> {
+    ) -> Option<DaisyRoseSelection> {
         if self.no_daisyrose_lora
             || !self.native_engine
             || self.profile != LaunchProfile::SwiftPq2Assessment
         {
-            return Ok(None);
+            return None;
         }
         // Only auto-attach a compiled lock when its baseModelSha256 matches the active weights.
-        let Some(expected_base_sha256) = self.active_base_sha256() else {
-            return Ok(None);
-        };
+        let expected_base_sha256 = self.active_base_sha256()?;
         let pinned = pinned.filter(|artifact| artifact.base_model_sha256 == expected_base_sha256);
         if let Some(explicit) = &self.daisyrose_lora {
-            if !multi_rank_supported {
-                return Err(LaunchError::NativeRuntime);
-            }
             if let Some(artifact) = pinned.filter(|artifact| {
                 artifact.default_enabled && paths_match(explicit, &artifact.path)
             }) {
-                return Ok(Some(DaisyRoseSelection::Promoted {
+                return Some(DaisyRoseSelection::Promoted {
                     artifact: Box::new(artifact),
                     explicitly_passed: true,
-                }));
+                });
             }
-            return Ok(Some(DaisyRoseSelection::Explicit(explicit.clone())));
+            return Some(DaisyRoseSelection::Explicit(explicit.clone()));
         }
-        if !multi_rank_supported {
-            return Ok(None);
-        }
-        Ok(pinned
+        pinned
             .filter(|artifact| artifact.default_enabled)
             .map(|artifact| DaisyRoseSelection::Promoted {
                 artifact: Box::new(artifact),
                 explicitly_passed: false,
-            }))
+            })
     }
 
     fn verify_daisyrose_selection(
@@ -1204,7 +1093,7 @@ impl LaunchConfig {
         )>,
         LaunchError,
     > {
-        if !self.runtime_supports_vision()? {
+        if !self.runtime_supports_vision() {
             return Ok(None);
         }
         let artifact = bonsai_cpu_policy::swift_mmproj_artifact(&self.data)
@@ -1278,7 +1167,7 @@ impl LaunchConfig {
         &self,
         plan: &LaunchPlan,
     ) -> Result<VerifiedLaunchGuards, LaunchError> {
-        let verify_vision = self.runtime_supports_vision()?;
+        let verify_vision = self.runtime_supports_vision();
         let daisyrose_selection = self.resolve_daisyrose_selection()?;
         let total_workers = crate::artifacts::default_chunk_workers();
         let exe_workers = usize::from(self.native_engine);
@@ -1346,13 +1235,9 @@ impl LaunchConfig {
         &self,
     ) -> Result<Option<(PathBuf, bonsai_artifacts::VerifiedFile)>, LaunchError> {
         if self.native_engine {
-            crate::inference::verify(
-                &self.data,
-                self.native_row_workers,
-                self.prompt_reuse.enabled(),
-            )
-            .map(Some)
-            .map_err(|_| LaunchError::NativeRuntime)
+            crate::inference::verify(&self.data, self.native_row_workers)
+                .map(Some)
+                .map_err(|_| LaunchError::NativeRuntime)
         } else {
             Ok(None)
         }
@@ -1384,17 +1269,13 @@ impl LaunchConfig {
             push_num(&mut arguments, "--verified-sections", verified_sections);
         }
         push_arg(&mut arguments, "--seed", "42");
-        if crate::inference::memory_context_supported().unwrap_or(false) {
-            push_num(&mut arguments, "--context-tokens", plan.context_tokens);
-            push_num(
-                &mut arguments,
-                "--memory-limit-bytes",
-                plan.native_child_memory_limit_bytes(),
-            );
-            if crate::inference::calibrated_cow_admission_supported().unwrap_or(false) {
-                push_arg(&mut arguments, "--admission-policy", "calibrated-cow");
-            }
-        }
+        push_num(&mut arguments, "--context-tokens", plan.context_tokens);
+        push_num(
+            &mut arguments,
+            "--memory-limit-bytes",
+            plan.native_child_memory_limit_bytes(),
+        );
+        push_arg(&mut arguments, "--admission-policy", "calibrated-cow");
         if self.native_row_workers > 1 {
             push_num(&mut arguments, "--row-workers", self.native_row_workers);
         }
@@ -1673,7 +1554,7 @@ impl LaunchConfig {
         if self.check_only {
             return Err(LaunchError::Arguments);
         }
-        let broker_pipe = self.uses_broker_pipe()?;
+        let broker_pipe = self.uses_broker_pipe_transport();
         self.check_launch_environment()?;
         self.validate_paths()?;
         // Resolve policy before creating secrets or loading any native code.
@@ -1719,7 +1600,7 @@ impl LaunchConfig {
             MAX_WORKER_PRIVATE_STORAGE_BYTES,
             MAX_WORKER_PRIVATE_STORAGE_ENTRIES,
         ));
-        let memory_context_supported = self.memory_context_supported()?;
+        let memory_context_supported = self.memory_context_supported();
         let max_attempts = if memory_context_supported {
             MAX_MEMORY_STARTUP_ATTEMPTS
         } else {
@@ -1747,8 +1628,6 @@ impl LaunchConfig {
                 preflight_frontend_port(self.frontend_port)?;
             }
             let mut active_mmproj = mmproj_artifact.clone();
-            let calibrated_admission = self.native_engine
-                && crate::inference::calibrated_cow_admission_supported().unwrap_or(false);
             fn try_with_retry_margin<T>(
                 attempt: usize,
                 raw_available: u64,
@@ -1765,7 +1644,7 @@ impl LaunchConfig {
             }
             let daisyrose_admitted = if memory_context_supported {
                 let raw_available = available_memory_bytes().map_err(|_| LaunchError::Memory)?;
-                if calibrated_admission {
+                if self.native_engine {
                     let (calibrated, admitted) =
                         try_with_retry_margin(attempt, raw_available, |budget| {
                             self.resolve_calibrated_daisyrose_admission(
@@ -1789,17 +1668,6 @@ impl LaunchConfig {
                         .map(|(tokens, (verify, checkpoint))| (tokens, verify, checkpoint));
                     daisyrose.is_some() && admitted
                 } else {
-                    if self.nariq_variant().is_some()
-                        || self.bonsai25_variant().is_some()
-                        || self.effective_speculation_tokens().is_some()
-                        || self.cpu_prefill_gdn.is_some()
-                        || self.prompt_reuse
-                            == crate::inference::PromptReuseMode::PromptEndAndLatest
-                        || self.prompt_reuse_checkpoints.is_some()
-                        || self.prompt_reuse_checkpoint_bytes.is_some()
-                    {
-                        return Err(LaunchError::NativeRuntime);
-                    }
                     let (context, vision_admitted, prefill_scratch, admitted) =
                         try_with_retry_margin(attempt, raw_available, |budget| {
                             self.resolve_profile_daisyrose_admission(
@@ -2056,31 +1924,27 @@ impl LaunchConfig {
         cpu_prefill: Option<(u8, usize)>,
         cpu_speculation: Option<(u8, usize, usize)>,
     ) -> Result<(), LaunchError> {
-        let verification = crate::inference::pinned_version()
-            .map_err(|_| NativeIdentityError::ReleasePin)
-            .and_then(|version| {
-                let base = WorkerReadiness::for_version(&version, self.native_row_workers);
-                identity::validate_native_identity_for_representation(
-                    models,
-                    self.weight_representation,
-                    WorkerReadiness {
-                        prefill_row_workers: self.prefill_row_workers.or(base.prefill_row_workers),
-                        prompt_reuse: self.prompt_reuse,
-                        prompt_reuse_checkpoints: self.prompt_reuse_checkpoints.unwrap_or(1),
-                        vision: vision_enabled,
-                        daisyrose,
-                        kv_cache: self.kv_cache,
-                        cpu_prefill,
-                        cpu_prefill_gdn_wy_f32: self
-                            .cpu_prefill_gdn
-                            .is_some_and(crate::inference::CpuPrefillGdn::is_wy_f32),
-                        cpu_speculation,
-                        placement: self.placement,
-                        context_tokens,
-                        ..base
-                    },
-                )
-            });
+        let base = WorkerReadiness::new(self.native_row_workers);
+        let verification = identity::validate_native_identity_for_representation(
+            models,
+            self.weight_representation,
+            WorkerReadiness {
+                prefill_row_workers: self.prefill_row_workers.unwrap_or(base.prefill_row_workers),
+                prompt_reuse: self.prompt_reuse,
+                prompt_reuse_checkpoints: self.prompt_reuse_checkpoints.unwrap_or(1),
+                vision: vision_enabled,
+                daisyrose,
+                kv_cache: self.kv_cache,
+                cpu_prefill,
+                cpu_prefill_gdn_wy_f32: self
+                    .cpu_prefill_gdn
+                    .is_some_and(crate::inference::CpuPrefillGdn::is_wy_f32),
+                cpu_speculation,
+                placement: self.placement,
+                context_tokens,
+                ..base
+            },
+        );
         if let Err(mismatch) = verification {
             note_startup_failure(StartupStage::NativeIdentity, LaunchError::Backend, process);
             let _result = write_native_identity_failure(&mut io::stderr().lock(), mismatch);
@@ -3597,30 +3461,26 @@ mod tests {
         let base_cfg = LaunchConfig::parse(base_args)?;
 
         assert_eq!(
-            base_cfg.resolve_daisyrose_selection_with(Some(promoted.clone()), false)?,
+            base_cfg.resolve_daisyrose_selection_with(Some(unpromoted)),
             None
         );
         assert_eq!(
-            base_cfg.resolve_daisyrose_selection_with(Some(unpromoted), true)?,
+            base_cfg.resolve_daisyrose_selection_with(Some(wrong_base)),
             None
         );
         assert_eq!(
-            base_cfg.resolve_daisyrose_selection_with(Some(wrong_base), true)?,
-            None
-        );
-        assert_eq!(
-            base_cfg.resolve_daisyrose_selection_with(Some(promoted.clone()), true)?,
+            base_cfg.resolve_daisyrose_selection_with(Some(promoted.clone())),
             Some(super::DaisyRoseSelection::Promoted {
                 artifact: Box::new(promoted.clone()),
                 explicitly_passed: false,
             })
         );
         assert_eq!(
-            no_daisy_cfg.resolve_daisyrose_selection_with(Some(promoted.clone()), true)?,
+            no_daisy_cfg.resolve_daisyrose_selection_with(Some(promoted.clone())),
             None
         );
         assert_eq!(
-            publisher_cfg.resolve_daisyrose_selection_with(Some(promoted.clone()), true)?,
+            publisher_cfg.resolve_daisyrose_selection_with(Some(promoted.clone())),
             None
         );
 
@@ -3633,11 +3493,7 @@ mod tests {
             r"c:/externaldata/adapters/rev/daisy.gguf",
         ));
         assert_eq!(
-            explicit_matching.resolve_daisyrose_selection_with(Some(promoted.clone()), false),
-            Err(LaunchError::NativeRuntime)
-        );
-        assert_eq!(
-            explicit_matching.resolve_daisyrose_selection_with(Some(promoted.clone()), true)?,
+            explicit_matching.resolve_daisyrose_selection_with(Some(promoted.clone())),
             Some(super::DaisyRoseSelection::Promoted {
                 artifact: Box::new(promoted.clone()),
                 explicitly_passed: true,
@@ -3647,7 +3503,7 @@ mod tests {
         let other_path = std::path::PathBuf::from(r"C:\ExternalData\other.gguf");
         explicit_matching.daisyrose_lora = Some(other_path.clone());
         assert_eq!(
-            explicit_matching.resolve_daisyrose_selection_with(Some(promoted), true)?,
+            explicit_matching.resolve_daisyrose_selection_with(Some(promoted)),
             Some(super::DaisyRoseSelection::Explicit(other_path))
         );
         Ok(())
@@ -4187,7 +4043,7 @@ mod tests {
         let mut config = LaunchConfig::parse(args.clone())?;
         // The exact reviewed release implements paired launch flags and the
         // selected-cache accounting contract. Other identities remain rejected.
-        assert!(config.memory_context_supported()?);
+        assert!(config.memory_context_supported());
         let gib = 1024 * 1024 * 1024_u64;
         let available = 20 * gib;
         // Under promoted 0.1.34 calibrated-CoW admission, full 262,144 K4/V4 context fits at 20 GiB,
@@ -4196,12 +4052,11 @@ mod tests {
         assert!(packed_18g.context_tokens < 262_144);
         let packed = config.swift_context_plan(available)?;
         assert_eq!(packed.context_tokens, 262_144);
-        assert!(crate::inference::full_context_supported()?);
         assert_eq!(config.swift_context_plan(24 * gib)?.context_tokens, 262_144);
         config.kv_cache = Some(KvCache::Rsq4K3v);
         let capacity = config.swift_context_plan(available)?;
         assert_eq!(capacity.context_tokens, 262_144);
-        assert!(config.memory_context_supported()?);
+        assert!(config.memory_context_supported());
         config.kv_cache = Some(KvCache::F16);
         let f16 = config.swift_context_plan(available)?;
         assert!(f16.context_tokens < packed.context_tokens);
@@ -4211,7 +4066,7 @@ mod tests {
 
         args.push("--publisher-engine".into());
         let publisher = LaunchConfig::parse(args)?;
-        assert!(publisher.memory_context_supported()?);
+        assert!(publisher.memory_context_supported());
         let plan = publisher.swift_context_plan(available)?;
         assert_eq!(plan.context_tokens, 37_120);
         assert_eq!(
@@ -4285,7 +4140,7 @@ mod tests {
     -> std::io::Result<()> {
         use bonsai_cpu_policy::Bonsai25Variant;
         use serde_json::json;
-        let workers = super::WorkerReadiness::for_version("0.1.39", 4);
+        let workers = super::WorkerReadiness::new(4);
         let variant = Bonsai25Variant::Pq2;
         let model = json!({
             "id": variant.model_id(),
@@ -4402,7 +4257,7 @@ mod tests {
         let variant = Bonsai25Variant::Pq2;
         let workers = super::WorkerReadiness {
             kv_cache: Some(crate::inference::KvCache::Rsq4),
-            ..super::WorkerReadiness::for_version("0.1.39", 4)
+            ..super::WorkerReadiness::new(4)
         };
         for field in [
             "adapter_sha256",
@@ -4560,13 +4415,13 @@ mod tests {
         publisher_args.push("--publisher-engine".into());
         let publisher = LaunchConfig::parse(publisher_args.clone())?;
         assert!(!publisher.no_mmproj);
-        assert!(publisher.runtime_supports_vision()?);
+        assert!(publisher.runtime_supports_vision());
 
         let mut opt_out = publisher_args;
         opt_out.push("--no-mmproj".into());
         let parsed_opt_out = LaunchConfig::parse(opt_out.clone())?;
         assert!(parsed_opt_out.no_mmproj);
-        assert!(!parsed_opt_out.runtime_supports_vision()?);
+        assert!(!parsed_opt_out.runtime_supports_vision());
         assert!(parsed_opt_out.mmproj_guard(1)?.is_none());
 
         // Duplicate --no-mmproj and reference-cpu --no-mmproj are rejected.
@@ -4580,13 +4435,13 @@ mod tests {
             Some(LaunchError::Arguments)
         );
 
-        // Native 0.1.31 supports vision unless --no-mmproj opts out.
+        // Native Swift supports vision unless --no-mmproj opts out.
         let mut native_opt_out = swift.clone();
         native_opt_out.push("--no-mmproj".into());
         let native = LaunchConfig::parse(swift)?;
-        assert!(native.runtime_supports_vision()?);
+        assert!(native.runtime_supports_vision());
         let parsed_native_opt_out = LaunchConfig::parse(native_opt_out)?;
-        assert!(!parsed_native_opt_out.runtime_supports_vision()?);
+        assert!(!parsed_native_opt_out.runtime_supports_vision());
         assert!(parsed_native_opt_out.mmproj_guard(1)?.is_none());
 
         // Real temp data directory: missing mmproj falls back cleanly to None;
@@ -4647,19 +4502,18 @@ mod tests {
             "--require-native-sandbox",
             &["--profile", "swift-pq2-assessment"],
         );
-        // With BROKER_PIPE_RELEASE pinned at 0.1.34, valid flag combinations succeed and enable broker pipe.
         let parsed = LaunchConfig::parse(valid.clone())?;
-        assert!(parsed.uses_broker_pipe()?);
+        assert!(parsed.uses_broker_pipe_transport());
 
         // Duplicate flag is rejected as Arguments.
         let mut dup = valid.clone();
         dup.push("--require-broker-pipe".into());
         assert_eq!(LaunchConfig::parse(dup).err(), Some(LaunchError::Arguments));
 
-        // Optional explicit --backend-port also succeeds with --require-broker-pipe when pinned.
+        // Optional explicit --backend-port also succeeds with --require-broker-pipe.
         valid.extend(["--backend-port", "8081"].map(OsString::from));
         let with_port = LaunchConfig::parse(valid)?;
-        assert!(with_port.uses_broker_pipe()?);
+        assert!(with_port.uses_broker_pipe_transport());
 
         // Invalid combinations reject with Arguments before release gating.
         for bad in [
@@ -4724,7 +4578,7 @@ mod tests {
             KvCache::Rsq4K3v,
         ] {
             config.kv_cache = Some(policy);
-            let profile = config.swift_context_profile()?;
+            let profile = config.swift_context_profile();
             for available in [17 * gib, 18 * gib, 20 * gib, 22 * gib, 24 * gib, 48 * gib] {
                 let (vision_context, vision_admitted) =
                     SwiftContextPlan::for_profile_with_vision(available, profile, true)
@@ -4889,7 +4743,6 @@ mod tests {
         use super::{NativeIdentityError, write_native_identity_failure};
 
         let all = [
-            (NativeIdentityError::ReleasePin, "release-pin"),
             (NativeIdentityError::Framing, "framing"),
             (NativeIdentityError::Schema, "schema"),
             (NativeIdentityError::Model, "model"),
@@ -5245,7 +5098,7 @@ mod tests {
         assert_eq!(branch.cpu_prefill_gdn, Some(CpuPrefillGdn::WyF32));
         assert_eq!(branch.cpu_family, Some(CpuFamily::X1));
         assert_eq!(branch.native_row_workers, 8);
-        assert!(branch.runtime_supports_vision()?);
+        assert!(branch.runtime_supports_vision());
 
         let gib = 1024 * 1024 * 1024_u64;
         let calibrated_branch = branch.calibrated_context_plan(48 * gib, true)?;
@@ -5299,7 +5152,7 @@ mod tests {
         assert_eq!(spec.effective_speculation_tokens(), Some(6));
         assert_eq!(spec.native_row_workers, 4);
         assert!(
-            !spec.runtime_supports_vision()?,
+            !spec.runtime_supports_vision(),
             "suffix speculation must automatically suppress optional mmproj"
         );
         let calibrated_spec = spec.calibrated_context_plan(24 * gib, false)?;
@@ -5691,10 +5544,7 @@ mod tests {
             cfg.evidence_parent = temp.path().to_path_buf();
             cfg.kv_cache = Some(crate::inference::KvCache::Rsq4);
             cfg.weight_representation = super::WeightRepresentation::Bonsai25(variant);
-            assert!(
-                cfg.runtime_supports_vision()
-                    .map_err(|error| std::io::Error::other(format!("{error:?}")))?
-            );
+            assert!(cfg.runtime_supports_vision());
 
             // Foreign-base DaisyRose locks (such as legacy Swift PQ2) never auto-attach onto Bonsai 2.5.
             let foreign_promoted = bonsai_cpu_policy::DaisyRoseLoraArtifact {
@@ -5715,16 +5565,13 @@ mod tests {
                 default_scale_tenths: Some(10),
             };
             assert_eq!(
-                cfg.resolve_daisyrose_selection_with(Some(foreign_promoted.clone()), true)
-                    .map_err(|error| std::io::Error::other(format!("{error:?}")))?,
+                cfg.resolve_daisyrose_selection_with(Some(foreign_promoted.clone())),
                 None
             );
             let mut b25_pq2_promoted = foreign_promoted;
             b25_pq2_promoted.base_model_sha256 =
                 bonsai_cpu_policy::Bonsai25Variant::Pq2.sha256().into();
-            let resolved_b25 = cfg
-                .resolve_daisyrose_selection_with(Some(b25_pq2_promoted), true)
-                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+            let resolved_b25 = cfg.resolve_daisyrose_selection_with(Some(b25_pq2_promoted));
             assert_eq!(
                 resolved_b25.is_some(),
                 variant == bonsai_cpu_policy::Bonsai25Variant::Pq2
@@ -5758,10 +5605,7 @@ mod tests {
         cfg.weight_representation =
             super::WeightRepresentation::NariQ(bonsai_cpu_policy::NariqVariant::Bpw2_5);
 
-        assert!(
-            !cfg.runtime_supports_vision()
-                .map_err(|error| std::io::Error::other(format!("{error:?}")))?
-        );
+        assert!(!cfg.runtime_supports_vision());
         let creds = super::PrivateCredentials::create(temp.path())?;
         let plan = cfg
             .build_launch_plan(cfg.backend_port, creds.backend_path())
@@ -5852,15 +5696,11 @@ mod tests {
         implicit_nariq.weight_representation =
             super::WeightRepresentation::NariQ(bonsai_cpu_policy::NariqVariant::Bpw2_5);
         assert_eq!(
-            implicit_nariq
-                .resolve_daisyrose_selection_with(Some(pq2_promoted.clone()), true)
-                .map_err(|e| std::io::Error::other(format!("{e:?}")))?,
+            implicit_nariq.resolve_daisyrose_selection_with(Some(pq2_promoted.clone())),
             None
         );
 
-        let selection = cfg
-            .resolve_daisyrose_selection_with(Some(pq2_promoted), true)
-            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        let selection = cfg.resolve_daisyrose_selection_with(Some(pq2_promoted));
         assert_eq!(
             selection,
             Some(super::DaisyRoseSelection::Explicit(gguf_path.clone()))
@@ -6007,10 +5847,7 @@ mod tests {
             cfg.data = temp.path().to_path_buf();
             cfg.evidence_parent = temp.path().to_path_buf();
             cfg.kv_cache = Some(crate::inference::KvCache::Rsq4);
-            assert!(
-                !cfg.runtime_supports_vision()
-                    .map_err(|e| std::io::Error::other(format!("{e:?}")))?
-            );
+            assert!(!cfg.runtime_supports_vision());
 
             let (calibrated, admitted) = cfg
                 .resolve_calibrated_daisyrose_admission(

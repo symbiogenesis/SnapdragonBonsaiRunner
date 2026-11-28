@@ -1058,26 +1058,16 @@ fn calibrated_cow_execution_matches_prism_accounting_across_packings_reuse_and_s
         .is_err()
     );
 
-    // Release-gated 64-token prefill tiles remain rejected on 0.1.35 and admit when enabled.
+    // 64-token prefill tiles are supported directly by the bundled runtime.
     let tile_64_options = SwiftCalibratedOptions {
         chunkwise_gdn_wy_f32: true,
         prefill_tokens: Some(64),
         ..pq2_options
     };
-    assert!(
-        SwiftContextPlan::for_calibrated_execution_with_tile_64(
-            24 * gib,
-            SwiftContextProfile::NativeRsq4Full,
-            tile_64_options,
-            false,
-        )
-        .is_err()
-    );
-    let tile_64_plan = SwiftContextPlan::for_calibrated_execution_with_tile_64(
+    let tile_64_plan = SwiftContextPlan::for_calibrated_execution(
         24 * gib,
         SwiftContextProfile::NativeRsq4Full,
         tile_64_options,
-        true,
     )?;
     assert_eq!(
         tile_64_plan
@@ -1085,11 +1075,10 @@ fn calibrated_cow_execution_matches_prism_accounting_across_packings_reuse_and_s
             .map(u64::try_from)
             .transpose()
             .map_err(|e| e.to_string())?,
-        context::swift_tiled_prefill_scratch_bytes_for_tile(
+        swift_tiled_prefill_scratch_bytes(
             64,
             tile_64_plan.context_plan.context_tokens,
             context::SwiftKvCacheFormat::Rsq4,
-            true,
         )
     );
     Ok(())

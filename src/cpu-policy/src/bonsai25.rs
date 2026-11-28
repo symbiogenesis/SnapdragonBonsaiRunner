@@ -146,14 +146,12 @@ pub fn is_super_memory_constrained_for_pq2(
     memory: Bonsai25MemorySnapshot,
     profile: crate::context::SwiftContextProfile,
     mut pq2_options: crate::context::SwiftCalibratedOptions,
-    allow_tile_64: bool,
 ) -> bool {
     pq2_options.weight_packing = crate::context::SwiftWeightPacking::Bonsai25Pq2;
-    if crate::context::SwiftContextPlan::for_calibrated_execution_with_tile_64(
+    if crate::context::SwiftContextPlan::for_calibrated_execution(
         u64::MAX / 2,
         profile,
         pq2_options,
-        allow_tile_64,
     )
     .is_err()
     {
@@ -162,11 +160,10 @@ pub fn is_super_memory_constrained_for_pq2(
     if memory.total_physical_bytes <= BONSAI25_PTQ1_AUTO_TOTAL_PHYSICAL_MAX_BYTES {
         return true;
     }
-    crate::context::SwiftContextPlan::for_calibrated_execution_with_tile_64(
+    crate::context::SwiftContextPlan::for_calibrated_execution(
         memory.available_physical_bytes,
         profile,
         pq2_options,
-        allow_tile_64,
     )
     .is_err()
 }
@@ -183,14 +180,13 @@ pub fn select_default_bonsai25_variant(
     cached: Bonsai25CachedVariants,
     profile: crate::context::SwiftContextProfile,
     pq2_options: crate::context::SwiftCalibratedOptions,
-    allow_tile_64: bool,
 ) -> Bonsai25Variant {
     match (cached.pq2_present, cached.ptq1_present) {
         (true, false) => Bonsai25Variant::Pq2,
         (false, true) => Bonsai25Variant::Ptq1,
         (false, false) | (true, true) => {
             if memory.is_some_and(|snapshot| {
-                is_super_memory_constrained_for_pq2(snapshot, profile, pq2_options, allow_tile_64)
+                is_super_memory_constrained_for_pq2(snapshot, profile, pq2_options)
             }) {
                 Bonsai25Variant::Ptq1
             } else {
@@ -649,7 +645,6 @@ mod tests {
                 Bonsai25CachedVariants::default(),
                 profile,
                 options,
-                false,
             ),
             Bonsai25Variant::Ptq1
         );
@@ -665,7 +660,6 @@ mod tests {
                     Bonsai25CachedVariants::default(),
                     profile,
                     options,
-                    false,
                 ),
                 Bonsai25Variant::Pq2
             );
@@ -681,7 +675,6 @@ mod tests {
                 Bonsai25CachedVariants::default(),
                 profile,
                 min_probe_options,
-                false,
             ),
             Bonsai25Variant::Ptq1
         );
@@ -694,7 +687,6 @@ mod tests {
                 Bonsai25CachedVariants::default(),
                 profile,
                 min_probe_options,
-                false,
             ),
             Bonsai25Variant::Pq2
         );
@@ -709,7 +701,6 @@ mod tests {
             constrained_snapshot,
             profile,
             options,
-            false
         ));
         assert_eq!(
             select_default_bonsai25_variant(
@@ -717,7 +708,6 @@ mod tests {
                 Bonsai25CachedVariants::default(),
                 profile,
                 options,
-                false,
             ),
             Bonsai25Variant::Ptq1
         );
@@ -732,7 +722,6 @@ mod tests {
                 },
                 profile,
                 options,
-                false,
             ),
             Bonsai25Variant::Pq2
         );
@@ -748,7 +737,6 @@ mod tests {
                 },
                 profile,
                 options,
-                false,
             ),
             Bonsai25Variant::Ptq1
         );
@@ -763,7 +751,6 @@ mod tests {
                 },
                 profile,
                 options,
-                false,
             ),
             Bonsai25Variant::Ptq1
         );
@@ -779,7 +766,6 @@ mod tests {
                 },
                 profile,
                 options,
-                false,
             ),
             Bonsai25Variant::Pq2
         );
@@ -791,7 +777,6 @@ mod tests {
                 Bonsai25CachedVariants::default(),
                 profile,
                 options,
-                false,
             ),
             Bonsai25Variant::Pq2
         );
@@ -799,7 +784,6 @@ mod tests {
             constrained_snapshot,
             SwiftContextProfile::PublisherF16,
             options,
-            false,
         ));
         Ok(())
     }

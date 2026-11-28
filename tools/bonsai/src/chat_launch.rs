@@ -827,7 +827,7 @@ fn prepare_for_host(
         let (profile, options) = request.calibrated_pq2_profile_and_options();
         let cached = cached_bonsai25_variants(&request.data_directory);
         request.bonsai25_variant = Some(bonsai_cpu_policy::select_default_bonsai25_variant(
-            memory, cached, profile, options, false,
+            memory, cached, profile, options,
         ));
     }
     let own_canary = request.canary_key_file.is_none() && !request.no_speech_models;

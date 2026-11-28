@@ -115,8 +115,7 @@ impl SnapdragonFamily {
         }
     }
 
-    /// Default native inference `(decode, prefill)` CPU row-worker budget for
-    /// releases supporting split prefill row-worker counts (`0.1.36+`).
+    /// Default native inference `(decode, prefill)` CPU row-worker budget.
     ///
     /// Snapdragon X Elite uses `8` decode workers across two Oryon clusters and
     /// `12` prefill workers across all `12` homogeneous Oryon cores; Snapdragon

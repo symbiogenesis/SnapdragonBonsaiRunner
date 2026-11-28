@@ -183,69 +183,14 @@ impl Placement {
     }
 }
 
-const REVIEWED_0_1_39: Option<(&str, &str)> =
-    Some(("0.1.39", "d25f70322768bdcaab704cc3a1036a5f6c55ee82"));
-
-// CPU placement must skip accelerator initialization and report both its
-// requested placement and effective CPU backend in a genuine reviewed release.
-// Source omission alone does not justify a smaller fixed memory allowance.
-const CPU_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-// Explicit Vulkan/Composite placements require a separately reviewed native
-// release before they can be admitted on a pinned bundle.
-const VULKAN_PLACEMENT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-// Opt-in Hexagon arena cache persistence requires a separately reviewed native
-// release implementing `--hexagon-arena-cache <dir>` and verified cache I/O.
-const HEXAGON_ARENA_CACHE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-fn hexagon_arena_cache_supported_for(
-    release: &ReleasePin,
-    cache_release: Option<(&str, &str)>,
-) -> bool {
-    reviewed_release_matches(release, cache_release)
-}
-
-pub(super) fn hexagon_arena_cache_supported() -> Result<bool, LaunchError> {
-    Ok(hexagon_arena_cache_supported_for(
-        pinned_release()?,
-        HEXAGON_ARENA_CACHE_RELEASE,
-    ))
-}
-
-fn select_placement(
-    release: &ReleasePin,
-    requested: Placement,
-    cpu_release: Option<(&str, &str)>,
-    vulkan_release: Option<(&str, &str)>,
-) -> Result<Placement, LaunchError> {
-    let supported = match requested {
-        Placement::Auto => true,
-        Placement::Cpu => reviewed_release_matches(release, cpu_release),
-        Placement::Vulkan | Placement::Composite => {
-            reviewed_release_matches(release, vulkan_release)
-        }
-    };
-    if supported {
-        Ok(requested)
-    } else {
-        Err(LaunchError::NativeRuntime)
-    }
-}
-
-pub(super) fn pinned_placement(
+pub(super) fn select_placement(
     native: bool,
     requested: Option<Placement>,
 ) -> Result<Placement, LaunchError> {
     if !native {
         return requested.map_or(Ok(Placement::Auto), |_| Err(LaunchError::Arguments));
     }
-    select_placement(
-        pinned_release()?,
-        requested.unwrap_or_default(),
-        CPU_PLACEMENT_RELEASE,
-        VULKAN_PLACEMENT_RELEASE,
-    )
+    Ok(requested.unwrap_or_default())
 }
 
 impl KvCache {
@@ -271,53 +216,21 @@ impl KvCache {
     }
 }
 
-fn reviewed_release_matches(release: &ReleasePin, identity: Option<(&str, &str)>) -> bool {
-    identity.is_some_and(|(version, commit)| release.version == version && release.commit == commit)
-}
-
-fn turboquant_supported(release: &ReleasePin, memory_release: Option<(&str, &str)>) -> bool {
-    // M1/M2 review includes the selected K4/V4 cache and its source-bound
-    // readiness contract; delivery must retain the ordinary cache default.
-    reviewed_release_matches(release, memory_release)
-}
-
-fn select_kv_cache(
-    release: &ReleasePin,
-    requested: Option<KvCache>,
-) -> Result<Option<KvCache>, LaunchError> {
-    if requested == Some(KvCache::Rsq4K3v) {
-        if k4v3_context_supported(release) {
-            Ok(requested)
-        } else {
-            Err(LaunchError::NativeRuntime)
-        }
-    } else if requested == Some(KvCache::Rsq4Kvf) {
-        if rsq4kvf_supported(release) {
-            Ok(requested)
-        } else {
-            Err(LaunchError::NativeRuntime)
-        }
-    } else if turboquant_supported(release, MEMORY_CONTEXT_RELEASE) {
-        Ok(Some(requested.unwrap_or(KvCache::Rsq4)))
-    } else if requested == Some(KvCache::Rsq4) {
-        Err(LaunchError::NativeRuntime)
-    } else {
-        // Historical servers do not accept --kv-cache; their reviewed profile
-        // already selects FP16. This is release selection, never retry fallback.
-        Ok(None)
-    }
-}
-
-pub(super) fn pinned_kv_cache(
+pub(super) fn select_kv_cache(
     native: bool,
     requested: Option<KvCache>,
 ) -> Result<Option<KvCache>, LaunchError> {
-    if native {
-        select_kv_cache(pinned_release()?, requested)
-    } else if requested.is_some() {
-        Err(LaunchError::Arguments)
+    if !native {
+        return if requested.is_some() {
+            Err(LaunchError::Arguments)
+        } else {
+            Ok(None)
+        };
+    }
+    if requested == Some(KvCache::Rsq4K3v) {
+        Err(LaunchError::NativeRuntime)
     } else {
-        Ok(None)
+        Ok(Some(requested.unwrap_or(KvCache::Rsq4)))
     }
 }
 
@@ -428,218 +341,19 @@ fn release(input: &str) -> Result<ReleasePin, LaunchError> {
     Ok(release)
 }
 
-fn row_workers_supported(
-    release: &ReleasePin,
-    workers: u8,
-    memory_release: Option<(&str, &str)>,
-) -> Result<(), LaunchError> {
-    if workers == 1
-        || (matches!(workers, 4 | 8 | 12) && reviewed_release_matches(release, memory_release))
-    {
-        Ok(())
-    } else {
-        Err(LaunchError::Artifacts)
-    }
-}
-
 static PINNED_RELEASE: LazyLock<Result<ReleasePin, LaunchError>> = LazyLock::new(|| release(LOCK));
 
 fn pinned_release() -> Result<&'static ReleasePin, LaunchError> {
     PINNED_RELEASE.as_ref().map_err(|_| LaunchError::Artifacts)
 }
 
-fn pinned_matches(identity: Option<(&str, &str)>) -> Result<bool, LaunchError> {
-    Ok(reviewed_release_matches(pinned_release()?, identity))
-}
-
-// Enable only after a reviewed source-bound release implements the paired
-// context/memory flags AND the selected-cache/sequential-scratch accounting
-// contract in bonsai_cpu_policy::context. A protocol-only source candidate must
-// not activate smaller process allowances. A version number alone attests neither.
-// This combined review also retains four row workers, K4/V4 and latest reuse;
-// a later repin cannot silently lose those existing serving capabilities.
-const MEMORY_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-// K4/V3 changes precision and needs its own reviewed capacity/quality release.
-// Both gates must identify the same genuine released source before this profile
-// can use its smaller admission charge. Existing K4/V4 releases stay unchanged.
-const K4V3_CONTEXT_RELEASE: Option<(&str, &str)> = None;
-
-// Version-3 scale-code co-optimized K4/V4 (`rsq4kvf`) and cognitive request
-// controls promoted with the reviewed Prism v0.1.39 release pin.
-const RSQ4KVF_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-// Full-model K4/V4 context needs the separately reviewed larger live-state and
-// checkpoint guards, not just the existing paired memory protocol. This exact
-// source supplies the geometry-derived Swift allowance; generic graphs retain
-// 4 GiB. Precision and process charges remain unchanged; this gate cannot
-// authorize an unrelated memory release.
-const K4V4_FULL_CONTEXT_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-fn full_context_release_matches(release: &ReleasePin, reviewed: Option<(&str, &str)>) -> bool {
-    reviewed.is_some()
-        && MEMORY_CONTEXT_RELEASE == reviewed
-        && reviewed_release_matches(release, reviewed)
-}
-
-pub(super) fn full_context_supported() -> Result<bool, LaunchError> {
-    Ok(full_context_release_matches(
-        pinned_release()?,
-        K4V4_FULL_CONTEXT_RELEASE,
-    ))
-}
-
-fn k4v3_context_supported(release: &ReleasePin) -> bool {
-    K4V3_CONTEXT_RELEASE.is_some_and(|identity| {
-        MEMORY_CONTEXT_RELEASE == Some(identity)
-            && release.version == identity.0
-            && release.commit == identity.1
-    })
-}
-
-fn rsq4kvf_supported(release: &ReleasePin) -> bool {
-    RSQ4KVF_RELEASE.is_some_and(|identity| {
-        MEMORY_CONTEXT_RELEASE == Some(identity)
-            && release.version == identity.0
-            && release.commit == identity.1
-    })
-}
-
-pub(super) fn memory_context_supported() -> Result<bool, LaunchError> {
-    pinned_matches(MEMORY_CONTEXT_RELEASE)
-}
-
-// In-place cancellation recovery requires a reviewed release whose worker loop
-// observes abandoned generation sockets, settles active computation within a
-// bounded timeout, and resets live model state on authenticated `POST /reset`
-// without expecting a `Content-Type` header.
-const RESET_ON_CANCEL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-pub(super) fn reset_on_cancel_supported() -> Result<bool, LaunchError> {
-    pinned_matches(RESET_ON_CANCEL_RELEASE)
-}
-
-// Offline anonymous broker-pipe transport requires a separately reviewed native
-// release implementing `--broker-pipe`, `AppContainer` verification, `SB2PIPE1`
-// / `SB2OKAY1` handshake, `KIND_SERVER_READY`, `KIND_RESET`, and `KIND_VERIFIED_SECTION`.
-const BROKER_PIPE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-pub(super) fn broker_pipe_supported() -> Result<bool, LaunchError> {
-    pinned_matches(BROKER_PIPE_RELEASE)
-}
-
-// Calibrated CoW admission, sparse branch prompt reuse, chunkwise GDN prefill,
-// and suffix CPU speculation require the reviewed Prism release.
-const CALIBRATED_COW_ADMISSION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-const BRANCH_PROMPT_REUSE_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-const CPU_PREFILL_GDN_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-// `wy-f32` chunkwise GDN prefill with rotated KV caches (`rsq4` / `rsq4k3v`)
-// requires a reviewed Prism release implementing rotated-KV WY prefill.
-const WY_F32_ROTATED_KV_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-const CPU_SPECULATION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-pub(super) fn calibrated_cow_admission_supported() -> Result<bool, LaunchError> {
-    pinned_matches(CALIBRATED_COW_ADMISSION_RELEASE)
-}
-
-pub(super) fn branch_prompt_reuse_supported() -> Result<bool, LaunchError> {
-    pinned_matches(BRANCH_PROMPT_REUSE_RELEASE)
-}
-
-pub(super) fn cpu_prefill_gdn_supported() -> Result<bool, LaunchError> {
-    pinned_matches(CPU_PREFILL_GDN_RELEASE)
-}
-
-fn select_wy_f32_kv_cache(
-    release: &ReleasePin,
-    gdn: Option<CpuPrefillGdn>,
-    kv_cache: Option<KvCache>,
-    gdn_release: Option<(&str, &str)>,
-    rotated_kv_release: Option<(&str, &str)>,
-) -> Result<(), LaunchError> {
-    if gdn != Some(CpuPrefillGdn::WyF32) {
-        return Ok(());
-    }
-    if !reviewed_release_matches(release, gdn_release) {
-        return Err(LaunchError::NativeRuntime);
-    }
-    match kv_cache {
-        Some(KvCache::F16) => Ok(()),
-        Some(KvCache::Rsq4 | KvCache::Rsq4Kvf | KvCache::Rsq4K3v)
-            if reviewed_release_matches(release, rotated_kv_release) =>
-        {
-            Ok(())
-        }
-        Some(KvCache::Rsq4 | KvCache::Rsq4Kvf | KvCache::Rsq4K3v) => {
-            Err(LaunchError::NativeRuntime)
-        }
-        None => Err(LaunchError::Arguments),
-    }
-}
-
-pub(super) fn pinned_wy_f32_kv_cache(
-    gdn: Option<CpuPrefillGdn>,
-    kv_cache: Option<KvCache>,
-) -> Result<(), LaunchError> {
-    select_wy_f32_kv_cache(
-        pinned_release()?,
-        gdn,
-        kv_cache,
-        CPU_PREFILL_GDN_RELEASE,
-        WY_F32_ROTATED_KV_RELEASE,
-    )
-}
-
-pub(super) fn cpu_speculation_supported() -> Result<bool, LaunchError> {
-    pinned_matches(CPU_SPECULATION_RELEASE)
-}
-
-// Multimodal image/mmproj support requires a separately reviewed native release
-// that implements vision projector loading, image embedding injection and the
-// matching readiness identity fields.
-const VISION_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-// Multi-rank DaisyRose LoRA support requires a reviewed Prism release supporting
-// `--multi-rank-adapter` and `multi-rank-lora-v1` readiness identity.
-const MULTI_RANK_LORA_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-// Opt-in NariQ trellis support requires a separately reviewed native Prism
-// release supporting `--nariq <2.5bpw|3.0bpw|2.0bpw>` and `:trellis-v1` identity.
-pub(crate) const NARIQ_TRELLIS_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-// Opt-in Ternary Bonsai 2.5 27B support requires a separately reviewed native
-// Prism release (`v0.1.35+`) supporting `--bonsai-2-5 <pq2|ptq1>`.
-pub(crate) const BONSAI_2_5_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-// CPU tiled prefill requires a separately reviewed native release supporting
-// `--cpu-prefill-tokens`, `--cpu-prefill-scratch-bytes`, and the matching
-// readiness fields (`cpu_prefill_tokens`, `cpu_prefill_scratch_bytes`, `:cpu-tiled-ffn-v1:{n}`).
-const CPU_PREFILL_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-// 64-token CPU tiled prefill (`--cpu-prefill-tokens 64`) requires a reviewed
-// native release (`0.1.38+`) supporting 64-row prefill tiles.
-const PREFILL_TILE_64_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-// Split decode/prefill CPU row-worker pools (`--prefill-row-workers`;
-// X1: 8 decode / 12 prefill, X2: 8 decode / 16 prefill) require a reviewed
-// native release (`0.1.38+`).
-const PREFILL_ROW_WORKERS_RELEASE: Option<(&str, &str)> = REVIEWED_0_1_39;
-
-pub(super) fn prefill_tile_64_supported() -> Result<bool, LaunchError> {
-    let release = pinned_release()?;
-    Ok(reviewed_release_matches(release, MEMORY_CONTEXT_RELEASE)
-        && reviewed_release_matches(release, CPU_PREFILL_RELEASE)
-        && reviewed_release_matches(release, PREFILL_TILE_64_RELEASE))
-}
-
 pub(super) fn parse_cpu_prefill_tokens(value: Option<&std::ffi::OsStr>) -> Result<u8, LaunchError> {
     parse_enum(value, &[("8", 8), ("16", 16), ("32", 32), ("64", 64)])
 }
 
-fn select_cpu_prefill_tokens(
-    release: &ReleasePin,
+pub(super) fn select_cpu_prefill_tokens(
     native: bool,
     requested: Option<u8>,
-    memory_release: Option<(&str, &str)>,
-    prefill_release: Option<(&str, &str)>,
-    tile_64_release: Option<(&str, &str)>,
 ) -> Result<Option<u8>, LaunchError> {
     let Some(tokens) = requested else {
         return Ok(None);
@@ -647,34 +361,7 @@ fn select_cpu_prefill_tokens(
     if !native || !matches!(tokens, 8 | 16 | 32 | 64) {
         return Err(LaunchError::Arguments);
     }
-    if tokens == 64 {
-        return if reviewed_release_matches(release, tile_64_release) {
-            Ok(Some(64))
-        } else {
-            Err(LaunchError::NativeRuntime)
-        };
-    }
-    if reviewed_release_matches(release, memory_release)
-        && reviewed_release_matches(release, prefill_release)
-    {
-        Ok(Some(tokens))
-    } else {
-        Err(LaunchError::NativeRuntime)
-    }
-}
-
-pub(super) fn pinned_cpu_prefill_tokens(
-    native: bool,
-    requested: Option<u8>,
-) -> Result<Option<u8>, LaunchError> {
-    select_cpu_prefill_tokens(
-        pinned_release()?,
-        native,
-        requested,
-        MEMORY_CONTEXT_RELEASE,
-        CPU_PREFILL_RELEASE,
-        PREFILL_TILE_64_RELEASE,
-    )
+    Ok(Some(tokens))
 }
 
 pub(super) fn parse_prefill_row_workers(
@@ -686,13 +373,11 @@ pub(super) fn parse_prefill_row_workers(
     )
 }
 
-fn select_prefill_row_workers(
-    release: &ReleasePin,
+pub(super) fn select_prefill_row_workers(
     native: bool,
     requested: Option<u8>,
     family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
     explicit_family: Option<CpuFamily>,
-    prefill_row_workers_release: Option<(&str, &str)>,
 ) -> Result<Option<u8>, LaunchError> {
     if !native {
         return if requested.is_some() {
@@ -705,78 +390,21 @@ fn select_prefill_row_workers(
         if !matches!(workers, 1 | 4 | 8 | 12 | 16) {
             return Err(LaunchError::Arguments);
         }
-        return if reviewed_release_matches(release, prefill_row_workers_release) {
-            Ok(Some(workers))
-        } else {
-            Err(LaunchError::NativeRuntime)
-        };
+        return Ok(Some(workers));
     }
-    if reviewed_release_matches(release, prefill_row_workers_release) {
-        let effective_family = explicit_family.map(CpuFamily::into_snapdragon).or(family);
-        let (_, prefill) =
-            bonsai_cpu_policy::hardware::SnapdragonFamily::default_native_row_worker_budget(
-                effective_family,
-            );
-        Ok(Some(prefill))
-    } else {
-        Ok(None)
+    let effective_family = explicit_family.map(CpuFamily::into_snapdragon).or(family);
+    let (_, prefill) =
+        bonsai_cpu_policy::hardware::SnapdragonFamily::default_native_row_worker_budget(
+            effective_family,
+        );
+    Ok(Some(prefill))
+}
+
+pub(super) fn verify(data: &Path, row_workers: u8) -> Result<(PathBuf, VerifiedFile), LaunchError> {
+    if !matches!(row_workers, 1 | 4 | 8 | 12) {
+        return Err(LaunchError::Artifacts);
     }
-}
-
-pub(super) fn pinned_prefill_row_workers(
-    native: bool,
-    requested: Option<u8>,
-    family: Option<bonsai_cpu_policy::hardware::SnapdragonFamily>,
-    explicit_family: Option<CpuFamily>,
-) -> Result<Option<u8>, LaunchError> {
-    select_prefill_row_workers(
-        pinned_release()?,
-        native,
-        requested,
-        family,
-        explicit_family,
-        PREFILL_ROW_WORKERS_RELEASE,
-    )
-}
-
-pub(super) fn vision_supported() -> Result<bool, LaunchError> {
-    pinned_matches(VISION_RELEASE)
-}
-
-pub(super) fn multi_rank_lora_supported() -> Result<bool, LaunchError> {
-    pinned_matches(MULTI_RANK_LORA_RELEASE)
-}
-
-pub(super) fn nariq_trellis_supported() -> Result<bool, LaunchError> {
-    pinned_matches(NARIQ_TRELLIS_RELEASE)
-}
-
-pub(super) fn bonsai_2_5_supported() -> Result<bool, LaunchError> {
-    pinned_matches(BONSAI_2_5_RELEASE)
-}
-
-pub(super) fn pinned_version() -> Result<String, LaunchError> {
-    pinned_release().map(|release| release.version.clone())
-}
-
-fn prompt_reuse_supported(release: &ReleasePin, latest: bool) -> Result<(), LaunchError> {
-    // Capability is bound to reviewed source and immutable released bytes. A
-    // later version must be reviewed explicitly, even if its CLI looks similar.
-    if !latest || turboquant_supported(release, MEMORY_CONTEXT_RELEASE) {
-        Ok(())
-    } else {
-        Err(LaunchError::Artifacts)
-    }
-}
-
-pub(super) fn verify(
-    data: &Path,
-    row_workers: u8,
-    latest_prompt_reuse: bool,
-) -> Result<(PathBuf, VerifiedFile), LaunchError> {
     let release = pinned_release()?;
-    row_workers_supported(release, row_workers, MEMORY_CONTEXT_RELEASE)?;
-    prompt_reuse_supported(release, latest_prompt_reuse)?;
     let file = release
         .files
         .iter()
@@ -797,247 +425,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cpu_placement_waits_for_an_exact_reviewed_release() -> Result<(), LaunchError> {
-        let mut pin = release(LOCK)?;
-        assert_eq!(
-            select_placement(
-                &pin,
-                Placement::Cpu,
-                CPU_PLACEMENT_RELEASE,
-                VULKAN_PLACEMENT_RELEASE
-            )?,
-            Placement::Cpu
-        );
-        for (version, commit) in [
-            ("0.1.27", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.28", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.30", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.33", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.36", "50977990398a20a8add2056bfe34ce59e1677510"),
-            ("0.1.38", "50977990398a20a8add2056bfe34ce59e1677510"),
-            ("0.1.39", "0000000000000000000000000000000000000000"),
-            ("0.1.39", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.40", "d25f70322768bdcaab704cc3a1036a5f6c55ee82"),
-        ] {
-            pin.version = version.into();
-            pin.commit = commit.into();
-            assert_eq!(
-                select_placement(
-                    &pin,
-                    Placement::Auto,
-                    CPU_PLACEMENT_RELEASE,
-                    VULKAN_PLACEMENT_RELEASE
-                )?,
-                Placement::Auto
-            );
-            assert_eq!(
-                select_placement(
-                    &pin,
-                    Placement::Cpu,
-                    CPU_PLACEMENT_RELEASE,
-                    VULKAN_PLACEMENT_RELEASE
-                ),
-                Err(LaunchError::NativeRuntime)
-            );
-        }
-        assert_eq!(pinned_placement(true, None)?, Placement::Auto);
-        assert!(reset_on_cancel_supported()?);
-        let mut pin = release(LOCK)?;
-        assert!(reviewed_release_matches(&pin, RESET_ON_CANCEL_RELEASE));
-        for (version, commit) in [
-            ("0.1.27", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.28", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.30", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.38", "50977990398a20a8add2056bfe34ce59e1677510"),
-            ("0.1.39", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.39", "0000000000000000000000000000000000000000"),
-        ] {
-            pin.version = version.into();
-            pin.commit = commit.into();
-            assert!(!reviewed_release_matches(&pin, RESET_ON_CANCEL_RELEASE));
-        }
-        assert_eq!(pinned_placement(false, None)?, Placement::Auto);
+    fn bundled_placement_selection_validates_native_and_non_native() -> Result<(), LaunchError> {
+        assert_eq!(select_placement(true, None)?, Placement::Auto);
         for placement in [
             Placement::Auto,
             Placement::Cpu,
             Placement::Vulkan,
             Placement::Composite,
         ] {
+            assert_eq!(select_placement(true, Some(placement))?, placement);
             assert_eq!(
-                pinned_placement(false, Some(placement)),
+                select_placement(false, Some(placement)),
                 Err(LaunchError::Arguments)
             );
         }
+        assert_eq!(select_placement(false, None)?, Placement::Auto);
         Ok(())
     }
 
     #[test]
-    fn kv_cache_default_and_recovery_require_the_exact_reviewed_source() -> Result<(), LaunchError>
+    fn bundled_kv_cache_selection_defaults_to_rsq4_and_rejects_rsq4k3v() -> Result<(), LaunchError>
     {
-        let mut pin = release(LOCK)?;
+        assert_eq!(select_kv_cache(true, None)?, Some(KvCache::Rsq4));
         assert_eq!(
-            MEMORY_CONTEXT_RELEASE,
-            Some((pin.version.as_str(), pin.commit.as_str()))
-        );
-        assert!(memory_context_supported()?);
-        assert!(row_workers_supported(&pin, 4, MEMORY_CONTEXT_RELEASE).is_ok());
-        assert_eq!(select_kv_cache(&pin, None)?, Some(KvCache::Rsq4));
-        assert_eq!(
-            select_kv_cache(&pin, Some(KvCache::F16))?,
+            select_kv_cache(true, Some(KvCache::F16))?,
             Some(KvCache::F16)
         );
         assert_eq!(
-            select_kv_cache(&pin, Some(KvCache::Rsq4))?,
+            select_kv_cache(true, Some(KvCache::Rsq4))?,
             Some(KvCache::Rsq4)
         );
         assert_eq!(
-            select_kv_cache(&pin, Some(KvCache::Rsq4Kvf))?,
+            select_kv_cache(true, Some(KvCache::Rsq4Kvf))?,
             Some(KvCache::Rsq4Kvf)
         );
-        assert!(rsq4kvf_supported(&pin));
-        for (version, commit) in [
-            ("0.1.27", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.28", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.30", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.33", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.36", "50977990398a20a8add2056bfe34ce59e1677510"),
-            ("0.1.38", "50977990398a20a8add2056bfe34ce59e1677510"),
-            ("0.1.39", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.39", "0000000000000000000000000000000000000000"),
-            ("0.1.40", "d25f70322768bdcaab704cc3a1036a5f6c55ee82"),
-        ] {
-            pin.version = version.into();
-            pin.commit = commit.into();
-            assert_eq!(select_kv_cache(&pin, None)?, None);
-            assert_eq!(select_kv_cache(&pin, Some(KvCache::F16))?, None);
-            assert_eq!(
-                select_kv_cache(&pin, Some(KvCache::Rsq4)),
-                Err(LaunchError::NativeRuntime)
-            );
-            assert_eq!(
-                select_kv_cache(&pin, Some(KvCache::Rsq4Kvf)),
-                Err(LaunchError::NativeRuntime)
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn full_k4v4_context_requires_its_own_aligned_source_release() -> Result<(), LaunchError> {
-        let mut pin = release(LOCK)?;
-        assert!(full_context_supported()?);
-        assert_eq!(K4V4_FULL_CONTEXT_RELEASE, MEMORY_CONTEXT_RELEASE);
-        assert!(!full_context_release_matches(&pin, None));
-        assert!(full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
-        for version in [
-            "0.1.27", "0.1.28", "0.1.30", "0.1.31", "0.1.32", "0.1.33", "0.1.34", "0.1.35",
-            "0.1.36", "0.1.38", "0.1.40",
-        ] {
-            pin.version = version.into();
-            assert!(!full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
-        }
-        pin.version = "0.1.39".into();
-        pin.commit = "0".repeat(40);
-        assert!(!full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
-        let other_source = (pin.version.as_str(), pin.commit.as_str());
-        assert!(!full_context_release_matches(&pin, Some(other_source)));
-        pin.version = "0.1.26".into();
-        pin.commit = "ac941f2668ae93dba9824002b4597081457aa09f".into();
-        assert!(!full_context_release_matches(&pin, MEMORY_CONTEXT_RELEASE));
-        Ok(())
-    }
-
-    #[test]
-    fn k4v3_capacity_selection_waits_for_a_separately_reviewed_memory_release()
-    -> Result<(), LaunchError> {
-        let mut pin = release(LOCK)?;
-        assert!(!k4v3_context_supported(&pin));
         assert_eq!(
-            select_kv_cache(&pin, Some(KvCache::Rsq4K3v)),
+            select_kv_cache(true, Some(KvCache::Rsq4K3v)),
             Err(LaunchError::NativeRuntime)
         );
         assert_eq!(
             KvCache::parse(Some(std::ffi::OsStr::new("rsq4k3v")))?,
             KvCache::Rsq4K3v
         );
-        for (version, commit) in [
-            ("0.1.27", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.28", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.30", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.33", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.36", "50977990398a20a8add2056bfe34ce59e1677510"),
-            ("0.1.38", "50977990398a20a8add2056bfe34ce59e1677510"),
-            ("0.1.39", "0000000000000000000000000000000000000000"),
+        assert_eq!(select_kv_cache(false, None)?, None);
+        for cache in [
+            KvCache::F16,
+            KvCache::Rsq4,
+            KvCache::Rsq4Kvf,
+            KvCache::Rsq4K3v,
         ] {
-            pin.version = version.into();
-            pin.commit = commit.into();
-            assert!(!k4v3_context_supported(&pin));
             assert_eq!(
-                select_kv_cache(&pin, Some(KvCache::Rsq4K3v)),
-                Err(LaunchError::NativeRuntime)
+                select_kv_cache(false, Some(cache)),
+                Err(LaunchError::Arguments)
             );
         }
-        assert_eq!(
-            pinned_kv_cache(false, Some(KvCache::Rsq4K3v)),
-            Err(LaunchError::Arguments)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn latest_prompt_reuse_requires_exact_reviewed_release_source() -> Result<(), LaunchError> {
-        let mut pin = release(LOCK)?;
-        assert!(prompt_reuse_supported(&pin, true).is_ok());
-        for version in [
-            "0.1.25",
-            "0.1.27",
-            "0.1.28",
-            "0.1.29",
-            "0.1.30",
-            "0.1.31",
-            "0.1.32",
-            "0.1.33",
-            "0.1.34",
-            "0.1.35",
-            "0.1.36",
-            "0.1.38",
-            "0.1.39-dev",
-            "v0.1.39",
-            "0.1.39.0",
-            "0.1.039",
-            "0.1.40",
-            "",
-            "latest",
-        ] {
-            pin.version = version.into();
-            assert_eq!(
-                prompt_reuse_supported(&pin, true),
-                Err(LaunchError::Artifacts)
-            );
-            assert!(prompt_reuse_supported(&pin, false).is_ok());
-        }
-        pin = release(LOCK)?;
-        pin.commit = "0".repeat(40);
-        assert_eq!(
-            prompt_reuse_supported(&pin, true),
-            Err(LaunchError::Artifacts)
-        );
-        assert!(prompt_reuse_supported(&pin, false).is_ok());
         Ok(())
     }
 
@@ -1092,107 +533,20 @@ mod tests {
     }
 
     #[test]
-    fn four_row_workers_require_the_reviewed_parallel_release() -> Result<(), LaunchError> {
-        let mut pin = release(LOCK)?;
+    fn verify_rejects_invalid_row_workers_before_artifact_lookup() {
+        let missing_dir = std::env::temp_dir().join("Bonsai-inference-verify-nonexistent");
+        for workers in [0, 2, 3, 5, 16, 255] {
+            assert_eq!(
+                verify(&missing_dir, workers).err(),
+                Some(LaunchError::Artifacts)
+            );
+        }
         for workers in [1, 4, 8, 12] {
-            assert!(row_workers_supported(&pin, workers, MEMORY_CONTEXT_RELEASE).is_ok());
-        }
-        for workers in [0, 2, 3, 5, 16, 255] {
             assert_eq!(
-                row_workers_supported(&pin, workers, MEMORY_CONTEXT_RELEASE),
-                Err(LaunchError::Artifacts)
+                verify(&missing_dir, workers).err(),
+                Some(LaunchError::Artifacts)
             );
         }
-        for version in [
-            "0.1.8",
-            "0.1.9",
-            "0.1.25",
-            "0.1.27",
-            "0.1.28",
-            "0.1.29",
-            "0.1.30",
-            "0.1.31",
-            "0.1.32",
-            "0.1.33",
-            "0.1.34",
-            "0.1.35",
-            "0.1.36",
-            "0.1.38",
-            "0.1.39-dev",
-            "v0.1.39",
-            "0.1.39.0",
-            "0.1.039",
-            "0.1.40",
-            "",
-            "latest",
-        ] {
-            pin.version = version.into();
-            assert!(row_workers_supported(&pin, 1, MEMORY_CONTEXT_RELEASE).is_ok());
-            for workers in [4, 8, 12] {
-                assert_eq!(
-                    row_workers_supported(&pin, workers, MEMORY_CONTEXT_RELEASE),
-                    Err(LaunchError::Artifacts)
-                );
-            }
-        }
-        pin = release(LOCK)?;
-        pin.commit = "0".repeat(40);
-        assert!(row_workers_supported(&pin, 1, MEMORY_CONTEXT_RELEASE).is_ok());
-        for workers in [4, 8, 12] {
-            assert_eq!(
-                row_workers_supported(&pin, workers, MEMORY_CONTEXT_RELEASE),
-                Err(LaunchError::Artifacts)
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn reviewed_memory_release_keeps_parallel_quantized_and_reuse_prerequisites()
-    -> Result<(), LaunchError> {
-        let mut pin = release(LOCK)?;
-        let reviewed = Some(("0.1.26", "1111111111111111111111111111111111111111"));
-        pin.version = "0.1.26".into();
-        pin.commit = "1111111111111111111111111111111111111111".into();
-        assert!(reviewed_release_matches(&pin, reviewed));
-        assert!(turboquant_supported(&pin, reviewed));
-        assert!(row_workers_supported(&pin, 4, reviewed).is_ok());
-        for workers in [0, 2, 3, 5, 16, 255] {
-            assert_eq!(
-                row_workers_supported(&pin, workers, reviewed),
-                Err(LaunchError::Artifacts)
-            );
-        }
-        for identity in [
-            None,
-            Some(("0.1.27", "1111111111111111111111111111111111111111")),
-            Some(("0.1.26", "0000000000000000000000000000000000000000")),
-        ] {
-            assert!(!reviewed_release_matches(&pin, identity));
-            assert!(!turboquant_supported(&pin, identity));
-            assert_eq!(
-                row_workers_supported(&pin, 4, identity),
-                Err(LaunchError::Artifacts)
-            );
-            assert!(row_workers_supported(&pin, 1, identity).is_ok());
-        }
-        // Synthetic source review does not open the production gate or change
-        // the published pin. Latest reuse shares the TurboQuant source review.
-        assert!(!turboquant_supported(&pin, MEMORY_CONTEXT_RELEASE));
-        assert_eq!(
-            select_kv_cache(&pin, Some(KvCache::Rsq4)),
-            Err(LaunchError::NativeRuntime)
-        );
-        assert_eq!(
-            prompt_reuse_supported(&pin, true),
-            Err(LaunchError::Artifacts)
-        );
-        assert!(prompt_reuse_supported(&pin, false).is_ok());
-        assert!(vision_supported()?);
-        assert!(!reviewed_release_matches(&pin, VISION_RELEASE));
-        assert!(multi_rank_lora_supported()?);
-        assert!(!reviewed_release_matches(&pin, MULTI_RANK_LORA_RELEASE));
-        Ok(())
     }
 
     #[test]
@@ -1204,53 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_pipe_and_0_1_39_capabilities_require_reviewed_release() -> Result<(), LaunchError> {
-        let mut pin = release(LOCK)?;
-        assert_eq!(
-            BROKER_PIPE_RELEASE,
-            Some(("0.1.39", "d25f70322768bdcaab704cc3a1036a5f6c55ee82"))
-        );
-        assert!(broker_pipe_supported()?);
-        assert!(reviewed_release_matches(&pin, BROKER_PIPE_RELEASE));
-        assert!(calibrated_cow_admission_supported()?);
-        assert!(branch_prompt_reuse_supported()?);
-        assert!(cpu_prefill_gdn_supported()?);
-        assert!(cpu_speculation_supported()?);
-        assert!(multi_rank_lora_supported()?);
-        assert!(hexagon_arena_cache_supported()?);
-        assert!(rsq4kvf_supported(&pin));
-        assert!(nariq_trellis_supported()?);
-        assert!(bonsai_2_5_supported()?);
-        for (version, commit) in [
-            ("0.1.31", "577966d98cf8b36021df52da194b1a5540429a6b"),
-            ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.34", "c64c9648f85ac4c99ff8d57f709871b31e785370"),
-            ("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-            ("0.1.38", "50977990398a20a8add2056bfe34ce59e1677510"),
-            ("0.1.39", "23e24e444a821d4426f65d56c6cf874cf568b0d9"),
-            ("0.1.39", "0000000000000000000000000000000000000000"),
-            ("0.1.36", "3bc76f135bf23c538b3bb789aef382143ff36839"),
-        ] {
-            pin.version = version.into();
-            pin.commit = commit.into();
-            assert!(!reviewed_release_matches(&pin, BROKER_PIPE_RELEASE));
-            assert!(!reviewed_release_matches(
-                &pin,
-                CALIBRATED_COW_ADMISSION_RELEASE
-            ));
-            assert!(!reviewed_release_matches(&pin, BRANCH_PROMPT_REUSE_RELEASE));
-            assert!(!reviewed_release_matches(&pin, CPU_PREFILL_GDN_RELEASE));
-            assert!(!reviewed_release_matches(&pin, WY_F32_ROTATED_KV_RELEASE));
-            assert!(!reviewed_release_matches(&pin, CPU_SPECULATION_RELEASE));
-            assert!(!reviewed_release_matches(&pin, MULTI_RANK_LORA_RELEASE));
-            assert!(!reviewed_release_matches(&pin, HEXAGON_ARENA_CACHE_RELEASE));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn parsed_0_1_32_session_enums_validate_exact_tokens_and_reject_aliases()
-    -> Result<(), LaunchError> {
+    fn session_enums_validate_exact_tokens_and_reject_aliases() -> Result<(), LaunchError> {
         use std::ffi::OsStr;
 
         assert_eq!(
@@ -1299,13 +607,7 @@ mod tests {
         assert_eq!(x1.default_row_workers(), 8);
         assert_eq!(x2.default_row_workers(), 8);
         assert!(CpuFamily::parse(Some(OsStr::new("x3"))).is_err());
-        Ok(())
-    }
 
-    #[test]
-    fn vulkan_and_composite_placements_parse_and_admit_reviewed_0_1_35() -> Result<(), LaunchError>
-    {
-        use std::ffi::OsStr;
         let vulkan = Placement::parse(Some(OsStr::new("vulkan")))?;
         let composite = Placement::parse(Some(OsStr::new("composite")))?;
         assert_eq!(vulkan, Placement::Vulkan);
@@ -1315,249 +617,79 @@ mod tests {
         assert_eq!(vulkan.as_str(), "vulkan");
         assert_eq!(composite.as_str(), "composite");
         assert!(Placement::parse(Some(OsStr::new("npu"))).is_err());
-
-        for requested in [Placement::Vulkan, Placement::Composite] {
-            assert_eq!(pinned_placement(true, Some(requested)), Ok(requested));
-            assert_eq!(
-                pinned_placement(false, Some(requested)),
-                Err(LaunchError::Arguments)
-            );
-        }
-
-        let mut reviewed = release(LOCK)?;
-        assert_eq!(
-            select_placement(
-                &reviewed,
-                Placement::Vulkan,
-                CPU_PLACEMENT_RELEASE,
-                VULKAN_PLACEMENT_RELEASE,
-            )?,
-            Placement::Vulkan
-        );
-        assert_eq!(
-            select_placement(
-                &reviewed,
-                Placement::Composite,
-                CPU_PLACEMENT_RELEASE,
-                VULKAN_PLACEMENT_RELEASE,
-            )?,
-            Placement::Composite
-        );
-        reviewed.version = "0.1.32".into();
-        reviewed.commit = "23e24e444a821d4426f65d56c6cf874cf568b0d9".into();
-        assert_eq!(
-            select_placement(
-                &reviewed,
-                Placement::Vulkan,
-                CPU_PLACEMENT_RELEASE,
-                VULKAN_PLACEMENT_RELEASE,
-            ),
-            Err(LaunchError::NativeRuntime)
-        );
-        assert_eq!(
-            select_placement(
-                &reviewed,
-                Placement::Vulkan,
-                Some(("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9")),
-                VULKAN_PLACEMENT_RELEASE,
-            ),
-            Err(LaunchError::NativeRuntime)
-        );
         Ok(())
     }
 
     #[test]
-    fn wy_f32_rotated_kv_gate_admits_reviewed_0_1_39_and_rejects_unreviewed_release()
-    -> Result<(), LaunchError> {
-        let pinned = release(LOCK)?;
-        assert_eq!(WY_F32_ROTATED_KV_RELEASE, REVIEWED_0_1_39);
-        for kv in [
-            KvCache::F16,
-            KvCache::Rsq4,
-            KvCache::Rsq4Kvf,
-            KvCache::Rsq4K3v,
-        ] {
-            assert_eq!(
-                pinned_wy_f32_kv_cache(Some(CpuPrefillGdn::WyF32), Some(kv)),
-                Ok(())
-            );
-        }
-        assert_eq!(
-            pinned_wy_f32_kv_cache(Some(CpuPrefillGdn::WyF32), None),
-            Err(LaunchError::Arguments)
-        );
-        assert_eq!(
-            pinned_wy_f32_kv_cache(Some(CpuPrefillGdn::Sequential), Some(KvCache::Rsq4)),
-            Ok(())
-        );
-
-        let mut unreviewed = pinned;
-        let reviewed_0_1_32 = ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9");
-        unreviewed.version = reviewed_0_1_32.0.into();
-        unreviewed.commit = reviewed_0_1_32.1.into();
-        assert_eq!(
-            select_wy_f32_kv_cache(
-                &unreviewed,
-                Some(CpuPrefillGdn::WyF32),
-                Some(KvCache::F16),
-                Some(reviewed_0_1_32),
-                WY_F32_ROTATED_KV_RELEASE,
-            ),
-            Ok(())
-        );
-        for kv in [KvCache::Rsq4, KvCache::Rsq4Kvf, KvCache::Rsq4K3v] {
-            assert_eq!(
-                select_wy_f32_kv_cache(
-                    &unreviewed,
-                    Some(CpuPrefillGdn::WyF32),
-                    Some(kv),
-                    Some(reviewed_0_1_32),
-                    WY_F32_ROTATED_KV_RELEASE,
-                ),
-                Err(LaunchError::NativeRuntime)
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn hexagon_arena_cache_requires_reviewed_release() -> Result<(), LaunchError> {
-        let mut pin = release(LOCK)?;
-        assert_eq!(HEXAGON_ARENA_CACHE_RELEASE, REVIEWED_0_1_39);
-        assert!(hexagon_arena_cache_supported()?);
-        assert!(hexagon_arena_cache_supported_for(
-            &pin,
-            HEXAGON_ARENA_CACHE_RELEASE
-        ));
-
-        let unreviewed = ("0.1.32", "23e24e444a821d4426f65d56c6cf874cf568b0d9");
-        assert!(!hexagon_arena_cache_supported_for(&pin, Some(unreviewed)));
-        assert!(!hexagon_arena_cache_supported_for(
-            &pin,
-            Some(("0.1.39", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
-        ));
-        assert!(!hexagon_arena_cache_supported_for(&pin, None));
-
-        pin.version = unreviewed.0.into();
-        pin.commit = unreviewed.1.into();
-        assert!(!hexagon_arena_cache_supported_for(
-            &pin,
-            HEXAGON_ARENA_CACHE_RELEASE
-        ));
-        assert!(!hexagon_arena_cache_supported_for(&pin, None));
-        Ok(())
-    }
-
-    #[test]
-    fn nariq_trellis_requires_exact_reviewed_release() -> Result<(), LaunchError> {
-        assert_eq!(NARIQ_TRELLIS_RELEASE, REVIEWED_0_1_39);
-        assert!(nariq_trellis_supported()?);
-        let mut pin = release(LOCK)?;
-        assert!(reviewed_release_matches(&pin, NARIQ_TRELLIS_RELEASE));
-        assert!(!reviewed_release_matches(
-            &pin,
-            Some(("0.1.34", &pin.commit))
-        ));
-        pin.version = "0.1.34".into();
-        assert!(!reviewed_release_matches(&pin, NARIQ_TRELLIS_RELEASE));
-        Ok(())
-    }
-
-    #[test]
-    fn bonsai25_release_gate_is_pinned() -> Result<(), LaunchError> {
-        assert_eq!(BONSAI_2_5_RELEASE, REVIEWED_0_1_39);
-        assert!(bonsai_2_5_supported()?);
-        let mut pin = release(LOCK)?;
-        assert!(reviewed_release_matches(&pin, BONSAI_2_5_RELEASE));
-        pin.version = "0.1.34".into();
-        assert!(!reviewed_release_matches(&pin, BONSAI_2_5_RELEASE));
-        Ok(())
-    }
-
-    #[test]
-    fn tile_64_and_prefill_row_workers_admit_reviewed_0_1_39_and_reject_unreviewed()
+    fn cpu_prefill_tokens_and_prefill_row_workers_validate_bundled_budgets()
     -> Result<(), LaunchError> {
         use bonsai_cpu_policy::hardware::SnapdragonFamily;
         use std::ffi::OsStr;
 
-        assert_eq!(PREFILL_TILE_64_RELEASE, REVIEWED_0_1_39);
-        assert_eq!(PREFILL_ROW_WORKERS_RELEASE, REVIEWED_0_1_39);
-        assert!(prefill_tile_64_supported()?);
-        assert_eq!(parse_cpu_prefill_tokens(Some(OsStr::new("64"))), Ok(64));
-        assert_eq!(pinned_cpu_prefill_tokens(true, Some(64)), Ok(Some(64)));
+        for (raw, expected) in [("8", 8_u8), ("16", 16), ("32", 32), ("64", 64)] {
+            assert_eq!(
+                parse_cpu_prefill_tokens(Some(OsStr::new(raw))),
+                Ok(expected)
+            );
+            assert_eq!(
+                select_cpu_prefill_tokens(true, Some(expected)),
+                Ok(Some(expected))
+            );
+            assert_eq!(
+                select_cpu_prefill_tokens(false, Some(expected)),
+                Err(LaunchError::Arguments)
+            );
+        }
+        assert_eq!(select_cpu_prefill_tokens(true, None), Ok(None));
+        assert_eq!(select_cpu_prefill_tokens(false, None), Ok(None));
         assert_eq!(
-            pinned_cpu_prefill_tokens(false, Some(64)),
+            select_cpu_prefill_tokens(true, Some(12)),
             Err(LaunchError::Arguments)
         );
+        assert!(parse_cpu_prefill_tokens(Some(OsStr::new("128"))).is_err());
 
-        assert_eq!(parse_prefill_row_workers(Some(OsStr::new("12"))), Ok(12));
-        assert_eq!(parse_prefill_row_workers(Some(OsStr::new("16"))), Ok(16));
+        for (raw, expected) in [("1", 1_u8), ("4", 4), ("8", 8), ("12", 12), ("16", 16)] {
+            assert_eq!(
+                parse_prefill_row_workers(Some(OsStr::new(raw))),
+                Ok(expected)
+            );
+            assert_eq!(
+                select_prefill_row_workers(true, Some(expected), None, None),
+                Ok(Some(expected))
+            );
+            assert_eq!(
+                select_prefill_row_workers(false, Some(expected), None, None),
+                Err(LaunchError::Arguments)
+            );
+        }
         assert_eq!(
-            pinned_prefill_row_workers(true, None, Some(SnapdragonFamily::XElite), None),
+            select_prefill_row_workers(true, None, Some(SnapdragonFamily::XElite), None),
             Ok(Some(12))
         );
         assert_eq!(
-            pinned_prefill_row_workers(true, None, Some(SnapdragonFamily::X2EliteExtreme), None),
+            select_prefill_row_workers(true, None, Some(SnapdragonFamily::X2EliteExtreme), None),
             Ok(Some(16))
         );
         assert_eq!(
-            pinned_prefill_row_workers(
+            select_prefill_row_workers(
                 true,
                 None,
                 Some(SnapdragonFamily::XElite),
-                Some(CpuFamily::X2)
+                Some(CpuFamily::X2),
             ),
             Ok(Some(16))
         );
         assert_eq!(
-            pinned_prefill_row_workers(true, None, None, None),
+            select_prefill_row_workers(true, None, None, None),
             Ok(Some(4))
         );
         assert_eq!(
-            pinned_prefill_row_workers(true, Some(12), Some(SnapdragonFamily::XElite), None),
-            Ok(Some(12))
-        );
-        assert_eq!(
-            pinned_prefill_row_workers(false, Some(12), None, None),
-            Err(LaunchError::Arguments)
-        );
-
-        let mut unreviewed_pin = release(LOCK)?;
-        let prior_0_1_35 = ("0.1.35", "3bc76f135bf23c538b3bb789aef382143ff36839");
-        unreviewed_pin.version = prior_0_1_35.0.into();
-        unreviewed_pin.commit = prior_0_1_35.1.into();
-        assert_eq!(
-            select_cpu_prefill_tokens(
-                &unreviewed_pin,
-                true,
-                Some(64),
-                PREFILL_TILE_64_RELEASE,
-                PREFILL_TILE_64_RELEASE,
-                PREFILL_TILE_64_RELEASE,
-            ),
-            Err(LaunchError::NativeRuntime)
-        );
-        assert_eq!(
-            select_prefill_row_workers(
-                &unreviewed_pin,
-                true,
-                None,
-                Some(SnapdragonFamily::XElite),
-                None,
-                PREFILL_ROW_WORKERS_RELEASE,
-            ),
+            select_prefill_row_workers(false, None, Some(SnapdragonFamily::XElite), None),
             Ok(None)
         );
         assert_eq!(
-            select_prefill_row_workers(
-                &unreviewed_pin,
-                true,
-                Some(12),
-                Some(SnapdragonFamily::XElite),
-                None,
-                PREFILL_ROW_WORKERS_RELEASE,
-            ),
-            Err(LaunchError::NativeRuntime)
+            select_prefill_row_workers(true, Some(2), None, None),
+            Err(LaunchError::Arguments)
         );
         Ok(())
     }

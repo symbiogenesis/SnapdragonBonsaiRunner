@@ -61,16 +61,15 @@ pub const SWIFT_ROW_TASK_SCRATCH_BYTES: u64 = 32 * 1024;
 pub const MIN_CONTEXT_TOKENS: usize =
     (4_096_usize + 64).div_ceil(CONTEXT_PAGE_TOKENS) * CONTEXT_PAGE_TOKENS;
 
-const fn valid_prefill_tile_tokens(tokens: usize, allow_tile_64: bool) -> bool {
-    matches!(tokens, 8 | 16 | 32) || (allow_tile_64 && tokens == 64)
+const fn valid_prefill_tile_tokens(tokens: usize) -> bool {
+    matches!(tokens, 8 | 16 | 32 | 64)
 }
 
 fn tile_scratch_fixed_and_per_ctx(
     tokens: usize,
     kv_format: SwiftKvCacheFormat,
-    allow_tile_64: bool,
 ) -> Option<(u64, u64)> {
-    if !valid_prefill_tile_tokens(tokens, allow_tile_64) {
+    if !valid_prefill_tile_tokens(tokens) {
         return None;
     }
     let t = u64::try_from(tokens).ok()?;
@@ -92,10 +91,10 @@ fn tile_scratch_fixed_and_per_ctx(
 }
 
 /// Conservative additional scratch reservation (`bytes`) required by Prism's
-/// `Qwen35::tiled_prefill_scratch_bytes` for an explicit `8`, `16`, or `32`-token
+/// `Qwen35::tiled_prefill_scratch_bytes` for an explicit `8`, `16`, `32`, or `64`-token
 /// CPU tiled prefill configuration at `context_tokens` and `kv_format`.
 ///
-/// Returns `None` for unsupported tile sizes (`!(8|16|32)`), `context_tokens == 0`,
+/// Returns `None` for unsupported tile sizes (`!(8|16|32|64)`), `context_tokens == 0`,
 /// or `u64` arithmetic overflow.
 #[must_use]
 pub fn swift_tiled_prefill_scratch_bytes(
@@ -103,23 +102,10 @@ pub fn swift_tiled_prefill_scratch_bytes(
     context_tokens: usize,
     kv_format: SwiftKvCacheFormat,
 ) -> Option<u64> {
-    swift_tiled_prefill_scratch_bytes_for_tile(tokens, context_tokens, kv_format, false)
-}
-
-/// Forward-compatible variant of [`swift_tiled_prefill_scratch_bytes`] that
-/// optionally admits `64`-token CPU prefill tiles when `allow_tile_64` is `true`
-/// (`0.1.36+` release-gated).
-#[must_use]
-pub fn swift_tiled_prefill_scratch_bytes_for_tile(
-    tokens: usize,
-    context_tokens: usize,
-    kv_format: SwiftKvCacheFormat,
-    allow_tile_64: bool,
-) -> Option<u64> {
     if context_tokens == 0 {
         return None;
     }
-    let (fixed, per_ctx) = tile_scratch_fixed_and_per_ctx(tokens, kv_format, allow_tile_64)?;
+    let (fixed, per_ctx) = tile_scratch_fixed_and_per_ctx(tokens, kv_format)?;
     let ctx = u64::try_from(context_tokens).ok()?;
     let scores = ctx.checked_mul(per_ctx)?;
     fixed.checked_add(scores)
@@ -144,22 +130,11 @@ pub fn swift_selected_state_budget_bytes(
 }
 
 /// Conservative logits verification scratch (`bytes`) required by Prism's
-/// `Qwen35::tiled_verification_scratch_bytes` for an explicit `8`, `16`, or `32`-token
+/// `Qwen35::tiled_verification_scratch_bytes` for an explicit `8`, `16`, `32`, or `64`-token
 /// CPU tiled prefill configuration.
 #[must_use]
 pub fn swift_tiled_verification_scratch_bytes(prefill_tokens: usize) -> Option<u64> {
-    swift_tiled_verification_scratch_bytes_for_tile(prefill_tokens, false)
-}
-
-/// Forward-compatible variant of [`swift_tiled_verification_scratch_bytes`] that
-/// optionally admits `64`-token CPU prefill tiles when `allow_tile_64` is `true`
-/// (`0.1.36+` release-gated).
-#[must_use]
-pub fn swift_tiled_verification_scratch_bytes_for_tile(
-    prefill_tokens: usize,
-    allow_tile_64: bool,
-) -> Option<u64> {
-    if !valid_prefill_tile_tokens(prefill_tokens, allow_tile_64) {
+    if !valid_prefill_tile_tokens(prefill_tokens) {
         return None;
     }
     let rows = u64::try_from(prefill_tokens.min(8)).ok()?;
@@ -543,28 +518,15 @@ impl SwiftExecutionShape {
     }
 
     /// Attach Prism's exact `CPU` tiled-prefill scratch reserve for `tokens` (`8`,
-    /// `16`, or `32`) at `context_tokens` using this shape's `kv_format`.
+    /// `16`, `32`, or `64`) at `context_tokens` using this shape's `kv_format`.
     #[must_use]
-    pub fn with_tiled_prefill_tokens(self, tokens: usize, context_tokens: usize) -> Option<Self> {
-        self.with_tiled_prefill_tokens_for_tile(tokens, context_tokens, false)
-    }
-
-    /// Forward-compatible variant of [`Self::with_tiled_prefill_tokens`] that
-    /// optionally admits `64`-token CPU prefill tiles when `allow_tile_64` is `true`
-    /// (`0.1.36+` release-gated).
-    #[must_use]
-    pub fn with_tiled_prefill_tokens_for_tile(
+    pub fn with_tiled_prefill_tokens(
         mut self,
         tokens: usize,
         context_tokens: usize,
-        allow_tile_64: bool,
     ) -> Option<Self> {
-        self.tile_prefill_scratch_bytes = swift_tiled_prefill_scratch_bytes_for_tile(
-            tokens,
-            context_tokens,
-            self.kv_format,
-            allow_tile_64,
-        )?;
+        self.tile_prefill_scratch_bytes =
+            swift_tiled_prefill_scratch_bytes(tokens, context_tokens, self.kv_format)?;
         Some(self)
     }
 
@@ -921,8 +883,7 @@ impl SwiftContextPlan {
         }
         let kv_format = SwiftKvCacheFormat::from_profile(profile);
         let (fixed_tile, score_per_ctx_token) =
-            tile_scratch_fixed_and_per_ctx(tile_tokens, kv_format, false)
-                .ok_or_else(insufficient)?;
+            tile_scratch_fixed_and_per_ctx(tile_tokens, kv_format).ok_or_else(insufficient)?;
         let fixed_bytes = FIXED_RUNTIME_BYTES
             .checked_add(fixed_tile)
             .ok_or_else(insufficient)?;
@@ -1159,7 +1120,7 @@ fn validate_calibrated_reuse(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Evaluates one calibrated CoW page count across explicit reuse, mmproj, and tile-64 gates."
+    reason = "Evaluates one calibrated CoW page count across explicit reuse and mmproj gates."
 )]
 fn eval_calibrated_cow_at(
     available_bytes: u64,
@@ -1170,7 +1131,6 @@ fn eval_calibrated_cow_at(
     min_checkpoint_slots: u64,
     explicit_checkpoint_bytes: Option<usize>,
     include_mmproj: bool,
-    allow_tile_64: bool,
 ) -> Option<SwiftCalibratedPlan> {
     let kv_format = SwiftKvCacheFormat::from_profile(profile);
     let ctx = u64::try_from(context_tokens).ok()?;
@@ -1212,20 +1172,16 @@ fn eval_calibrated_cow_at(
         )?;
 
     let prefill_scratch_u64 = match options.prefill_tokens {
-        Some(tokens) => Some(swift_tiled_prefill_scratch_bytes_for_tile(
+        Some(tokens) => Some(swift_tiled_prefill_scratch_bytes(
             tokens,
             context_tokens,
             kv_format,
-            allow_tile_64,
         )?),
         None => None,
     };
     let verify_scratch_u64 = if options.speculation_tokens.is_some() {
         let prefill = options.prefill_tokens?;
-        Some(swift_tiled_verification_scratch_bytes_for_tile(
-            prefill,
-            allow_tile_64,
-        )?)
+        Some(swift_tiled_verification_scratch_bytes(prefill)?)
     } else {
         None
     };
@@ -1296,28 +1252,12 @@ impl SwiftContextPlan {
         profile: SwiftContextProfile,
         options: SwiftCalibratedOptions,
     ) -> Result<SwiftCalibratedPlan, String> {
-        Self::for_calibrated_execution_with_tile_64(available_bytes, profile, options, false)
-    }
-
-    /// Forward-compatible variant of [`Self::for_calibrated_execution`] that
-    /// optionally admits `64`-token CPU prefill tiles when `allow_tile_64` is `true`
-    /// (`0.1.36+` release-gated).
-    ///
-    /// # Errors
-    /// Rejects non-native profiles, invalid tile/speculation/GDN combinations,
-    /// undersized explicit checkpoint reserves, insufficient RAM, or overflow.
-    pub fn for_calibrated_execution_with_tile_64(
-        available_bytes: u64,
-        profile: SwiftContextProfile,
-        options: SwiftCalibratedOptions,
-        allow_tile_64: bool,
-    ) -> Result<SwiftCalibratedPlan, String> {
         if profile == SwiftContextProfile::PublisherF16 {
             return Err(insufficient());
         }
         let kv_format = SwiftKvCacheFormat::from_profile(profile);
         if let Some(tokens) = options.prefill_tokens
-            && !valid_prefill_tile_tokens(tokens, allow_tile_64)
+            && !valid_prefill_tile_tokens(tokens)
         {
             return Err(insufficient());
         }
@@ -1363,7 +1303,6 @@ impl SwiftContextPlan {
                     min_checkpoint_slots,
                     explicit_checkpoint_bytes,
                     include_mmproj,
-                    allow_tile_64,
                 )
             };
             let mut best = eval_pages(min_pages)?;
@@ -1400,46 +1339,13 @@ impl SwiftContextPlan {
         options: SwiftCalibratedOptions,
         extra_adapter_bytes: u64,
     ) -> Result<SwiftCalibratedPlan, String> {
-        Self::for_calibrated_execution_with_adapter_reserve_and_tile_64(
-            available_bytes,
-            profile,
-            options,
-            extra_adapter_bytes,
-            false,
-        )
-    }
-
-    /// Forward-compatible variant of [`Self::for_calibrated_execution_with_adapter_reserve`]
-    /// that optionally admits `64`-token CPU prefill tiles when `allow_tile_64` is `true`
-    /// (`0.1.36+` release-gated).
-    ///
-    /// # Errors
-    /// Returns an error if `available_bytes` cannot cover `extra_adapter_bytes` plus the
-    /// minimum calibrated execution profile, or on arithmetic overflow.
-    pub fn for_calibrated_execution_with_adapter_reserve_and_tile_64(
-        available_bytes: u64,
-        profile: SwiftContextProfile,
-        options: SwiftCalibratedOptions,
-        extra_adapter_bytes: u64,
-        allow_tile_64: bool,
-    ) -> Result<SwiftCalibratedPlan, String> {
         if extra_adapter_bytes == 0 {
-            return Self::for_calibrated_execution_with_tile_64(
-                available_bytes,
-                profile,
-                options,
-                allow_tile_64,
-            );
+            return Self::for_calibrated_execution(available_bytes, profile, options);
         }
         let remaining = available_bytes
             .checked_sub(extra_adapter_bytes)
             .ok_or_else(insufficient)?;
-        let mut plan = Self::for_calibrated_execution_with_tile_64(
-            remaining,
-            profile,
-            options,
-            allow_tile_64,
-        )?;
+        let mut plan = Self::for_calibrated_execution(remaining, profile, options)?;
         let extra_usize = usize::try_from(extra_adapter_bytes).map_err(|_| insufficient())?;
         plan.context_plan.memory_limit_bytes = plan
             .context_plan
@@ -1886,14 +1792,14 @@ mod tests {
             Some(39_190_528)
         );
         assert_eq!(
-            swift_tiled_prefill_scratch_bytes_for_tile(64, 262_144, SwiftKvCacheFormat::Rsq4, true),
+            swift_tiled_prefill_scratch_bytes(64, 262_144, SwiftKvCacheFormat::Rsq4),
             Some(156_467_200)
         );
         assert_eq!(
             swift_tiled_prefill_scratch_bytes(16, 62_720, SwiftKvCacheFormat::F16),
             Some(46_497_792)
         );
-        for invalid in [0, 1, 4, 7, 15, 64] {
+        for invalid in [0, 1, 4, 7, 15, 128] {
             assert_eq!(
                 swift_tiled_prefill_scratch_bytes(invalid, 8_192, SwiftKvCacheFormat::F16),
                 None
