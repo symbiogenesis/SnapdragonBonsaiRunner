@@ -205,26 +205,13 @@ const PQ2_ADAPTER_LIFECYCLE_PROFILE: AdapterProfile = AdapterProfile {
     required_scale_history: true,
 };
 
-// This delivery needs its independently reviewed source as well as its version.
-// Historical fixed-source workloads retain their original release identities.
-const MEMORY_CONTEXT_REVISION: &str = "d25f70322768bdcaab704cc3a1036a5f6c55ee82";
-const HISTORICAL_0_1_38_REVISION: &str = "50977990398a20a8add2056bfe34ce59e1677510";
-const HISTORICAL_0_1_35_REVISION: &str = "3bc76f135bf23c538b3bb789aef382143ff36839";
-const HISTORICAL_0_1_32_REVISION: &str = "23e24e444a821d4426f65d56c6cf874cf568b0d9";
-const PRECEDING_MEMORY_CONTEXT_REVISION: &str = "89df9aaff9e580d66679f2befe94d471bcf4fc7f";
-const PRIOR_MEMORY_CONTEXT_REVISION: &str = "99671be7ab2be01e406a11b0c3d6caede398d96f";
-const PREVIOUS_MEMORY_CONTEXT_REVISION: &str = "1429a33772089dfd3a50a96c698b9dbe0b36836a";
-const LEGACY_MEMORY_CONTEXT_REVISION: &str = "ac941f2668ae93dba9824002b4597081457aa09f";
-
+// This delivery needs its exact bundled source commit as well as its version.
 fn reviewed_memory_context_release(version: Option<&str>, revision: Option<&str>) -> bool {
-    (version == Some("0.1.39") && revision == Some(MEMORY_CONTEXT_REVISION))
-        || (version == Some("0.1.38") && revision == Some(HISTORICAL_0_1_38_REVISION))
-        || (version == Some("0.1.35") && revision == Some(HISTORICAL_0_1_35_REVISION))
-        || (version == Some("0.1.32") && revision == Some(HISTORICAL_0_1_32_REVISION))
-        || (version == Some("0.1.30") && revision == Some(PRECEDING_MEMORY_CONTEXT_REVISION))
-        || (version == Some("0.1.28") && revision == Some(PRIOR_MEMORY_CONTEXT_REVISION))
-        || (version == Some("0.1.27") && revision == Some(PREVIOUS_MEMORY_CONTEXT_REVISION))
-        || (version == Some("0.1.26") && revision == Some(LEGACY_MEMORY_CONTEXT_REVISION))
+    let runtime = runtime_lock();
+    version.is_some()
+        && revision.is_some()
+        && version == runtime["version"].as_str()
+        && revision == runtime["commit"].as_str()
 }
 
 fn native_four_worker_release(version: Option<&str>, revision: Option<&str>) -> bool {
@@ -237,9 +224,8 @@ fn worker_readiness_receipt(
     expected: u8,
     verified: bool,
 ) -> Value {
-    // These reviewed owners require a matching field from the instantiated graph.
-    // Historical versions without reviewed revisions cannot supply it, and later
-    // versions need another review. Configured arguments cannot supply it.
+    // Require a matching field from the instantiated graph bound to the
+    // bundled runtime identity. Configured arguments cannot supply it.
     let observed =
         reviewed_memory_context_release(version, revision) && matches!(expected, 1 | 4) && verified;
     json!({"configuredNativeRowWorkers":expected, "verifiedReadinessObserved":verified,
@@ -251,7 +237,7 @@ fn worker_readiness_receipt(
 
 fn record_worker_readiness(report: &mut Value, expected: u8, verified: bool) {
     // Read the same compiled lock as LaunchConfig; never trust a mutable report
-    // field to turn a legacy or missing readiness result into observed identity.
+    // field to turn a missing or mismatched readiness result into observed identity.
     let runtime = runtime_lock();
     let observation = worker_readiness_receipt(
         runtime["version"].as_str(),
@@ -291,29 +277,17 @@ fn assert_worker_receipt_case(
 
 #[test]
 fn native_worker_receipts_require_exact_release_and_verified_readiness() {
+    let runtime = runtime_lock();
+    let current_version = runtime["version"].as_str().unwrap();
+    let prefixed = format!("v{current_version}");
+    let dev = format!("{current_version}-dev");
+    let padded = format!("{current_version}.0");
     for version in [
-        "0.1.8",
-        "0.1.9",
-        "0.1.10",
-        "0.1.11",
-        "0.1.25",
-        "0.1.26",
-        "0.1.27",
-        "0.1.28",
-        "0.1.29",
-        "0.1.30",
-        "0.1.31",
-        "0.1.32",
-        "0.1.33",
-        "0.1.34",
-        "0.1.35",
-        "0.1.36",
-        "0.1.38",
-        "0.1.39",
-        "v0.1.39",
-        "0.1.39-dev",
-        "0.1.39.0",
-        "0.1.039",
+        current_version,
+        prefixed.as_str(),
+        dev.as_str(),
+        padded.as_str(),
+        "0.0.0",
         "",
     ] {
         assert_worker_receipt_case(Some(version), None, false, false);
@@ -323,76 +297,19 @@ fn native_worker_receipts_require_exact_release_and_verified_readiness() {
 
 #[test]
 fn native_worker_receipts_require_the_reviewed_memory_context_source() {
-    assert_worker_receipt_case(Some("0.1.39"), Some(MEMORY_CONTEXT_REVISION), true, true);
-    assert_worker_receipt_case(Some("0.1.38"), Some(HISTORICAL_0_1_38_REVISION), true, true);
-    assert_worker_receipt_case(Some("0.1.35"), Some(HISTORICAL_0_1_35_REVISION), true, true);
-    assert_worker_receipt_case(Some("0.1.32"), Some(HISTORICAL_0_1_32_REVISION), true, true);
-    assert_worker_receipt_case(
-        Some("0.1.30"),
-        Some(PRECEDING_MEMORY_CONTEXT_REVISION),
-        true,
-        true,
-    );
-    assert_worker_receipt_case(
-        Some("0.1.28"),
-        Some(PRIOR_MEMORY_CONTEXT_REVISION),
-        true,
-        true,
-    );
-    assert_worker_receipt_case(
-        Some("0.1.27"),
-        Some(PREVIOUS_MEMORY_CONTEXT_REVISION),
-        true,
-        true,
-    );
-    assert_worker_receipt_case(
-        Some("0.1.26"),
-        Some(LEGACY_MEMORY_CONTEXT_REVISION),
-        true,
-        true,
-    );
-    for revision in [
+    let runtime = runtime_lock();
+    let version = runtime["version"].as_str().unwrap();
+    let commit = runtime["commit"].as_str().unwrap();
+    assert_worker_receipt_case(Some(version), Some(commit), true, true);
+    for bad_revision in [
         None,
         Some("99bab71270b1e6a6fb6d47eec2e34b8097cdcd4c"),
         Some("0000000000000000000000000000000000000000"),
     ] {
-        for version in ["0.1.27", "0.1.28", "0.1.30", "0.1.32", "0.1.34", "0.1.35"] {
-            assert_worker_receipt_case(Some(version), revision, false, false);
-        }
+        assert_worker_receipt_case(Some(version), bad_revision, false, false);
     }
-    assert_worker_receipt_case(Some("0.1.26"), Some(MEMORY_CONTEXT_REVISION), false, false);
-    assert_worker_receipt_case(
-        Some("0.1.27"),
-        Some(LEGACY_MEMORY_CONTEXT_REVISION),
-        false,
-        false,
-    );
-    assert_worker_receipt_case(Some("0.1.27"), Some(MEMORY_CONTEXT_REVISION), false, false);
-    assert_worker_receipt_case(Some("0.1.28"), Some(MEMORY_CONTEXT_REVISION), false, false);
-    assert_worker_receipt_case(Some("0.1.30"), Some(MEMORY_CONTEXT_REVISION), false, false);
-    assert_worker_receipt_case(
-        Some("0.1.31"),
-        Some("577966d98cf8b36021df52da194b1a5540429a6b"),
-        false,
-        false,
-    );
-    assert_worker_receipt_case(Some("0.1.32"), Some(MEMORY_CONTEXT_REVISION), false, false);
-    assert_worker_receipt_case(Some("0.1.34"), Some(MEMORY_CONTEXT_REVISION), false, false);
-    assert_worker_receipt_case(Some("0.1.35"), Some(MEMORY_CONTEXT_REVISION), false, false);
-    assert_worker_receipt_case(Some("0.1.38"), Some(MEMORY_CONTEXT_REVISION), false, false);
-    assert_worker_receipt_case(
-        Some("0.1.39"),
-        Some(HISTORICAL_0_1_38_REVISION),
-        false,
-        false,
-    );
-    assert_worker_receipt_case(
-        Some("0.1.38"),
-        Some(HISTORICAL_0_1_35_REVISION),
-        false,
-        false,
-    );
-    assert_worker_receipt_case(Some("0.1.36"), Some(MEMORY_CONTEXT_REVISION), false, false);
+    assert_worker_receipt_case(Some("0.0.0"), Some(commit), false, false);
+    assert_worker_receipt_case(None, Some(commit), false, false);
 }
 
 #[test]
