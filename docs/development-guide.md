@@ -356,8 +356,19 @@ and [storage limits](streaming-resources.md#native-chat-and-transcript).
 
 Chat automatically saves drafts,
 response settings, voice description, transcript and exact completed history in
-`DataDirectory/chat-recovery.dpapi`. User-scoped DPAPI encrypts the bounded 8 MiB
-workspace; a file lock permits one writer per data folder.
+`DataDirectory/chat-recovery.dpapi`, rotating the preceding encrypted snapshot into
+`DataDirectory/chat-recovery.backup.dpapi` on each save. User-scoped DPAPI encrypts the bounded 8 MiB
+workspace; a file lock permits one writer per data folder. Structural conversation
+changes (creating, switching, renaming, deleting, or undoing deletion) and prompt
+submissions/commits flush immediately instead of waiting for the idle autosave timer.
+If `chat-recovery.dpapi` cannot be decoded or fails strict schema checks on startup,
+recovery automatically attempts tolerant salvage (preserving healthy conversations around
+unknown future fields or isolated corrupt entries) and falls back to
+`chat-recovery.backup.dpapi`; unreadable primary bytes are quarantined into
+`DataDirectory/chat-recovery.preserved.dpapi` before replacement so nothing is silently
+overwritten. Deleting a conversation retains the most recently deleted entry in session
+memory for immediate **Undo** from the deletion notice or **Settings > Privacy**
+(**Restore last deleted conversation**).
 An interrupted reply with a locally identified prompt and visible answer is marked
 **Interrupted** and retained as conversation context; a reply that reaches the
 selected output cap without retaining a complete Extra effort draft is marked
@@ -373,10 +384,13 @@ ambiguous partial replies remain visible outside history.
 
 Restore activates neither microphone nor playback.
 In **Settings > Privacy**, disable **Save conversations on this device** to delete
-the saved copy and keep the workspace open without saving. This choice survives restarts;
+all encrypted workspace copies (`chat-recovery.dpapi`, `chat-recovery.backup.dpapi` and
+`chat-recovery.preserved.dpapi`), clear the in-session delete-undo buffer, and keep the
+workspace open without saving. This choice survives restarts;
 the locked `chat-recovery.lock` sentinel retains only the saving preference.
-Enable the setting again to resume saving. Corrupt or
-unreadable recovery is preserved with a warning until explicit saving replaces it.
+Enable the setting again to resume saving. When neither salvage nor backup can restore
+an unreadable primary file, it is preserved with a warning until explicit saving replaces
+it (quarantining the unreadable bytes to `chat-recovery.preserved.dpapi`).
 Save failures identify the failed step and available Windows error code without
 including conversation text or paths. Unsaved changes stay in the open window;
 the next automatic save retries the latest workspace.
