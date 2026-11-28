@@ -976,6 +976,67 @@ mod tests {
             !scratch.exists(),
             "TempWorkDir Drop guard must remove SwiftBonsai-RustCheck-* directory."
         );
+
+        // is_transient_fs_error classification
+        for code in [5_i32, 32, 33] {
+            assert!(is_transient_fs_error(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        assert!(is_transient_fs_error(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied"
+        )));
+        assert!(is_transient_fs_error(&std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "blocked"
+        )));
+        assert!(!is_transient_fs_error(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing"
+        )));
+
+        // receipt() error paths: missing filename and rename failure into existing directory
+        let no_name = Path::new("C:\\");
+        assert!(receipt(no_name, &json!({"Success": false})).is_err());
+
+        let err_dir = std::env::temp_dir().join(format!(
+            "SwiftBonsai-ReceiptErr-{}-{nonce}",
+            std::process::id()
+        ));
+        let dest_dir = err_dir.join("occupied");
+        let dest_partial = err_dir.join("occupied.partial");
+        {
+            let _guard = TempWorkDir::create(err_dir.clone())?;
+            fs::create_dir(&dest_dir).map_err(|e| e.to_string())?;
+            assert!(receipt(&dest_dir, &json!({"Success": true})).is_err());
+            assert!(!dest_partial.exists());
+            assert!(dest_dir.is_dir());
+
+            // TempWorkDir::drop refuses non-temp path and refuses junction inside temp_dir
+            let target_dir = err_dir.join("target-with-sentinel");
+            let sentinel = target_dir.join("keep.txt");
+            fs::create_dir(&target_dir).map_err(|e| e.to_string())?;
+            fs::write(&sentinel, b"keep").map_err(|e| e.to_string())?;
+            let junction = err_dir.join("junction");
+            let status = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &junction.to_string_lossy(),
+                    &target_dir.to_string_lossy(),
+                ])
+                .output()
+                .map_err(|e| e.to_string())?;
+            assert!(status.status.success(), "mklink /J failed");
+            drop(TempWorkDir(junction.clone()));
+            assert!(junction.exists());
+            assert!(sentinel.exists());
+            fs::remove_dir(&junction).map_err(|e| e.to_string())?;
+        }
+        let non_temp = PathBuf::from("non-temp-relative-guard-path");
+        drop(TempWorkDir(non_temp));
         Ok(())
     }
 }

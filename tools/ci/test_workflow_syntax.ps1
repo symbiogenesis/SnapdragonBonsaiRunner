@@ -83,6 +83,30 @@ $cases = [ordered]@{
         Assert-CiReject { Get-PinnedActionlintArchive 'https://fixture.invalid/pinned.zip' $digest 'asset.zip' (Join-Path $scratch 'download.zip') $cache } 'Pinned actionlint archive checksum differs'
         Assert-Ci (-not (Test-Path -LiteralPath $cache)) 'A rejected download published cache data.'
     } }
+    archive_cache_tolerates_concurrent_publication_race = { Invoke-ArchiveCacheFixture { param($scratch)
+        $payload = Join-Path $scratch 'payload.zip'
+        [IO.File]::WriteAllText($payload, 'Inert concurrent archive bytes.')
+        $digest = (Get-FileHash -LiteralPath $payload -Algorithm SHA256).Hash.ToLowerInvariant()
+        $cache = Join-Path $scratch 'cache'
+        $cacheDir = Join-Path $cache $digest
+        $cachedArchive = Join-Path $cacheDir 'asset.zip'
+        function Invoke-WebRequest {
+            param($Uri, $OutFile, $ConnectionTimeoutSeconds, $OperationTimeoutSeconds, $MaximumRetryCount, $RetryIntervalSec)
+            [IO.File]::Copy($payload, $OutFile, $false)
+            [void][IO.Directory]::CreateDirectory($cacheDir)
+            [IO.File]::Copy($payload, $cachedArchive, $false)
+        }
+        $privateArchive = Join-Path $scratch 'private.zip'
+        Assert-CiEqual (Get-PinnedActionlintArchive 'https://fixture.invalid/pinned.zip' $digest 'asset.zip' $privateArchive $cache) $privateArchive
+        Assert-CiEqual ([IO.File]::ReadAllText($privateArchive)) 'Inert concurrent archive bytes.'
+        Assert-CiEqual (@(Get-ChildItem -LiteralPath $cacheDir -Filter '*.partial').Count) 0
+        # Remove-WorkflowDirectoryWithRetry cleans directory cleanly and retries/rejects cleanly
+        $remDir = Join-Path $scratch 'remove-me'
+        [void][IO.Directory]::CreateDirectory($remDir)
+        [IO.File]::WriteAllText((Join-Path $remDir 'file.txt'), 'temp')
+        Remove-WorkflowDirectoryWithRetry -Path $remDir -MaxAttempts 2 -InitialDelayMs 1
+        Assert-Ci (-not (Test-Path -LiteralPath $remDir))
+    } }
     snapshot_custom_runner_labels_use_explicit_configuration = {
         Invoke-SyntaxFixture ($valid.Replace('runs-on: ubuntu-latest', 'runs-on: [self-hosted, fixture-snapdragon]')) $false $true
     }

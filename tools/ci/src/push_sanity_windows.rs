@@ -2494,6 +2494,10 @@ mod tests {
         );
 
         assert_eq!(
+            finalize_with_cleanup(Err("primary".into()), Ok(())),
+            Err("primary".into())
+        );
+        assert_eq!(
             finalize_with_cleanup(Err("primary".into()), Err("cleanup".into())),
             Err("primary".into())
         );
@@ -2505,6 +2509,57 @@ mod tests {
             finalize_with_cleanup(Ok("ok".into()), Ok(())),
             Ok("ok".into())
         );
+
+        // Work::is_transient_remove_error classification
+        for code in [5_i32, 32, 33, 145] {
+            assert!(Work::is_transient_remove_error(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(Work::is_transient_remove_error(&std::io::Error::new(
+            std::io::ErrorKind::DirectoryNotEmpty,
+            "not empty"
+        )));
+        assert!(!Work::is_transient_remove_error(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing"
+        )));
+
+        // Work::drop refuses directory outside temp_dir and Work::remove_entry removes a junction without recursing
+        let outside = PathBuf::from("non-temp-push-work-guard-path");
+        drop(Work {
+            directory: outside,
+            started: Instant::now(),
+            sequence: 0,
+            pruned_target_cache: false,
+        });
+
+        let j_root = temporary.join(format!(
+            "bonsai-push-junction-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let j_scratch = j_root.join("scratch");
+        let j_target = j_root.join("target");
+        let sentinel = j_target.join("sentinel.txt");
+        fs::create_dir_all(&j_scratch).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&j_target).map_err(|e| e.to_string())?;
+        fs::write(&sentinel, b"must-survive").map_err(|e| e.to_string())?;
+        let link = j_scratch.join("link-to-target");
+        let out = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &j_target.to_string_lossy(),
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        assert!(out.status.success(), "mklink /J failed");
+        Work::remove_entry(&j_scratch)?;
+        assert!(!j_scratch.exists());
+        assert!(sentinel.exists(), "junction target must not be deleted");
+        Work::remove_entry(&j_root)?;
         Ok(())
     }
 }

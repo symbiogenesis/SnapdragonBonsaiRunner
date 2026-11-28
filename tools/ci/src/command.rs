@@ -659,5 +659,78 @@ mod tests {
         assert!(matches!(rejected, Err(ureq::Error::StatusCode(404))));
         assert_eq!(permanent_attempts, 1);
         assert!(permanent_sleeps.is_empty());
+
+        // Exhaustion preserves last error and sleeps (max_attempts - 1) times; max_attempts == 0 clamps to 1
+        let mut exhaust_attempts = 0_usize;
+        let mut exhaust_sleeps = Vec::new();
+        let exhausted: Result<(), ureq::Error> = super::retry_with_backoff(
+            3,
+            std::time::Duration::from_millis(5),
+            || {
+                exhaust_attempts += 1;
+                Err(ureq::Error::StatusCode(503))
+            },
+            super::is_transient_github_error,
+            |delay| exhaust_sleeps.push(delay),
+        );
+        assert!(matches!(exhausted, Err(ureq::Error::StatusCode(503))));
+        assert_eq!(exhaust_attempts, 3);
+        assert_eq!(
+            exhaust_sleeps,
+            vec![
+                std::time::Duration::from_millis(5),
+                std::time::Duration::from_millis(10),
+            ]
+        );
+
+        let mut zero_attempts = 0_usize;
+        let zero_res: Result<(), ureq::Error> = super::retry_with_backoff(
+            0,
+            std::time::Duration::from_millis(5),
+            || {
+                zero_attempts += 1;
+                Err(ureq::Error::StatusCode(503))
+            },
+            super::is_transient_github_error,
+            |_| {},
+        );
+        assert!(matches!(zero_res, Err(ureq::Error::StatusCode(503))));
+        assert_eq!(zero_attempts, 1);
+
+        // Remaining ureq::Error transient/non-transient and sanitization variants
+        for (err, transient, expected) in [
+            (
+                ureq::Error::Timeout(ureq::Timeout::Global),
+                true,
+                "request timeout",
+            ),
+            (ureq::Error::HostNotFound, true, "host not found"),
+            (ureq::Error::ConnectionFailed, true, "connection failed"),
+            (ureq::Error::RedirectFailed, false, "redirect error"),
+            (ureq::Error::TooManyRedirects, false, "redirect error"),
+            (
+                ureq::Error::LargeResponseHeader(100, 50),
+                false,
+                "response header too large",
+            ),
+            (
+                ureq::Error::ConnectProxyFailed("https://secret-proxy".into()),
+                false,
+                "proxy connection failed",
+            ),
+            (
+                ureq::Error::InvalidProxyUrl,
+                false,
+                "invalid proxy configuration",
+            ),
+            (
+                ureq::Error::RequireHttpsOnly("http://secret".into()),
+                false,
+                "HTTPS required",
+            ),
+        ] {
+            assert_eq!(super::is_transient_github_error(&err), transient);
+            assert_eq!(super::sanitize_github_error(&err), expected);
+        }
     }
 }

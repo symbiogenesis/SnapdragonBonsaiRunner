@@ -35,5 +35,18 @@ $cases=[ordered]@{
  missing_inputs_and_members_fail={ Invoke-CacheFixture { param($r) foreach ($pair in @(@('',$image),@(('a'*63),$image),@($source,''),@($source,"image`nother"))) { Assert-CiReject { Test-CiCache $r $pair[0] $pair[1] } }; [IO.File]::Delete((Join-Path $r 'bonsai-ci.exe')); Assert-CiReject { Test-CiCache $r $source $image } } }
  malformed_utf8_receipt_fails={ Invoke-CacheFixture { param($r) $path=Join-Path $r 'receipt.json'; [IO.File]::WriteAllBytes($path,([IO.File]::ReadAllBytes($path)+[byte[]]@(0xff))); Assert-CiReject { Test-CiCache $r $source $image } } }
  cli_failure_selects_no_bytes={ Invoke-CacheFixture { param($r) [IO.File]::WriteAllText((Join-Path $r 'bonsai-ci.exe'),'invalid'); $start=[Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path); $start.UseShellExecute=$false; $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true; foreach ($arg in @('-NoProfile','-File',(Join-Path $PSScriptRoot 'native_ci_cache.ps1'),'verify','-PackageDirectory',$r,'-SourceId',$source,'-HostId',$image)) { $start.ArgumentList.Add($arg) }; $process=[Diagnostics.Process]::Start($start); try { $stdout=$process.StandardOutput.ReadToEnd(); $stderr=$process.StandardError.ReadToEnd(); Assert-Ci ($process.WaitForExit(15000)) 'Cache CLI fixture timed out'; Assert-CiEqual $process.ExitCode 1; Assert-CiEqual $stdout ''; Assert-Ci ($stderr.Contains('CI bootstrap verification failed:')) } finally { $process.Dispose() } } }
+ receipt_write_is_atomic_without_bom_or_partial_leaks={ Invoke-CacheFixture { param($r)
+    $receiptPath = Join-Path $r 'receipt.json'
+    New-CiCacheReceipt $r $source $image $compilerIdentity | Out-Null
+    $bytes = [IO.File]::ReadAllBytes($receiptPath)
+    Assert-Ci ($bytes.Length -ge 3 -and -not ($bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf)) 'Receipt must not include UTF-8 BOM.'
+    Assert-CiEqual (@(Get-ChildItem -LiteralPath $r -Filter '*.partial').Count) 0
+    # Failure when destination receipt.json is an existing directory must clean up .partial
+    [IO.File]::Delete($receiptPath)
+    [void][IO.Directory]::CreateDirectory($receiptPath)
+    Assert-CiReject { New-CiCacheReceipt $r $source $image $compilerIdentity | Out-Null }
+    Assert-CiEqual (@(Get-ChildItem -LiteralPath $r -Filter '*.partial').Count) 0
+    Assert-Ci (Test-Path -LiteralPath $receiptPath -PathType Container)
+ } }
 }
 Invoke-CiCases $cases $Case

@@ -362,6 +362,83 @@ function Get-ReleaseToolchain([string]$RepositoryRoot) {
             }
         } finally { Remove-CiScratch $scratch }
     }
+    push_file_retry_and_atomic_receipt_cleanup = {
+        $scratch = New-CiScratch 'bonsai-push-file-retry-'
+        try {
+            Invoke-RedirectedStdin '' {
+                . $adapter
+                # 1. Transient IOException & UnauthorizedAccessException recover; ActionPreferenceStopException unwrapped
+                $script:attempts = 0
+                Invoke-PushFileRetry -MaxAttempts 4 -InitialDelayMs 1 -Operation {
+                    $script:attempts++
+                    if ($script:attempts -eq 1) { throw [IO.IOException]::new('locked') }
+                    if ($script:attempts -eq 2) { throw [UnauthorizedAccessException]::new('denied') }
+                }
+                Assert-CiEqual $script:attempts 3
+
+                $script:apsAttempts = 0
+                Invoke-PushFileRetry -MaxAttempts 3 -InitialDelayMs 1 -Operation {
+                    $script:apsAttempts++
+                    if ($script:apsAttempts -eq 1) {
+                        Write-Error -Exception ([IO.IOException]::new('wrapped')) -Message 'wrapped' -ErrorAction Stop
+                    }
+                }
+                Assert-CiEqual $script:apsAttempts 2
+
+                # Non-transient InvalidOperationException fails on attempt 1 without retry
+                $script:nonTransAttempts = 0
+                Assert-CiReject {
+                    Invoke-PushFileRetry -MaxAttempts 4 -InitialDelayMs 1 -Operation {
+                        $script:nonTransAttempts++
+                        throw [InvalidOperationException]::new('permanent')
+                    }
+                } 'permanent'
+                Assert-CiEqual $script:nonTransAttempts 1
+
+                # Exhaustion stops at MaxAttempts
+                $script:exhAttempts = 0
+                Assert-CiReject {
+                    Invoke-PushFileRetry -MaxAttempts 3 -InitialDelayMs 1 -Operation {
+                        $script:exhAttempts++
+                        throw [IO.IOException]::new('always locked')
+                    }
+                } 'always locked'
+                Assert-CiEqual $script:exhAttempts 3
+
+                # 2. Write-PushReceiptAtomic writes UTF-8 without BOM, leaves no .partial, cleans .partial on failure
+                $receiptPath = Join-Path $scratch 'sub/push-checker.json'
+                Write-PushReceiptAtomic $receiptPath @{ SchemaVersion = 1; Sha256 = ('a' * 64) }
+                $bytes = [IO.File]::ReadAllBytes($receiptPath)
+                Assert-Ci ($bytes.Length -ge 3 -and -not ($bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf)) 'Push receipt must not include UTF-8 BOM.'
+                Assert-CiEqual (@(Get-ChildItem -LiteralPath (Split-Path $receiptPath -Parent) -Filter '*.partial').Count) 0
+
+                $dirTarget = Join-Path $scratch 'occupied'
+                [void][IO.Directory]::CreateDirectory($dirTarget)
+                Assert-CiReject { Write-PushReceiptAtomic $dirTarget @{ SchemaVersion = 1 } }
+                Assert-CiEqual (@(Get-ChildItem -LiteralPath $scratch -Filter '*.partial').Count) 0
+            }
+        } finally { Remove-CiScratch $scratch }
+    }
+    hooks_path_rejection_restores_pwsh_env = {
+        $scratch = New-CiScratch 'bonsai-push-hookspath-env-'
+        $origPwsh = [Environment]::GetEnvironmentVariable('BONSAI_PUSH_PWSH_PATH')
+        try {
+            $repository = Join-Path $scratch 'repository'
+            Write-CiFixture $repository '.githooks/pre-push' '# inert hook'
+            & git -C $repository init --quiet
+            if ($LASTEXITCODE) { throw 'Cannot initialize hooksPath fixture.' }
+            & git -C $repository config core.hooksPath wrong-hooks
+            if ($LASTEXITCODE) { throw 'Cannot set core.hooksPath fixture.' }
+            [Environment]::SetEnvironmentVariable('BONSAI_PUSH_PWSH_PATH', 'sentinel-pwsh-path')
+            Invoke-RedirectedStdin "refs/heads/main $('0' * 40) refs/heads/main $('0' * 40)`n" {
+                Assert-CiReject { & $adapter -Root $repository } 'core.hooksPath'
+            }
+            Assert-CiEqual ([Environment]::GetEnvironmentVariable('BONSAI_PUSH_PWSH_PATH')) 'sentinel-pwsh-path'
+        } finally {
+            if ($null -eq $origPwsh) { [Environment]::SetEnvironmentVariable('BONSAI_PUSH_PWSH_PATH', [NullString]::Value) } else { [Environment]::SetEnvironmentVariable('BONSAI_PUSH_PWSH_PATH', $origPwsh) }
+            Remove-CiScratch $scratch
+        }
+    }
 }
 
 try {
