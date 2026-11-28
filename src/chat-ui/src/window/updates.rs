@@ -9,7 +9,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
@@ -17,8 +17,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(10);
 const CHECK_INTERVAL: Duration = Duration::from_mins(15);
 const MAX_OUTPUT: u64 = 64 * 1024;
+const MAX_PROGRESS: u64 = 4 * 1024;
 
 #[derive(Clone)]
 struct Installation {
@@ -203,6 +205,31 @@ fn bounded_text(path: &Path) -> io::Result<String> {
     crate::bounded_file::text(path, MAX_OUTPUT, "Update tool output exceeded its limit.")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgress {
+    phase: String,
+    #[serde(default)]
+    downloaded_bytes: u64,
+    #[serde(default)]
+    total_bytes: u64,
+}
+
+fn bounded_progress(path: &Path) -> Option<DownloadProgress> {
+    let text = crate::bounded_file::text(path, MAX_PROGRESS, "Progress exceeded limit.").ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn format_mib(bytes: u64) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::as_conversions,
+        reason = "Approximate display units only; update verification enforces exact byte counts."
+    )]
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    format!("{mib:.1} MiB")
+}
+
 struct UpdateScratch {
     directory: Option<PrivateDirectory>,
     can_cleanup: Cell<bool>,
@@ -235,7 +262,7 @@ impl UpdateScratch {
             return;
         };
         let path = directory.path().to_owned();
-        for name in ["request.json", "stdout.json", "stderr.txt"] {
+        for name in ["request.json", "stdout.json", "stderr.txt", "progress.json"] {
             let entry = path.join(name);
             if entry.try_exists().unwrap_or(false) {
                 let _removed = fs::remove_file(entry);
@@ -301,12 +328,22 @@ fn update_request(
     version: Option<&str>,
     identity: Option<&str>,
     restart: bool,
+    manual: bool,
+    progress_path: Option<&Path>,
 ) -> serde_json::Value {
     let mut request = if installation.portable {
         serde_json::json!({"operation": format!("portable-{}", operation.name())})
     } else {
         serde_json::json!({"operation": operation.name(), "installationDirectory": installation.root})
     };
+    if operation == Operation::Check && manual {
+        request["manual"] = true.into();
+    }
+    if operation == Operation::Download
+        && let Some(progress) = progress_path
+    {
+        request["progressPath"] = serde_json::json!(progress);
+    }
     if let Some(version) = version.filter(|_| operation != Operation::Check) {
         request["version"] = version.into();
     }
@@ -322,17 +359,35 @@ fn update_request(
     request
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Update worker entry binds installation, operation, cancellation, progress, and repaint wakeup."
+)]
 fn execute(
     installation: &Installation,
     operation: Operation,
     version: Option<&str>,
     identity: Option<&str>,
     restart: bool,
+    manual: bool,
+    background: bool,
+    progress: &Arc<Mutex<Option<DownloadProgress>>>,
+    repaint: Option<&egui::Context>,
     cancelled: &AtomicBool,
 ) -> io::Result<Response> {
     let scratch = UpdateScratch::create()?;
     let directory_path = scratch.path()?.to_owned();
-    let request = update_request(installation, operation, version, identity, restart);
+    let progress_path =
+        (operation == Operation::Download).then(|| directory_path.join("progress.json"));
+    let request = update_request(
+        installation,
+        operation,
+        version,
+        identity,
+        restart,
+        manual,
+        progress_path.as_deref(),
+    );
     let path = directory_path.join("request.json");
     fs::write(
         &path,
@@ -353,7 +408,11 @@ fn execute(
     if cancelled.load(Ordering::Acquire) {
         return Err(io::Error::other("Update operation cancelled."));
     }
-    let started_process = match OwnedProcess::start_tool(&spec) {
+    let started_process = match if background {
+        OwnedProcess::start_background_tool(&spec)
+    } else {
+        OwnedProcess::start_tool(&spec)
+    } {
         Ok(process) => process,
         Err(error) => {
             if bonsai_windows_process::process_start_cleanup_unconfirmed(&error) {
@@ -378,6 +437,16 @@ fn execute(
             || fs::metadata(&spec.stderr)?.len() > MAX_OUTPUT
         {
             return Err(io::Error::other("Update tool output exceeded its limit."));
+        }
+        if let Some(progress_file) = &progress_path
+            && let Some(latest) = bounded_progress(progress_file)
+            && let Ok(mut guard) = progress.lock()
+            && guard.as_ref() != Some(&latest)
+        {
+            *guard = Some(latest);
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
+            }
         }
         if let Some(code) = child.wait_for_exit(remaining.min(Duration::from_millis(250)))? {
             break Ok(code);
@@ -404,20 +473,30 @@ struct Task {
     operation: Operation,
     incoming: Receiver<io::Result<Response>>,
     cancelled: Arc<AtomicBool>,
+    progress: Arc<Mutex<Option<DownloadProgress>>>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Task {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Task launch carries installation, mode, identity, restart policy, and repaint context."
+    )]
     fn start(
         installation: Installation,
         operation: Operation,
         version: Option<String>,
         identity: Option<String>,
         restart: bool,
+        manual: bool,
+        background: bool,
+        repaint: Option<egui::Context>,
     ) -> io::Result<Self> {
         let (outgoing, incoming) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(None));
         let cancellation = Arc::clone(&cancelled);
+        let worker_progress = Arc::clone(&progress);
         let worker = thread::Builder::new()
             .name("swift-app-update".into())
             .spawn(move || {
@@ -427,14 +506,22 @@ impl Task {
                     version.as_deref(),
                     identity.as_deref(),
                     restart,
+                    manual,
+                    background,
+                    &worker_progress,
+                    repaint.as_ref(),
                     &cancellation,
                 );
                 let _sent = outgoing.send(result);
+                if let Some(ctx) = repaint {
+                    ctx.request_repaint();
+                }
             })?;
         Ok(Self {
             operation,
             incoming,
             cancelled,
+            progress,
             worker: Some(worker),
         })
     }
@@ -482,6 +569,7 @@ impl Drop for Task {
 pub(super) struct Updates {
     installation: Installation,
     task: Option<Task>,
+    repaint_ctx: Option<egui::Context>,
     version: Option<String>,
     release_identity: Option<String>,
     downloaded: bool,
@@ -511,6 +599,7 @@ impl Updates {
         Some(Self {
             installation,
             task: None,
+            repaint_ctx: None,
             version: None,
             release_identity: None,
             downloaded: false,
@@ -522,11 +611,15 @@ impl Updates {
             notified: false,
             deferred: false,
             close_requested: false,
-            next_check: Instant::now(),
+            next_check: Instant::now() + STARTUP_CHECK_DELAY,
             status: "Checking for updates shortly…".into(),
             error: None,
             error_offline: false,
         })
+    }
+
+    pub(super) fn set_repaint_ctx(&mut self, ctx: &egui::Context) {
+        self.repaint_ctx = Some(ctx.clone());
     }
 
     pub(super) fn available(&self) -> bool {
@@ -577,6 +670,10 @@ impl Updates {
     }
 
     fn start(&mut self, operation: Operation) {
+        self.start_operation(operation, false, operation != Operation::Install);
+    }
+
+    fn start_operation(&mut self, operation: Operation, manual: bool, background: bool) {
         if self.task.is_some() || self.queued || self.cleanup_unconfirmed {
             return;
         }
@@ -595,6 +692,9 @@ impl Updates {
             self.version.clone(),
             self.release_identity.clone(),
             !self.close_requested,
+            manual,
+            background,
+            self.repaint_ctx.clone(),
         ) {
             Ok(task) => {
                 self.task = Some(task);
@@ -612,6 +712,13 @@ impl Updates {
                 self.error_offline = false;
             }
         }
+    }
+
+    fn download_progress(&self) -> Option<DownloadProgress> {
+        self.task
+            .as_ref()
+            .filter(|task| task.operation == Operation::Download)
+            .and_then(|task| task.progress.lock().ok().and_then(|guard| guard.clone()))
     }
 
     /// Polls one finite worker result and schedules at most one periodic check.
@@ -751,6 +858,7 @@ impl Updates {
                 portable: false,
             },
             task: None,
+            repaint_ctx: None,
             version: None,
             release_identity: None,
             downloaded: false,
@@ -817,32 +925,68 @@ impl Updates {
 
     /// Background availability never opens a modal or takes keyboard focus.
     pub(super) fn nudge(&mut self, ui: &mut egui::Ui, can_install: bool) {
+        if self.installing() {
+            super::controls::notice_frame(ui)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let (dot, _) =
+                            ui.allocate_exact_size(egui::Vec2::splat(8.0), egui::Sense::hover());
+                        ui.painter().circle_stroke(
+                            dot.center(),
+                            3.5,
+                            egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
+                        );
+                        let title = if let Some(version) = &self.version {
+                            format!("Updating to v{version}")
+                        } else {
+                            "Updating Swift".to_owned()
+                        };
+                        ui.label(egui::RichText::new(title).strong());
+                        ui.label(egui::RichText::new(&self.status).small().weak());
+                    });
+                });
+            ui.add_space(8.0);
+            return;
+        }
         if !self.notification_pending() || self.confirming {
             return;
         }
-        super::controls::notice_frame(ui).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("Update ready").strong());
-                if ui
-                    .add_enabled(can_install, update_button(ui, "Restart to update", true))
-                    .on_disabled_hover_text(
-                        "Finish the response and wait for setup or shutdown before restarting.",
-                    )
-                    .clicked()
-                {
-                    self.confirming = true;
-                }
-                if ui
-                    .add(update_button(ui, "Later", false))
-                    .on_hover_text(
-                        "Install this update when you close Swift, without reopening it.",
-                    )
-                    .clicked()
-                {
-                    self.defer();
-                }
+        super::controls::notice_frame(ui)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::Vec2::splat(8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(
+                        dot.center(),
+                        3.5,
+                        ui.visuals().selection.stroke.color,
+                    );
+                    ui.label(egui::RichText::new("Update ready").strong());
+                    if let Some(version) = &self.version {
+                        ui.label(egui::RichText::new(format!("v{version}")).small().weak());
+                    }
+                    if ui
+                        .add_enabled(can_install, update_button(ui, "Restart to update", true))
+                        .on_disabled_hover_text(
+                            "Finish the response and wait for setup or shutdown before restarting.",
+                        )
+                        .clicked()
+                    {
+                        self.confirming = true;
+                    }
+                    if ui
+                        .add(update_button(ui, "Later", false))
+                        .on_hover_text(
+                            "Install this update when you close Swift, without reopening it.",
+                        )
+                        .clicked()
+                    {
+                        self.defer();
+                    }
+                });
             });
-        });
         ui.add_space(8.0);
     }
 
@@ -855,7 +999,9 @@ impl Updates {
         let mut cancel = false;
         let width = (ctx.content_rect().width() - 64.0).clamp(240.0, 420.0);
         let idle = self.task.is_none() && !self.installing() && !self.cleanup_unconfirmed;
-        let modal = egui::Modal::new(egui::Id::unique("application-update-prompt")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("application-update-prompt"))
+            .frame(super::controls::dialog_frame(ctx))
+            .show(ctx, |ui| {
             ui.set_width(width);
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.heading(if self.installation.portable { "Restart to update?" } else { "Close and install update?" });
@@ -941,14 +1087,80 @@ impl Updates {
     pub(super) fn controls(&mut self, ui: &mut egui::Ui, can_install: bool) {
         update_header(ui);
         let idle = self.task.is_none() && !self.installing() && !self.cleanup_unconfirmed;
+        let downloading = self
+            .task
+            .as_ref()
+            .is_some_and(|task| task.operation == Operation::Download);
         if self.error_offline && self.task.is_none() && !self.installing() {
             offline_alert(ui, &self.status);
+        } else if downloading {
+            let progress = self.download_progress();
+            let phase_text = match progress.as_ref().map(|item| item.phase.as_str()) {
+                Some("checking") => self.version.as_ref().map_or_else(
+                    || "Checking update details…".to_owned(),
+                    |version| format!("Checking version {version}…"),
+                ),
+                Some("verifying") => self.version.as_ref().map_or_else(
+                    || "Verifying download…".to_owned(),
+                    |version| format!("Verifying version {version}…"),
+                ),
+                Some("preparing") => self.version.as_ref().map_or_else(
+                    || "Preparing update…".to_owned(),
+                    |version| format!("Preparing version {version}…"),
+                ),
+                _ => self.version.as_ref().map_or_else(
+                    || "Downloading update…".to_owned(),
+                    |version| format!("Downloading version {version}…"),
+                ),
+            };
+            ui.horizontal_top(|ui| {
+                ui.spinner();
+                super::error_ui::summary(ui, &phase_text);
+            });
+            if let Some(progress) = progress
+                && progress.phase == "downloading"
+                && progress.total_bytes > 0
+            {
+                let downloaded = progress.downloaded_bytes.min(progress.total_bytes);
+                #[expect(
+                    clippy::cast_precision_loss,
+                    clippy::as_conversions,
+                    reason = "Approximate display only; update verification enforces exact byte counts."
+                )]
+                let fraction = downloaded as f32 / progress.total_bytes as f32;
+                ui.add_space(4.0);
+                let label = ui.label(
+                    egui::RichText::new(format!(
+                        "{:.0}% · {} / {}",
+                        fraction * 100.0,
+                        format_mib(downloaded),
+                        format_mib(progress.total_bytes)
+                    ))
+                    .small()
+                    .weak(),
+                );
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_height(6.0)
+                        .animate(false),
+                )
+                .labelled_by(label.id);
+            }
         } else {
+            let status_text = if idle
+                && self.verified_download()
+                && self.deferred
+                && let Some(version) = &self.version
+            {
+                format!("Version {version} is ready — will install when you close Swift.")
+            } else {
+                self.status.clone()
+            };
             ui.horizontal_top(|ui| {
                 if self.task.is_some() || self.installing() {
                     ui.spinner();
                 }
-                super::error_ui::summary(ui, &self.status);
+                super::error_ui::summary(ui, &status_text);
             });
         }
         if !idle {
@@ -976,12 +1188,10 @@ impl Updates {
         {
             if ready {
                 self.confirming = true;
+            } else if self.version.is_some() {
+                self.start_operation(Operation::Download, false, true);
             } else {
-                self.start(if self.version.is_some() {
-                    Operation::Download
-                } else {
-                    Operation::Check
-                });
+                self.start_operation(Operation::Check, true, false);
             }
         }
     }
@@ -1101,6 +1311,7 @@ mod tests {
                 portable: true,
             },
             task: None,
+            repaint_ctx: None,
             version: Some(next_version(env!("CARGO_PKG_VERSION"))?),
             release_identity: Some("a".repeat(64)),
             downloaded: true,
@@ -1128,6 +1339,7 @@ mod tests {
             operation,
             incoming,
             cancelled: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(Mutex::new(None)),
             worker: None,
         }
     }
@@ -1341,6 +1553,8 @@ mod tests {
             updates.version.as_deref(),
             updates.release_identity.as_deref(),
             !updates.closing(),
+            false,
+            None,
         );
         assert_eq!(request["restart"], false);
         state.fail("Synthetic unknown owned-model teardown");
@@ -1909,20 +2123,37 @@ mod tests {
                 Some("0.9.0"),
                 Some(&"a".repeat(64)),
                 true,
+                false,
+                None,
             );
             assert!(check.get("version").is_none());
+            assert!(check.get("manual").is_none());
             assert_eq!(
                 check["operation"],
                 if portable { "portable-check" } else { "check" }
             );
+            let manual_check = update_request(
+                &installation,
+                Operation::Check,
+                Some("0.9.0"),
+                Some(&"a".repeat(64)),
+                true,
+                true,
+                None,
+            );
+            assert_eq!(manual_check["manual"], true);
+            let progress_file = root.join("progress.json");
             let download = update_request(
                 &installation,
                 Operation::Download,
                 Some("0.9.0"),
                 Some(&"a".repeat(64)),
                 true,
+                false,
+                Some(&progress_file),
             );
             assert_eq!(download["version"], "0.9.0");
+            assert_eq!(download["progressPath"], serde_json::json!(progress_file));
             assert_eq!(
                 download["operation"],
                 if portable {
@@ -1940,6 +2171,8 @@ mod tests {
                 Some("0.9.0"),
                 Some(&"a".repeat(64)),
                 true,
+                false,
+                None,
             );
             assert_eq!(install.get("releaseIdentity").is_some(), portable);
             if portable {
@@ -2173,15 +2406,84 @@ mod tests {
             portable: true,
         };
         let cancelled = AtomicBool::new(true);
+        let progress = Arc::new(Mutex::new(None));
         let cancel_err = execute(
             &installation,
             Operation::Check,
             None,
             None,
             false,
+            false,
+            true,
+            &progress,
+            None,
             &cancelled,
         );
         assert!(cancel_err.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn download_progress_deferred_status_and_installing_strip_render_cleanly() -> io::Result<()> {
+        use egui_kittest::{Harness, kittest::Queryable as _};
+
+        let mut updates = update_fixture()?;
+        let version = updates
+            .version
+            .clone()
+            .ok_or_else(|| io::Error::other("Missing fixture version"))?;
+        updates.downloaded = false;
+        updates.release_identity = None;
+        let task = completed_task(Operation::Download, None);
+        if let Ok(mut guard) = task.progress.lock() {
+            *guard = Some(DownloadProgress {
+                phase: "downloading".into(),
+                downloaded_bytes: 25 * 1024 * 1024,
+                total_bytes: 50 * 1024 * 1024,
+            });
+        }
+        updates.task = Some(task);
+        let progress_harness = Harness::builder().with_size([640.0, 240.0]).build_ui_state(
+            |ui, updates: &mut Updates| updates.controls(ui, true),
+            updates,
+        );
+        assert!(
+            progress_harness
+                .query_by_label(&format!("Downloading version {version}…"))
+                .is_some()
+        );
+        assert!(
+            progress_harness
+                .query_by_label("50% · 25.0 MiB / 50.0 MiB")
+                .is_some()
+        );
+
+        let mut deferred_updates = update_fixture()?;
+        deferred_updates.defer();
+        let deferred_harness = Harness::builder().with_size([640.0, 240.0]).build_ui_state(
+            |ui, updates: &mut Updates| updates.controls(ui, true),
+            deferred_updates,
+        );
+        assert!(
+            deferred_harness
+                .query_by_label(&format!(
+                    "Version {version} is ready — will install when you close Swift."
+                ))
+                .is_some()
+        );
+
+        let mut installing_updates = update_fixture()?;
+        installing_updates.confirmed = true;
+        installing_updates.wait_for_stop();
+        let strip_harness = Harness::builder().with_size([640.0, 240.0]).build_ui_state(
+            |ui, updates: &mut Updates| updates.nudge(ui, true),
+            installing_updates,
+        );
+        assert!(
+            strip_harness
+                .query_by_label(&format!("Updating to v{version}"))
+                .is_some()
+        );
         Ok(())
     }
 }

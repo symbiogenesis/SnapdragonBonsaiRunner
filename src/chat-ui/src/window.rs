@@ -2777,6 +2777,7 @@ impl State {
         let Some(updates) = &mut self.updates else {
             return;
         };
+        updates.set_repaint_ctx(ctx);
         if self.model.reloadable() || setup_stopped {
             updates.finish_stop(true);
         } else if self.model == ModelLifecycle::Unavailable {
@@ -3364,6 +3365,7 @@ impl State {
         let waiting = self.image_cache.has_pending()
             || self.image_export.is_some()
             || self.attachment_import.is_some()
+            || self.updates_installing()
             || self
                 .branch_comparison
                 .as_ref()
