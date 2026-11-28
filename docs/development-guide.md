@@ -91,7 +91,7 @@ speech prerequisites, run this from the checkout:
 
 The script builds or reuses all five native application executables, collects
 the complete locked-dependency notices and writes one
-`%LOCALAPPDATA%\SwiftBonsai2\build\distribution\SwiftBonsai2Runner.exe`.
+`%LOCALAPPDATA%\SnapdragonBonsai\build\distribution\SwiftBonsai2Runner.exe`.
 Use `-OutputPath C:\Bonsai\SwiftBonsai2Runner.exe` for another absolute output.
 Existing outputs are never overwritten; choose a new path or explicitly remove
 an earlier local build first. `-RepositoryRoot` and `-DataDirectory` select an
@@ -159,11 +159,11 @@ worker prepares Swift and its pinned adapter. Rebuild after maintenance-source c
 
 ```powershell
 $repo = $PWD.Path
-$target = Join-Path $env:LOCALAPPDATA 'SwiftBonsai2/build/maintenance'
+$target = Join-Path $env:LOCALAPPDATA 'SnapdragonBonsai/build/maintenance'
 cargo --config 'target.aarch64-pc-windows-msvc.rustflags=["-C","target-feature=+crt-static"]' build --locked --release --target aarch64-pc-windows-msvc --manifest-path (Join-Path $repo 'Cargo.toml') --package bonsai-tools --bin bonsai-tools --target-dir $target
 $env:BONSAI_TOOLS_PATH = Join-Path $target 'aarch64-pc-windows-msvc/release/bonsai-tools.exe'
 $env:PATH = (Split-Path $env:BONSAI_TOOLS_PATH) + [IO.Path]::PathSeparator + $env:PATH
-$data = Join-Path $env:LOCALAPPDATA 'SwiftBonsai2'
+$data = Join-Path $env:LOCALAPPDATA 'SnapdragonBonsai'
 bonsai-tools chat --data-directory $data
 ```
 
@@ -171,7 +171,7 @@ The explicit target keeps application static-CRT flags out of host build scripts
 and procedural macros, including when the host is also Windows ARM64.
 
 The convenience launcher builds or refreshes `bonsai-tools.exe` into
-`%LOCALAPPDATA%\SwiftBonsai2\build\maintenance` automatically when `-ToolPath`
+`%LOCALAPPDATA%\SnapdragonBonsai\build\maintenance` automatically when `-ToolPath`
 and `BONSAI_TOOLS_PATH` are omitted (falling back to a cached or `PATH`
 executable when Cargo is unavailable), and skips Cargo when `-ToolPath` or
 `BONSAI_TOOLS_PATH` is explicitly provided:
@@ -459,7 +459,7 @@ users do not install a separate Visual C++ speech runtime.
 Swift's `native-q2` policy is separate. TTS NPU/GPU, ternary and new 48 kHz
 artifacts retain independent gates. See the [TTS contract](../src/speech-tts/README.md).
 The four pinned Q8_0 GGUF files total about 6.1 GiB under
-`%LOCALAPPDATA%/SwiftBonsai2/speech/native/` by default; ASR uses `qwen3-asr/<revision>/`, and TTS uses
+`%LOCALAPPDATA%/SnapdragonBonsai/speech/native/` by default; ASR uses `qwen3-asr/<revision>/`, and TTS uses
 `qwen-tts/<revision>/`. Downloads resume with exact size/SHA-256
 verification. Background speech preparation fully verifies cached files and repairs
 corrupt bytes before starting the services; each service independently hashes and
@@ -683,7 +683,7 @@ Session credentials and diagnostics stay fresh. `--force-build` repeats Cargo/na
 preparation, including after external compiler/cache changes. Absolute `--chat-path`
 and `--broker-path` must select matching current builds. Unique system-temp lanes retain `source-build-*.log` and `chat.log`.
 
-One user-wide exclusive `%LOCALAPPDATA%/SwiftBonsai2/chat.lock` covers preparation
+One user-wide exclusive `%LOCALAPPDATA%/SnapdragonBonsai/chat.lock` covers preparation
 through app exit, including launches from other checkouts/packages/data/ports.
 If another running instance is proven to be a strictly older version, the newer
 launcher terminates that older process tree, waits for exit, and takes over
@@ -813,15 +813,19 @@ These are contributor inspection and artifact-tool API examples. Ordinary app
 launch performs its own setup; users do not run this section before opening Swift.
 
 Use an absolute local data directory outside Git on a hard-link-capable filesystem
-such as NTFS; junctions/device paths reject. The default retains `SwiftBonsai2`
-for installation compatibility, separate from the `SwiftBonsai2Runner` checkout.
+such as NTFS; junctions/device paths reject. The default folder is
+`%LOCALAPPDATA%\SnapdragonBonsai`, separate from the `SnapdragonBonsaiRunner` checkout;
+launching with that default folder automatically migrates persistent data
+(conversations, preferences, models, speech, adapters, downloads and updates)
+from legacy `%LOCALAPPDATA%\SwiftBonsai2`, clears transient `build`, `staging` and
+`application-bundles` caches, and removes the old directory once empty.
 
 ```powershell
 bonsai-tools doctor --json '{}'
 # Optional existing data directory and new report file:
 bonsai-tools doctor --json '{"dataPath":"D:\\BonsaiData","outputPath":"D:\\Reports\\doctor.json"}'
 
-$data = Join-Path $env:LOCALAPPDATA 'SwiftBonsai2'
+$data = Join-Path $env:LOCALAPPDATA 'SnapdragonBonsai'
 bonsai-tools provision --json (@{ operation = 'engine'; dataDirectory = $data } | ConvertTo-Json -Compress)
 bonsai-tools provision --json (@{ operation = 'model'; dataDirectory = $data } | ConvertTo-Json -Compress)
 bonsai-tools provision --json (@{ operation = 'engine'; dataDirectory = $data; verifyOnly = $true } | ConvertTo-Json -Compress)

@@ -25,7 +25,7 @@ Checksums establish byte integrity within GitHub's trust boundary; the executabl
 is unsigned.
 
 The launcher verifies and extracts its package into
-`%LOCALAPPDATA%\SwiftBonsai2\application-bundles\<first-24-manifest-sha256-characters>\`
+`%LOCALAPPDATA%\SnapdragonBonsai\application-bundles\<first-24-manifest-sha256-characters>\`
 and verifies cached files before reuse. Process ownership follows
 [Windows sandboxing](sandboxing.md).
 

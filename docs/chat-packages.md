@@ -112,7 +112,7 @@ bundle; its internal checks do not independently authenticate its publisher.
 
 Open the generated executable to extract and launch its verified package through
 the native package launcher. The retained cache is under
-`%LOCALAPPDATA%\SwiftBonsai2\application-bundles\<first-24-manifest-sha256-characters>\` and is
+`%LOCALAPPDATA%\SnapdragonBonsai\application-bundles\<first-24-manifest-sha256-characters>\` and is
 verified on reuse. `bundled-chat` accepts the installed launch options,
 including `--data-directory` and `--no-speech-models`, while preserving its own
 package location. Bundled launches automatically check and download verified

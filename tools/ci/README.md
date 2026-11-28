@@ -883,7 +883,7 @@ executable. When both the checker and its recovery supervisor need repair, the
 hook automatically prepares them through an independently trusted prebuilt
 `bonsai-tools.exe`. It selects `BONSAI_TOOLS_PATH`, then
 `aarch64-pc-windows-msvc/release/bonsai-tools.exe` or `release/bonsai-tools.exe`
-under `%LOCALAPPDATA%\SwiftBonsai2\build\maintenance`, then `bonsai-tools.exe` on
+under `%LOCALAPPDATA%\SnapdragonBonsai\build\maintenance`, then `bonsai-tools.exe` on
 PATH. This maintenance executable is a provisioning
 prerequisite with the required `release-tool` capability; it is not required to
 match current `HEAD` source. An unavailable or unsupported maintenance executable

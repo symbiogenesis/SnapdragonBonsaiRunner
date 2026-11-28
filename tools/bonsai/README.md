@@ -895,7 +895,7 @@ five-minute total allowance; select a feasible bound including setup/cleanup.
 Both operations accept an explicit trusted `ggufToolPath` (or
 `BONSAI_GGUF_TOOL`). Otherwise they verify the compiled inference archive and
 complete installed inventory under `dataDirectory`, `BONSAI_DATA_DIRECTORY`,
-or `%LOCALAPPDATA%/SwiftBonsai2`, retaining artifact guards through execution.
+or `%LOCALAPPDATA%/SnapdragonBonsai`, retaining artifact guards through execution.
 Missing binaries fail; these operations never download or compile tools.
 Metadata inspection skips tensor payloads; census and export read them.
 
