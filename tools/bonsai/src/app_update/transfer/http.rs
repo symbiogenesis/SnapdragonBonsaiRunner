@@ -5,7 +5,8 @@ use std::{
     fs,
     io::Read as _,
     path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -252,19 +253,55 @@ fn request_headers(cached: Option<&Cached>) -> Vec<(String, String)> {
     headers
 }
 
-fn cooldown_error(cooldown: &Cooldown) -> String {
+#[derive(Clone, Copy)]
+pub(in super::super) struct MetadataPolicy {
+    pub(in super::super) conditional: bool,
+    pub(in super::super) bypass_offline_cooldown: bool,
+    pub(in super::super) retry_transient: bool,
+}
+
+fn format_wait_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        "for less than a minute".into()
+    } else {
+        let minutes = seconds.div_ceil(60);
+        if minutes < 60 {
+            if minutes == 1 {
+                "for about 1 minute".into()
+            } else {
+                format!("for about {minutes} minutes")
+            }
+        } else {
+            let hours = seconds.div_ceil(3600);
+            if hours == 1 {
+                "for about 1 hour".into()
+            } else {
+                format!("for about {hours} hours")
+            }
+        }
+    }
+}
+
+fn cooldown_blocked(cooldown: &Cooldown, now_secs: u64, bypass_offline: bool) -> bool {
+    cooldown.until > now_secs && !(bypass_offline && cooldown.offline)
+}
+
+fn cooldown_error_at(cooldown: &Cooldown, now_secs: u64) -> String {
+    let wait = format_wait_duration(cooldown.until.saturating_sub(now_secs));
     if cooldown.offline {
         format!(
-            "{} GitHub update requests are paused until Unix time {} after a network failure. Your installed app is unchanged.",
+            "{} GitHub update requests are paused {wait} after a network failure. Your installed app is unchanged.",
             crate::https_transfer::OFFLINE_PREFIX,
-            cooldown.until
         )
     } else {
         format!(
-            "GitHub update requests are paused until Unix time {} after a server or network failure. Your installed app is unchanged.",
-            cooldown.until
+            "GitHub update requests are paused {wait} after a server or network failure. Your installed app is unchanged.",
         )
     }
+}
+
+fn cooldown_error(cooldown: &Cooldown) -> String {
+    cooldown_error_at(cooldown, now())
 }
 
 fn record_failure(
@@ -297,45 +334,146 @@ fn response_body(
     decoded(&response.body, content_encoding(&response.headers)?)
 }
 
-pub(super) fn metadata(
+fn is_resilient_retry_status(status: u16) -> bool {
+    matches!(status, 408 | 500 | 502 | 503 | 504)
+}
+
+fn is_resilient_retry_error(error: &str) -> bool {
+    if crate::https_transfer::is_offline_message(error) {
+        return true;
+    }
+    let lower = error.to_ascii_lowercase();
+    [
+        "connection reset",
+        "connection aborted",
+        "unexpected eof",
+        "ended before content-length",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn wait_resilient_backoff(delay: Duration, deadline: Instant) -> crate::Result<bool> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Ok(false);
+    };
+    if delay >= remaining {
+        return Ok(false);
+    }
+    let wake = Instant::now() + delay;
+    loop {
+        crate::startup_cancel::checkpoint()?;
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(false);
+        };
+        let Some(wait) = wake.checked_duration_since(Instant::now()) else {
+            return Ok(true);
+        };
+        if wait.is_zero() {
+            return Ok(true);
+        }
+        thread::sleep(wait.min(remaining).min(Duration::from_millis(50)));
+    }
+}
+
+fn fetch_metadata_once(
+    url: &str,
+    headers: &[(String, String)],
+) -> crate::Result<crate::https_transfer::Response> {
+    crate::https_transfer::metadata(url, headers, Duration::from_secs(10), MAX_METADATA)
+}
+
+fn fetch_metadata_resilient(
+    url: &str,
+    headers: &[(String, String)],
+) -> crate::Result<crate::https_transfer::Response> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last_error: Option<String> = None;
+    for attempt in 0..=2_usize {
+        crate::startup_cancel::checkpoint()?;
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        if remaining.is_zero() {
+            break;
+        }
+        let timeout = remaining.min(Duration::from_secs(10));
+        match crate::https_transfer::metadata(url, headers, timeout, MAX_METADATA) {
+            Ok(response) => {
+                if attempt < 2 && is_resilient_retry_status(response.status) {
+                    let delay = Duration::from_millis(250_u64 * (1_u64 << attempt));
+                    if !wait_resilient_backoff(delay, deadline)? {
+                        return Ok(response);
+                    }
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(error) => {
+                if attempt < 2 && is_resilient_retry_error(&error) {
+                    last_error = Some(error);
+                    let delay = Duration::from_millis(250_u64 * (1_u64 << attempt));
+                    if !wait_resilient_backoff(delay, deadline)? {
+                        break;
+                    }
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        "GitHub update request exceeded its retry allowance. Your installed app is unchanged."
+            .into()
+    }))
+}
+
+pub(in super::super) fn metadata_with_policy(
     url: &str,
     _working: &Path,
     asset: Option<&Asset>,
-    conditional: bool,
+    policy: MetadataPolicy,
 ) -> crate::Result<Vec<u8>> {
     let slot = slot(url)?;
     let root = super::super::cache_root()?.join("http");
     external(&root)?;
     fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     external(&root)?;
-    let _lock = crate::startup_cache::lock_file(&root.join("cache.lock"))?;
-    // User-writable cache is only an efficiency hint for read-only discovery.
-    // Every mutating gate requires new unconditional HTTPS publication bytes.
-    let cached = discovery_cache(&root, slot, url, conditional);
-    if let (Some(asset), Some((entry, body))) = (asset, &cached)
-        && entry.sha256 == asset.sha256
-        && u64::try_from(body.len()).map_err(|error| error.to_string())? == asset.bytes
-    {
-        // The freshly revalidated catalog authenticates these immutable bytes.
-        return Ok(body.clone());
-    }
-    let cooldown = load_cooldown(&root);
-    if cooldown.until > now() {
-        return Err(cooldown_error(&cooldown));
-    }
-    let result = crate::https_transfer::metadata(
-        url,
-        &request_headers(cached.as_ref().map(|(entry, _)| entry)),
-        Duration::from_secs(10),
-        MAX_METADATA,
-    );
+
+    let cached = {
+        let _lock = crate::startup_cache::lock_file(&root.join("cache.lock"))?;
+        // User-writable cache is only an efficiency hint for read-only discovery.
+        // Every mutating gate requires new unconditional HTTPS publication bytes.
+        let cached = discovery_cache(&root, slot, url, policy.conditional);
+        if let (Some(asset), Some((entry, body))) = (asset, &cached)
+            && entry.sha256 == asset.sha256
+            && u64::try_from(body.len()).map_err(|error| error.to_string())? == asset.bytes
+        {
+            // The freshly revalidated catalog authenticates these immutable bytes.
+            return Ok(body.clone());
+        }
+        let cooldown = load_cooldown(&root);
+        if cooldown_blocked(&cooldown, now(), policy.bypass_offline_cooldown) {
+            return Err(cooldown_error(&cooldown));
+        }
+        cached
+    };
+
+    let headers = request_headers(cached.as_ref().map(|(entry, _)| entry));
+    let result = if policy.retry_transient && !policy.conditional {
+        fetch_metadata_resilient(url, &headers)
+    } else {
+        fetch_metadata_once(url, &headers)
+    };
     let response = match result {
         Ok(response) => response,
         Err(error) => {
+            let _lock = crate::startup_cache::lock_file(&root.join("cache.lock"))?;
+            let latest_cooldown = load_cooldown(&root);
             record_failure(
                 &root,
                 &BTreeMap::new(),
-                &cooldown,
+                &latest_cooldown,
                 crate::https_transfer::is_offline_message(&error),
             )?;
             return Err(error);
@@ -344,12 +482,17 @@ pub(super) fn metadata(
     let body = match response_body(&response, cached.as_ref()) {
         Ok(body) => body,
         Err(error) => {
-            record_failure(&root, &response.headers, &cooldown, false)?;
+            let _lock = crate::startup_cache::lock_file(&root.join("cache.lock"))?;
+            let latest_cooldown = load_cooldown(&root);
+            record_failure(&root, &response.headers, &latest_cooldown, false)?;
             return Err(error);
         }
     };
+
+    let _lock = crate::startup_cache::lock_file(&root.join("cache.lock"))?;
+    let latest_cooldown = load_cooldown(&root);
     if response.status == 304 {
-        if cooldown.failures != 0 || cooldown.until != 0 {
+        if latest_cooldown.failures != 0 || latest_cooldown.until != 0 {
             store_cooldown(&root, &Cooldown::default())?;
         }
         return Ok(body);
@@ -373,7 +516,7 @@ pub(super) fn metadata(
         &root.join(format!("{slot}.json")),
         &serde_json::to_vec(&descriptor).map_err(|error| error.to_string())?,
     )?;
-    if cooldown.failures != 0 || cooldown.until != 0 {
+    if latest_cooldown.failures != 0 || latest_cooldown.until != 0 {
         store_cooldown(&root, &Cooldown::default())?;
     }
     Ok(body)
@@ -587,6 +730,33 @@ mod tests {
         };
         let offline_message = cooldown_error(&offline);
         assert!(crate::https_transfer::is_offline_message(&offline_message));
+        assert!(!offline_message.contains("Unix time"));
+
+        // Manual and mutating probes bypass stale offline cooldowns, while
+        // honoring server/rate-limit cooldowns.
+        assert!(cooldown_blocked(&offline, 1000, false));
+        assert!(!cooldown_blocked(&offline, 1000, true));
+        assert!(cooldown_blocked(&legacy, 1000, false));
+        assert!(cooldown_blocked(&legacy, 1000, true));
+
+        let minute_msg = cooldown_error_at(
+            &Cooldown {
+                until: 1090,
+                failures: 1,
+                offline: true,
+            },
+            1000,
+        );
+        assert!(minute_msg.contains("for about 2 minutes"));
+        let hour_msg = cooldown_error_at(
+            &Cooldown {
+                until: 4600,
+                failures: 1,
+                offline: false,
+            },
+            1000,
+        );
+        assert!(hour_msg.contains("for about 1 hour"));
         Ok(())
     }
 }

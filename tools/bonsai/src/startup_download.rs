@@ -197,7 +197,8 @@ pub(crate) fn receive_repair_observed(
     receive_repair_observed_with(uri, path, bytes, sha256, working, transfer, observe)
 }
 
-/// Shares one absolute allowance across verification, resume and fresh restart.
+/// Shares one absolute allowance across cached verification, resume and fresh restart.
+#[cfg(test)]
 pub(crate) fn receive_repair_with_timeout(
     uri: &str,
     path: &Path,
@@ -216,6 +217,43 @@ pub(crate) fn receive_repair_with_timeout(
             |uri, partial, offset, bytes, working| {
                 transfer_repair_until(uri, partial, offset, bytes, working, until)
             },
+        )
+    })
+}
+
+/// Shares one absolute allowance across verification, resume, progress reporting and publication.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Explicit repair timeout entry combines activity observation and byte progress callbacks."
+)]
+pub(crate) fn receive_repair_observed_with_timeout(
+    uri: &str,
+    path: &Path,
+    bytes: u64,
+    sha256: &str,
+    working: &Path,
+    timeout: Duration,
+    observe: &mut (impl FnMut(RepairActivity) -> crate::Result<()> + ?Sized),
+    mut on_progress: impl FnMut(u64, u64) + Send,
+) -> crate::Result<()> {
+    with_repair_deadline(timeout, |until| {
+        receive_repair_observed_with(
+            uri,
+            path,
+            bytes,
+            sha256,
+            working,
+            |uri, partial, offset, bytes, _working| {
+                transfer_repair_until_with_progress(
+                    uri,
+                    partial,
+                    offset,
+                    bytes,
+                    until,
+                    Some(&mut on_progress),
+                )
+            },
+            observe,
         )
     })
 }
@@ -246,6 +284,13 @@ fn is_transient_download_error(error: &str) -> bool {
         "connection reset",
         "connection aborted",
         "connection refused",
+        "connection failed",
+        "host not found",
+        "connect proxy failed",
+        "network unreachable",
+        "host unreachable",
+        "network down",
+        "forcibly closed",
         "broken pipe",
         "unexpected eof",
         "ended before its locked byte length",
@@ -257,6 +302,16 @@ fn is_transient_download_error(error: &str) -> bool {
         "http 502",
         "http 503",
         "http 504",
+        "os error 10050",
+        "os error 10051",
+        "os error 10052",
+        "os error 10053",
+        "os error 10054",
+        "os error 10060",
+        "os error 10064",
+        "os error 10065",
+        "os error 11001",
+        "os error 11002",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -341,6 +396,17 @@ fn transfer_repair_until(
     _working: &Path,
     until: Instant,
 ) -> crate::Result<()> {
+    transfer_repair_until_with_progress(uri, partial, offset, bytes, until, None)
+}
+
+fn transfer_repair_until_with_progress(
+    uri: &str,
+    partial: &Path,
+    offset: u64,
+    bytes: u64,
+    until: Instant,
+    mut on_progress: Option<&mut (dyn FnMut(u64, u64) + Send)>,
+) -> crate::Result<()> {
     let until =
         REPAIR_DEADLINE.with(|deadline| deadline.get().map_or(until, |outer| outer.min(until)));
     repair_remaining(until)?;
@@ -353,9 +419,20 @@ fn transfer_repair_until(
         until,
         retry_delay,
         |file, offset| {
-            crate::https_transfer::download(uri, file, offset, bytes, until, &mut || {
-                repair_remaining(until).map(|_| ())
-            })
+            let mut checkpoint = || repair_remaining(until).map(|_| ());
+            if let Some(progress) = on_progress.as_deref_mut() {
+                crate::https_transfer::download_with_progress(
+                    uri,
+                    file,
+                    offset,
+                    bytes,
+                    until,
+                    &mut checkpoint,
+                    progress,
+                )
+            } else {
+                crate::https_transfer::download(uri, file, offset, bytes, until, &mut checkpoint)
+            }
         },
     );
     repair_remaining(until)?;
@@ -624,6 +701,7 @@ fn remove_redundant_download(path: &Path) -> crate::Result<()> {
     })
 }
 
+#[cfg(test)]
 fn receive_repair_with(
     uri: &str,
     path: &Path,
@@ -1778,6 +1856,9 @@ mod tests {
             "Native HTTPS request failed: timeout: resolve",
             "Native HTTPS request failed: timeout: per read",
             "Native HTTPS request failed: io: connection reset",
+            "No internet connection: Native HTTPS request failed: connection failed",
+            "No internet connection: Native HTTPS request failed: host not found",
+            "Native HTTPS request failed: io: An existing connection was forcibly closed (os error 10054)",
             "Pinned download ended before its locked byte length.",
             "Pinned download returned HTTP 503.",
         ] {

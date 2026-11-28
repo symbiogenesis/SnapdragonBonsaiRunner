@@ -32,6 +32,12 @@ pub(super) struct Replacement {
     // Older launchers always reopened the application after replacement.
     #[serde(default = "super::restart_by_default")]
     pub(super) restart: bool,
+    // Newer launchers pass their process identity so replacement waits cleanly
+    // for handle exit instead of polling blindly against sharing violations.
+    #[serde(default)]
+    pub(super) launcher_pid: Option<u32>,
+    #[serde(default)]
+    pub(super) launcher_creation_time_file_time: Option<u64>,
 }
 
 struct Temporary(PathBuf);
@@ -196,20 +202,46 @@ fn copy_and_replace(
     })();
     let result = copied.and_then(|()| {
         destination.rewind().map_err(|error| error.to_string())?;
-        let mut hasher = crate::identity::Hasher::new()?;
-        let mut buffer = vec![0; 1024 * 1024];
-        loop {
-            checkpoint()?;
-            let count = destination
-                .read(&mut buffer)
-                .map_err(|error| error.to_string())?;
-            checkpoint()?;
-            if count == 0 {
-                break;
-            }
-            hasher.update(&buffer[..count])?;
+        let mut stopped = None;
+        #[cfg(windows)]
+        let mapped = bonsai_windows_credentials::try_hash_locked_file_mapped(
+            &destination,
+            asset.bytes,
+            &mut || {
+                checkpoint().map_err(|error| {
+                    stopped = Some(error);
+                    io::Error::new(io::ErrorKind::Interrupted, "cancelled")
+                })
+            },
+            |error| error,
+        );
+        #[cfg(not(windows))]
+        let mapped: io::Result<Option<[u8; 32]>> = Ok(None);
+        if let Some(error) = stopped {
+            return Err(error);
         }
-        if hasher.finalize_hex()? != asset.sha256 {
+        let actual_sha256 = match mapped {
+            Ok(Some(digest)) => crate::identity::hex(&digest),
+            Ok(None) => {
+                destination.rewind().map_err(|error| error.to_string())?;
+                let mut hasher = crate::identity::Hasher::new()?;
+                let mut buffer = vec![0; 1024 * 1024];
+                loop {
+                    checkpoint()?;
+                    let count = destination
+                        .read(&mut buffer)
+                        .map_err(|error| error.to_string())?;
+                    checkpoint()?;
+                    if count == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..count])?;
+                }
+                hasher.finalize_hex()?
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        if actual_sha256 != asset.sha256 {
             return Err("The portable replacement copy failed SHA-256 verification.".into());
         }
         publish(
@@ -297,6 +329,28 @@ pub(super) fn replace(request: &Replacement) -> crate::Result<Value> {
         return Err("Portable replacement must run from the verified staged release.".into());
     }
     let deadline = Instant::now() + REPLACE_ALLOWANCE;
+    #[cfg(windows)]
+    if let (Some(pid), Some(creation)) = (
+        request.launcher_pid,
+        request.launcher_creation_time_file_time,
+    ) && let Ok(launcher) = bonsai_windows_process::ParentProcess::open(pid, creation)
+    {
+        let wait_until = deadline.min(Instant::now() + Duration::from_secs(5));
+        loop {
+            crate::startup_cancel::checkpoint()?;
+            let Some(remaining) = wait_until.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+            match launcher.wait_for_exit(remaining.min(Duration::from_millis(50))) {
+                Ok(true) | Err(_) => break,
+                Ok(false) => {}
+            }
+        }
+    }
+    let mut retry_attempt = 0_usize;
     copy_and_replace(
         &source,
         &published.asset,
@@ -307,8 +361,17 @@ pub(super) fn replace(request: &Replacement) -> crate::Result<Value> {
             if !matches!(error.raw_os_error(), Some(5 | 32 | 33)) || Instant::now() >= deadline {
                 return false;
             }
+            let delay_ms = match retry_attempt {
+                0 => 25,
+                1 => 50,
+                2 => 75,
+                3 => 100,
+                _ => 150,
+            };
+            retry_attempt = retry_attempt.saturating_add(1);
             thread::sleep(
-                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+                Duration::from_millis(delay_ms)
+                    .min(deadline.saturating_duration_since(Instant::now())),
             );
             Instant::now() < deadline
         },
@@ -320,6 +383,7 @@ pub(super) fn replace(request: &Replacement) -> crate::Result<Value> {
             Ok(())
         },
     )?;
+    super::prune_obsolete_updates_best_effort(&request.version);
     let mut command = Command::new(&request.target);
     let arguments = match request.arguments.as_slice() {
         [command, rest @ ..] if command == "bundled-chat" || command == "updated-chat" => rest,
@@ -388,16 +452,22 @@ mod tests {
         let request: Replacement =
             serde_json::from_value(legacy.clone()).map_err(|error| error.to_string())?;
         assert!(request.release_identity.is_none());
+        assert!(request.launcher_pid.is_none());
+        assert!(request.launcher_creation_time_file_time.is_none());
         assert!(request.restart);
         let mut bound = legacy;
         bound["releaseIdentity"] = "b".repeat(64).into();
         bound["restart"] = false.into();
+        bound["launcherPid"] = 4242_u64.into();
+        bound["launcherCreationTimeFileTime"] = 987_654_321_u64.into();
         let request: Replacement =
             serde_json::from_value(bound).map_err(|error| error.to_string())?;
         assert_eq!(
             request.release_identity.as_deref(),
             Some("b".repeat(64).as_str())
         );
+        assert_eq!(request.launcher_pid, Some(4242));
+        assert_eq!(request.launcher_creation_time_file_time, Some(987_654_321));
         assert!(!request.restart);
         let result = report_restart(&request, || {
             Err(io::Error::other(
@@ -730,6 +800,8 @@ mod tests {
             ],
             release_identity: None,
             restart: true,
+            launcher_pid: None,
+            launcher_creation_time_file_time: None,
         };
         let arguments = request.arguments.clone();
         validate_restart_arguments(&request)?;

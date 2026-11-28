@@ -773,9 +773,22 @@ fn download_with(
     until: Instant,
     cancelled: &AtomicBool,
 ) -> crate::Result<()> {
-    download_with_mode(agent, uri, file, (offset, false), bytes, until, cancelled)
+    download_with_mode(
+        agent,
+        uri,
+        file,
+        (offset, false),
+        bytes,
+        until,
+        cancelled,
+        None,
+    )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Single download helper shares framing, range validation, and optional progress callbacks."
+)]
 fn download_with_mode(
     agent: &Agent,
     uri: &str,
@@ -784,6 +797,7 @@ fn download_with_mode(
     bytes: u64,
     until: Instant,
     cancelled: &AtomicBool,
+    mut on_progress: Option<&mut (dyn FnMut(u64, u64) + Send)>,
 ) -> crate::Result<()> {
     let (offset, fresh) = mode;
     if bytes == 0 || offset >= bytes || file.metadata().map_err(|e| e.to_string())?.len() != offset
@@ -824,6 +838,9 @@ fn download_with_mode(
     file.seek(SeekFrom::Start(start))
         .map_err(|e| e.to_string())?;
     let mut written = start;
+    if let Some(progress) = on_progress.as_deref_mut() {
+        progress(written, bytes);
+    }
     let mut buffer = vec![0; 64 * 1024];
     let mut reader = response.body_mut().as_reader();
     loop {
@@ -842,6 +859,9 @@ fn download_with_mode(
         file.write_all(&buffer[..count])
             .map_err(|e| e.to_string())?;
         written = end;
+        if let Some(progress) = on_progress.as_deref_mut() {
+            progress(written, bytes);
+        }
     }
     if written != bytes {
         return Err("Pinned download ended before its locked byte length.".into());
@@ -864,6 +884,30 @@ pub(crate) fn download(
     })
 }
 
+pub(crate) fn download_with_progress(
+    uri: &str,
+    file: &mut File,
+    offset: u64,
+    bytes: u64,
+    until: Instant,
+    checkpoint: &mut (impl FnMut() -> crate::Result<()> + ?Sized),
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
+) -> crate::Result<()> {
+    validate_uri(uri)?;
+    owned(agent(), until, checkpoint, |agent, cancelled| {
+        download_with_mode(
+            agent,
+            uri,
+            file,
+            (offset, false),
+            bytes,
+            until,
+            cancelled,
+            Some(on_progress),
+        )
+    })
+}
+
 /// Fresh-only public-reference intake retains its original HTTP-200 and 30-second idle bounds.
 pub(crate) fn download_fresh(
     uri: &str,
@@ -874,7 +918,7 @@ pub(crate) fn download_fresh(
 ) -> crate::Result<()> {
     validate_uri(uri)?;
     owned(agent(), until, checkpoint, |agent, cancelled| {
-        download_with_mode(agent, uri, file, (0, true), bytes, until, cancelled)
+        download_with_mode(agent, uri, file, (0, true), bytes, until, cancelled, None)
     })
 }
 
@@ -1249,7 +1293,7 @@ mod tests {
             (b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-3/4\r\nConnection: close\r\n\r\ndata".as_slice(),false),
         ] {
             let mut partial=Partial::new(b"")?;
-            let (result,_) = fixture(response,|agent,uri|Ok(download_with_mode(&agent,uri,&mut partial.file,(0,true),4,Instant::now()+Duration::from_secs(5),&AtomicBool::new(false))))?;
+            let (result,_) = fixture(response,|agent,uri|Ok(download_with_mode(&agent,uri,&mut partial.file,(0,true),4,Instant::now()+Duration::from_secs(5),&AtomicBool::new(false),None)))?;
             assert_eq!(result.is_ok(),success);
             assert_eq!(partial.bytes()?,if success{b"data".as_slice()}else{b"".as_slice()});
         }

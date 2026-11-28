@@ -442,3 +442,71 @@ fn replacement_stage_lookup_prefers_current_dir_and_falls_back_to_legacy_updates
 
     crate::fs_guard::remove_dir_all_with_retry(&root).map_err(|error| error.to_string())
 }
+
+#[test]
+fn obsolete_cache_pruning_preserves_http_locked_newer_and_kept_bundles() -> crate::Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "Bonsai-Prune-Caches-{}",
+        crate::startup_process::unique()
+    ));
+    external(&root)?;
+    let updates_root = root.join("updates");
+    let http_dir = updates_root.join("http");
+    let older_unlocked = updates_root.join("0.1.0");
+    let current_unlocked = updates_root.join(env!("CARGO_PKG_VERSION"));
+    let current_version = Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let newer_version = current_version.next_for_test()?;
+    let newer_unlocked = updates_root.join(&newer_version);
+    let locked_older = updates_root.join("0.0.1");
+    for dir in [
+        &http_dir,
+        &older_unlocked,
+        &current_unlocked,
+        &newer_unlocked,
+        &locked_older,
+    ] {
+        fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    }
+    fs::write(http_dir.join("releases-1.body"), b"[]").map_err(|error| error.to_string())?;
+    fs::write(older_unlocked.join("old.exe"), b"old").map_err(|error| error.to_string())?;
+    fs::write(newer_unlocked.join("new.exe"), b"new").map_err(|error| error.to_string())?;
+    let update_lock = crate::startup_cache::lock_file(&locked_older.join("update.lock"))?;
+
+    let removed_updates = prune_obsolete_updates_in(&updates_root, current_version)?;
+    assert_eq!(removed_updates, 2);
+    assert!(http_dir.exists());
+    assert!(newer_unlocked.exists());
+    assert!(locked_older.exists());
+    assert!(!older_unlocked.exists());
+    assert!(!current_unlocked.exists());
+    drop(update_lock);
+
+    let bundles_root = root.join("application-bundles");
+    let keep_active = "a".repeat(24);
+    let keep_staged = "b".repeat(24);
+    let obsolete_bundle = "c".repeat(24);
+    let locked_bundle = "d".repeat(24);
+    let non_hex_dir = "custom-notes";
+    for name in [
+        keep_active.as_str(),
+        keep_staged.as_str(),
+        obsolete_bundle.as_str(),
+        locked_bundle.as_str(),
+        non_hex_dir,
+    ] {
+        fs::create_dir_all(bundles_root.join(name)).map_err(|error| error.to_string())?;
+    }
+    let bundle_lock =
+        crate::startup_cache::lock_file(&bundles_root.join(&locked_bundle).join("package.lock"))?;
+
+    let removed_bundles = prune_obsolete_bundles_in(&bundles_root, &[&keep_active, &keep_staged])?;
+    assert_eq!(removed_bundles, 1);
+    assert!(bundles_root.join(&keep_active).exists());
+    assert!(bundles_root.join(&keep_staged).exists());
+    assert!(bundles_root.join(&locked_bundle).exists());
+    assert!(bundles_root.join(non_hex_dir).exists());
+    assert!(!bundles_root.join(&obsolete_bundle).exists());
+    drop(bundle_lock);
+
+    crate::fs_guard::remove_dir_all_with_retry(&root).map_err(|error| error.to_string())
+}

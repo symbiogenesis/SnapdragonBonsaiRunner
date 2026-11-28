@@ -3,6 +3,11 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use bonsai_artifacts::validate_external_path;
@@ -25,10 +30,16 @@ pub(crate) const UPDATE_EXIT_CODE: u32 = 42;
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
 enum Request {
-    PortableCheck,
+    #[serde(rename_all = "camelCase")]
+    PortableCheck {
+        #[serde(default)]
+        manual: bool,
+    },
     #[serde(rename_all = "camelCase")]
     PortableDownload {
         version: String,
+        #[serde(default)]
+        progress_path: Option<PathBuf>,
     },
     #[serde(rename_all = "camelCase")]
     PortableInstall {
@@ -42,11 +53,15 @@ enum Request {
     #[serde(rename_all = "camelCase")]
     Check {
         installation_directory: PathBuf,
+        #[serde(default)]
+        manual: bool,
     },
     #[serde(rename_all = "camelCase")]
     Download {
         installation_directory: PathBuf,
         version: String,
+        #[serde(default)]
+        progress_path: Option<PathBuf>,
     },
     #[serde(rename_all = "camelCase")]
     Install {
@@ -174,8 +189,12 @@ fn staged_for_replacement(version: &str) -> crate::Result<PathBuf> {
     staged(version)
 }
 
-fn discover(working: &Path) -> crate::Result<(bool, Option<Candidate>)> {
-    let data = cached_release_catalog(working)?;
+fn discover(working: &Path, manual: bool) -> crate::Result<(bool, Option<Candidate>)> {
+    let data = if manual {
+        manual_cached_release_catalog(working)?
+    } else {
+        cached_release_catalog(working)?
+    };
     policy::select(&data, env!("CARGO_PKG_VERSION"))
 }
 
@@ -204,7 +223,7 @@ fn collect_releases(
 
 fn release_catalog(working: &Path) -> crate::Result<Vec<u8>> {
     collect_releases(|page| {
-        transfer::metadata(
+        transfer::resilient_metadata(
             &format!("https://api.github.com/repos/{REPOSITORY}/releases?per_page=100&page={page}"),
             working,
         )
@@ -214,6 +233,15 @@ fn release_catalog(working: &Path) -> crate::Result<Vec<u8>> {
 fn cached_release_catalog(working: &Path) -> crate::Result<Vec<u8>> {
     collect_releases(|page| {
         transfer::cached_metadata(
+            &format!("https://api.github.com/repos/{REPOSITORY}/releases?per_page=100&page={page}"),
+            working,
+        )
+    })
+}
+
+fn manual_cached_release_catalog(working: &Path) -> crate::Result<Vec<u8>> {
+    collect_releases(|page| {
+        transfer::manual_cached_metadata(
             &format!("https://api.github.com/repos/{REPOSITORY}/releases?per_page=100&page={page}"),
             working,
         )
@@ -248,45 +276,171 @@ fn verified_portable_release(
     candidate: &Candidate,
     working: &Path,
 ) -> crate::Result<policy::Installer> {
-    release_metadata(candidate, working, false, policy::Distribution::Portable)
+    release_metadata(
+        candidate,
+        working,
+        MetadataMode::FreshResilient,
+        policy::Distribution::Portable,
+    )
 }
 
 type AssetMetadata = fn(&policy::Asset, &Path) -> crate::Result<Vec<u8>>;
 type Metadata = fn(&str, &Path) -> crate::Result<Vec<u8>>;
 
-const fn metadata_functions(conditional: bool) -> (AssetMetadata, Metadata) {
-    if conditional {
-        (transfer::cached_asset_metadata, transfer::cached_metadata)
-    } else {
-        (transfer::asset_metadata, transfer::metadata)
+#[derive(Clone, Copy)]
+enum MetadataMode {
+    Conditional { bypass_offline: bool },
+    FreshResilient,
+}
+
+const fn metadata_functions(mode: MetadataMode) -> (AssetMetadata, Metadata) {
+    match mode {
+        MetadataMode::Conditional {
+            bypass_offline: false,
+        } => (transfer::cached_asset_metadata, transfer::cached_metadata),
+        MetadataMode::Conditional {
+            bypass_offline: true,
+        } => (
+            transfer::manual_cached_asset_metadata,
+            transfer::manual_cached_metadata,
+        ),
+        MetadataMode::FreshResilient => (
+            transfer::resilient_asset_metadata,
+            transfer::resilient_metadata,
+        ),
     }
 }
 
 fn release_metadata(
     candidate: &Candidate,
     working: &Path,
-    conditional: bool,
+    mode: MetadataMode,
     distribution: policy::Distribution,
 ) -> crate::Result<policy::Installer> {
-    let (asset, metadata) = metadata_functions(conditional);
-    let manifest = asset(&candidate.manifest, working)?;
-    let checksums = asset(&candidate.checksums, working)?;
+    let (asset_fn, metadata_fn) = metadata_functions(mode);
+    let commit_url = format!(
+        "https://api.github.com/repos/{REPOSITORY}/commits/v{}",
+        candidate.version
+    );
+    let peer_cancel = Arc::new(AtomicBool::new(false));
+    let (manifest, checksums, commit) = std::thread::scope(|scope| {
+        let manifest_cancel = Arc::clone(&peer_cancel);
+        let manifest_handle = std::thread::Builder::new()
+            .name("update-manifest".into())
+            .spawn_scoped(scope, move || {
+                crate::startup_cancel::with_peer_cancellation(&manifest_cancel, || {
+                    let result = asset_fn(&candidate.manifest, working);
+                    if result.is_err() {
+                        manifest_cancel.store(true, Ordering::Release);
+                    }
+                    result
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        let checksums_cancel = Arc::clone(&peer_cancel);
+        let checksums_handle = std::thread::Builder::new()
+            .name("update-checksums".into())
+            .spawn_scoped(scope, move || {
+                crate::startup_cancel::with_peer_cancellation(&checksums_cancel, || {
+                    let result = asset_fn(&candidate.checksums, working);
+                    if result.is_err() {
+                        checksums_cancel.store(true, Ordering::Release);
+                    }
+                    result
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        let commit = crate::startup_cancel::with_peer_cancellation(&peer_cancel, || {
+            let result = metadata_fn(&commit_url, working);
+            if result.is_err() {
+                peer_cancel.store(true, Ordering::Release);
+            }
+            result
+        });
+        let manifest = manifest_handle
+            .join()
+            .map_err(|_| "Update manifest worker stopped unexpectedly.".to_owned())?;
+        let checksums = checksums_handle
+            .join()
+            .map_err(|_| "Update checksum worker stopped unexpectedly.".to_owned())?;
+        Ok::<_, String>((manifest, checksums, commit))
+    })?;
+    let (manifest, checksums, commit) = match (manifest, checksums, commit) {
+        (Ok(manifest), Ok(checksums), Ok(commit)) => (manifest, checksums, commit),
+        (m, c, s) => {
+            for error in [m.err(), c.err(), s.err()].into_iter().flatten() {
+                if error != "Startup operation cancelled after a peer failed." {
+                    return Err(error);
+                }
+            }
+            return Err("Startup operation cancelled after a peer failed.".into());
+        }
+    };
     let application = match distribution {
         policy::Distribution::Portable => policy::portable(candidate, &manifest, &checksums)?,
         policy::Distribution::Installer => policy::installer(candidate, &manifest, &checksums)?,
     };
-    let commit = metadata(
-        &format!(
-            "https://api.github.com/repos/{REPOSITORY}/commits/v{}",
-            candidate.version
-        ),
-        working,
-    )?;
     application.verify_source(&commit)?;
     Ok(application)
 }
 
-fn portable_download(version: &str) -> crate::Result<Value> {
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgressSnapshot<'a> {
+    phase: &'a str,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+}
+
+struct ProgressReporter {
+    path: Option<PathBuf>,
+    last_phase: &'static str,
+    last_emit: Option<Instant>,
+}
+
+impl ProgressReporter {
+    fn new(path: Option<&Path>) -> crate::Result<Self> {
+        if let Some(path) = path {
+            external(path)?;
+        }
+        Ok(Self {
+            path: path.map(Path::to_path_buf),
+            last_phase: "",
+            last_emit: None,
+        })
+    }
+
+    fn report(&mut self, phase: &'static str, downloaded_bytes: u64, total_bytes: u64) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let phase_changed = phase != self.last_phase;
+        let completed = total_bytes > 0 && downloaded_bytes >= total_bytes;
+        if !phase_changed
+            && !completed
+            && self
+                .last_emit
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(150))
+        {
+            return;
+        }
+        if let Ok(bytes) = serde_json::to_vec(&ProgressSnapshot {
+            phase,
+            downloaded_bytes,
+            total_bytes,
+        }) {
+            let _ = transfer::write_current(path, &bytes);
+            self.last_phase = phase;
+            self.last_emit = Some(Instant::now());
+        }
+    }
+}
+
+fn portable_download(version: &str, progress_path: Option<&Path>) -> crate::Result<Value> {
+    let reporter = Mutex::new(ProgressReporter::new(progress_path)?);
+    if let Ok(mut guard) = reporter.lock() {
+        guard.report("checking", 0, 0);
+    }
     portable_installation()?;
     Version::parse(version)?.newer_than_current()?;
     let directory = staged(version)?;
@@ -295,16 +449,46 @@ fn portable_download(version: &str) -> crate::Result<Value> {
     let _lock = crate::startup_cache::lock_file(&directory.join("update.lock"))?;
     let candidate = published_portable_release(version, &directory)?;
     let published = verified_portable_release(&candidate, &directory)?;
+    let expected_bytes = published.asset.bytes;
     let identity = stage_portable_with(&directory, version, &published, |path| {
-        crate::startup_download::receive_repair_with_timeout(
+        crate::startup_download::receive_repair_observed_with_timeout(
             &published.asset.url,
             path,
-            published.asset.bytes,
+            expected_bytes,
             &published.asset.sha256,
             &directory,
-            std::time::Duration::from_secs(180),
+            Duration::from_secs(180),
+            &mut |activity| {
+                let (phase, downloaded) = match activity {
+                    crate::startup_download::RepairActivity::VerifyingExisting => ("checking", 0),
+                    crate::startup_download::RepairActivity::Downloading { offset } => {
+                        ("downloading", offset)
+                    }
+                    crate::startup_download::RepairActivity::VerifyingDownloaded
+                    | crate::startup_download::RepairActivity::Publishing => {
+                        ("verifying", expected_bytes)
+                    }
+                };
+                if let Ok(mut guard) = reporter.lock() {
+                    guard.report(phase, downloaded, expected_bytes);
+                }
+                Ok(())
+            },
+            |downloaded, total| {
+                if let Ok(mut guard) = reporter.lock() {
+                    guard.report("downloading", downloaded, total);
+                }
+            },
         )
     })?;
+    if let Ok(mut guard) = reporter.lock() {
+        guard.report("preparing", expected_bytes, expected_bytes);
+    }
+    crate::startup_cancel::checkpoint()?;
+    let _preextracted = crate::chat_package::bundle::preextract_staged_bundle(
+        &directory.join(&published.asset.name),
+    );
+    crate::startup_cancel::checkpoint()?;
     Ok(json!({"Status": "downloaded", "Version": version, "ReleaseIdentity": identity}))
 }
 
@@ -401,7 +585,12 @@ fn startup_handoff(handoff: &Path) -> crate::Result<Value> {
 }
 
 fn verified_release(candidate: &Candidate, working: &Path) -> crate::Result<policy::Installer> {
-    release_metadata(candidate, working, false, policy::Distribution::Installer)
+    release_metadata(
+        candidate,
+        working,
+        MetadataMode::FreshResilient,
+        policy::Distribution::Installer,
+    )
 }
 
 fn selected_release(version: &str, working: &Path) -> crate::Result<Candidate> {
@@ -414,7 +603,9 @@ fn selected_release(version: &str, working: &Path) -> crate::Result<Candidate> {
         })
 }
 
-fn download(root: &Path, version: &str) -> crate::Result<Value> {
+fn download(root: &Path, version: &str, progress_path: Option<&Path>) -> crate::Result<Value> {
+    let mut reporter = ProgressReporter::new(progress_path)?;
+    reporter.report("checking", 0, 0);
     installation(root, true)?;
     Version::parse(version)?.newer_than_current()?;
     let directory = staged(version)?;
@@ -424,14 +615,16 @@ fn download(root: &Path, version: &str) -> crate::Result<Value> {
     let candidate = selected_release(version, &directory)?;
     let installer = verified_release(&candidate, &directory)?;
     let path = directory.join(&installer.asset.name);
+    reporter.report("downloading", 0, installer.asset.bytes);
     crate::startup_download::receive_with_timeout(
         &installer.asset.url,
         &path,
         installer.asset.bytes,
         &installer.asset.sha256,
         &directory,
-        std::time::Duration::from_secs(180),
+        Duration::from_secs(180),
     )?;
+    reporter.report("verifying", installer.asset.bytes, installer.asset.bytes);
     transfer::write_new_or_identical(
         &directory.join("verified-release.json"),
         &serde_json::to_vec(&installer).map_err(|error| error.to_string())?,
@@ -557,6 +750,114 @@ fn queue(root: &Path, version: &str, handoff: &Path) -> crate::Result<Value> {
     Ok(json!({"Status": "queued", "Version": version}))
 }
 
+fn prune_obsolete_updates_in(
+    updates_root: &Path,
+    current_version: Version,
+) -> crate::Result<usize> {
+    external(updates_root)?;
+    let Ok(entries) = fs::read_dir(updates_root) else {
+        return Ok(0);
+    };
+    let mut removed = 0_usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if external(&path).is_err() {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || bonsai_artifacts::is_redirect(&metadata) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name == "http" {
+            continue;
+        }
+        let Ok(version) = Version::parse(name) else {
+            continue;
+        };
+        if version > current_version {
+            continue;
+        }
+        let Ok(lock) = crate::startup_cache::lock_file(&path.join("update.lock")) else {
+            continue;
+        };
+        drop(lock);
+        if crate::fs_guard::remove_dir_all_with_retry(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn prune_obsolete_bundles_in(bundles_root: &Path, keep_prefixes: &[&str]) -> crate::Result<usize> {
+    external(bundles_root)?;
+    let Ok(entries) = fs::read_dir(bundles_root) else {
+        return Ok(0);
+    };
+    let mut removed = 0_usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if external(&path).is_err() {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || bonsai_artifacts::is_redirect(&metadata) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !crate::identity::is_lower_hex(name, 24) || keep_prefixes.contains(&name) {
+            continue;
+        }
+        let Ok(lock) = crate::startup_cache::lock_file(&path.join("package.lock")) else {
+            continue;
+        };
+        drop(lock);
+        if crate::fs_guard::remove_dir_all_with_retry(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn prune_obsolete_updates_best_effort(current_version: &str) {
+    if let (Ok(version), Ok(updates_root)) = (
+        Version::parse(current_version),
+        crate::data_dir::default_subpath("updates"),
+    ) {
+        let _ = prune_obsolete_updates_in(&updates_root, version);
+    }
+}
+
+fn prune_obsolete_caches_best_effort(
+    current_bundle_digest: &str,
+    staged_candidate: Option<&Candidate>,
+) {
+    prune_obsolete_updates_best_effort(env!("CARGO_PKG_VERSION"));
+    if let Ok(bundles_root) = crate::data_dir::default_subpath("application-bundles") {
+        let mut keep = Vec::new();
+        if current_bundle_digest.len() >= 24 {
+            keep.push(current_bundle_digest[..24].to_owned());
+        }
+        if let Some(candidate) = staged_candidate
+            && let Ok(dir) = staged(&candidate.version)
+            && let Some(prefix) =
+                crate::chat_package::bundle::bundle_prefix(&dir.join(&candidate.msi.name))
+        {
+            keep.push(prefix);
+        }
+        let keep_refs: Vec<&str> = keep.iter().map(String::as_str).collect();
+        let _ = prune_obsolete_bundles_in(&bundles_root, &keep_refs);
+    }
+}
+
 /// Checks for, downloads, or queues an explicit installed application update.
 ///
 /// # Errors
@@ -567,26 +868,39 @@ pub fn run(value: Value) -> crate::Result<Value> {
         return Err("Application updates require native Windows ARM64.".into());
     }
     match serde_json::from_value(value).map_err(|error| error.to_string())? {
-        Request::PortableCheck => {
+        Request::PortableCheck { manual } => {
             // Discovery is read-only. Admit the running bundle without hashing
             // every extracted application executable on each timer tick. The
             // download and installation gates still verify the full package.
-            crate::chat_package::bundle::update_identity()?;
+            let (_, current_digest) = crate::chat_package::bundle::update_identity()?;
             let working = cache_root()?;
-            let (published, candidate) = policy::select_portable(
-                &cached_release_catalog(&working)?,
-                env!("CARGO_PKG_VERSION"),
-            )?;
+            let catalog = if manual {
+                manual_cached_release_catalog(&working)?
+            } else {
+                cached_release_catalog(&working)?
+            };
+            let (published, candidate) =
+                policy::select_portable(&catalog, env!("CARGO_PKG_VERSION"))?;
+            prune_obsolete_caches_best_effort(&current_digest, candidate.as_ref());
             if let Some(candidate) = candidate {
-                let published =
-                    release_metadata(&candidate, &working, true, policy::Distribution::Portable)?;
+                let published = release_metadata(
+                    &candidate,
+                    &working,
+                    MetadataMode::Conditional {
+                        bypass_offline: manual,
+                    },
+                    policy::Distribution::Portable,
+                )?;
                 Ok(json!({"Status": "available", "Version": candidate.version,
                     "ReleaseIdentity": published.release_identity()?}))
             } else {
                 Ok(json!({"Status": if published { "current" } else { "no-release" }}))
             }
         }
-        Request::PortableDownload { version } => portable_download(&version),
+        Request::PortableDownload {
+            version,
+            progress_path,
+        } => portable_download(&version, progress_path.as_deref()),
         Request::PortableInstall {
             version,
             handoff_path,
@@ -603,12 +917,20 @@ pub fn run(value: Value) -> crate::Result<Value> {
         }
         Request::Check {
             installation_directory,
+            manual,
         } => {
             installation(&installation_directory, true)?;
             let working = cache_root()?;
-            let (published, candidate) = discover(&working)?;
+            let (published, candidate) = discover(&working, manual)?;
             if let Some(candidate) = candidate {
-                release_metadata(&candidate, &working, true, policy::Distribution::Installer)?;
+                release_metadata(
+                    &candidate,
+                    &working,
+                    MetadataMode::Conditional {
+                        bypass_offline: manual,
+                    },
+                    policy::Distribution::Installer,
+                )?;
                 Ok(
                     json!({"Status": "available", "Version": candidate.version, "ReleaseUrl": candidate.release_url}),
                 )
@@ -621,7 +943,8 @@ pub fn run(value: Value) -> crate::Result<Value> {
         Request::Download {
             installation_directory,
             version,
-        } => download(&installation_directory, &version),
+            progress_path,
+        } => download(&installation_directory, &version, progress_path.as_deref()),
         Request::Install {
             installation_directory,
             version,
@@ -701,9 +1024,14 @@ fn apply_portable_after_exit(handoff: &Path, value: Value) -> crate::Result<Valu
                 .map_err(|_| "Portable restart arguments must be Unicode.".to_owned())
         })
         .collect::<crate::Result<Vec<_>>>()?;
-    let request = json!({"operation": "replace-portable", "target": target,
+    let mut request = json!({"operation": "replace-portable", "target": target,
         "previousSha256": previous_sha256, "version": queued.version, "arguments": arguments,
         "releaseIdentity": queued.release_identity, "restart": queued.restart});
+    #[cfg(windows)]
+    if let Ok(creation) = bonsai_windows_process::current_process_creation_time() {
+        request["launcherPid"] = std::process::id().into();
+        request["launcherCreationTimeFileTime"] = creation.into();
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;

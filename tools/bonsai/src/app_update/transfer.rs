@@ -163,25 +163,93 @@ fn require_successful_http(status: u16) -> crate::Result<()> {
     Ok(())
 }
 
-pub(super) fn metadata(url: &str, working: &Path) -> crate::Result<Vec<u8>> {
-    http::metadata(url, working, None, false)
-}
-
 pub(super) fn cached_metadata(url: &str, working: &Path) -> crate::Result<Vec<u8>> {
-    http::metadata(url, working, None, true)
+    http::metadata_with_policy(
+        url,
+        working,
+        None,
+        http::MetadataPolicy {
+            conditional: true,
+            bypass_offline_cooldown: false,
+            retry_transient: false,
+        },
+    )
 }
 
-pub(super) fn asset_metadata(asset: &Asset, working: &Path) -> crate::Result<Vec<u8>> {
-    checked_asset(
-        asset,
-        http::metadata(&asset.url, working, Some(asset), false)?,
+pub(super) fn manual_cached_metadata(url: &str, working: &Path) -> crate::Result<Vec<u8>> {
+    http::metadata_with_policy(
+        url,
+        working,
+        None,
+        http::MetadataPolicy {
+            conditional: true,
+            bypass_offline_cooldown: true,
+            retry_transient: false,
+        },
+    )
+}
+
+pub(super) fn resilient_metadata(url: &str, working: &Path) -> crate::Result<Vec<u8>> {
+    http::metadata_with_policy(
+        url,
+        working,
+        None,
+        http::MetadataPolicy {
+            conditional: false,
+            bypass_offline_cooldown: true,
+            retry_transient: true,
+        },
     )
 }
 
 pub(super) fn cached_asset_metadata(asset: &Asset, working: &Path) -> crate::Result<Vec<u8>> {
     checked_asset(
         asset,
-        http::metadata(&asset.url, working, Some(asset), true)?,
+        http::metadata_with_policy(
+            &asset.url,
+            working,
+            Some(asset),
+            http::MetadataPolicy {
+                conditional: true,
+                bypass_offline_cooldown: false,
+                retry_transient: false,
+            },
+        )?,
+    )
+}
+
+pub(super) fn manual_cached_asset_metadata(
+    asset: &Asset,
+    working: &Path,
+) -> crate::Result<Vec<u8>> {
+    checked_asset(
+        asset,
+        http::metadata_with_policy(
+            &asset.url,
+            working,
+            Some(asset),
+            http::MetadataPolicy {
+                conditional: true,
+                bypass_offline_cooldown: true,
+                retry_transient: false,
+            },
+        )?,
+    )
+}
+
+pub(super) fn resilient_asset_metadata(asset: &Asset, working: &Path) -> crate::Result<Vec<u8>> {
+    checked_asset(
+        asset,
+        http::metadata_with_policy(
+            &asset.url,
+            working,
+            Some(asset),
+            http::MetadataPolicy {
+                conditional: false,
+                bypass_offline_cooldown: true,
+                retry_transient: true,
+            },
+        )?,
     )
 }
 
