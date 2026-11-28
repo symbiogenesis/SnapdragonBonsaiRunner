@@ -942,5 +942,28 @@ fn validate_section_grants_rejects_mismatches_and_accepts_valid_slots() -> Resul
     assert_eq!(attestations[0].child_handle, 0x1234);
     assert_eq!(attestations[0].bytes, 4096);
     assert_eq!(attestations[0].sha256, digest);
+
+    // Empty grants/digests -> Ok(vec![]).
+    assert!(validate_section_grants(vec![], vec![])?.is_empty());
+
+    // Multi-slot grants: ordered slots [0, 1] accepted, out-of-order [1, 0] and extra grant rejected.
+    let digest2 = [0x99_u8; 32];
+    let g0 = InheritedSectionGrant {
+        slot: 0,
+        child_handle: 0x100,
+        bytes: 1024,
+    };
+    let g1 = InheritedSectionGrant {
+        slot: 1,
+        child_handle: 0x200,
+        bytes: 2048,
+    };
+    let multi = validate_section_grants(vec![g0, g1], vec![digest, digest2])?;
+    assert_eq!(multi.len(), 2);
+    assert_eq!((multi[0].slot, multi[0].sha256), (0, digest));
+    assert_eq!((multi[1].slot, multi[1].sha256), (1, digest2));
+
+    assert!(validate_section_grants(vec![g1, g0], vec![digest, digest2]).is_err());
+    assert!(validate_section_grants(vec![g0, g1], vec![digest]).is_err());
     Ok(())
 }

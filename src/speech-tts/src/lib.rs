@@ -1573,4 +1573,24 @@ mod tests {
         assert!(!message.contains("private"));
         assert!(!message.contains("credential"));
     }
+
+    #[test]
+    fn reference_48k_bounds_and_decimation_match_24k_extractor_contract() {
+        use crate::codec;
+        let too_short = vec![0.25_f32; codec::TOKENIZER_HOP_48K - 1];
+        let min_exact = vec![0.25_f32; codec::TOKENIZER_HOP_48K];
+        let max_exact_samples = 48_000 * 30;
+        let short_count = sample_count_for_rate(&too_short, 0, SAMPLE_RATE_48K);
+        assert_eq!(short_count, Some(codec::TOKENIZER_HOP_48K - 1));
+        assert!(
+            !(codec::TOKENIZER_HOP_48K..=max_exact_samples).contains(&short_count.unwrap_or(0))
+        );
+        let valid_count = sample_count_for_rate(&min_exact, 0, SAMPLE_RATE_48K);
+        assert_eq!(valid_count, Some(codec::TOKENIZER_HOP_48K));
+        assert!((codec::TOKENIZER_HOP_48K..=max_exact_samples).contains(&valid_count.unwrap_or(0)));
+
+        let decimated = codec::decimate_48k_to_24k(&min_exact);
+        assert_eq!(decimated.len(), codec::TOKENIZER_HOP_24K);
+        assert!(decimated.iter().all(|sample| sample.is_finite()));
+    }
 }

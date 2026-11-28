@@ -319,4 +319,21 @@ mod tests {
         assert!(unwound.is_err());
         assert!(!super::IN_WORKER.with(std::cell::Cell::get));
     }
+
+    #[test]
+    fn nested_run_aligned_runs_inline_without_reentering_pool() {
+        let mut outer = [0.0_f32; 16];
+        run_aligned(&mut outer, 4, 4, &|outer_offset, outer_chunk| {
+            assert!(super::IN_WORKER.with(std::cell::Cell::get));
+            run_aligned(outer_chunk, 4, 2, &|inner_offset, inner_chunk| {
+                for (i, slot) in inner_chunk.iter_mut().enumerate() {
+                    let val = outer_offset + inner_offset + i + 1;
+                    *slot = f32::from(u16::try_from(val).unwrap_or(0));
+                }
+            });
+        });
+        let expected: Vec<f32> = (1_u16..=16).map(f32::from).collect();
+        assert_eq!(&outer[..], &expected[..]);
+        assert!(!super::IN_WORKER.with(std::cell::Cell::get));
+    }
 }

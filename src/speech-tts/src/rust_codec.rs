@@ -4653,6 +4653,88 @@ mod tests {
             4,
         )?;
         assert_eq!(serial, parallel);
+
+        // Edge cases: count == 0, checked_mul overflow, serial path with count == 1.
+        super::apply_rope_batch(&mut [], 0, num_heads, head_dim, &[], &[], 2)?;
+        assert!(super::apply_rope_batch(&mut [], 1, usize::MAX, 2, &[], &[], 1).is_err());
+        let mut single = vec![1.0_f32, 0.0, 1.0, 0.0];
+        super::apply_rope_batch(&mut single, 1, 1, 4, &[0.0, 0.0], &[1.0, 1.0], 1)?;
+
+        // load_dac_decoder rejects unsupported sample rates (e.g. 16_000) and builds 48 kHz 5-block decoder.
+        struct ZeroCodecSource {
+            shapes: std::collections::HashMap<String, Vec<usize>>,
+        }
+        impl ZeroCodecSource {
+            fn for_48k() -> Self {
+                let mut shapes = std::collections::HashMap::new();
+                shapes.insert("tok_dec.dec.0.conv.weight".into(), vec![7, 1024, 1536]);
+                shapes.insert("tok_dec.dec.7.conv.weight".into(), vec![7, 48, 1]);
+                for (idx, stride, channels) in [
+                    (0_usize, 8_usize, 1536_usize),
+                    (1, 5, 768),
+                    (2, 4, 384),
+                    (3, 3, 192),
+                    (4, 2, 96),
+                ] {
+                    let next = channels / 2;
+                    shapes.insert(
+                        format!("tok_dec.dec.{}.conv_t.weight", idx + 1),
+                        vec![stride * 2, next, channels],
+                    );
+                    for unit in 0..3 {
+                        shapes.insert(
+                            format!("tok_dec.dec.{}.res.{unit}.conv1.weight", idx + 1),
+                            vec![7, next, next],
+                        );
+                        shapes.insert(
+                            format!("tok_dec.dec.{}.res.{unit}.conv2.weight", idx + 1),
+                            vec![1, next, next],
+                        );
+                    }
+                }
+                Self { shapes }
+            }
+        }
+        impl super::CodecSource for ZeroCodecSource {
+            fn parallel_load(&self) -> bool {
+                false
+            }
+            fn u32_meta(&self, _key: &str) -> std::io::Result<u32> {
+                Err(super::invalid())
+            }
+            fn f32_meta(&self, _key: &str) -> std::io::Result<f32> {
+                Err(super::invalid())
+            }
+            fn u32_array_meta(&self, _key: &str) -> std::io::Result<Vec<u32>> {
+                Err(super::invalid())
+            }
+            fn tensor_shape(&self, name: &str) -> std::io::Result<&[usize]> {
+                self.shapes
+                    .get(name)
+                    .map(Vec::as_slice)
+                    .ok_or_else(super::invalid)
+            }
+            fn tensor_f32(&self, _name: &str, shape: &[usize]) -> std::io::Result<Vec<f32>> {
+                let len = shape
+                    .iter()
+                    .try_fold(1_usize, |acc, &d| acc.checked_mul(d))
+                    .ok_or_else(super::invalid)?;
+                Ok(vec![0.0_f32; len])
+            }
+            fn projection(
+                &self,
+                _name: &str,
+                _in_dim: usize,
+                _out_dim: usize,
+            ) -> std::io::Result<super::LinearProjection> {
+                Err(super::invalid())
+            }
+        }
+        let zero_src = ZeroCodecSource::for_48k();
+        assert!(super::load_dac_decoder(&zero_src, 1024, 16_000, 1).is_err());
+        let dac_48k = super::load_dac_decoder(&zero_src, 1024, super::SAMPLE_RATE_48K, 2)?;
+        assert_eq!(dac_48k.sample_rate(), super::SAMPLE_RATE_48K);
+        assert_eq!(dac_48k.blocks.len(), 5);
         Ok(())
     }
 }

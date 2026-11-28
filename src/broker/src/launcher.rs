@@ -1261,26 +1261,23 @@ impl LaunchConfig {
         Ok(artifacts)
     }
 
+    fn join_guard_handle<T>(
+        handle: Option<
+            Result<std::thread::ScopedJoinHandle<'_, Result<Option<T>, LaunchError>>, LaunchError>,
+        >,
+        panic_error: LaunchError,
+    ) -> Result<Option<T>, LaunchError> {
+        match handle {
+            None => Ok(None),
+            Some(Err(err)) => Err(err),
+            Some(Ok(h)) => h.join().map_err(|_| panic_error)?,
+        }
+    }
+
     fn verify_launch_artifacts(
         &self,
         plan: &LaunchPlan,
     ) -> Result<VerifiedLaunchGuards, LaunchError> {
-        fn join_opt<T>(
-            handle: Option<
-                Result<
-                    std::thread::ScopedJoinHandle<'_, Result<Option<T>, LaunchError>>,
-                    LaunchError,
-                >,
-            >,
-            panic_error: LaunchError,
-        ) -> Result<Option<T>, LaunchError> {
-            match handle {
-                None => Ok(None),
-                Some(Err(err)) => Err(err),
-                Some(Ok(h)) => h.join().map_err(|_| panic_error)?,
-            }
-        }
-
         let verify_vision = self.runtime_supports_vision()?;
         let daisyrose_selection = self.resolve_daisyrose_selection()?;
         let total_workers = crate::artifacts::default_chunk_workers();
@@ -1313,9 +1310,10 @@ impl LaunchConfig {
             });
 
             let artifacts_result = self.verify_artifacts(plan, model_workers);
-            let native_executable = join_opt(native_handle, LaunchError::NativeRuntime);
-            let daisyrose = join_opt(daisyrose_handle, LaunchError::Adapter);
-            let mmproj = join_opt(mmproj_handle, LaunchError::Artifacts);
+            let native_executable =
+                Self::join_guard_handle(native_handle, LaunchError::NativeRuntime);
+            let daisyrose = Self::join_guard_handle(daisyrose_handle, LaunchError::Adapter);
+            let mmproj = Self::join_guard_handle(mmproj_handle, LaunchError::Artifacts);
             Ok(VerifiedLaunchGuards {
                 native_executable: native_executable?,
                 artifacts: artifacts_result?,
@@ -6169,5 +6167,39 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn join_guard_handle_handles_none_spawn_error_panic_and_value() {
+        assert!(matches!(
+            LaunchConfig::join_guard_handle::<u32>(None, LaunchError::NativeRuntime),
+            Ok(None)
+        ));
+        assert!(matches!(
+            LaunchConfig::join_guard_handle::<u32>(
+                Some(Err(LaunchError::Adapter)),
+                LaunchError::NativeRuntime,
+            ),
+            Err(LaunchError::Adapter)
+        ));
+        std::thread::scope(|scope| {
+            let panicked = std::thread::Builder::new()
+                .spawn_scoped(scope, || -> Result<Option<u32>, LaunchError> {
+                    std::panic::resume_unwind(Box::new("guard panic"))
+                })
+                .map_err(|_| LaunchError::Artifacts);
+            assert!(matches!(
+                LaunchConfig::join_guard_handle(Some(panicked), LaunchError::Artifacts),
+                Err(LaunchError::Artifacts)
+            ));
+
+            let ok_handle = std::thread::Builder::new()
+                .spawn_scoped(scope, || Ok(Some(42_u32)))
+                .map_err(|_| LaunchError::Adapter);
+            assert!(matches!(
+                LaunchConfig::join_guard_handle(Some(ok_handle), LaunchError::Adapter),
+                Ok(Some(42))
+            ));
+        });
     }
 }

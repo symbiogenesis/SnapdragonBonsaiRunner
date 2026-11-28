@@ -2664,6 +2664,29 @@ pub(crate) mod tests {
             talker.prefill(&prompt, &mut snapshot, &mut || Ok(()), &mut workspace)?;
         assert_eq!(hidden_second, hidden_first);
         assert_eq!(caches_second.len(), caches_first.len());
+
+        // Partial-prefix hit (reused && prefix < prompt.rows.len()) must match a cold prefill.
+        let mut partial_snap = None;
+        let short_prefix = Prompt {
+            rows: prompt.rows[..2].to_vec(),
+            trailing: vec![vec![0.2; talker.geometry.hidden]],
+            cacheable_rows: 2,
+        };
+        let _ = talker.prefill(
+            &short_prefix,
+            &mut partial_snap,
+            &mut || Ok(()),
+            &mut workspace,
+        )?;
+        let extended = Prompt {
+            rows: prompt.rows.clone(),
+            trailing: prompt.trailing.clone(),
+            cacheable_rows: 2,
+        };
+        let (reused_caches, reused_hidden) =
+            talker.prefill(&extended, &mut partial_snap, &mut || Ok(()), &mut workspace)?;
+        assert_eq!(reused_hidden, hidden_first);
+        assert_eq!(reused_caches.len(), caches_first.len());
         Ok(())
     }
 }

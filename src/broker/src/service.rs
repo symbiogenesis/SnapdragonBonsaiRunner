@@ -938,4 +938,48 @@ mod tests {
             assert!(!is_transient_accept_error(&io::Error::new(kind, "fatal")));
         }
     }
+
+    #[test]
+    fn accept_survives_aborted_loopback_peer_and_serves_subsequent_client() -> io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let dummy_backend = bound_loopback_socket(0)?.listen(4)?;
+            let backend_port = dummy_backend.local_addr()?.port();
+            let service = LocalChatService::bind(0, FRONTEND_KEY, backend_port, BACKEND_KEY, 1)
+                .await
+                .map_err(|_| io::Error::other("bind failed"))?;
+            let port = service.port();
+
+            // Connect and immediately drop/reset a peer, then connect a healthy loopback client.
+            let aborted = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))?;
+            drop(aborted);
+            let mut healthy = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
+            healthy.write_all(b"GET /health HTTP/1.1\r\n").await?;
+
+            // Either both sockets accept or set_nodelay skips the dead one; the accept loop
+            // must never die and must accept the healthy socket.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut got_health = false;
+            while Instant::now() < deadline {
+                let first = tokio::time::timeout(Duration::from_secs(2), service.accept())
+                    .await
+                    .map_err(|_| io::Error::other("accept timed out"))?
+                    .map_err(|err| io::Error::other(format!("accept failed: {err:?}")))?;
+                let mut stream = first.stream;
+                let mut buf = [0_u8; 32];
+                match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await
+                {
+                    Ok(Ok(n)) if buf[..n].starts_with(b"GET /health") => {
+                        got_health = true;
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+            assert!(got_health);
+            Ok::<(), io::Error>(())
+        })
+    }
 }

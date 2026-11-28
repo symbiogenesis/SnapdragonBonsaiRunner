@@ -989,6 +989,144 @@ mod pcm_tests {
         .err()
         .ok_or_else(|| io::Error::other("expected timeout error"))?;
         assert_eq!(write_err.kind(), io::ErrorKind::TimedOut);
+
+        // Additional error branches for read_with_deadline and write_before_with_deadline.
+        struct ScriptedIo {
+            read_result: Option<io::Result<usize>>,
+            write_result: Option<io::Result<usize>>,
+        }
+        impl Read for ScriptedIo {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                self.read_result
+                    .take()
+                    .unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::Interrupted)))
+            }
+        }
+        impl Write for ScriptedIo {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                self.write_result
+                    .take()
+                    .unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::Interrupted)))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let future = Instant::now() + Duration::from_secs(1);
+        let mut eof_io = ScriptedIo {
+            read_result: Some(Ok(0)),
+            write_result: None,
+        };
+        let eof_err = super::read_with_deadline(&mut eof_io, &mut |_, _| Ok(()), &mut buf, future)
+            .err()
+            .ok_or_else(|| io::Error::other("expected incomplete_request"))?;
+        assert_eq!((eof_err.status, eof_err.code), (400, "incomplete_request"));
+
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock] {
+            let mut to_io = ScriptedIo {
+                read_result: Some(Err(io::Error::from(kind))),
+                write_result: None,
+            };
+            let to_err =
+                super::read_with_deadline(&mut to_io, &mut |_, _| Ok(()), &mut buf, future)
+                    .err()
+                    .ok_or_else(|| io::Error::other("expected intake_timeout"))?;
+            assert_eq!((to_err.status, to_err.code), (408, "intake_timeout"));
+        }
+
+        let mut reset_io = ScriptedIo {
+            read_result: Some(Err(io::Error::from(io::ErrorKind::ConnectionReset))),
+            write_result: None,
+        };
+        let reset_err =
+            super::read_with_deadline(&mut reset_io, &mut |_, _| Ok(()), &mut buf, future)
+                .err()
+                .ok_or_else(|| io::Error::other("expected read_failed"))?;
+        assert_eq!((reset_err.status, reset_err.code), (400, "read_failed"));
+
+        let mut timeout_err_io = ScriptedIo {
+            read_result: None,
+            write_result: Some(Err(io::Error::from(io::ErrorKind::BrokenPipe))),
+        };
+        let st_read_err = super::read_with_deadline(
+            &mut timeout_err_io,
+            &mut |_, _| Err(io::Error::other("set_timeout failed")),
+            &mut buf,
+            future,
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("expected set_timeout read_failed"))?;
+        assert_eq!((st_read_err.status, st_read_err.code), (400, "read_failed"));
+
+        let soon = Instant::now() + Duration::from_millis(15);
+        let mut loop_eintr = ScriptedIo {
+            read_result: None,
+            write_result: None,
+        };
+        let eintr_read_err =
+            super::read_with_deadline(&mut loop_eintr, &mut |_, _| Ok(()), &mut buf, soon)
+                .err()
+                .ok_or_else(|| io::Error::other("expected EINTR deadline timeout"))?;
+        assert_eq!(
+            (eintr_read_err.status, eintr_read_err.code),
+            (408, "intake_timeout")
+        );
+
+        let mut zero_w = ScriptedIo {
+            read_result: None,
+            write_result: Some(Ok(0)),
+        };
+        assert_eq!(
+            super::write_before_with_deadline(&mut zero_w, &mut |_, _| Ok(()), b"abc", future)
+                .err()
+                .map(|e| e.kind()),
+            Some(io::ErrorKind::WriteZero)
+        );
+        let mut pipe_w = ScriptedIo {
+            read_result: None,
+            write_result: Some(Err(io::Error::from(io::ErrorKind::BrokenPipe))),
+        };
+        assert_eq!(
+            super::write_before_with_deadline(&mut pipe_w, &mut |_, _| Ok(()), b"abc", future)
+                .err()
+                .map(|e| e.kind()),
+            Some(io::ErrorKind::BrokenPipe)
+        );
+        assert_eq!(
+            super::write_before_with_deadline(
+                &mut timeout_err_io,
+                &mut |_, _| Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+                b"abc",
+                future,
+            )
+            .err()
+            .map(|e| e.kind()),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+        // Empty slice returns Ok(()) even when deadline has already expired without calling write.
+        super::write_before_with_deadline(
+            &mut zero_w,
+            &mut |_, _| Err(io::Error::other("must not set_timeout")),
+            b"",
+            Instant::now() - Duration::from_secs(1),
+        )?;
+        let soon_w = Instant::now() + Duration::from_millis(15);
+        let mut loop_w_eintr = ScriptedIo {
+            read_result: None,
+            write_result: None,
+        };
+        assert_eq!(
+            super::write_before_with_deadline(
+                &mut loop_w_eintr,
+                &mut |_, _| Ok(()),
+                b"abc",
+                soon_w
+            )
+            .err()
+            .map(|e| e.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
         Ok(())
     }
 }

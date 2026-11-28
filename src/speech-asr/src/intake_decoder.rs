@@ -874,5 +874,68 @@ mod tests {
         )
         .err();
         assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::Interrupted));
+
+        // Single-worker path (count == 1 forces workers <= 1) cancellation -> Interrupted.
+        let err_single = super::load_mapped_blocks(1, &mut || true, |layer| Ok(layer)).err();
+        assert_eq!(
+            err_single.map(|e| e.kind()),
+            Some(io::ErrorKind::Interrupted)
+        );
+
+        // Pre-cancelled with count == 0 and count == 8 invokes load_layer 0 times.
+        let layer_calls = std::sync::atomic::AtomicUsize::new(0);
+        for n in [0_usize, 8] {
+            let pre_err = super::load_mapped_blocks(n, &mut || true, |layer| {
+                layer_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(layer)
+            })
+            .err();
+            assert_eq!(pre_err.map(|e| e.kind()), Some(io::ErrorKind::Interrupted));
+        }
+        assert_eq!(layer_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // Uncancelled count == 0 returns Ok(vec![]).
+        assert_eq!(
+            super::load_mapped_blocks(0, &mut || false, |layer| Ok(layer)).ok(),
+            Some(Vec::new())
+        );
+
+        // Worker returning Err(InvalidData) aborts peers and propagates error.
+        let abort_err = super::load_mapped_blocks(8, &mut || false, |layer| {
+            if layer == 2 {
+                Err(io::Error::new(io::ErrorKind::InvalidData, "bad layer"))
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                Ok(layer)
+            }
+        })
+        .err();
+        assert_eq!(
+            abort_err.map(|e| e.kind()),
+            Some(io::ErrorKind::InvalidData)
+        );
+
+        // Multi-worker broadcast cancellation via Barrier stops peer workers with Interrupted.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let cancel_flag = std::sync::atomic::AtomicBool::new(false);
+        let worker_barrier = std::sync::Arc::clone(&barrier);
+        let cancel_ref = &cancel_flag;
+        let broadcast_err = super::load_mapped_blocks(
+            8,
+            &mut || cancel_ref.load(std::sync::atomic::Ordering::Acquire),
+            move |layer| {
+                if layer < 2 {
+                    worker_barrier.wait();
+                    cancel_ref.store(true, std::sync::atomic::Ordering::Release);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(3));
+                Ok(layer)
+            },
+        )
+        .err();
+        assert_eq!(
+            broadcast_err.map(|e| e.kind()),
+            Some(io::ErrorKind::Interrupted)
+        );
     }
 }

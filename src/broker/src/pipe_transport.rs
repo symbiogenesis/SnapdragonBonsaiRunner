@@ -2116,4 +2116,80 @@ mod tests {
             Ok(())
         })
     }
+
+    #[test]
+    fn full_rx_channel_surfaces_broken_pipe_on_clean_eof_and_succeeds_on_kind_eof() -> io::Result<()>
+    {
+        run_async(async {
+            // 1. CleanEof with active stream and full 64-entry RX channel surfaces BrokenPipe.
+            let (backend, _p_to_c_r, mut c_to_p_w) = ready_memory_backend().await?;
+            let mut stream = backend
+                .connect(Instant::now() + Duration::from_secs(1))
+                .await
+                .map_err(|_| io::Error::other("connect 1 failed"))?;
+            for _ in 0..CHANNEL_CAPACITY {
+                write_frame(&mut c_to_p_w, 1, KIND_DATA, b"x")?;
+            }
+            c_to_p_w.wait_for_reader_idle();
+            drop(c_to_p_w);
+            let mut out = Vec::new();
+            let err =
+                stream.read_to_end(&mut out).await.err().ok_or_else(|| {
+                    io::Error::other("expected BrokenPipe after full-RX CleanEof")
+                })?;
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            drop(stream);
+            drop(backend);
+
+            // 2. Normal KIND_EOF with full 64-entry RX channel succeeds without error.
+            let (backend, _p_to_c_r, mut c_to_p_w) = ready_memory_backend().await?;
+            let mut stream = backend
+                .connect(Instant::now() + Duration::from_secs(1))
+                .await
+                .map_err(|_| io::Error::other("connect 2 failed"))?;
+            for _ in 0..CHANNEL_CAPACITY {
+                write_frame(&mut c_to_p_w, 1, KIND_DATA, b"z")?;
+            }
+            c_to_p_w.wait_for_reader_idle();
+            write_frame(&mut c_to_p_w, 1, KIND_EOF, &[])?;
+            c_to_p_w.wait_for_reader_idle();
+            let mut out = Vec::new();
+            let n = stream.read_to_end(&mut out).await?;
+            assert_eq!(n, CHANNEL_CAPACITY);
+            assert_eq!(out, vec![b'z'; CHANNEL_CAPACITY]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn clean_eof_before_ready_marks_backend_failed_and_joins_teardown() -> io::Result<()> {
+        run_async(async {
+            let (p_to_c_w, mut p_to_c_r) = memory_channel();
+            let (mut c_to_p_w, c_to_p_r) = memory_channel();
+            let backend = PipeBackend::from_io(c_to_p_r, p_to_c_w, VALID_KEY)
+                .map_err(|_| io::Error::other("PipeBackend::from_io failed"))?;
+            complete_handshake(&mut p_to_c_r, &mut c_to_p_w)?;
+            // Close writer BEFORE sending KIND_SERVER_READY.
+            drop(c_to_p_w);
+            let ready_res = backend
+                .wait_server_ready(Instant::now() + Duration::from_secs(2))
+                .await;
+            assert!(ready_res.is_err());
+            drop(backend);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn thread_completion_wait_exited_times_out_cleanly_and_wakes_on_exit_guard_drop() {
+        let completion = ThreadCompletion::new();
+        assert!(!completion.wait_exited(Duration::from_millis(10)));
+        let wake_completion = Arc::clone(&completion);
+        let handle = std::thread::spawn(move || {
+            let _guard = ExitGuard(wake_completion);
+            std::thread::sleep(Duration::from_millis(5));
+        });
+        assert!(completion.wait_exited(Duration::from_secs(2)));
+        let _ = handle.join();
+    }
 }
