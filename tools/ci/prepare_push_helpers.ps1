@@ -17,6 +17,8 @@ $PSNativeCommandUseErrorActionPreference = $true
 $maintenanceTool = $env:BONSAI_TOOLS_PATH
 if (-not $maintenanceTool -and $env:LOCALAPPDATA) {
     foreach ($relative in @(
+        'SnapdragonBonsai/build/maintenance/aarch64-pc-windows-msvc/release/bonsai-tools.exe',
+        'SnapdragonBonsai/build/maintenance/release/bonsai-tools.exe',
         'SwiftBonsai2/build/maintenance/aarch64-pc-windows-msvc/release/bonsai-tools.exe',
         'SwiftBonsai2/build/maintenance/release/bonsai-tools.exe'
     )) {

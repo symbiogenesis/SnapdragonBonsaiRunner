@@ -3,7 +3,7 @@
 [CmdletBinding(DefaultParameterSetName='Build')]
 param([Parameter(ParameterSetName='Build')][string]$RepositoryRoot=(Split-Path $PSScriptRoot -Parent),
     [Parameter(ParameterSetName='Build')][string]$TargetDirectory=$env:CARGO_TARGET_DIR,
-    [string]$DataDirectory=(Join-Path $env:LOCALAPPDATA 'SwiftBonsai2'),[string]$OutputPath,
+    [string]$DataDirectory=(Join-Path $env:LOCALAPPDATA 'SnapdragonBonsai'),[string]$OutputPath,
     [Parameter(Mandatory,ParameterSetName='Package')][string]$PackageDirectory,
     [Parameter(Mandatory,ParameterSetName='Package')][string]$ManifestSha256)
 Set-StrictMode -Version Latest

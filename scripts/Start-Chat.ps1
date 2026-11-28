@@ -95,7 +95,7 @@ try {
         }
     } else {
         $maintenanceTarget = if ($env:LOCALAPPDATA) {
-            Join-Path $env:LOCALAPPDATA 'SwiftBonsai2/build/maintenance'
+            Join-Path $env:LOCALAPPDATA 'SnapdragonBonsai/build/maintenance'
         } elseif ($DataDirectory) {
             Join-Path $DataDirectory 'build/maintenance'
         } else {
@@ -144,6 +144,8 @@ try {
         } else {
             if ($env:LOCALAPPDATA) {
                 foreach ($relative in @(
+                    'SnapdragonBonsai/build/maintenance/aarch64-pc-windows-msvc/release/bonsai-tools.exe',
+                    'SnapdragonBonsai/build/maintenance/release/bonsai-tools.exe',
                     'SwiftBonsai2/build/maintenance/aarch64-pc-windows-msvc/release/bonsai-tools.exe',
                     'SwiftBonsai2/build/maintenance/release/bonsai-tools.exe'
                 )) {
