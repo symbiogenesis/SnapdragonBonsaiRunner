@@ -264,13 +264,22 @@ action (except automatic fresh warm restart after a response stop on the publish
 rollback runtime). Replace the ordered event channel on worker attachment. Late
 events cannot reopen admission in another phase.
 
-Drafting, browsing and conversation creation remain available during preparation,
-failure and generation. Only one request runs: incoming content, reasoning, stages
-and history belong to its submitting conversation, which cannot be deleted until
-it settles. Stop and Escape-to-stop control generation only while that owner is
-selected; other conversations show a disabled Send button with hover text and a
+Drafting, browsing, conversation creation and message queuing remain available during
+preparation, failure and generation. Only one request runs at a time: incoming
+content, reasoning, stages and history belong to its submitting conversation,
+which cannot be deleted until it settles. While generating, `Queue  ↑` or `Enter`
+queues up to `8` messages (text and/or staged attachments) FIFO across
+conversations without disturbing active drafts, cursors or unrelated read-aloud
+playback. Stop and Escape-to-stop control generation only while the generating
+owner is selected; other conversations show `Queue  ↑` (without Stop) and a
 single background-response notice below the composer, with no duplicate workspace
-banner or return button.
+banner or return button. Queued messages for the selected conversation appear in a
+compact strip above the composer with `Edit` (when the composer is empty), `×`
+remove, `Clear`, and (when ready) `Send next`, while inactive sidebar rows with
+queued messages show a `N queued` badge. Normal completion (`Finished`) dispatches
+the next queued message automatically; Stop, reply-cap completion (`TokenLimit`),
+rejection, failure or update teardown pauses the queue without discarding items or
+replaying them after recovery.
 Its sidebar row shows an animated vertical activity indicator while generating,
 including thinking and responses received while another conversation is selected;
 selecting that row returns to the response.
@@ -358,9 +367,10 @@ No audio upload or inference precedes complete finalized-WAV validation.
 The composer's `+` button (`Add attachment`) opens the native `Attachment options`
 popup with `Audio files`, `Text files` and `Images and Videos`. `Audio files` is
 disabled with a spinner and `Loading ASR…` until Qwen3-ASR is ready (or
-`ASR unavailable` when disabled or unconfigured). While Swift is still loading,
-`Text files` and `Images and Videos` remain enabled and attach files strictly to
-the active draft without auto-sending on import completion or model readiness.
+`ASR unavailable` when disabled or unconfigured). While Swift is loading or
+responding, `Text files` and `Images and Videos` remain enabled and attach files
+strictly to the active draft without auto-sending on import completion or model
+readiness.
 Up to `8` attachments fit on one message: UTF-8 text files (`256 KiB` per file,
 `512 KiB` per message) format as fenced blocks on send; source media files
 (`<= 64 MiB`) decode off the UI thread inside the private headless
