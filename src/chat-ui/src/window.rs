@@ -212,6 +212,7 @@ struct State {
     recovery_dirty: bool,
     recovery_flush_now: bool,
     recovery_erase_pending: bool,
+    recovery_quarantine_primary: bool,
     recovery_notice: String,
     last_recovery_save: Instant,
     last_workspace_bytes: std::cell::Cell<usize>,
@@ -394,6 +395,7 @@ impl State {
             recovery_dirty: false,
             recovery_flush_now: false,
             recovery_erase_pending: false,
+            recovery_quarantine_primary: false,
             recovery_notice: String::new(),
             last_recovery_save: Instant::now(),
             last_workspace_bytes: std::cell::Cell::new(0),
@@ -2136,7 +2138,9 @@ impl Drop for State {
             if self.recovery_erase_pending {
                 recovery.finish_erase();
             } else if self.save_conversations {
-                recovery.finish_with(|| self.workspace_bytes().ok());
+                recovery.finish_with_quarantine(self.recovery_quarantine_primary, || {
+                    self.workspace_bytes().ok()
+                });
             }
         }
         self.microphone.take();

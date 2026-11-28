@@ -132,13 +132,30 @@ impl State {
                 if let Some(bytes) = opened.saved {
                     if self.restore_workspace(&bytes).is_ok() {
                         self.save_conversations = true;
+                        self.recovery_quarantine_primary = false;
                         "Conversations restored. Interrupted replies remain available as context."
                             .clone_into(&mut self.recovery_notice);
                     } else {
-                        "Could not restore saved conversations. The existing file is preserved. Enable saving to replace it with this workspace.".clone_into(&mut self.recovery_notice);
+                        self.recovery_quarantine_primary = true;
+                        if self.restore_from_backup() {
+                            self.save_conversations = true;
+                            self.recovery_dirty = true;
+                            self.recovery_flush_now = true;
+                            "Restored conversations from your previous encrypted backup because the latest file could not be read.".clone_into(&mut self.recovery_notice);
+                        } else {
+                            "Could not restore saved conversations. The existing file is preserved. Enable saving to replace it with this workspace.".clone_into(&mut self.recovery_notice);
+                        }
                     }
                 } else if opened.load_failed {
-                    "Could not unlock saved conversations. The existing file is preserved. Enable saving to replace it with this workspace.".clone_into(&mut self.recovery_notice);
+                    self.recovery_quarantine_primary = true;
+                    if self.restore_from_backup() {
+                        self.save_conversations = true;
+                        self.recovery_dirty = true;
+                        self.recovery_flush_now = true;
+                        "Restored conversations from your previous encrypted backup because the latest file could not be read.".clone_into(&mut self.recovery_notice);
+                    } else {
+                        "Could not unlock saved conversations. The existing file is preserved. Enable saving to replace it with this workspace.".clone_into(&mut self.recovery_notice);
+                    }
                 } else if opened.saving_disabled {
                     self.recovery_erase_pending = true;
                     "Saving is off. Enable it to keep conversations after closing this window."
@@ -154,6 +171,17 @@ impl State {
                 "Could not open conversation saving. Another window may be using this data folder, or the folder is not writable.".clone_into(&mut self.recovery_notice);
             }
         }
+    }
+
+    fn restore_from_backup(&mut self) -> bool {
+        let Some(backup_bytes) = self
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.read_backup().ok().flatten())
+        else {
+            return false;
+        };
+        self.restore_workspace(&backup_bytes).is_ok()
     }
 
     pub(super) fn workspace_bytes(&self) -> io::Result<Vec<u8>> {
@@ -367,6 +395,7 @@ impl State {
                             crate::recovery::Event::Saved(_) if self.save_conversations => {
                                 self.alerts
                                     .clear_dismissed(super::error_ui::AlertKind::Recovery);
+                                self.recovery_quarantine_primary = false;
                                 "Saved on this device with Windows user encryption."
                                     .clone_into(&mut self.recovery_notice);
                             }
@@ -374,6 +403,7 @@ impl State {
                                 self.alerts
                                     .clear_dismissed(super::error_ui::AlertKind::Recovery);
                                 self.recovery_erase_pending = false;
+                                self.recovery_quarantine_primary = false;
                                 "Saving is off. The saved workspace has been removed."
                                     .clone_into(&mut self.recovery_notice);
                             }
@@ -417,7 +447,9 @@ impl State {
             && self.recovery_dirty
             && let Some(recovery) = &self.recovery
         {
-            match recovery.save_with(|| self.workspace_bytes()) {
+            match recovery
+                .save_with_quarantine(self.recovery_quarantine_primary, || self.workspace_bytes())
+            {
                 Ok(crate::recovery::DispatchStatus::Queued) => self.recovery_dirty = false,
                 Ok(crate::recovery::DispatchStatus::Busy) => self.recovery_dirty = true,
                 Ok(crate::recovery::DispatchStatus::Disconnected) => {
@@ -779,11 +811,17 @@ mod tests {
     }
 
     fn remove_recovery_directory(directory: &std::path::Path) -> io::Result<()> {
-        let path = directory.join("chat-recovery.dpapi");
-        if path.exists() {
-            std::fs::remove_file(path)?;
+        for name in [
+            "chat-recovery.dpapi",
+            "chat-recovery.backup.dpapi",
+            "chat-recovery.preserved.dpapi",
+            "chat-recovery.lock",
+        ] {
+            let path = directory.join(name);
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
         }
-        std::fs::remove_file(directory.join("chat-recovery.lock"))?;
         std::fs::remove_dir(directory)
     }
 
@@ -1346,9 +1384,7 @@ mod tests {
         let mut recovered = self::state();
         recovered.restore_workspace(&plain)?;
         assert_eq!(recovered.input, "Last valid draft");
-        std::fs::remove_file(path)?;
-        std::fs::remove_file(directory.join("chat-recovery.lock"))?;
-        std::fs::remove_dir(directory)?;
+        remove_recovery_directory(&directory)?;
         Ok(())
     }
 
@@ -1666,5 +1702,82 @@ mod tests {
         assert!(!s_erase.recovery_erase_pending);
         assert!(s_erase.recovery_notice.starts_with("Could not"));
         Ok(())
+    }
+
+    #[test]
+    fn corrupt_primary_restores_from_backup_and_quarantines_unreadable_file() -> io::Result<()> {
+        let directory = recovery_directory("backup-restore")?;
+        let mut first = state();
+        first.attach_recovery(crate::recovery::Recovery::open(&directory));
+        first.input = "Saved backup draft".to_owned();
+        first
+            .transcript
+            .push(Role::User, "Remembered prompt".to_owned());
+        drop(first);
+
+        let mut second = state();
+        second.attach_recovery(crate::recovery::Recovery::open(&directory));
+        second.input = "Newer primary draft".to_owned();
+        drop(second);
+
+        // Corrupt primary after two saves so backup holds "Saved backup draft".
+        let primary = directory.join("chat-recovery.dpapi");
+        let preserved = directory.join("chat-recovery.preserved.dpapi");
+        std::fs::write(&primary, b"corrupt-primary")?;
+
+        let mut recovered = state();
+        recovered.attach_recovery(crate::recovery::Recovery::open(&directory));
+        assert!(recovered.save_conversations);
+        assert!(recovered.recovery_quarantine_primary);
+        assert_eq!(recovered.input, "Saved backup draft");
+        assert!(
+            recovered
+                .transcript
+                .plain_text()
+                .contains("Remembered prompt")
+        );
+        assert!(recovered.recovery_notice.contains("backup"));
+        drop(recovered);
+
+        assert_eq!(std::fs::read(&preserved)?, b"corrupt-primary");
+        let mut reopened = state();
+        reopened.attach_recovery(crate::recovery::Recovery::open(&directory));
+        assert_eq!(reopened.input, "Saved backup draft");
+        drop(reopened);
+
+        remove_recovery_directory(&directory)
+    }
+
+    #[test]
+    fn corrupt_primary_without_backup_preserves_failure_until_explicit_save_then_quarantines()
+    -> io::Result<()> {
+        let directory = recovery_directory("quarantine-no-backup")?;
+        let primary = directory.join("chat-recovery.dpapi");
+        let preserved = directory.join("chat-recovery.preserved.dpapi");
+        std::fs::write(&primary, b"unreadable-without-backup")?;
+
+        let mut failed = state();
+        failed.attach_recovery(crate::recovery::Recovery::open(&directory));
+        assert!(!failed.save_conversations);
+        assert!(failed.recovery_quarantine_primary);
+        assert!(failed.recovery_notice.starts_with("Could not"));
+        drop(failed);
+        assert_eq!(std::fs::read(&primary)?, b"unreadable-without-backup");
+        assert!(!preserved.exists());
+
+        let mut replaced = state();
+        replaced.attach_recovery(crate::recovery::Recovery::open(&directory));
+        replaced.save_conversations = true;
+        replaced.recovery_dirty = true;
+        replaced.input = "Fresh workspace".to_owned();
+        drop(replaced);
+
+        assert_eq!(std::fs::read(&preserved)?, b"unreadable-without-backup");
+        let mut reopened = state();
+        reopened.attach_recovery(crate::recovery::Recovery::open(&directory));
+        assert_eq!(reopened.input, "Fresh workspace");
+        drop(reopened);
+
+        remove_recovery_directory(&directory)
     }
 }

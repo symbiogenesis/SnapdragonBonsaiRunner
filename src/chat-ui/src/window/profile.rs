@@ -207,9 +207,18 @@ mod tests {
             "Voice restored from the legacy workspace"
         );
         drop(restored);
-        fs::remove_file(directory.join("chat-profile.dpapi"))?;
-        fs::remove_file(directory.join("chat-recovery.dpapi"))?;
-        fs::remove_file(directory.join("chat-recovery.lock"))?;
+        for name in [
+            "chat-profile.dpapi",
+            "chat-recovery.dpapi",
+            "chat-recovery.backup.dpapi",
+            "chat-recovery.preserved.dpapi",
+            "chat-recovery.lock",
+        ] {
+            let file = directory.join(name);
+            if file.exists() {
+                fs::remove_file(file)?;
+            }
+        }
         fs::remove_dir(directory)
     }
 

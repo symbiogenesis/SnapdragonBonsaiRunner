@@ -8,7 +8,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek as _, Write},
     os::windows::fs::{MetadataExt as _, OpenOptionsExt as _},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -21,7 +21,7 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SEALED: u64 = 8 * 1024 * 1024 + 65_536;
 
 enum Command {
-    Save(u64, crate::scrub::ScrubbingBytes, SnapshotSlot),
+    Save(u64, crate::scrub::ScrubbingBytes, SnapshotSlot, bool),
     Erase(u64),
     Fence(SyncSender<()>),
     Shutdown,
@@ -107,6 +107,7 @@ pub(crate) struct Recovery {
     worker: Option<JoinHandle<()>>,
     operation: Cell<u64>,
     snapshot_occupied: Arc<AtomicBool>,
+    backup_path: Option<PathBuf>,
 }
 
 pub(crate) struct Opened {
@@ -121,8 +122,16 @@ impl Recovery {
     /// lock prevents concurrent windows from overwriting each other's recovery.
     pub(crate) fn open(data: &Path) -> io::Result<Opened> {
         let path = data.join("chat-recovery.dpapi");
+        let backup_path = data.join("chat-recovery.backup.dpapi");
+        let preserved_path = data.join("chat-recovery.preserved.dpapi");
         let lock_path = data.join("chat-recovery.lock");
-        for candidate in [data, path.as_path(), lock_path.as_path()] {
+        for candidate in [
+            data,
+            path.as_path(),
+            backup_path.as_path(),
+            preserved_path.as_path(),
+            lock_path.as_path(),
+        ] {
             bonsai_windows_credentials::validate_external_path(candidate)?;
         }
         let mut lock = open_lock(&lock_path)?;
@@ -136,13 +145,21 @@ impl Recovery {
         let saved = loaded.unwrap_or_default();
         let (commands, incoming) = mpsc::sync_channel(1);
         let (events, outgoing) = mpsc::channel();
+        let worker_backup = backup_path.clone();
         let worker = std::thread::Builder::new()
             .name("swift-chat-recovery".to_owned())
             .spawn(move || {
                 while let Ok(command) = incoming.recv() {
                     let event = match command {
-                        Command::Save(operation, bytes, slot) => {
-                            let saved = save(&path, &bytes).and_then(|()| {
+                        Command::Save(operation, bytes, slot, quarantine_existing) => {
+                            let saved = save_with_rotation(
+                                &path,
+                                &worker_backup,
+                                &preserved_path,
+                                quarantine_existing,
+                                &bytes,
+                            )
+                            .and_then(|()| {
                                 if saving_enabled_persisted {
                                     Ok(())
                                 } else {
@@ -169,9 +186,12 @@ impl Recovery {
                                     Failure::at("remembering the saving preference", &error)
                                 })
                                 .and_then(|()| {
-                                    erase(&path).map_err(|error| {
-                                        Failure::at("removing the saved workspace", &error)
-                                    })
+                                    erase(&path)
+                                        .and_then(|()| erase(&worker_backup))
+                                        .and_then(|()| erase(&preserved_path))
+                                        .map_err(|error| {
+                                            Failure::at("removing the saved workspace", &error)
+                                        })
                                 }) {
                                 Ok(()) => Event::Erased(operation),
                                 Err(error) => Event::Failed(operation, error),
@@ -195,6 +215,7 @@ impl Recovery {
                 worker: Some(worker),
                 operation: Cell::new(0),
                 snapshot_occupied: Arc::new(AtomicBool::new(false)),
+                backup_path: Some(backup_path),
             },
             saved,
             load_failed,
@@ -202,10 +223,26 @@ impl Recovery {
         })
     }
 
+    pub(crate) fn read_backup(&self) -> io::Result<Option<crate::scrub::ScrubbingBytes>> {
+        let Some(path) = self.backup_path.as_deref() else {
+            return Ok(None);
+        };
+        read(path)
+    }
+
     /// Reserve the only plaintext snapshot before encoding. An occupied worker
     /// skips encoding entirely; retain dirty state and retry the latest state.
+    #[cfg(test)]
     pub(crate) fn save_with(
         &self,
+        encode: impl FnOnce() -> io::Result<Vec<u8>>,
+    ) -> io::Result<DispatchStatus> {
+        self.save_with_quarantine(false, encode)
+    }
+
+    pub(crate) fn save_with_quarantine(
+        &self,
+        quarantine_existing: bool,
         encode: impl FnOnce() -> io::Result<Vec<u8>>,
     ) -> io::Result<DispatchStatus> {
         let Some(slot) = SnapshotSlot::reserve(&self.snapshot_occupied) else {
@@ -218,7 +255,7 @@ impl Recovery {
         let operation = self.operation.get().saturating_add(1);
         match self
             .commands
-            .try_send(Command::Save(operation, bytes, slot))
+            .try_send(Command::Save(operation, bytes, slot, quarantine_existing))
         {
             Ok(()) => {
                 self.operation.set(operation);
@@ -253,12 +290,22 @@ impl Recovery {
 
     /// Flushes the last snapshot during window shutdown, preserving ordering
     /// with an erase or save that is already in progress.
+    #[cfg(test)]
     pub(crate) fn finish_with(&self, encode: impl FnOnce() -> Option<Vec<u8>>) {
+        self.finish_with_quarantine(false, encode);
+    }
+
+    pub(crate) fn finish_with_quarantine(
+        &self,
+        quarantine_existing: bool,
+        encode: impl FnOnce() -> Option<Vec<u8>>,
+    ) {
         // Shutdown already waits for the worker. Wait before encoding its final
         // state as well, so a slow save never overlaps a second plaintext copy.
         let (complete, finished) = mpsc::sync_channel(0);
         if self.commands.send(Command::Fence(complete)).is_ok() && finished.recv().is_ok() {
-            let _saved = self.save_with(|| Ok(encode().unwrap_or_default()));
+            let _saved =
+                self.save_with_quarantine(quarantine_existing, || Ok(encode().unwrap_or_default()));
         }
     }
 
@@ -284,7 +331,7 @@ impl ControlledRecovery {
             .recv_timeout(std::time::Duration::from_secs(5))
             .map_err(io::Error::other)?
         {
-            Command::Save(operation, _, _slot) => Ok(Event::Saved(operation)),
+            Command::Save(operation, _, _slot, _) => Ok(Event::Saved(operation)),
             Command::Erase(operation) => Ok(Event::Erased(operation)),
             Command::Fence(_) => Err(io::Error::other("Unexpected recovery fence.")),
             Command::Shutdown => Err(io::Error::other("No recovery operation.")),
@@ -308,6 +355,7 @@ impl Recovery {
                 worker: None,
                 operation: Cell::new(0),
                 snapshot_occupied: Arc::new(AtomicBool::new(false)),
+                backup_path: None,
             },
             ControlledRecovery { incoming, events },
         )
@@ -388,7 +436,13 @@ fn read(path: &Path) -> io::Result<Option<crate::scrub::ScrubbingBytes>> {
         .map(Some)
 }
 
-fn save(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
+fn save_with_rotation(
+    path: &Path,
+    backup_path: &Path,
+    preserved_path: &Path,
+    quarantine_existing: bool,
+    bytes: &[u8],
+) -> Result<(), Failure> {
     if bytes.is_empty() || bytes.len() > MAX_BYTES {
         return Err(Failure::at(
             "checking the saved-state limit",
@@ -399,6 +453,16 @@ fn save(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
         .map_err(|error| Failure::at("checking the storage path", &error))?;
     let sealed = bonsai_windows_credentials::protect_private_data(bytes)
         .map_err(|error| Failure::at("encrypting the workspace", &error))?;
+    if let Ok(Some(existing)) = crate::bounded_file::read_regular_optional(path, MAX_SEALED)
+        && !existing.is_empty()
+    {
+        let destination = if quarantine_existing {
+            preserved_path
+        } else {
+            backup_path
+        };
+        let _rotated = crate::window::atomic_file::replace(destination, &existing);
+    }
     // A unique create-new sibling receives ciphertext only; atomic replacement
     // preserves the prior snapshot on any write/sync/revalidation failure.
     crate::window::atomic_file::replace_staged(path, &sealed).map_err(|failure| {
@@ -475,6 +539,8 @@ mod tests {
         );
         drop(store);
         fs::remove_file(path)?;
+        let _ = erase(&directory.join("chat-recovery.backup.dpapi"));
+        let _ = erase(&directory.join("chat-recovery.preserved.dpapi"));
         fs::remove_file(directory.join("chat-recovery.lock"))?;
         fs::remove_dir(directory)
     }
@@ -561,7 +627,7 @@ mod tests {
             .join()
             .map_err(|_| io::Error::other("Final-save worker panicked."))?;
         assert!(encoded.load(Ordering::Acquire));
-        let Command::Save(_, bytes, _slot) = controlled
+        let Command::Save(_, bytes, _slot, _) = controlled
             .incoming
             .recv_timeout(std::time::Duration::from_secs(5))
             .map_err(io::Error::other)?
@@ -703,5 +769,103 @@ mod tests {
         drop(controlled);
         assert_eq!(store.erase(), DispatchStatus::Disconnected);
         Ok(())
+    }
+
+    #[test]
+    fn encrypted_recovery_rotates_backup_and_erases_all_copies() -> io::Result<()> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("Bonsai-recovery-backup-{stamp}"));
+        fs::create_dir(&directory)?;
+        let path = directory.join("chat-recovery.dpapi");
+        let backup = directory.join("chat-recovery.backup.dpapi");
+        let opened = Recovery::open(&directory)?;
+        let store = opened.store;
+
+        store.finish_with(|| Some(b"First snapshot".to_vec()));
+        assert!(matches!(
+            store.events.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(Event::Saved(_))
+        ));
+        assert!(path.exists());
+        assert!(!backup.exists());
+
+        store.finish_with(|| Some(b"Second snapshot".to_vec()));
+        assert!(matches!(
+            store.events.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(Event::Saved(_))
+        ));
+        assert_eq!(read(&path)?.as_deref(), Some(b"Second snapshot".as_slice()));
+        assert_eq!(
+            store.read_backup()?.as_deref(),
+            Some(b"First snapshot".as_slice())
+        );
+
+        assert_eq!(store.erase(), DispatchStatus::Queued);
+        assert!(matches!(
+            store.events.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(Event::Erased(_))
+        ));
+        assert!(!path.exists());
+        assert!(!backup.exists());
+        drop(store);
+        fs::remove_file(directory.join("chat-recovery.lock"))?;
+        fs::remove_dir(directory)
+    }
+
+    #[test]
+    fn encrypted_recovery_quarantines_unreadable_primary_before_overwrite() -> io::Result<()> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("Bonsai-recovery-quarantine-{stamp}"));
+        fs::create_dir(&directory)?;
+        let path = directory.join("chat-recovery.dpapi");
+        let backup = directory.join("chat-recovery.backup.dpapi");
+        let preserved = directory.join("chat-recovery.preserved.dpapi");
+
+        let valid_backup = bonsai_windows_credentials::protect_private_data(b"Healthy backup")?;
+        fs::write(&backup, &valid_backup)?;
+        fs::write(&path, b"corrupt-primary-bytes")?;
+
+        let opened = Recovery::open(&directory)?;
+        assert!(opened.load_failed);
+        assert_eq!(
+            opened.store.read_backup()?.as_deref(),
+            Some(b"Healthy backup".as_slice())
+        );
+
+        opened
+            .store
+            .finish_with_quarantine(true, || Some(b"Replacement snapshot".to_vec()));
+        assert!(matches!(
+            opened
+                .store
+                .events
+                .recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(Event::Saved(_))
+        ));
+        assert_eq!(fs::read(&preserved)?, b"corrupt-primary-bytes");
+        assert_eq!(fs::read(&backup)?, valid_backup);
+        assert_eq!(
+            read(&path)?.as_deref(),
+            Some(b"Replacement snapshot".as_slice())
+        );
+
+        assert_eq!(opened.store.erase(), DispatchStatus::Queued);
+        assert!(matches!(
+            opened
+                .store
+                .events
+                .recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(Event::Erased(_))
+        ));
+        assert!(!preserved.exists());
+        drop(opened.store);
+        fs::remove_file(directory.join("chat-recovery.lock"))?;
+        fs::remove_dir(directory)
     }
 }
