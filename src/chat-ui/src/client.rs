@@ -27,6 +27,7 @@ use std::{
 
 #[cfg(test)]
 mod cancellation_tests;
+mod continuation;
 mod effort;
 mod event_queue;
 #[cfg(test)]
@@ -561,6 +562,7 @@ pub(crate) enum Command {
         images: Arc<[Arc<str>]>,
         max_completion_tokens: u32,
         extra_effort: bool,
+        auto_continue: bool,
         enable_thinking: bool,
         daisyrose_scale: f32,
         cognitive: CognitiveOptions,
@@ -587,6 +589,7 @@ pub(crate) enum Event {
     Ready,
     Text(String),
     Reasoning(String),
+    Continuing(u32),
     Complete(Completion),
     Committed(Vec<Message>),
     Failed(String),
@@ -865,6 +868,7 @@ struct ResponseOptions {
     turn_appendix: Option<Arc<str>>,
     request_logprobs: bool,
     temperature_nudge: f32,
+    reasoning_budget_override: Option<u32>,
 }
 
 /// Launch the owned broker, then serve one in-memory conversation until shutdown.
@@ -1230,6 +1234,7 @@ fn serve_broker(
                 images,
                 max_completion_tokens,
                 extra_effort,
+                auto_continue,
                 enable_thinking,
                 daisyrose_scale,
                 cognitive,
@@ -1263,33 +1268,46 @@ fn serve_broker(
                     turn_appendix,
                     request_logprobs: false,
                     temperature_nudge: 0.0,
+                    reasoning_budget_override: None,
                 };
-                let outcome =
+                let outcome = if extra_effort {
                     serialize_request_with_options(&pending, &options).and_then(|request| {
-                        if extra_effort {
-                            // Validate the original request locally; effort
-                            // constructs its own stage bodies.
-                            drop(request);
-                            effort::run(
-                                config.frontend_port,
-                                key.as_hex(),
-                                &pending,
-                                &options,
-                                commands,
-                                events,
-                                Some(broker),
-                            )
-                        } else {
-                            generate_with_broker(
-                                config.frontend_port,
-                                key.as_hex(),
-                                request,
-                                commands,
-                                events,
-                                Some(broker),
-                            )
-                        }
-                    });
+                        // Validate the original request locally; effort
+                        // constructs its own stage bodies.
+                        drop(request);
+                        effort::run(
+                            config.frontend_port,
+                            key.as_hex(),
+                            &pending,
+                            &options,
+                            commands,
+                            events,
+                            Some(broker),
+                        )
+                    })
+                } else if auto_continue {
+                    continuation::run(
+                        config.frontend_port,
+                        key.as_hex(),
+                        &pending,
+                        &options,
+                        context_tokens,
+                        commands,
+                        events,
+                        Some(broker),
+                    )
+                } else {
+                    serialize_request_with_options(&pending, &options).and_then(|request| {
+                        generate_with_broker(
+                            config.frontend_port,
+                            key.as_hex(),
+                            request,
+                            commands,
+                            events,
+                            Some(broker),
+                        )
+                    })
+                };
                 finish_turn(
                     history,
                     pending,
@@ -1830,10 +1848,12 @@ impl WireCognitiveFields {
         if options.cognitive.reasoning_effort != ReasoningEffort::XHigh {
             fields.reasoning_effort = Some(options.cognitive.reasoning_effort.as_str());
         }
-        fields.reasoning_budget = options
-            .cognitive
-            .thinking_budget
-            .compute_budget(options.max_completion_tokens, options.enable_thinking);
+        fields.reasoning_budget = options.reasoning_budget_override.or_else(|| {
+            options
+                .cognitive
+                .thinking_budget
+                .compute_budget(options.max_completion_tokens, options.enable_thinking)
+        });
         let base_temp = match options.cognitive.sampling_preset {
             SamplingPreset::Canonical => None,
             SamplingPreset::Precise => {
@@ -2132,6 +2152,28 @@ fn generate_with_options(
     events: &EventSender,
     broker: Option<&OwnedProcess>,
 ) -> Result<(Message, Completion, Option<sse::ConfidenceSummary>)> {
+    generate_with_stream_hooks(
+        port,
+        key,
+        request,
+        stop_on_collapse,
+        commands,
+        broker,
+        &mut |text| events.stream_text(text, false, commands),
+        &mut |reasoning| events.stream_text(reasoning, true, commands),
+    )
+}
+
+fn generate_with_stream_hooks(
+    port: u16,
+    key: &str,
+    request: Vec<u8>,
+    stop_on_collapse: bool,
+    commands: &Receiver<Command>,
+    broker: Option<&OwnedProcess>,
+    on_text: &mut (impl FnMut(Cow<'_, str>) -> Result<()> + ?Sized),
+    on_reasoning: &mut (impl FnMut(Cow<'_, str>) -> Result<()> + ?Sized),
+) -> Result<(Message, Completion, Option<sse::ConfidenceSummary>)> {
     check_broker_and_commands(commands, broker)?;
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     let connect_timeout = Duration::from_secs(1);
@@ -2146,19 +2188,21 @@ fn generate_with_options(
     let mut connection = crate::http::PollStream::new(stream, |phase| match phase {
         crate::http::PollPhase::Check | crate::http::PollPhase::Wait => check_commands(commands),
     });
-    let outcome = exchange(
+    let outcome = exchange_with_hooks(
         &mut connection,
         port,
         key,
         request,
         stop_on_collapse,
-        events,
         commands,
+        on_text,
+        on_reasoning,
     );
     let _checked = connection.check();
     connection.take_interrupted().map_or(outcome, Err)
 }
 
+#[cfg(test)]
 fn exchange(
     connection: &mut (impl Read + Write),
     port: u16,
@@ -2167,6 +2211,28 @@ fn exchange(
     stop_on_collapse: bool,
     events: &EventSender,
     commands: &Receiver<Command>,
+) -> Result<(Message, Completion, Option<sse::ConfidenceSummary>)> {
+    exchange_with_hooks(
+        connection,
+        port,
+        key,
+        request,
+        stop_on_collapse,
+        commands,
+        &mut |text| events.stream_text(text, false, commands),
+        &mut |reasoning| events.stream_text(reasoning, true, commands),
+    )
+}
+
+fn exchange_with_hooks(
+    connection: &mut (impl Read + Write),
+    port: u16,
+    key: &str,
+    request: impl AsRef<[u8]>,
+    stop_on_collapse: bool,
+    commands: &Receiver<Command>,
+    on_text: &mut (impl FnMut(Cow<'_, str>) -> Result<()> + ?Sized),
+    on_reasoning: &mut (impl FnMut(Cow<'_, str>) -> Result<()> + ?Sized),
 ) -> Result<(Message, Completion, Option<sse::ConfidenceSummary>)> {
     {
         let head = crate::http::bearer_request_head(
@@ -2199,10 +2265,10 @@ fn exchange(
     while let Some(bytes) = body.next_payload()? {
         sse.push(bytes, &mut |text, reasoning| {
             if !text.is_empty() {
-                events.stream_text(text, false, commands)?;
+                on_text(text)?;
             }
             if !reasoning.is_empty() {
-                events.stream_text(reasoning, true, commands)?;
+                on_reasoning(reasoning)?;
             }
             Ok(())
         })?;
@@ -3672,6 +3738,7 @@ mod tests {
                     images: super::Arc::default(),
                     max_completion_tokens: 4096,
                     extra_effort: false,
+                    auto_continue: false,
                     enable_thinking: false,
                     daisyrose_scale: super::DEFAULT_DAISYROSE_SCALE,
                     cognitive: super::CognitiveOptions::default(),

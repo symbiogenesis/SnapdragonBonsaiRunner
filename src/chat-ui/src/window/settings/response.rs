@@ -82,8 +82,12 @@ impl State {
                 .id_salt("settings-advanced-response")
                 .show(ui, |ui| {
                     ui.add_space(8.0);
-                    self.recovery_dirty |=
-                        reply_preferences(ui, &mut self.output_budget, !self.model.busy());
+                    self.recovery_dirty |= reply_preferences(
+                        ui,
+                        &mut self.output_budget,
+                        &mut self.auto_continue,
+                        !self.model.busy(),
+                    );
                     ui.add_space(12.0);
                     ui.separator();
                     let daisyrose_changed = daisyrose_preferences(
@@ -145,10 +149,16 @@ impl ThinkingPreferences<'_> {
     }
 }
 
-fn reply_preferences(ui: &mut egui::Ui, output_budget: &mut usize, editable: bool) -> bool {
+fn reply_preferences(
+    ui: &mut egui::Ui,
+    output_budget: &mut usize,
+    auto_continue: &mut bool,
+    editable: bool,
+) -> bool {
     ui.label(RichText::new("Reply length").strong());
     ui.add_space(8.0);
-    let before = *output_budget;
+    let before_budget = *output_budget;
+    let before_continue = *auto_continue;
     ui.add_enabled_ui(editable, |ui| {
         ui.horizontal(|ui| {
             let label = ui.label("Output cap");
@@ -165,10 +175,21 @@ fn reply_preferences(ui: &mut egui::Ui, output_budget: &mut usize, editable: boo
                 .response
                 .labelled_by(label.id);
         });
+        ui.add_space(8.0);
+        ui.checkbox(auto_continue, "Auto-continue long responses");
     });
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Automatically continues responses that reach the output cap as one seamless message \
+             while context remains.",
+        )
+        .small()
+        .weak(),
+    );
     ui.add_space(8.0);
     ui.label(RichText::new("The output cap includes thinking. A smaller cap leaves more room for your conversation. Open Context for the capacity selected for this model.").small().weak());
-    before != *output_budget
+    before_budget != *output_budget || before_continue != *auto_continue
 }
 
 fn loaded_daisyrose_summary(max_rank: Option<u16>, sha256_prefix: Option<&str>) -> Option<String> {

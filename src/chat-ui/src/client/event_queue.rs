@@ -94,7 +94,26 @@ impl EventSender {
             return Err(());
         }
         let mut queue = self.0.lock().map_err(|_| ())?;
-        if queue.receiver_closed || queue.events.len() >= STREAM_EVENTS + CONTROL_RESERVE {
+        if queue.receiver_closed {
+            return Err(());
+        }
+        if let Event::Continuing(part) = event {
+            if let Some(existing) = queue
+                .events
+                .iter_mut()
+                .rev()
+                .find(|queued| matches!(queued, Event::Continuing(_)))
+            {
+                *existing = Event::Continuing(part);
+                let repaint = queue.take_repaint();
+                drop(queue);
+                notify_repaint(repaint);
+                return Ok(());
+            }
+            if queue.events.len() >= STREAM_EVENTS + CONTROL_RESERVE {
+                return Ok(());
+            }
+        } else if queue.events.len() >= STREAM_EVENTS + CONTROL_RESERVE {
             return Err(());
         }
         queue.events.push_back(event);

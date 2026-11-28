@@ -462,6 +462,11 @@ fn settings_response_controls_stay_locked_while_a_response_is_generating() {
             .accesskit_node()
             .is_disabled()
     );
+    assert!(
+        chat.get_by_role_and_label(egui::Role::CheckBox, "Auto-continue long responses")
+            .accesskit_node()
+            .is_disabled()
+    );
     chat.get_by_role_and_label(egui::Role::Slider, "DaisyRose scale")
         .scroll_to_me();
     chat.run();
@@ -524,6 +529,11 @@ fn settings_reply_limit_is_advanced_and_keeps_each_conversations_choice() {
         chat.get_by_label("1024 tokens").click();
         chat.run();
         assert_eq!(chat.state().app.output_budget, 1);
+        assert!(chat.state().app.auto_continue);
+        chat.get_by_role_and_label(egui::Role::CheckBox, "Auto-continue long responses")
+            .click();
+        chat.run();
+        assert!(!chat.state().app.auto_continue);
         assert!(chat.state().app.recovery_dirty);
         assert!(chat.state().commands.try_recv().is_err());
         chat.get_by_role_and_label(egui::Role::Button, "Done")
@@ -531,9 +541,11 @@ fn settings_reply_limit_is_advanced_and_keeps_each_conversations_choice() {
         chat.run();
         chat.state_mut().app.new_chat();
         assert_eq!(chat.state().app.output_budget, 3);
+        assert!(chat.state().app.auto_continue);
         chat.state_mut().app.switch_conversation(original);
         chat.run();
         assert_eq!(chat.state().app.output_budget, 1);
+        assert!(!chat.state().app.auto_continue);
         assert_eq!(chat.state().app.input, "Keep my next draft 🌱");
         assert!(
             chat.state()

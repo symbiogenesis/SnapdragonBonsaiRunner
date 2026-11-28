@@ -62,6 +62,7 @@ pub(crate) struct Estimate {
 
 impl Estimate {
     /// Combine a cached committed-history estimate with the current draft/options.
+    #[cfg(test)]
     pub(crate) fn new(
         history: usize,
         draft: &str,
@@ -73,6 +74,7 @@ impl Estimate {
     }
 
     /// Combine a cached committed-history estimate with the current draft, images and options.
+    #[cfg(test)]
     pub(crate) fn with_images(
         history: usize,
         draft: &str,

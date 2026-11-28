@@ -78,6 +78,7 @@ impl ModelLifecycle {
             }
             Event::Text(_)
             | Event::Reasoning(_)
+            | Event::Continuing(_)
             | Event::Stage(_)
             | Event::Draft(_)
             | Event::RetainedAnswer(_)

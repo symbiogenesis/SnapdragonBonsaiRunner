@@ -429,63 +429,44 @@ fn interrupted_partial_response_offers_visible_continue_and_retry_buttons() {
 }
 
 #[test]
-fn token_limit_automatically_continues_without_alerting_while_context_window_has_capacity() {
+fn worker_continuation_streams_seamlessly_without_alerting_and_token_limit_stays_quiet() {
     let mut chat = harness([1180.0, 860.0]);
     chat.state_mut().app.context_tokens = Some(131_072);
     chat.state_mut().app.input = "Write a comprehensive guide".into();
     chat.state_mut().app.submit();
     assert!(matches!(
         chat.state().commands.try_recv(),
-        Ok(Command::Send { .. })
+        Ok(Command::Send {
+            auto_continue: true,
+            ..
+        })
     ));
     chat.state_mut().app.input = "Draft for after completion 🌱".into();
     chat.state_mut()
         .app
-        .model_event(Event::Text("Section 1 hit the reply cap.".into()));
-    let mut committed = chat.state().app.committed.clone();
-    committed.push(client::Message {
-        role: "user",
-        content: "Write a comprehensive guide".into(),
-        images: std::sync::Arc::default(),
-        reasoning_content: None,
-    });
-    committed.push(client::Message {
-        role: "assistant",
-        content: "Section 1 hit the reply cap.".into(),
-        images: std::sync::Arc::default(),
-        reasoning_content: None,
-    });
+        .model_event(Event::Text("Section 1 hit the reply cap. ".into()));
+    chat.state_mut().app.model_event(Event::Continuing(2));
     chat.state_mut()
         .app
-        .model_event(Event::Committed(committed));
-    chat.state_mut()
-        .app
-        .model_event(Event::Complete(Completion::TokenLimit));
+        .model_event(Event::Text("Section 2 completed the guide.".into()));
     chat.run();
 
     assert!(chat.query_by_label("Model needs attention").is_none());
     assert!(chat.query_by_label("1 alert").is_none());
     assert!(chat.state().app.model.busy());
     assert_eq!(chat.state().app.input, "Draft for after completion 🌱");
-    assert!(matches!(
-        chat.state().commands.try_recv(),
-        Ok(Command::Send { text, .. }) if text == iteration::CONTINUE_PROMPT
-    ));
     assert!(chat.state().commands.try_recv().is_err());
 
-    chat.state_mut()
-        .app
-        .model_event(Event::Text("Section 2 completed the guide.".into()));
     let mut final_committed = chat.state().app.committed.clone();
     final_committed.push(client::Message {
         role: "user",
-        content: iteration::CONTINUE_PROMPT.into(),
+        content: "Write a comprehensive guide".into(),
         images: std::sync::Arc::default(),
         reasoning_content: None,
     });
     final_committed.push(client::Message {
         role: "assistant",
-        content: "Section 2 completed the guide.".into(),
+        content: "Section 1 hit the reply cap. Section 2 completed the guide.".into(),
         images: std::sync::Arc::default(),
         reasoning_content: None,
     });
@@ -494,11 +475,16 @@ fn token_limit_automatically_continues_without_alerting_while_context_window_has
         .model_event(Event::Committed(final_committed));
     chat.state_mut()
         .app
-        .model_event(Event::Complete(Completion::Finished));
+        .model_event(Event::Complete(Completion::TokenLimit));
     chat.run();
 
     assert_eq!(chat.state().app.model, ModelLifecycle::Ready);
     assert!(chat.query_by_label("Model needs attention").is_none());
+    assert!(chat.query_by_label("1 alert").is_none());
+    assert!(
+        chat.query_by_role_and_label(egui::Role::Button, "Continue response")
+            .is_some()
+    );
     assert_eq!(chat.state().app.input, "Draft for after completion 🌱");
     assert!(chat.state().commands.try_recv().is_err());
 }

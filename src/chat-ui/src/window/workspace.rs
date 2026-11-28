@@ -5,6 +5,10 @@ use super::{Command, State, Transcript, client, history_search};
 mod dialogs;
 mod list;
 
+const fn default_auto_continue() -> bool {
+    true
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 #[expect(
@@ -24,6 +28,8 @@ pub(super) struct ConversationSnapshot {
     pub(super) retained_draft: String,
     pub(super) answer_complete: bool,
     pub(super) extra_effort: bool,
+    #[serde(default = "default_auto_continue")]
+    pub(super) auto_continue: bool,
     #[serde(default)]
     pub(super) enable_thinking: bool,
     #[serde(default)]
@@ -149,6 +155,7 @@ impl State {
             retained_draft: std::mem::take(&mut self.retained_draft),
             answer_complete: self.answer_complete,
             extra_effort: self.extra_effort,
+            auto_continue: self.auto_continue,
             enable_thinking: self.enable_thinking,
             streaming_read_aloud: self.streaming_read_aloud,
             output_budget: self.output_budget,
@@ -198,6 +205,7 @@ impl State {
         self.streaming_svg_filter.reset();
         self.lightbox = None;
         self.extra_effort = false;
+        self.auto_continue = true;
         self.enable_thinking = false;
         self.streaming_read_aloud = false;
         self.output_budget = 3;
@@ -221,6 +229,7 @@ impl State {
         self.retained_draft = snapshot.retained_draft;
         self.answer_complete = snapshot.answer_complete;
         self.extra_effort = snapshot.extra_effort;
+        self.auto_continue = snapshot.auto_continue;
         self.enable_thinking = snapshot.enable_thinking;
         self.streaming_read_aloud = snapshot.streaming_read_aloud;
         self.output_budget = snapshot.output_budget;
@@ -357,6 +366,7 @@ impl State {
         std::mem::swap(&mut self.retained_draft, &mut saved.retained_draft);
         std::mem::swap(&mut self.answer_complete, &mut saved.answer_complete);
         std::mem::swap(&mut self.extra_effort, &mut saved.extra_effort);
+        std::mem::swap(&mut self.auto_continue, &mut saved.auto_continue);
         std::mem::swap(&mut self.enable_thinking, &mut saved.enable_thinking);
         std::mem::swap(
             &mut self.streaming_read_aloud,

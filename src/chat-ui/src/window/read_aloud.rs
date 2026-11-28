@@ -342,28 +342,8 @@ mod tests {
             matches!(next(&speech_commands)?, speech::Command::AppendStream { text } if text == "First part. ")
         );
 
-        let first_committed = vec![
-            client::Message {
-                role: "user",
-                content: "Read a two-part story".into(),
-                images: std::sync::Arc::default(),
-                reasoning_content: None,
-            },
-            client::Message {
-                role: "assistant",
-                content: "First part. ".into(),
-                images: std::sync::Arc::default(),
-                reasoning_content: None,
-            },
-        ];
-        state.model_event(client::Event::Committed(first_committed.clone()));
-        state.model_event(client::Event::Complete(client::Completion::TokenLimit));
-
+        state.model_event(client::Event::Continuing(2));
         assert!(state.model.busy() && state.streaming_active);
-        assert!(matches!(
-            incoming_model.try_recv(),
-            Ok(client::Command::Send { .. })
-        ));
         // Part 1 is not cut off with StopSpeaking or closed early with FinishStream.
         assert!(
             speech_commands
@@ -375,20 +355,21 @@ mod tests {
         assert!(
             matches!(next(&speech_commands)?, speech::Command::AppendStream { text } if text == "Second part.")
         );
-        let mut second_committed = first_committed;
-        second_committed.push(client::Message {
-            role: "user",
-            content: crate::window::iteration::CONTINUE_PROMPT.into(),
-            images: std::sync::Arc::default(),
-            reasoning_content: None,
-        });
-        second_committed.push(client::Message {
-            role: "assistant",
-            content: "Second part.".into(),
-            images: std::sync::Arc::default(),
-            reasoning_content: None,
-        });
-        state.model_event(client::Event::Committed(second_committed));
+        let committed = vec![
+            client::Message {
+                role: "user",
+                content: "Read a two-part story".into(),
+                images: std::sync::Arc::default(),
+                reasoning_content: None,
+            },
+            client::Message {
+                role: "assistant",
+                content: "First part. Second part.".into(),
+                images: std::sync::Arc::default(),
+                reasoning_content: None,
+            },
+        ];
+        state.model_event(client::Event::Committed(committed));
         state.model_event(client::Event::Complete(client::Completion::Finished));
         assert!(matches!(
             next(&speech_commands)?,
