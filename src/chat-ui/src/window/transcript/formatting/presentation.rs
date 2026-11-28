@@ -1,11 +1,56 @@
 //! Native reading typography, independent of the offline parser's style hints.
 use super::egui;
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 pub(super) const CODE_BLOCK: &str = "Bonsai Code Block";
 
 fn block_code(format: &egui::TextFormat) -> bool {
     matches!(&format.font_id.family, egui::FontFamily::Name(name) if name.as_ref() == CODE_BLOCK)
+}
+
+pub(super) fn gap_format(base: &egui::TextFormat, size: f32) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id: egui::FontId::proportional(1.0),
+        line_height: Some(size * 0.65),
+        ..base.clone()
+    }
+}
+
+pub(super) fn visit_runs(
+    text: &str,
+    prev_ended_with_newline: bool,
+    format: &egui::TextFormat,
+    mut visit: impl FnMut(Range<usize>, bool) -> bool,
+) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+    if block_code(format) || !text.contains('\n') {
+        return visit(0..text.len(), false);
+    }
+    let bytes = text.as_bytes();
+    let mut cursor = 0_usize;
+    for pos in memchr::memchr_iter(b'\n', bytes) {
+        let prev_is_newline = if pos > 0 {
+            bytes[pos - 1] == b'\n'
+        } else {
+            prev_ended_with_newline
+        };
+        if prev_is_newline {
+            if cursor < pos && !visit(cursor..pos, false) {
+                return false;
+            }
+            if !visit(pos..pos + 1, true) {
+                return false;
+            }
+            cursor = pos + 1;
+        }
+    }
+    if cursor < text.len() {
+        visit(cursor..text.len(), false)
+    } else {
+        true
+    }
 }
 
 pub(super) fn body_format(size: f32, visuals: &egui::Visuals) -> egui::TextFormat {
@@ -74,30 +119,15 @@ pub(super) fn append(
         job.append(text, 0.0, format);
         return;
     }
-    let bytes = text.as_bytes();
-    let mut cursor = 0_usize;
-    for pos in memchr::memchr_iter(b'\n', bytes) {
-        let prev_is_newline = if pos > cursor {
-            bytes[pos - 1] == b'\n'
-        } else {
-            job.text.ends_with('\n')
-        };
-        if prev_is_newline {
-            if cursor < pos {
-                job.append(&text[cursor..pos], 0.0, format.clone());
-            }
-            let gap = egui::TextFormat {
-                font_id: egui::FontId::proportional(1.0),
-                line_height: Some(size * 0.65),
-                ..format.clone()
-            };
-            job.append("\n", 0.0, gap);
-            cursor = pos + 1;
-        }
-    }
-    if cursor < text.len() {
-        job.append(&text[cursor..], 0.0, format);
-    }
+    let gap = gap_format(&format, size);
+    visit_runs(text, job.text.ends_with('\n'), &format, |sub, is_gap| {
+        job.append(
+            &text[sub],
+            0.0,
+            if is_gap { gap.clone() } else { format.clone() },
+        );
+        true
+    });
 }
 
 /// Cache full-width code surfaces with the galley. Walk rendered UTF-8 once;
