@@ -51,7 +51,7 @@ fn failure(
 fn module_name(buffer: &[u16], count: usize) -> Option<String> {
     // A full buffer may be truncated. Reject malformed UTF-16 and names which
     // could expose paths, embed controls, or collapse distinct observations.
-    if count == 0 || count >= buffer.len() - 1 {
+    if count == 0 || count >= buffer.len().saturating_sub(1) {
         return None;
     }
     let name = String::from_utf16(buffer.get(..count)?).ok()?;
@@ -76,6 +76,24 @@ fn file_candidate_indices<T>(before: Option<&[String]>, modules: &[(String, T)])
         .take(16)
         .map(|(index, _)| index)
         .collect()
+}
+
+fn resolve_module_path(
+    stack_len: usize,
+    stack_capacity: usize,
+    read_stack: impl FnOnce(usize) -> Option<PathBuf>,
+    read_heap: impl FnOnce() -> Option<(usize, usize, PathBuf)>,
+) -> Option<PathBuf> {
+    let path = if stack_len > 0 && stack_len < stack_capacity.saturating_sub(1) {
+        read_stack(stack_len)
+    } else if stack_len >= stack_capacity.saturating_sub(1) {
+        read_heap().and_then(|(full_len, heap_capacity, path)| {
+            (full_len > 0 && full_len < heap_capacity.saturating_sub(1)).then_some(path)
+        })
+    } else {
+        None
+    };
+    path.filter(|path| path.is_absolute())
 }
 
 fn module_snapshot(
@@ -133,22 +151,25 @@ fn module_snapshot(
             let length =
                 unsafe { K32GetModuleFileNameExW(process, *module, stack.as_mut_ptr(), 260) };
             let path = usize::try_from(length).ok().and_then(|length| {
-                let path = if length > 0 && length < stack.len() - 1 {
-                    Some(PathBuf::from(OsString::from_wide(&stack[..length])))
-                } else if length >= stack.len() - 1 {
-                    let mut heap = vec![0_u16; 32768];
-                    // SAFETY: Same live snapshot module handle and bounded 32768-unit heap buffer.
-                    let full = unsafe {
-                        K32GetModuleFileNameExW(process, *module, heap.as_mut_ptr(), 32768)
-                    };
-                    usize::try_from(full)
-                        .ok()
-                        .filter(|full| *full > 0 && *full < heap.len() - 1)
-                        .map(|full| PathBuf::from(OsString::from_wide(&heap[..full])))
-                } else {
-                    None
-                };
-                path.filter(|path| path.is_absolute())
+                resolve_module_path(
+                    length,
+                    stack.len(),
+                    |len| Some(PathBuf::from(OsString::from_wide(&stack[..len]))),
+                    || {
+                        let mut heap = vec![0_u16; 32768];
+                        // SAFETY: Same live snapshot module handle and bounded 32768-unit heap buffer.
+                        let full = unsafe {
+                            K32GetModuleFileNameExW(process, *module, heap.as_mut_ptr(), 32768)
+                        };
+                        usize::try_from(full).ok().map(|full_len| {
+                            (
+                                full_len,
+                                heap.len(),
+                                PathBuf::from(OsString::from_wide(&heap[..full_len])),
+                            )
+                        })
+                    },
+                )
             });
             candidates.push(VulkanModuleFileCandidate {
                 name: name.clone(),
@@ -779,6 +800,42 @@ mod tests {
         }
         assert!(module_name(&[65, 66], 2).is_none());
         assert!(module_name(&[65, 0], 3).is_none());
+        assert!(module_name(&[], 0).is_none());
+        assert!(module_name(&[], 1).is_none());
+        assert!(module_name(&[65], 1).is_none());
+
+        // resolve_module_path stack/heap truncation boundaries
+        let abs = PathBuf::from(r"C:\Windows\System32\vulkan-1.dll");
+        assert_eq!(
+            resolve_module_path(0, 260, |_| Some(abs.clone()), || None),
+            None
+        );
+        assert_eq!(
+            resolve_module_path(258, 260, |_| Some(abs.clone()), || None),
+            Some(abs.clone())
+        );
+        assert_eq!(
+            resolve_module_path(
+                259,
+                260,
+                |_| Some(abs.clone()),
+                || Some((32766, 32768, abs.clone()))
+            ),
+            Some(abs.clone())
+        );
+        assert_eq!(
+            resolve_module_path(
+                259,
+                260,
+                |_| Some(abs.clone()),
+                || Some((32767, 32768, abs))
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_module_path(10, 260, |_| Some(PathBuf::from("relative.dll")), || None),
+            None
+        );
     }
 
     #[test]

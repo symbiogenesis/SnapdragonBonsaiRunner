@@ -132,6 +132,26 @@ mod tests {
             assert!(result.is_err());
             assert!(!attempt.0.load(Ordering::Relaxed));
         }
+
+        // Same instance still accepts valid boundary timeouts after an invalid call
+        for valid_timeout in [
+            Duration::from_millis(1),
+            Duration::from_millis(u64::from(u32::MAX) - 1),
+        ] {
+            let attempt = StopAttempt::default();
+            assert!(attempt.run(Duration::ZERO, || Ok(())).is_err());
+            let mut ran = false;
+            assert!(
+                attempt
+                    .run(valid_timeout, || {
+                        ran = true;
+                        Ok(())
+                    })
+                    .is_ok()
+            );
+            assert!(ran);
+            assert!(attempt.0.load(Ordering::Relaxed));
+        }
     }
 
     #[test]

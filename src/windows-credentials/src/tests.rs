@@ -588,3 +588,63 @@ fn parallel_mapped_chunk_verification_honors_immediate_cancellation() -> io::Res
     fs::remove_dir_all(&lane)?;
     Ok(())
 }
+
+#[test]
+fn validate_external_path_creatable_enforces_existing_ancestors_and_component_rules() -> io::Result<()>
+{
+    let lane = test_lane("creatable-path")?;
+
+    // 1. Existing non-directory ancestor followed by missing segments MUST fail
+    let existing_file = lane.join("not-a-dir.txt");
+    fs::write(&existing_file, b"x")?;
+    assert!(validate_external_path_creatable(&existing_file.join("missing").join("leaf")).is_err());
+
+    // 2. Existing .git directory ancestor followed by missing segments MUST fail
+    let repo_dir = lane.join("repo");
+    fs::create_dir(&repo_dir)?;
+    fs::create_dir(repo_dir.join(".git"))?;
+    assert!(
+        validate_external_path_creatable(&repo_dir.join(".git").join("missing").join("leaf"))
+            .is_err()
+    );
+
+    // 3. Existing symlink/junction ancestor followed by missing segments MUST fail
+    let target = lane.join("real-target");
+    fs::create_dir(&target)?;
+    let link = lane.join("link-dir");
+    let link_created = symlink_dir(&target, &link).is_ok()
+        || std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .output()
+            .is_ok_and(|o| o.status.success());
+    assert!(link_created, "could not create test symlink/junction");
+    assert!(validate_external_path_creatable(&link.join("missing").join("leaf")).is_err());
+
+    // 4. Multiple deep nonexistent segments succeed
+    validate_external_path_creatable(&lane.join("a").join("b").join("c").join("d").join("leaf.bin"))?;
+
+    // 5. Invalid component rules in missing segments still fail
+    for bad in [
+        lane.join("missing").join("trailing."),
+        lane.join("missing").join("trailing "),
+        lane.join("missing").join("bad*name"),
+        lane.join("missing").join("LPT\u{00B9}.bin"),
+        lane.join("missing").join("bad\x07ctrl"),
+    ] {
+        assert!(
+            validate_external_path_creatable(&bad).is_err(),
+            "expected rejection for {}",
+            bad.display()
+        );
+    }
+
+    let _ = fs::remove_dir(&link);
+    fs::remove_dir_all(&lane)?;
+    Ok(())
+}

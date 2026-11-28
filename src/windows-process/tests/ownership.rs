@@ -1602,3 +1602,52 @@ fn native_sandbox_broker_pipe_with_sections_inherits_grants_and_stops_cleanly() 
     let _ = fs::remove_dir_all(&lane.path);
     Ok(())
 }
+
+#[test]
+fn failed_tool_start_cleans_created_outputs_and_invalid_stop_preserves_allowance() -> io::Result<()>
+{
+    let lane = Lane::new("tool-cleanup-stop")?;
+    let missing_exe = lane.path.join("nonexistent-tool.exe");
+    let stdout = lane.path.join("stdout.log");
+    let stderr = lane.path.join("stderr.log");
+
+    // 1. Failed start_tool (nonexistent exe) must delete newly created stdout/stderr files
+    let bad_spec = ToolProcessSpec {
+        executable: missing_exe,
+        arguments: Vec::new(),
+        working_directory: lane.path.clone(),
+        stdout: stdout.clone(),
+        stderr: stderr.clone(),
+        environment: std::collections::BTreeMap::new(),
+    };
+    assert!(OwnedProcess::start_tool(&bad_spec).is_err());
+    assert!(!stdout.exists());
+    assert!(!stderr.exists());
+
+    // 2. Pre-existing stdout fails CREATE_NEW without deleting the pre-existing file
+    fs::write(&stdout, b"keep-existing")?;
+    assert!(OwnedProcess::start_tool(&bad_spec).is_err());
+    assert_eq!(fs::read(&stdout)?, b"keep-existing");
+    assert!(!stderr.exists());
+    fs::remove_file(&stdout)?;
+
+    // 3. Invalid stop(Duration::ZERO) returns InvalidInput without spending stop allowance,
+    //    so a subsequent valid stop succeeds.
+    let spec = ToolProcessSpec {
+        executable: probe_executable(),
+        arguments: vec![OsString::from("sleep")],
+        working_directory: lane.path.clone(),
+        stdout,
+        stderr,
+        environment: std::collections::BTreeMap::new(),
+    };
+    let process = OwnedProcess::start_tool(&spec)?;
+    let invalid_err = process
+        .stop(Duration::ZERO)
+        .err()
+        .ok_or_else(|| io::Error::other("zero stop timeout unexpectedly succeeded"))?;
+    assert_eq!(invalid_err.kind(), io::ErrorKind::InvalidInput);
+    process.stop(Duration::from_secs(2))?;
+    let _ = fs::remove_dir_all(&lane.path);
+    Ok(())
+}

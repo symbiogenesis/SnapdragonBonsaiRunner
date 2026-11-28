@@ -256,3 +256,51 @@ fn extract<R: Read + Seek>(
     }
     Ok((files, handles))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn remove_dir_all_with_retry_recovers_from_transient_lock_and_fails_on_not_found()
+    -> std::io::Result<()> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "SwiftBonsai-InstallRetry-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root)?;
+        let locked_path = root.join("locked.bin");
+        fs::write(&locked_path, b"locked")?;
+
+        let missing = root.join("nonexistent-dir");
+        let missing_err = remove_dir_all_with_retry(&missing)
+            .err()
+            .ok_or_else(|| std::io::Error::other("missing directory removal succeeded"))?;
+        assert_eq!(missing_err.kind(), std::io::ErrorKind::NotFound);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            let locked = OpenOptions::new().read(true).share_mode(0).open(&locked_path)?;
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(15));
+                drop(locked);
+            });
+            remove_dir_all_with_retry(&root)?;
+            releaser
+                .join()
+                .map_err(|_| std::io::Error::other("releaser panicked"))?;
+            assert!(!root.exists());
+        }
+        #[cfg(not(windows))]
+        {
+            fs::remove_dir_all(&root)?;
+        }
+        Ok(())
+    }
+}

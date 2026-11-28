@@ -2537,9 +2537,29 @@ mod storage_budget_tests {
         let opened = fs::File::open(&data_path)?;
         let no_prefetch = MappedFile::from_file_without_prefetch(&opened)?;
         assert_eq!(no_prefetch.as_slice(), payload.as_slice());
+        // While MappedFile section is active, truncation on an open handle must fail cleanly.
+        assert!(opened.set_len(1).is_err());
         drop(no_prefetch);
         drop(opened);
         drop(mapped);
+
+        // Junctions must be rejected by MappedFile::open (FILE_FLAG_OPEN_REPARSE_POINT).
+        let junction_target = tree.0.join("junction-target");
+        fs::create_dir(&junction_target)?;
+        let junction_path = tree.0.join("junction-link");
+        let mklink = Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &junction_path.to_string_lossy(),
+                &junction_target.to_string_lossy(),
+            ])
+            .output()?;
+        if mklink.status.success() {
+            assert!(MappedFile::open(&junction_path).is_err());
+            let _ = fs::remove_dir(&junction_path);
+        }
 
         let concurrent_writer = fs::OpenOptions::new().write(true).open(&data_path)?;
         assert!(MappedFile::open(&data_path).is_err());
@@ -2731,6 +2751,24 @@ mod maintenance_tests {
         });
         assert!(perm.is_err());
         assert_eq!(perm_attempts, 1);
+
+        // ErrorKind::PermissionDenied without raw OS error is not retried
+        let mut kind_only_attempts = 0_usize;
+        let kind_only = retry_transient_win32::<()>(true, || {
+            kind_only_attempts += 1;
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "no os code"))
+        });
+        assert!(kind_only.is_err());
+        assert_eq!(kind_only_attempts, 1);
+
+        // Exhaustion caps at 6 attempts and returns the last transient error
+        let mut exhaust_attempts = 0_usize;
+        let exhausted = retry_transient_win32::<()>(false, || {
+            exhaust_attempts += 1;
+            Err(io::Error::from_raw_os_error(32))
+        });
+        assert_eq!(exhausted.err().and_then(|e| e.raw_os_error()), Some(32));
+        assert_eq!(exhaust_attempts, 6);
         Ok(())
     }
 }

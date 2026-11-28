@@ -760,6 +760,28 @@ mod tests {
         )?;
         assert_eq!(slice_digest, expected);
         assert!(slice_checks >= 3);
+
+        // Empty slice matches SHA-256 of "" and checkpoint error stops hashing mid-stream
+        let empty_digest = hash_mapped_bytes(&[], &mut || Ok::<(), io::Error>(()), |e| e)?;
+        assert_eq!(
+            crate::hex(&empty_digest),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let mut err_checks = 0_usize;
+        let aborted = hash_mapped_bytes(
+            mapped.as_bytes(),
+            &mut || {
+                err_checks += 1;
+                if err_checks >= 2 {
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "aborted"))
+                } else {
+                    Ok(())
+                }
+            },
+            |e| e,
+        );
+        assert!(aborted.is_err());
+        assert_eq!(err_checks, 2);
         drop(mapped);
 
         drop(file);

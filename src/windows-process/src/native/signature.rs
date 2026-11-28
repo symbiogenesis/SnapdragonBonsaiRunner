@@ -166,6 +166,25 @@ fn signer(data: &WINTRUST_DATA) -> io::Result<crate::AuthenticodeSigner> {
     })
 }
 
+fn retry_bad_length<T>(
+    mut acquire: impl FnMut() -> io::Result<T>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> io::Result<T> {
+    const MAX_ATTEMPTS: usize = 16;
+    let bad_length = i32::try_from(ERROR_BAD_LENGTH).ok();
+    for attempt in 0..MAX_ATTEMPTS {
+        match acquire() {
+            Ok(value) => return Ok(value),
+            Err(error) if error.raw_os_error() == bad_length && attempt + 1 < MAX_ATTEMPTS => {
+                let delay_ms = u64::try_from((attempt + 1).min(5)).unwrap_or(5);
+                sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::other("Module snapshot retry loop exhausted."))
+}
+
 pub(crate) fn modules(id: u32, basename: &str) -> io::Result<Vec<PathBuf>> {
     if id == 0
         || basename.is_empty()
@@ -174,28 +193,15 @@ pub(crate) fn modules(id: u32, basename: &str) -> io::Result<Vec<PathBuf>> {
     {
         return Err(super::invalid("Invalid process module selection."));
     }
-    const MAX_ATTEMPTS: usize = 16;
-    let bad_length = i32::try_from(ERROR_BAD_LENGTH).ok();
-    let mut snapshot = None;
-    for attempt in 0..MAX_ATTEMPTS {
-        // SAFETY: This creates a read-only snapshot for a numeric process identifier.
-        match super::owned(unsafe {
-            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, id)
-        }) {
-            Ok(handle) => {
-                snapshot = Some(handle);
-                break;
-            }
-            Err(error) if error.raw_os_error() == bad_length && attempt + 1 < MAX_ATTEMPTS => {
-                let delay_ms = u64::try_from((attempt + 1).min(5)).unwrap_or(5);
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    let Some(snapshot) = snapshot else {
-        return Err(io::Error::other("Module snapshot retry loop exhausted."));
-    };
+    let snapshot = retry_bad_length(
+        || {
+            // SAFETY: This creates a read-only snapshot for a numeric process identifier.
+            super::owned(unsafe {
+                CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, id)
+            })
+        },
+        std::thread::sleep,
+    )?;
     let mut entry = MODULEENTRY32W {
         dwSize: super::win_size::<MODULEENTRY32W>(),
         ..MODULEENTRY32W::default()
@@ -229,4 +235,54 @@ pub(crate) fn modules(id: u32, basename: &str) -> io::Result<Vec<PathBuf>> {
         return Err(error);
     }
     Ok(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_bad_length_recovers_exhausts_at_16_and_stops_on_other_errors() {
+        let bad = i32::try_from(ERROR_BAD_LENGTH).unwrap_or(24);
+        let mut attempts = 0_usize;
+        let mut sleeps = Vec::new();
+        let ok = retry_bad_length(
+            || {
+                attempts += 1;
+                if attempts < 4 {
+                    Err(io::Error::from_raw_os_error(bad))
+                } else {
+                    Ok(42_usize)
+                }
+            },
+            |d| sleeps.push(d),
+        );
+        assert_eq!(ok.ok(), Some(42));
+        assert_eq!(attempts, 4);
+        assert_eq!(sleeps.len(), 3);
+
+        let mut exh_attempts = 0_usize;
+        let mut exh_sleeps = Vec::new();
+        let exh = retry_bad_length::<()>(
+            || {
+                exh_attempts += 1;
+                Err(io::Error::from_raw_os_error(bad))
+            },
+            |d| exh_sleeps.push(d),
+        );
+        assert_eq!(exh.err().and_then(|e| e.raw_os_error()), Some(bad));
+        assert_eq!(exh_attempts, 16);
+        assert_eq!(exh_sleeps.len(), 15);
+
+        let mut perm_attempts = 0_usize;
+        let perm = retry_bad_length::<()>(
+            || {
+                perm_attempts += 1;
+                Err(io::Error::from_raw_os_error(5))
+            },
+            |_| {},
+        );
+        assert_eq!(perm.err().and_then(|e| e.raw_os_error()), Some(5));
+        assert_eq!(perm_attempts, 1);
+    }
 }

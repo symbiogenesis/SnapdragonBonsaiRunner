@@ -4570,6 +4570,94 @@ mod tests {
                 bias: Some([0.0, f32::INFINITY, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
             };
             assert!(!band_target.fill_zero(2));
+
+            let mut band_finite = ScatterTarget::Band {
+                band,
+                local_col: 0,
+                bias: Some([1.0; 8]),
+            };
+            assert!(band_finite.fill_zero(2));
+            assert!(band_finite.fill_zero(0));
         }
+
+        let mut rows = [9.0_f32; 16];
+        let mut rows_target = ScatterTarget::Rows {
+            out_rows: &mut rows,
+            row_stride: 2,
+        };
+        assert!(rows_target.fill_zero(2));
+        assert!(rows.iter().all(|&v| v == 0.0));
+
+        let mut scatter_zero_tok = [0.0_f32; 16];
+        let mut s_zero = ScatterTarget::Scatter {
+            out_tokens: &mut scatter_zero_tok,
+            out_stride: 8,
+            bias: Some([f32::NAN; 8]),
+        };
+        assert!(s_zero.fill_zero(0));
+        let mut s_none = ScatterTarget::Scatter {
+            out_tokens: &mut scatter_zero_tok,
+            out_stride: 8,
+            bias: None,
+        };
+        assert!(s_none.fill_zero(2));
+        let mut s_neginf = ScatterTarget::Scatter {
+            out_tokens: &mut scatter_zero_tok,
+            out_stride: 8,
+            bias: Some([f32::NEG_INFINITY; 8]),
+        };
+        assert!(!s_neginf.fill_zero(1));
+
+        // blocks == 0 propagation through all 4 GEMM dispatchers
+        let mut out_gemm = [0.0_f32; 8];
+        let nan_bias = Some([f32::NAN; 8]);
+        assert!(!gemm_q8_0_8x_panels_dispatch(
+            0,
+            &[],
+            &[],
+            1,
+            &[],
+            ScatterTarget::Scatter {
+                out_tokens: &mut out_gemm,
+                out_stride: 8,
+                bias: nan_bias,
+            }
+        ));
+        assert!(!gemm_repacked_q8_0_8_8x_panels_dispatch(
+            0,
+            &[],
+            &[],
+            1,
+            &[],
+            ScatterTarget::Scatter {
+                out_tokens: &mut out_gemm,
+                out_stride: 8,
+                bias: nan_bias,
+            }
+        ));
+        assert!(!gemm_q4_k_repacked8_8x_panels_dispatch(
+            0,
+            &[],
+            &[],
+            1,
+            &[],
+            ScatterTarget::Scatter {
+                out_tokens: &mut out_gemm,
+                out_stride: 8,
+                bias: nan_bias,
+            }
+        ));
+        assert!(!gemm_q6_k_8x_panels_dispatch(
+            0,
+            &[],
+            &[],
+            1,
+            &[],
+            ScatterTarget::Scatter {
+                out_tokens: &mut out_gemm,
+                out_stride: 8,
+                bias: nan_bias,
+            }
+        ));
     }
 }

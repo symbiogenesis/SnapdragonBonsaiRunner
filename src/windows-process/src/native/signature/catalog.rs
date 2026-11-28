@@ -36,8 +36,27 @@ impl Drop for Catalog<'_> {
     }
 }
 
-pub(super) fn verify(file: &File, filename: &[u16]) -> io::Result<crate::AuthenticodeSigner> {
+fn enumerate_catalogs<T>(
+    mut next_catalog: impl FnMut() -> Option<isize>,
+    mut verify_member: impl FnMut(isize) -> io::Result<T>,
+) -> io::Result<T> {
     const MAX_CATALOGS: usize = 16;
+    let mut last_error = None;
+    for _ in 0..MAX_CATALOGS {
+        let Some(context) = next_catalog() else {
+            break;
+        };
+        match verify_member(context) {
+            Ok(signer) => return Ok(signer),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        super::super::invalid("No installed catalog binds the retained file hash.")
+    }))
+}
+
+pub(super) fn verify(file: &File, filename: &[u16]) -> io::Result<crate::AuthenticodeSigner> {
     let mut admin = 0;
     let subsystem = DRIVER_ACTION_VERIFY;
     let algorithm = windows_sys::core::w!("SHA256");
@@ -79,38 +98,37 @@ pub(super) fn verify(file: &File, filename: &[u16]) -> io::Result<crate::Authent
         admin: &admin,
         context: 0,
     };
-    let mut last_error = None;
-    for _ in 0..MAX_CATALOGS {
-        let mut prev_context = std::mem::replace(&mut catalog.context, 0);
-        // SAFETY: The live administrator receives the exact SHA-256 bytes and either
-        // 0 (fresh search) or the prior context whose ownership transfers to
-        // `CryptCATAdminEnumCatalogFromHash` (which releases it).
-        let context = unsafe {
-            CryptCATAdminEnumCatalogFromHash(
-                admin.0,
-                hash.as_ptr(),
-                hash_bytes,
-                0,
-                &raw mut prev_context,
-            )
-        };
-        if context == 0 {
-            break;
-        }
-        catalog.context = context;
-        match verify_catalog_member(&admin, &catalog, file, filename, &member, &hash, hash_bytes) {
-            Ok(signer) => return Ok(signer),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        super::super::invalid("No installed catalog binds the retained file hash.")
-    }))
+    let catalog_cell = std::cell::RefCell::new(&mut catalog);
+    enumerate_catalogs(
+        || {
+            let mut cat = catalog_cell.borrow_mut();
+            let mut prev_context = std::mem::replace(&mut cat.context, 0);
+            // SAFETY: The live administrator receives the exact SHA-256 bytes and either
+            // 0 (fresh search) or the prior context whose ownership transfers to
+            // `CryptCATAdminEnumCatalogFromHash` (which releases it).
+            let context = unsafe {
+                CryptCATAdminEnumCatalogFromHash(
+                    admin.0,
+                    hash.as_ptr(),
+                    hash_bytes,
+                    0,
+                    &raw mut prev_context,
+                )
+            };
+            if context == 0 {
+                None
+            } else {
+                cat.context = context;
+                Some(context)
+            }
+        },
+        |context| verify_catalog_member(&admin, context, file, filename, &member, &hash, hash_bytes),
+    )
 }
 
 fn verify_catalog_member(
     admin: &Admin,
-    catalog: &Catalog<'_>,
+    catalog_context: isize,
     file: &File,
     filename: &[u16],
     member: &[u16],
@@ -123,7 +141,7 @@ fn verify_catalog_member(
     };
     // SAFETY: The selected catalog remains owned; info is correctly sized and writable.
     super::super::check(unsafe {
-        CryptCATCatalogInfoFromContext(catalog.context, &raw mut info, 0)
+        CryptCATCatalogInfoFromContext(catalog_context, &raw mut info, 0)
     })?;
     if !info.wszCatalogFile.contains(&0) {
         return Err(super::super::invalid("Catalog path was not terminated."));
@@ -148,4 +166,48 @@ fn verify_catalog_member(
         "Installed catalog trust or membership was rejected.",
         "Installed catalog trust state did not close.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enumerate_catalogs_falls_back_through_candidates_and_bounds_max_catalogs() {
+        // 0 catalogs -> "No installed catalog binds..."
+        let none = enumerate_catalogs::<()>(|| None, |_| Ok(()));
+        assert!(
+            none.err()
+                .is_some_and(|e| e.to_string().contains("No installed catalog"))
+        );
+
+        // 1st fails, 2nd succeeds
+        let mut idx = 0_isize;
+        let second = enumerate_catalogs(
+            || {
+                idx += 1;
+                Some(idx)
+            },
+            |ctx| {
+                if ctx == 1 {
+                    Err(io::Error::other("first rejected"))
+                } else {
+                    Ok(ctx)
+                }
+            },
+        );
+        assert_eq!(second.ok(), Some(2));
+
+        // More than 16 failing catalogs stops at MAX_CATALOGS = 16 and returns last_error
+        let mut many = 0_isize;
+        let capped = enumerate_catalogs::<()>(
+            || {
+                many += 1;
+                Some(many)
+            },
+            |ctx| Err(io::Error::other(format!("fail-{ctx}"))),
+        );
+        assert_eq!(many, 16);
+        assert_eq!(capped.err().map(|e| e.to_string()), Some("fail-16".into()));
+    }
 }

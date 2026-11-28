@@ -73,3 +73,60 @@ pub(crate) fn replace(file: &File, target: &Path) -> io::Result<()> {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, OpenOptions};
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_SHARE_READ};
+
+    #[test]
+    fn replace_open_file_retries_transient_sharing_conflict() -> io::Result<()> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "bonsai-replace-retry-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root)?;
+        let source_path = root.join("new.bin");
+        let dest_path = root.join("target.bin");
+        fs::write(&source_path, b"new-bytes")?;
+        fs::write(&dest_path, b"old-bytes")?;
+
+        // Open source with DELETE access so FileRenameInfo can replace dest_path.
+        let source_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ)
+            .access_mode(
+                windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
+                    | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
+                    | DELETE,
+            )
+            .open(&source_path)?;
+
+        // Hold an unshared lock on dest_path briefly so SetFileInformationByHandle hits ERROR_SHARING_VIOLATION then recovers.
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&dest_path)?;
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            drop(lock);
+        });
+        replace(&source_file, &dest_path)?;
+        drop(source_file);
+        releaser
+            .join()
+            .map_err(|_| io::Error::other("releaser panicked"))?;
+        assert_eq!(fs::read(&dest_path)?, b"new-bytes");
+        assert!(!source_path.exists());
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+}
