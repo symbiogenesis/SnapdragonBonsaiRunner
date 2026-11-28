@@ -369,6 +369,19 @@ impl ParentProcess {
             _ => Err(io::Error::last_os_error()),
         }
     }
+
+    pub(super) fn wait_for_exit(&self, timeout: Duration) -> io::Result<bool> {
+        let millis = u32::try_from(timeout.as_millis())
+            .unwrap_or(u32::MAX - 1)
+            .min(u32::MAX - 1);
+        // SAFETY: This noninheritable process synchronization handle remains
+        // owned for the entire wait and `millis` is bounded below `INFINITE`.
+        match unsafe { WaitForSingleObject(self.0.as_raw_handle(), millis) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
 }
 
 pub(super) fn process_creation_time(id: u32) -> io::Result<u64> {

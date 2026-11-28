@@ -1278,6 +1278,17 @@ impl ParentProcess {
     pub fn ensure_alive(&self) -> io::Result<()> {
         self.0.ensure_alive()
     }
+
+    /// Waits up to `timeout` for the retained process to exit.
+    ///
+    /// Returns `Ok(true)` once the process signals exit and `Ok(false)` if it is
+    /// still running when `timeout` elapses.
+    ///
+    /// # Errors
+    /// Returns an OS wait error if Windows cannot wait on the handle.
+    pub fn wait_for_exit(&self, timeout: Duration) -> io::Result<bool> {
+        self.0.wait_for_exit(timeout)
+    }
 }
 
 impl OwnedProcess {
@@ -2720,8 +2731,26 @@ mod maintenance_tests {
     fn current_identity_retains_the_running_process() -> io::Result<()> {
         let created = current_process_creation_time()?;
         assert_ne!(created, 0);
-        ParentProcess::open(std::process::id(), created)?.ensure_alive()?;
+        let current = ParentProcess::open(std::process::id(), created)?;
+        current.ensure_alive()?;
+        assert!(!current.wait_for_exit(Duration::from_millis(5))?);
         assert!(ParentProcess::open(std::process::id(), created + 1).is_err());
+
+        let comspec =
+            std::env::var_os("ComSpec").ok_or_else(|| io::Error::other("Missing ComSpec"))?;
+        let mut child = std::process::Command::new(comspec)
+            .args(["/d", "/c", "exit 0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let child_pid = child.id();
+        if let Ok(child_created) = process_creation_file_time(child_pid)
+            && let Ok(retained) = ParentProcess::open(child_pid, child_created)
+        {
+            assert!(retained.wait_for_exit(Duration::from_secs(5))?);
+        }
+        let _ = child.wait();
         Ok(())
     }
 
